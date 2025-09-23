@@ -1,6 +1,9 @@
-pluginManagement { includeBuild("../node_modules/@react-native/gradle-plugin") }
-plugins { id("com.facebook.react.settings") }
-extensions.configure(com.facebook.react.ReactSettingsExtension){ ex -> ex.autolinkLibrariesFromCommand() }
-rootProject.name = 'RMZWallet'
+rootProject.name = 'RMZ Wallet'
+
 include ':app'
-includeBuild('../node_modules/@react-native/gradle-plugin')
+
+include ':capacitor-android'
+project(':capacitor-android').projectDir = new File('../node_modules/@capacitor/android/capacitor')
+
+include ':capacitor-cordova-android-plugins'
+project(':capacitor-cordova-android-plugins').projectDir = new File('../node_modules/@capacitor/cli/assets/capacitor-cordova-android-plugins')
