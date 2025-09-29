@@ -47,7 +47,7 @@ dependencies {
     implementation "androidx.appcompat:appcompat:${rootProject.ext.androidxAppCompatVersion}"
     implementation "androidx.coordinatorlayout:coordinatorlayout:${rootProject.ext.androidxCoordinatorLayoutVersion}"
     implementation "androidx.core:core-splashscreen:${rootProject.ext.coreSplashScreenVersion}"
-    implementation project(':capacitor-android')
+    implementation "com.capacitorjs:capacitor-android:7.0.0"
     testImplementation "junit:junit:${rootProject.ext.junitVersion}"
     androidTestImplementation "androidx.test.ext:junit:${rootProject.ext.androidxJunitVersion}"
     androidTestImplementation "androidx.test.espresso:espresso-core:${rootProject.ext.androidxEspressoCoreVersion}"
