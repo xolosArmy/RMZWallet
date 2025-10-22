@@ -1,7 +1,6 @@
 import { Injectable } from '@angular/core';
 import { ChronikClient } from 'chronik-client';
 
-import { CHRONIK_URL } from './chronik.constants';
 import { addressToHash160 } from '../utils/address';
 
 import { TxStorageService } from './tx-storage.service';
@@ -20,7 +19,7 @@ type ChronikWsMessage = {
   providedIn: 'root',
 })
 export class ChronikService {
-  private readonly chronik = new ChronikClient([CHRONIK_URL]);
+  private readonly chronik = new ChronikClient(['https://chronik.e.cash']);
   private readonly subscribedAddresses = new Set<string>();
   private wsClient?: ChronikWsClient;
   private wsReady!: Promise<void>;
