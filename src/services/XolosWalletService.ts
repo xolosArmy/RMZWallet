@@ -1,5 +1,12 @@
-import { MinimalXECWallet } from 'minimal-xec-wallet'
+import * as MinimalXecWalletModule from 'minimal-xec-wallet'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
+
+// The package ships a UMD/CJS build without an ES default export; grab whatever
+// is available (named export, default from CJS transform, or browser global).
+const MinimalXECWallet =
+  (MinimalXecWalletModule as any).MinimalXECWallet ||
+  (MinimalXecWalletModule as any).default ||
+  (typeof window !== 'undefined' ? (window as any).MinimalXecWallet : undefined)
 
 // ID real del eToken $RMZ de xolosArmy en la red eCash
 const RMZ_TOKEN_ID = '9e0a9d4720782cf661beaea6c5513f1972e0f3b1541ba4c83f4c87ef65f843dc'
