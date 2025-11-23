@@ -84,10 +84,19 @@ class XolosWalletService {
   }
 
   encryptAndStoreMnemonic(password: string): void {
-    if (!this.decryptedMnemonic) {
-      throw new Error('No hay semilla en memoria para cifrar.')
+    let mnemonic = this.decryptedMnemonic
+
+    const walletMnemonic = this.wallet?.mnemonic || this.wallet?.walletInfo?.mnemonic
+    if (!mnemonic && walletMnemonic) {
+      mnemonic = walletMnemonic
+      this.decryptedMnemonic = mnemonic
     }
-    const cipherText = encryptWithPassword(this.decryptedMnemonic, password)
+
+    if (!mnemonic) {
+      throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
+    }
+
+    const cipherText = encryptWithPassword(mnemonic, password)
     localStorage.setItem(STORAGE_KEY_MNEMONIC, cipherText)
     this.encryptedMnemonic = cipherText
   }

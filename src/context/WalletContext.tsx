@@ -119,9 +119,14 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
   const encryptAndStore = useCallback(
     (password: string) => {
-      xolosWalletService.encryptAndStoreMnemonic(password)
-      setBackupVerifiedState(true)
-      localStorage.setItem(BACKUP_KEY, 'true')
+      try {
+        xolosWalletService.encryptAndStoreMnemonic(password)
+        setBackupVerifiedState(true)
+        localStorage.setItem(BACKUP_KEY, 'true')
+      } catch (e) {
+        console.error(e)
+        setError('No pudimos acceder a tu seed para cifrarla. Vuelve a iniciar el proceso de onboarding y respaldo.')
+      }
     },
     []
   )
