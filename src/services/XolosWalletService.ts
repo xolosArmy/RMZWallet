@@ -1,0 +1,144 @@
+import { MinimalXECWallet } from 'minimal-xec-wallet'
+import { decryptWithPassword, encryptWithPassword } from './crypto'
+
+// ID real del eToken $RMZ de xolosArmy en la red eCash
+const RMZ_TOKEN_ID = '9e0a9d4720782cf661beaea6c5513f1972e0f3b1541ba4c83f4c87ef65f843dc'
+const CHRONIK_ENDPOINTS = ['https://chronik.e.cash', 'https://chronik.paybutton.org']
+const DERIVATION_PATH = "m/44'/899'/0'/0/0"
+const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
+
+export interface WalletBalance {
+  xec: number // satoshis
+  rmz: number // tokens RMZ
+  xecFormatted: string // XEC con 2 decimales
+}
+
+class XolosWalletService {
+  private static instance: XolosWalletService
+  private wallet: any | null = null
+  private isReady = false
+  private encryptedMnemonic: string | null = null
+  private decryptedMnemonic: string | null = null
+
+  private constructor() {
+    this.encryptedMnemonic = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_MNEMONIC) : null
+  }
+
+  static getInstance(): XolosWalletService {
+    if (!XolosWalletService.instance) {
+      XolosWalletService.instance = new XolosWalletService()
+    }
+    return XolosWalletService.instance
+  }
+
+  private buildWallet(mnemonic?: string) {
+    this.wallet = new MinimalXECWallet(mnemonic, {
+      hdPath: DERIVATION_PATH,
+      chronikUrls: CHRONIK_ENDPOINTS,
+      enableDonations: false
+    })
+    return this.wallet
+  }
+
+  private ensureReady() {
+    if (!this.wallet || !this.isReady) {
+      throw new Error('La billetera no está inicializada aún.')
+    }
+  }
+
+  async createNewWallet(): Promise<string> {
+    this.buildWallet()
+    const walletInfo = await this.wallet.walletInfoPromise
+    await this.wallet.initialize()
+    this.isReady = true
+    this.decryptedMnemonic = walletInfo?.mnemonic || null
+    this.encryptedMnemonic = null
+    return this.decryptedMnemonic || ''
+  }
+
+  async restoreFromMnemonic(mnemonic: string): Promise<void> {
+    if (!mnemonic || mnemonic.trim().split(' ').length < 12) {
+      throw new Error('La frase semilla es inválida.')
+    }
+    this.buildWallet(mnemonic.trim())
+    await this.wallet.walletInfoPromise
+    await this.wallet.initialize()
+    this.isReady = true
+    this.decryptedMnemonic = mnemonic.trim()
+  }
+
+  async loadFromStorage(password: string): Promise<void> {
+    if (!this.encryptedMnemonic) {
+      throw new Error('No existe una semilla cifrada en este dispositivo.')
+    }
+    const mnemonic = decryptWithPassword(this.encryptedMnemonic, password)
+    await this.restoreFromMnemonic(mnemonic)
+    this.decryptedMnemonic = mnemonic
+  }
+
+  encryptAndStoreMnemonic(password: string): void {
+    if (!this.decryptedMnemonic) {
+      throw new Error('No hay semilla en memoria para cifrar.')
+    }
+    const cipherText = encryptWithPassword(this.decryptedMnemonic, password)
+    localStorage.setItem(STORAGE_KEY_MNEMONIC, cipherText)
+    this.encryptedMnemonic = cipherText
+  }
+
+  clearStoredWallet(): void {
+    localStorage.removeItem(STORAGE_KEY_MNEMONIC)
+    this.encryptedMnemonic = null
+    this.decryptedMnemonic = null
+    this.wallet = null
+    this.isReady = false
+  }
+
+  async getBalances(): Promise<WalletBalance> {
+    this.ensureReady()
+    await this.wallet.initialize()
+
+    const [xecBalance, rmzBalanceObj] = await Promise.all([
+      this.wallet.getXecBalance(),
+      this.wallet.getETokenBalance({ tokenId: RMZ_TOKEN_ID })
+    ])
+
+    const rmz =
+      typeof rmzBalanceObj === 'number'
+        ? rmzBalanceObj
+        : rmzBalanceObj?.balance?.display || 0
+
+    const xecInSats = Math.round((xecBalance || 0) * 100) // XEC tiene 2 decimales, satoshis = XEC * 100
+
+    return {
+      xec: xecInSats,
+      rmz,
+      xecFormatted: (xecBalance || 0).toFixed(2)
+    }
+  }
+
+  async sendRMZ(destination: string, amount: number): Promise<string> {
+    this.ensureReady()
+    if (amount <= 0) {
+      throw new Error('El monto debe ser mayor a cero.')
+    }
+    return this.wallet.sendETokens(RMZ_TOKEN_ID, [{ address: destination, amount }])
+  }
+
+  async sendXEC(destination: string, amountInSats: number): Promise<string> {
+    this.ensureReady()
+    if (amountInSats <= 0) {
+      throw new Error('El monto debe ser mayor a cero.')
+    }
+    return this.wallet.sendXec([{ address: destination, amountSat: amountInSats }])
+  }
+
+  getMnemonic(): string | null {
+    return this.decryptedMnemonic
+  }
+
+  getAddress(): string | null {
+    return this.wallet?.walletInfo?.xecAddress || null
+  }
+}
+
+export const xolosWalletService = XolosWalletService.getInstance()
