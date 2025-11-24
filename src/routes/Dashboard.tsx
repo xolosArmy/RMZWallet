@@ -34,7 +34,9 @@ function Dashboard() {
         <div>
           <p className="eyebrow">Panel principal</p>
           <h1 className="section-title">Guardianía RMZ sobre eCash</h1>
-          <p className="muted">Saldos, gas y tu dirección protegida en una sola vista.</p>
+          <p className="muted">
+            Saldos, gas y tu dirección protegida en una sola vista. La seed nunca sale de tu dispositivo.
+          </p>
         </div>
         <div className="actions">
           <Link className="cta primary" to="/send">
