@@ -2,6 +2,7 @@ import type { FormEvent } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useWallet } from '../context/WalletContext'
+import TopBar from '../components/TopBar'
 
 interface BackupState {
   password: string
@@ -58,10 +59,12 @@ function BackupSeed() {
 
   return (
     <div className="page">
-      <header className="header">
+      <TopBar />
+      <header className="section-header">
         <div>
-          <p className="subtitle">Respalda tu seed</p>
-          <h1 className="title">Sin seed, no hay $RMZ</h1>
+          <p className="eyebrow">Respalda tu seed</p>
+          <h1 className="section-title">Sin seed, no hay $RMZ</h1>
+          <p className="muted">Guarda tus 12 palabras como si fueran tu tesoro más valioso.</p>
         </div>
       </header>
 

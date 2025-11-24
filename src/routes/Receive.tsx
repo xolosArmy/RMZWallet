@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom'
 import { useWallet } from '../context/WalletContext'
+import TopBar from '../components/TopBar'
 
 function Receive() {
   const { address, initialized } = useWallet()
@@ -7,10 +8,11 @@ function Receive() {
   if (!initialized) {
     return (
       <div className="page">
-        <h1 className="title">Configura tu billetera</h1>
+        <TopBar />
+        <h1 className="section-title">Configura tu billetera</h1>
         <p className="muted">Ve al onboarding para generar o desbloquear tu seed.</p>
         <div className="actions">
-          <Link className="cta" to="/onboarding">
+          <Link className="cta primary" to="/onboarding">
             Ir a onboarding
           </Link>
         </div>
@@ -20,10 +22,12 @@ function Receive() {
 
   return (
     <div className="page">
-      <header className="header">
+      <TopBar />
+      <header className="section-header">
         <div>
-          <p className="subtitle">Recibir</p>
-          <h1 className="title">Comparte tu dirección eCash</h1>
+          <p className="eyebrow">Recibir</p>
+          <h1 className="section-title">Comparte tu dirección eCash</h1>
+          <p className="muted">Recibe RMZ y XEC en la misma dirección cifrada en tu dispositivo.</p>
         </div>
       </header>
 

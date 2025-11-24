@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { useWallet } from '../context/WalletContext'
+import TopBar from '../components/TopBar'
 
 function Dashboard() {
   const { address, balance, initialized, refreshBalances, loading, error } = useWallet()
@@ -14,10 +15,11 @@ function Dashboard() {
   if (!initialized) {
     return (
       <div className="page">
-        <h1 className="title">Bienvenido</h1>
+        <TopBar />
+        <h1 className="section-title">Bienvenido</h1>
         <p className="muted">Configura tu billetera para ver tus saldos.</p>
         <div className="actions">
-          <Link className="cta" to="/onboarding">
+          <Link className="cta primary" to="/onboarding">
             Ir a onboarding
           </Link>
         </div>
@@ -27,16 +29,18 @@ function Dashboard() {
 
   return (
     <div className="page">
-      <header className="header">
+      <TopBar />
+      <header className="section-header">
         <div>
-          <p className="subtitle">xolosArmy Wallet</p>
-          <h1 className="title">$RMZ es el protagonista</h1>
+          <p className="eyebrow">Panel principal</p>
+          <h1 className="section-title">Guardianía RMZ sobre eCash</h1>
+          <p className="muted">Saldos, gas y tu dirección protegida en una sola vista.</p>
         </div>
         <div className="actions">
-          <Link className="cta" to="/send">
+          <Link className="cta primary" to="/send">
             Enviar RMZ
           </Link>
-          <Link className="cta secondary" to="/receive">
+          <Link className="cta outline" to="/receive">
             Recibir
           </Link>
         </div>
