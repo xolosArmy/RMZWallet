@@ -1,6 +1,7 @@
 import type { FormEvent } from 'react'
 import { useState } from 'react'
 import { useWallet } from '../context/WalletContext'
+import TopBar from '../components/TopBar'
 
 function SendRMZ() {
   const { sendRMZ, initialized, backupVerified, loading, error } = useWallet()
@@ -39,10 +40,12 @@ function SendRMZ() {
 
   return (
     <div className="page">
-      <header className="header">
+      <TopBar />
+      <header className="section-header">
         <div>
-          <p className="subtitle">Enviar</p>
-          <h1 className="title">RMZ hacia otra dirección</h1>
+          <p className="eyebrow">Enviar</p>
+          <h1 className="section-title">RMZ hacia otra dirección</h1>
+          <p className="muted">Mueve RMZ con confianza sobre la red eCash.</p>
         </div>
       </header>
 

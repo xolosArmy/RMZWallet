@@ -1,7 +1,8 @@
 import type { FormEvent } from 'react'
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useWallet } from '../context/WalletContext'
+import TopBar from '../components/TopBar'
 
 function Onboarding() {
   const navigate = useNavigate()
@@ -52,15 +53,46 @@ function Onboarding() {
 
   return (
     <div className="page">
-      <header className="header">
-        <div>
-          <p className="subtitle">Bienvenido a xolosArmy Wallet</p>
-          <h1 className="title">$RMZ en tu propio dispositivo</h1>
-        </div>
-      </header>
+      <TopBar />
 
-      <div className="grid">
-        <form className="card" onSubmit={handleCreate}>
+      <section className="hero">
+        <div className="hero-copy">
+          <p className="eyebrow">Bienvenido a RMZWallet</p>
+          <h1 className="hero-title">Tu templo seguro para XEC y el eToken RMZ</h1>
+          <p className="lead">
+            Configura tu cartera para ver tus saldos y mover XEC con seguridad. Explora tus tokens, NFTs y el
+            ecosistema XolosArmy desde una sola interfaz.
+          </p>
+          <div className="hero-actions">
+            <a className="cta primary" href="#crear">
+              Crear nueva cartera RMZWallet
+            </a>
+            <a className="cta outline" href="#importar">
+              Conectar cartera existente
+            </a>
+            <a className="cta ghost" href="#lectura">
+              Ver saldos de tokens y NFTs
+            </a>
+          </div>
+        </div>
+
+        <div className="hero-card">
+          <p className="muted">Cyber-aztec · XolosArmy Network</p>
+          <div className="hero-badge">Guardianía digital</div>
+          <p className="hero-note">
+            La seed y el cifrado viven solo en tu dispositivo. Usa un password local que recuerdes y respalda tu frase
+            de 12 palabras.
+          </p>
+          <div className="hero-stats">
+            <span className="pill">RMZ listo para eCash (XEC)</span>
+            <span className="pill pill-ghost">Modo lectura disponible</span>
+          </div>
+        </div>
+      </section>
+
+      <div className="grid onboarding-grid">
+        <form id="crear" className="card" onSubmit={handleCreate}>
+          <p className="card-kicker">Nuevo templo</p>
           <h2>Crear billetera nueva</h2>
           <p className="muted">La seed se genera localmente y nunca sale de tu dispositivo.</p>
           <label htmlFor="new-password">Password/PIN local</label>
@@ -72,13 +104,14 @@ function Onboarding() {
             onChange={(e) => setPasswordNew(e.target.value)}
           />
           <div className="actions">
-            <button className="cta" type="submit" disabled={loading}>
+            <button className="cta primary" type="submit" disabled={loading}>
               Generar seed
             </button>
           </div>
         </form>
 
-        <form className="card" onSubmit={handleExisting}>
+        <form id="importar" className="card" onSubmit={handleExisting}>
+          <p className="card-kicker">Conectar</p>
           <h2>Usar billetera guardada</h2>
           <p className="muted">Ingresa el password/PIN con el que cifraste la seed.</p>
           <label htmlFor="existing-password">Password/PIN</label>
@@ -90,11 +123,24 @@ function Onboarding() {
             onChange={(e) => setPasswordExisting(e.target.value)}
           />
           <div className="actions">
-            <button className="cta secondary" type="submit" disabled={loading}>
+            <button className="cta outline" type="submit" disabled={loading}>
               Desbloquear
             </button>
           </div>
         </form>
+
+        <div id="lectura" className="card highlight">
+          <p className="card-kicker">Modo lectura</p>
+          <h2>Ver saldos de tokens y NFTs</h2>
+          <p className="muted">
+            Puedes entrar en modo solo lectura para revisar tu dirección, saldo RMZ y gas en XEC sin exponer tu seed.
+          </p>
+          <div className="actions">
+            <Link className="cta ghost" to="/">
+              Abrir vista de saldos
+            </Link>
+          </div>
+        </div>
       </div>
 
       {(localError || error) && <div className="error">{localError || error}</div>}
