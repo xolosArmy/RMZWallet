@@ -60,8 +60,8 @@ function Onboarding() {
           <p className="eyebrow">Bienvenido a RMZWallet</p>
           <h1 className="hero-title">Tu templo seguro para XEC y el eToken RMZ</h1>
           <p className="lead">
-            Configura tu cartera para ver tus saldos y mover XEC con seguridad. Explora tus tokens, NFTs y el
-            ecosistema XolosArmy desde una sola interfaz.
+            Configura tu cartera para ver saldos y mover XEC con seguridad. Explora tus tokens, NFTs y el ecosistema
+            XolosArmy desde una sola interfaz.
           </p>
           <div className="hero-actions">
             <a className="cta primary" href="#crear">

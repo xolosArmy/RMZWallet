@@ -1,13 +1,13 @@
 :root {
-  --bg: #020617;
-  --bg-alt: #0b1120;
+  --bg: #05070c;
+  --bg-alt: #050812;
   --panel: rgba(255, 255, 255, 0.03);
   --panel-strong: rgba(247, 148, 77, 0.06);
   --border: rgba(255, 255, 255, 0.08);
   --text: #f5f5f5;
   --muted: #9fa6b2;
-  --accent: #d76823;
-  --accent-2: #f29a4a;
+  --accent: #ff7a1a;
+  --accent-2: #ffa157;
   --teal: #39d0c2;
   --radius-lg: 20px;
   --radius-pill: 999px;
@@ -70,12 +70,14 @@ a {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 12px 16px;
+  flex-wrap: wrap;
+  padding: 14px 18px;
   margin-bottom: 28px;
   border-radius: var(--radius-lg);
-  background: linear-gradient(120deg, rgba(215, 104, 35, 0.14), rgba(11, 17, 32, 0.95));
-  border: 1px solid rgba(215, 104, 35, 0.25);
-  box-shadow: var(--shadow);
+  background: linear-gradient(135deg, rgba(5, 7, 12, 0.95), rgba(5, 8, 18, 0.9));
+  border: 1px solid rgba(255, 122, 26, 0.25);
+  box-shadow: 0 16px 50px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(8px);
 }
 
 .brand {
@@ -85,11 +87,11 @@ a {
 }
 
 .brand-mark {
-  width: 52px;
-  height: 52px;
+  width: 48px;
+  height: 48px;
   border-radius: 16px;
-  background: radial-gradient(circle at 30% 30%, rgba(242, 154, 74, 0.4), rgba(2, 6, 23, 0.9));
-  border: 1px solid rgba(242, 154, 74, 0.25);
+  background: radial-gradient(circle at 30% 30%, rgba(255, 122, 26, 0.28), rgba(5, 7, 12, 0.95));
+  border: 1px solid rgba(255, 122, 26, 0.3);
   box-shadow: 0 14px 32px rgba(0, 0, 0, 0.35);
   display: grid;
   place-items: center;
@@ -97,10 +99,11 @@ a {
 }
 
 .brand-mark img {
-  width: 44px;
-  height: 44px;
+  width: 100%;
+  height: 100%;
+  max-height: 38px;
   object-fit: contain;
-  filter: drop-shadow(0 8px 20px rgba(242, 154, 74, 0.25));
+  filter: drop-shadow(0 8px 20px rgba(255, 122, 26, 0.25));
 }
 
 .brand-copy {
@@ -120,6 +123,7 @@ a {
   margin: 0;
   color: var(--muted);
   font-size: 13px;
+  line-height: 1.4;
 }
 
 .status-pill {
@@ -397,5 +401,14 @@ textarea:focus {
   .topbar {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .brand-mark {
+    width: 42px;
+    height: 42px;
+  }
+
+  .brand-title {
+    font-size: 17px;
   }
 }
