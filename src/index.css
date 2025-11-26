@@ -44,6 +44,8 @@ a {
   min-height: 100vh;
   position: relative;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .app-glow {
@@ -55,6 +57,34 @@ a {
   filter: blur(50px);
   opacity: 0.8;
   z-index: 0;
+}
+
+.app-content {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+}
+
+.app-footer {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  padding: 14px 18px;
+  border-top: 1px solid rgba(255, 122, 26, 0.12);
+  text-align: center;
+  font-size: 0.78rem;
+  color: #b6bcc7;
+  background: linear-gradient(180deg, rgba(5, 8, 18, 0.7), rgba(5, 7, 12, 0.92));
+  backdrop-filter: blur(8px);
+}
+
+.app-footer a {
+  color: inherit;
+  transition: color 160ms ease;
+}
+
+.app-footer a:hover {
+  color: var(--accent);
 }
 
 .page {
