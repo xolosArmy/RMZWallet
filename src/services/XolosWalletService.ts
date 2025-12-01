@@ -1,4 +1,5 @@
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
+import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 
 // The package ships a UMD/CJS build without an ES default export; grab whatever
@@ -8,8 +9,6 @@ const MinimalXECWallet =
   (MinimalXecWalletModule as any).default ||
   (typeof window !== 'undefined' ? (window as any).MinimalXecWallet : undefined)
 
-// ID real del eToken $RMZ de xolosArmy en la red eCash
-const RMZ_TOKEN_ID = '9e0a9d4720782cf661beaea6c5513f1972e0f3b1541ba4c83f4c87ef65f843dc'
 const CHRONIK_ENDPOINTS = ['https://chronik.e.cash', 'https://chronik.paybutton.org']
 const DERIVATION_PATH = "m/44'/899'/0'/0/0"
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
@@ -115,7 +114,7 @@ class XolosWalletService {
 
     const [xecBalance, rmzBalanceObj] = await Promise.all([
       this.wallet.getXecBalance(),
-      this.wallet.getETokenBalance({ tokenId: RMZ_TOKEN_ID })
+      this.wallet.getETokenBalance({ tokenId: RMZ_ETOKEN_ID })
     ])
 
     const rmz =
@@ -137,7 +136,7 @@ class XolosWalletService {
     if (amount <= 0) {
       throw new Error('El monto debe ser mayor a cero.')
     }
-    return this.wallet.sendETokens(RMZ_TOKEN_ID, [{ address: destination, amount }])
+    return this.wallet.sendETokens(RMZ_ETOKEN_ID, [{ address: destination, amount }])
   }
 
   async sendXEC(destination: string, amountInSats: number): Promise<string> {
