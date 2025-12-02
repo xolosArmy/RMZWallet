@@ -1,2 +1,2 @@
 // ID real del eToken $RMZ de xolosArmy en la red eCash
-export const RMZ_ETOKEN_ID = '9e0a9d4720782cf661beaea6c5513f1972e0f3b1541ba4c83f4c87ef65f843dc'
+export const RMZ_ETOKEN_ID = 'c923bd0f09c630c5e9980cf518c8d34b6353802a3cb7c3f34fa7cc85c9305908'
