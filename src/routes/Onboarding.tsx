@@ -6,9 +6,12 @@ import TopBar from '../components/TopBar'
 
 function Onboarding() {
   const navigate = useNavigate()
-  const { createNewWallet, loadExistingWallet, backupVerified, getMnemonic, loading, error } = useWallet()
+  const { createNewWallet, loadExistingWallet, restoreWallet, backupVerified, getMnemonic, loading, error } =
+    useWallet()
   const [passwordNew, setPasswordNew] = useState('')
   const [passwordExisting, setPasswordExisting] = useState('')
+  const [seedPhrase, setSeedPhrase] = useState('')
+  const [passwordImport, setPasswordImport] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
 
   const handleCreate = async (e: FormEvent) => {
@@ -51,6 +54,29 @@ function Onboarding() {
     }
   }
 
+  const handleImport = async (e: FormEvent) => {
+    e.preventDefault()
+    setLocalError(null)
+    if (passwordImport.length < 6) {
+      setLocalError('El password/PIN debe tener al menos 6 caracteres.')
+      return
+    }
+
+    const phrase = seedPhrase.trim()
+    const wordsCount = phrase.split(' ').length
+    if (wordsCount !== 12 && wordsCount !== 24) {
+      setLocalError('La frase seed debe contener 12 o 24 palabras.')
+      return
+    }
+
+    try {
+      await restoreWallet(phrase)
+      navigate('/backup', { state: { password: passwordImport, mnemonic: phrase } })
+    } catch (err) {
+      setLocalError((err as Error).message)
+    }
+  }
+
   return (
     <div className="page">
       <TopBar />
@@ -69,6 +95,9 @@ function Onboarding() {
             </a>
             <a className="cta outline" href="#importar">
               Conectar cartera existente
+            </a>
+            <a className="cta outline" href="#restaurar">
+              Importar cartera desde seed
             </a>
             <a className="cta ghost" href="#lectura">
               Ver saldos de tokens y NFTs
@@ -125,6 +154,35 @@ function Onboarding() {
           <div className="actions">
             <button className="cta outline" type="submit" disabled={loading}>
               Desbloquear
+            </button>
+          </div>
+        </form>
+
+        <form id="restaurar" className="card" onSubmit={handleImport}>
+          <p className="card-kicker">Importar</p>
+          <h2>Importar cartera desde seed</h2>
+          <p className="muted">
+            Pega tu frase de 12 o 24 palabras para restaurar tu cartera. Nota: la seed nunca sale de tu dispositivo.
+          </p>
+          <label htmlFor="seed-phrase">Frase seed</label>
+          <textarea
+            id="seed-phrase"
+            rows={3}
+            placeholder="Ingrese aquí las 12 o 24 palabras"
+            value={seedPhrase}
+            onChange={(e) => setSeedPhrase(e.target.value)}
+          />
+          <label htmlFor="import-password">Nuevo Password/PIN local</label>
+          <input
+            id="import-password"
+            type="password"
+            placeholder="Mínimo 6 caracteres"
+            value={passwordImport}
+            onChange={(e) => setPasswordImport(e.target.value)}
+          />
+          <div className="actions">
+            <button className="cta outline" type="submit" disabled={loading}>
+              Importar cartera
             </button>
           </div>
         </form>

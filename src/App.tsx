@@ -5,6 +5,8 @@ import Receive from './routes/Receive'
 import Settings from './routes/Settings'
 import Onboarding from './routes/Onboarding'
 import BackupSeed from './routes/BackupSeed'
+import { ScanQR } from './routes/ScanQR'
+import RevealSeed from './routes/RevealSeed'
 
 function App() {
   return (
@@ -15,9 +17,11 @@ function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/send" element={<SendRMZ />} />
           <Route path="/receive" element={<Receive />} />
+          <Route path="/scan" element={<ScanQR />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/backup" element={<BackupSeed />} />
+          <Route path="/reveal-seed" element={<RevealSeed />} />
           <Route path="*" element={<Navigate to="/onboarding" replace />} />
         </Routes>
       </main>

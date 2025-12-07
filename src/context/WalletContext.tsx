@@ -18,7 +18,8 @@ export interface WalletContextValue {
   encryptAndStore: (password: string) => void
   refreshBalances: () => Promise<void>
   sendRMZ: (to: string, amount: number) => Promise<string>
-   getMnemonic: () => string | null
+  getMnemonic: () => string | null
+  unlockEncryptedWallet: (password: string) => Promise<void>
   setBackupVerified?: (value: boolean) => void
 }
 
@@ -117,6 +118,20 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     [syncAddressAndBalance]
   )
 
+  const unlockEncryptedWallet = useCallback(
+    async (password: string) => {
+      setError(null)
+      try {
+        await xolosWalletService.unlockEncryptedWallet(password)
+      } catch (err) {
+        const message = (err as Error).message || 'No se pudo desbloquear la seed cifrada.'
+        setError(message)
+        throw new Error(message)
+      }
+    },
+    []
+  )
+
   const encryptAndStore = useCallback(
     (password: string) => {
       try {
@@ -170,6 +185,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       refreshBalances,
       sendRMZ,
       getMnemonic,
+      unlockEncryptedWallet,
       setBackupVerified: setBackupVerifiedState
     }),
     [
@@ -185,7 +201,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       encryptAndStore,
       refreshBalances,
       sendRMZ,
-      getMnemonic
+      getMnemonic,
+      unlockEncryptedWallet
     ]
   )
 

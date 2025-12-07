@@ -82,6 +82,14 @@ class XolosWalletService {
     this.decryptedMnemonic = mnemonic
   }
 
+  async unlockEncryptedWallet(password: string): Promise<void> {
+    if (!this.encryptedMnemonic) {
+      throw new Error('No existe una semilla cifrada en este dispositivo.')
+    }
+    const mnemonic = decryptWithPassword(this.encryptedMnemonic, password)
+    this.decryptedMnemonic = mnemonic
+  }
+
   encryptAndStoreMnemonic(password: string): void {
     let mnemonic = this.decryptedMnemonic
 

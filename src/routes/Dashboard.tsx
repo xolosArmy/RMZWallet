@@ -45,6 +45,12 @@ function Dashboard() {
           <Link className="cta outline" to="/receive">
             Recibir
           </Link>
+          <Link className="cta outline" to="/scan">
+            Escanear QR para recibir RMZ
+          </Link>
+          <Link className="cta outline" to="/reveal-seed">
+            Ver frase seed
+          </Link>
         </div>
       </header>
 
