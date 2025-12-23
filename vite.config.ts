@@ -47,6 +47,14 @@ export default defineConfig({
       // COOP/COEP necesarios para WASM/SharedArrayBuffer seguro en el navegador.
       'Cross-Origin-Embedder-Policy': 'require-corp',
       'Cross-Origin-Opener-Policy': 'same-origin'
+    },
+    proxy: {
+      '/chronik': {
+        target: 'http://192.168.0.48:8331',
+        changeOrigin: true,
+        // /chronik/... -> /...
+        rewrite: (path) => path.replace(/^\/chronik/, '')
+      }
     }
   },
   optimizeDeps: {

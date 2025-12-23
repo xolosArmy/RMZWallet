@@ -9,7 +9,23 @@ const MinimalXECWallet =
   (MinimalXecWalletModule as any).default ||
   (typeof window !== 'undefined' ? (window as any).MinimalXecWallet : undefined)
 
-const CHRONIK_ENDPOINTS = ['https://chronik.e.cash', 'https://chronik.paybutton.org']
+const DEFAULT_DEV_CHRONIK = 'http://localhost:5173/chronik'
+const DEFAULT_PROD_CHRONIK = 'https://chronik.e.cash'
+
+const resolveChronikUrl = (value: string | undefined): string => {
+  if (value && /^https?:\/\//i.test(value)) {
+    return value
+  }
+  if (value && value.startsWith('/') && typeof window !== 'undefined') {
+    return `${window.location.origin}${value}`
+  }
+  if (import.meta.env.DEV) {
+    return DEFAULT_DEV_CHRONIK
+  }
+  return DEFAULT_PROD_CHRONIK
+}
+
+export const CHRONIK_ENDPOINTS = [resolveChronikUrl(import.meta.env.VITE_CHRONIK_URL)]
 const DERIVATION_PATH = "m/44'/899'/0'/0/0"
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
 
@@ -153,6 +169,25 @@ class XolosWalletService {
       throw new Error('El monto debe ser mayor a cero.')
     }
     return this.wallet.sendXec([{ address: destination, amountSat: amountInSats }])
+  }
+
+  getKeyInfo(): { address: string; publicKeyHex: string; privateKeyHex: string } {
+    this.ensureReady()
+    const walletInfo = this.wallet?.walletInfo as {
+      xecAddress?: string
+      publicKey?: string
+      privateKey?: string
+    }
+
+    if (!walletInfo?.xecAddress || !walletInfo.publicKey || !walletInfo.privateKey) {
+      throw new Error('No pudimos acceder a las llaves de la billetera.')
+    }
+
+    return {
+      address: walletInfo.xecAddress,
+      publicKeyHex: walletInfo.publicKey,
+      privateKeyHex: walletInfo.privateKey
+    }
   }
 
   getMnemonic(): string | null {

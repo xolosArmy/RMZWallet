@@ -13,6 +13,7 @@
     "@scure/bip39": "^2.0.1",
     "chronik-client": "^3.5.0",
     "crypto-js": "^4.2.0",
+    "ecash-agora": "^2.6.9",
     "ecash-lib": "^4.5.2",
     "html5-qrcode": "^2.3.8",
     "minimal-xec-wallet": "^2.0.2",
