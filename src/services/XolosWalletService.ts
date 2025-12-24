@@ -37,6 +37,14 @@ export interface WalletBalance {
   xecFormatted: string // XEC con 2 decimales
 }
 
+export interface WalletKeyInfo {
+  mnemonic: string | null
+  xecAddress: string | null
+  address: string | null
+  publicKeyHex: string | null
+  privateKeyHex: string | null
+}
+
 class XolosWalletService {
   private static instance: XolosWalletService
   private wallet: MinimalXECWalletInstance | null = null
@@ -182,10 +190,14 @@ class XolosWalletService {
     return this.decryptedMnemonic
   }
 
-  getKeyInfo(): { mnemonic: string | null; xecAddress: string | null } {
+  getKeyInfo(): WalletKeyInfo {
+    const xecAddress = this.getAddress()
     return {
       mnemonic: this.getMnemonic(),
-      xecAddress: this.getAddress()
+      xecAddress,
+      address: xecAddress,
+      publicKeyHex: this.getPublicKeyHex(),
+      privateKeyHex: this.getPrivateKeyHex()
     }
   }
 
