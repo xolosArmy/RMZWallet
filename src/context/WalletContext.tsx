@@ -1,7 +1,11 @@
 import type { ReactNode } from 'react'
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import { ALL_BIP143, P2PKHSignatory, Script, TxBuilder, fromHex } from 'ecash-lib'
+import type { TxBuilderInput, TxBuilderOutput } from 'ecash-lib'
 import { xolosWalletService } from '../services/XolosWalletService'
 import type { WalletBalance } from '../services/XolosWalletService'
+import { getChronik } from '../services/ChronikClient'
+import { XEC_COMMISSION_ADDRESS, XEC_COMMISSION_SATS, XEC_DUST_SATS, XEC_FIXED_FEE_SATS } from '../config/xecFees'
 
 const BACKUP_KEY = 'xoloswallet_backup_verified'
 
@@ -174,11 +178,84 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no está lista: termina el onboarding y el respaldo de la seed.')
       }
+      if (!amount || amount <= 0) {
+        throw new Error('El monto debe ser mayor a cero.')
+      }
       setLoading(true)
       setError(null)
       try {
-        const sats = Math.round(amount * 100)
-        const txid = await xolosWalletService.sendXEC(to, sats)
+        const amountSat = Math.round(amount * 100)
+        const totalSat = amountSat + XEC_FIXED_FEE_SATS + XEC_COMMISSION_SATS
+        const balanceInfo = await xolosWalletService.getBalances()
+        if (balanceInfo.xec < totalSat) {
+          throw new Error(
+            `Saldo insuficiente: necesitas ${(totalSat / 100).toFixed(2)} XEC (incluye tarifa fija y comisión).`
+          )
+        }
+
+        let destinationScript: Script
+        try {
+          destinationScript = Script.fromAddress(to)
+        } catch {
+          throw new Error('La dirección de destino no es válida.')
+        }
+
+        const keyInfo = xolosWalletService.getKeyInfo()
+        const publicKey = fromHex(keyInfo.publicKeyHex)
+        const privateKey = fromHex(keyInfo.privateKeyHex)
+        const changeAddress = keyInfo.address
+        const changeScript = Script.fromAddress(changeAddress)
+
+        const chronik = getChronik()
+        const scriptUtxos = await chronik.address(changeAddress).utxos()
+        const spendableUtxos = scriptUtxos.utxos
+          .filter((utxo) => !utxo.token)
+          .sort((a, b) => (a.sats > b.sats ? -1 : 1))
+
+        const inputs: TxBuilderInput[] = []
+        let accumulated = 0n
+        const requiredSat = BigInt(totalSat)
+
+        for (const utxo of spendableUtxos) {
+          inputs.push({
+            input: {
+              prevOut: utxo.outpoint,
+              signData: {
+                sats: utxo.sats,
+                outputScript: changeScript
+              }
+            },
+            signatory: P2PKHSignatory(privateKey, publicKey, ALL_BIP143)
+          })
+          accumulated += utxo.sats
+          const change = accumulated - requiredSat
+          if (change >= 0n && (change === 0n || change >= BigInt(XEC_DUST_SATS))) {
+            break
+          }
+        }
+
+        if (accumulated < requiredSat) {
+          throw new Error('No se encontraron suficientes UTXOs para construir la transacción.')
+        }
+
+        const changeSat = accumulated - requiredSat
+        if (changeSat > 0n && changeSat < BigInt(XEC_DUST_SATS)) {
+          throw new Error('El cambio resultante es inferior al mínimo permitido. Intenta con otro monto.')
+        }
+
+        const outputs: TxBuilderOutput[] = [
+          { sats: BigInt(amountSat), script: destinationScript },
+          { sats: BigInt(XEC_COMMISSION_SATS), script: Script.fromAddress(XEC_COMMISSION_ADDRESS) }
+        ]
+
+        if (changeSat > 0n) {
+          outputs.push({ sats: changeSat, script: changeScript })
+        }
+
+        const txBuilder = new TxBuilder({ inputs, outputs })
+        const signedTx = txBuilder.sign()
+        const rawTxHex = signedTx.toHex()
+        const { txid } = await chronik.broadcastTx(rawTxHex)
         await syncAddressAndBalance()
         return txid
       } catch (err) {

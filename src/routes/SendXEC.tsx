@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/WalletContext'
 import { getChronik } from '../services/ChronikClient'
+import { XEC_COMMISSION_ADDRESS, XEC_COMMISSION_SATS, XEC_FIXED_FEE_SATS } from '../config/xecFees'
 
 function SendXEC() {
   const { sendXEC, initialized, backupVerified, loading, error, balance } = useWallet()
@@ -11,6 +12,11 @@ function SendXEC() {
   const [txid, setTxid] = useState<string | null>(null)
   const [confirmed, setConfirmed] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
+
+  const amountInSats = Math.round(amount * 100)
+  const totalInSats = amountInSats + XEC_FIXED_FEE_SATS + XEC_COMMISSION_SATS
+  const formatXec = (sats: number) => (sats / 100).toFixed(2)
+  const shortenedCommission = `${XEC_COMMISSION_ADDRESS.slice(0, 12)}...${XEC_COMMISSION_ADDRESS.slice(-6)}`
 
   useEffect(() => {
     if (!txid) return
@@ -63,9 +69,10 @@ function SendXEC() {
       return
     }
 
-    const amountInSats = Math.round(amount * 100)
-    if (amountInSats > balance.xec) {
-      setLocalError('Saldo insuficiente para enviar este monto.')
+    if (totalInSats > balance.xec) {
+      setLocalError(
+        `Saldo insuficiente. Se requieren ${formatXec(totalInSats)} XEC incluyendo tarifa fija y comisión.`
+      )
       return
     }
 
@@ -84,7 +91,7 @@ function SendXEC() {
         <div>
           <p className="eyebrow">Enviar</p>
           <h1 className="section-title">XEC hacia otra dirección</h1>
-          <p className="muted">Envía eCash nativo con comisión mínima.</p>
+          <p className="muted">Envía eCash con tarifa fija y comisión RMZArmy.</p>
         </div>
       </header>
 
@@ -113,6 +120,31 @@ function SendXEC() {
           onChange={(event) => setAmount(Number(event.target.value))}
           placeholder="Ej. 10.00"
         />
+
+        <div className="fee-breakdown">
+          <div>
+            <span>Monto a enviar</span>
+            <strong>{amountInSats > 0 ? `${formatXec(amountInSats)} XEC` : '—'}</strong>
+          </div>
+          <div>
+            <span>Tarifa de transacción (fija)</span>
+            <strong>{formatXec(XEC_FIXED_FEE_SATS)} XEC</strong>
+          </div>
+          <div>
+            <span>Comisión RMZArmy</span>
+            <strong>{formatXec(XEC_COMMISSION_SATS)} XEC</strong>
+          </div>
+          <div className="muted">
+            Dirección de comisión: <span className="address-box">{shortenedCommission}</span>
+          </div>
+          <div className="total-line">
+            <span>Total a deducir</span>
+            <strong>{amountInSats > 0 ? `${formatXec(totalInSats)} XEC` : '—'}</strong>
+          </div>
+          <p className="muted note">
+            La comisión es fija y no se puede modificar. Se enviarán dos salidas: destinatario y comisión.
+          </p>
+        </div>
 
         <div className="actions">
           <button className="cta" type="submit" disabled={!initialized || !backupVerified || loading}>
