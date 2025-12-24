@@ -1,13 +1,24 @@
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
+import type { MinimalXECWallet as MinimalXECWalletInstance } from 'minimal-xec-wallet'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 
+type MinimalXECWalletCtor = new (mnemonic?: string, options?: Record<string, unknown>) => MinimalXECWalletInstance
+
+type MinimalXecWalletModuleType = {
+  MinimalXECWallet?: MinimalXECWalletCtor
+  default?: MinimalXECWalletCtor
+}
+
 // The package ships a UMD/CJS build without an ES default export; grab whatever
 // is available (named export, default from CJS transform, or browser global).
-const MinimalXECWallet =
-  (MinimalXecWalletModule as any).MinimalXECWallet ||
-  (MinimalXecWalletModule as any).default ||
-  (typeof window !== 'undefined' ? (window as any).MinimalXecWallet : undefined)
+const MinimalXECWallet = (
+  (MinimalXecWalletModule as MinimalXecWalletModuleType).MinimalXECWallet ||
+  (MinimalXecWalletModule as MinimalXecWalletModuleType).default ||
+  (typeof window !== 'undefined'
+    ? (window as Window & { MinimalXecWallet?: MinimalXECWalletCtor }).MinimalXecWallet
+    : undefined)
+) as MinimalXECWalletCtor
 
 const CHRONIK_ENDPOINTS = ['https://chronik.e.cash', 'https://chronik.paybutton.org']
 const DERIVATION_PATH = "m/44'/899'/0'/0/0"
@@ -21,7 +32,7 @@ export interface WalletBalance {
 
 class XolosWalletService {
   private static instance: XolosWalletService
-  private wallet: any | null = null
+  private wallet: MinimalXECWalletInstance | null = null
   private isReady = false
   private encryptedMnemonic: string | null = null
   private decryptedMnemonic: string | null = null
@@ -37,7 +48,7 @@ class XolosWalletService {
     return XolosWalletService.instance
   }
 
-  private buildWallet(mnemonic?: string) {
+  private buildWallet(mnemonic?: string): MinimalXECWalletInstance {
     this.wallet = new MinimalXECWallet(mnemonic, {
       hdPath: DERIVATION_PATH,
       chronikUrls: CHRONIK_ENDPOINTS,
@@ -53,9 +64,9 @@ class XolosWalletService {
   }
 
   async createNewWallet(): Promise<string> {
-    this.buildWallet()
-    const walletInfo = await this.wallet.walletInfoPromise
-    await this.wallet.initialize()
+    const wallet = this.buildWallet()
+    const walletInfo = await wallet.walletInfoPromise
+    await wallet.initialize()
     this.isReady = true
     this.decryptedMnemonic = walletInfo?.mnemonic || null
     this.encryptedMnemonic = null
@@ -66,9 +77,9 @@ class XolosWalletService {
     if (!mnemonic || mnemonic.trim().split(' ').length < 12) {
       throw new Error('La frase semilla es inválida.')
     }
-    this.buildWallet(mnemonic.trim())
-    await this.wallet.walletInfoPromise
-    await this.wallet.initialize()
+    const wallet = this.buildWallet(mnemonic.trim())
+    await wallet.walletInfoPromise
+    await wallet.initialize()
     this.isReady = true
     this.decryptedMnemonic = mnemonic.trim()
   }
@@ -118,11 +129,14 @@ class XolosWalletService {
 
   async getBalances(): Promise<WalletBalance> {
     this.ensureReady()
-    await this.wallet.initialize()
+    const wallet = this.wallet!
+    await wallet.initialize()
+
+    type RmzBalanceResponse = number | { balance?: { display?: number } }
 
     const [xecBalance, rmzBalanceObj] = await Promise.all([
-      this.wallet.getXecBalance(),
-      this.wallet.getETokenBalance({ tokenId: RMZ_ETOKEN_ID })
+      wallet.getXecBalance(),
+      wallet.getETokenBalance({ tokenId: RMZ_ETOKEN_ID }) as Promise<RmzBalanceResponse>
     ])
 
     const rmz =
@@ -141,20 +155,47 @@ class XolosWalletService {
 
   async sendRMZ(destination: string, amount: number): Promise<string> {
     this.ensureReady()
+    const wallet = this.wallet!
     if (amount <= 0) {
       throw new Error('El monto debe ser mayor a cero.')
     }
-    return this.wallet.sendETokens(RMZ_ETOKEN_ID, [{ address: destination, amount }])
+    return wallet.sendETokens(RMZ_ETOKEN_ID, [{ address: destination, amount }])
   }
 
   async sendXEC(destination: string, amountInSats: number): Promise<string> {
     this.ensureReady()
+    const wallet = this.wallet!
     if (amountInSats <= 0) {
       throw new Error('El monto debe ser mayor a cero.')
     }
-    return this.wallet.sendXec([{ address: destination, amountSat: amountInSats }])
+    return wallet.sendXec([{ address: destination, amountSat: amountInSats }])
   }
 
+    
+type MinimalXECWalletCtor = new (
+  mnemonic?: string,
+  options?: Record<string, unknown>
+) => MinimalXECWalletInstance;
+
+type MinimalXecWalletModuleType = {
+  MinimalXECWallet?: MinimalXECWalletCtor;
+  default?: MinimalXECWalletCtor;
+};
+
+// The package ships a UMD/CJS build without an ES default export; grab whatever
+// is available (named export, default from CJS transform, or browser global).
+const MinimalXECWallet: MinimalXECWalletCtor | undefined =
+  (MinimalXecWalletModule as MinimalXecWalletModuleType).MinimalXECWallet ??
+  (MinimalXecWalletModule as MinimalXecWalletModuleType).default ??
+  (typeof window !== 'undefined'
+    ? ((window as any).MinimalXecWallet as MinimalXECWalletCtor | undefined)
+    : undefined);
+
+if (!MinimalXECWallet) {
+  throw new Error('MinimalXECWallet constructor not found (module export mismatch)');
+}
+
+ e0d729f (Fix lint errors (no behavior change))
   getMnemonic(): string | null {
     return this.decryptedMnemonic
   }

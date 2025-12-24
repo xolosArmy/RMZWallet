@@ -318,6 +318,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function useWallet(): WalletContextValue {
   const context = useContext(WalletContext)
   if (!context) {
