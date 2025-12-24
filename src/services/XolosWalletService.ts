@@ -29,6 +29,8 @@ if (!MinimalXECWallet) {
   throw new Error('MinimalXECWallet constructor not found (module export mismatch)')
 }
 
+const MinimalXECWalletResolved = MinimalXECWallet as MinimalXECWalletCtor
+
 export interface WalletBalance {
   xec: number // satoshis
   rmz: number // tokens RMZ
@@ -54,7 +56,7 @@ class XolosWalletService {
   }
 
   private buildWallet(mnemonic?: string): MinimalXECWalletInstance {
-    this.wallet = new MinimalXECWallet(mnemonic, {
+    this.wallet = new MinimalXECWalletResolved(mnemonic, {
       hdPath: DERIVATION_PATH,
       chronikUrls: CHRONIK_ENDPOINTS,
       enableDonations: false
@@ -178,6 +180,21 @@ class XolosWalletService {
 
   getMnemonic(): string | null {
     return this.decryptedMnemonic
+  }
+
+  getKeyInfo(): { mnemonic: string | null; xecAddress: string | null } {
+    return {
+      mnemonic: this.getMnemonic(),
+      xecAddress: this.getAddress()
+    }
+  }
+
+  getPublicKeyHex(): string | null {
+    return this.wallet?.walletInfo?.publicKey || null
+  }
+
+  getPrivateKeyHex(): string | null {
+    return this.wallet?.walletInfo?.privateKey || null
   }
 
   getAddress(): string | null {

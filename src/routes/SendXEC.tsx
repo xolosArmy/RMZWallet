@@ -53,17 +53,21 @@ function SendXEC() {
     if (!txid) return
     const chronik = getChronik()
     const ws = chronik.ws({
-      onMessage: (msg) => {
+      onMessage: (msg: unknown) => {
         if (msg instanceof Error) {
           console.error(msg)
           return
         }
-        if (msg.type === 'Tx' && msg.msgType === 'TX_CONFIRMED' && msg.txid === txid) {
+        if (typeof msg !== 'object' || msg === null) {
+          return
+        }
+        const payload = msg as { type?: string; msgType?: string; txid?: string }
+        if (payload.type === 'Tx' && payload.msgType === 'TX_CONFIRMED' && payload.txid === txid) {
           setConfirmed(true)
           ws.close()
         }
       },
-      onError: (err) => {
+      onError: (err: unknown) => {
         console.error(err)
       }
     })

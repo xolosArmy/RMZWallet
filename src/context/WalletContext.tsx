@@ -301,7 +301,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
       const amountSat = xecToSats(amount)
       const keyInfo = xolosWalletService.getKeyInfo()
-      const changeAddress = keyInfo.address
+      const changeAddress = keyInfo.xecAddress
+
+      if (!changeAddress) {
+        throw new Error('La billetera no está lista.')
+      }
 
       const chronik = getChronik()
       const scriptUtxos = await chronik.address(changeAddress).utxos()
@@ -340,9 +344,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         }
 
         const keyInfo = xolosWalletService.getKeyInfo()
-        const publicKey = fromHex(keyInfo.publicKeyHex)
-        const privateKey = fromHex(keyInfo.privateKeyHex)
-        const changeAddress = keyInfo.address
+        const changeAddress = keyInfo.xecAddress
+        const publicKeyHex = xolosWalletService.getPublicKeyHex()
+        const privateKeyHex = xolosWalletService.getPrivateKeyHex()
+
+        if (!changeAddress || !publicKeyHex || !privateKeyHex) {
+          throw new Error('La billetera no está lista.')
+        }
+
+        const publicKey = fromHex(publicKeyHex)
+        const privateKey = fromHex(privateKeyHex)
         const changeScript = Script.fromAddress(changeAddress)
 
         const chronik = getChronik()
