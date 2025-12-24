@@ -8,6 +8,7 @@ import Onboarding from './routes/Onboarding'
 import BackupSeed from './routes/BackupSeed'
 import { ScanQR } from './routes/ScanQR'
 import RevealSeed from './routes/RevealSeed'
+import DEX from './routes/DEX'
 
 function App() {
   return (
@@ -20,6 +21,7 @@ function App() {
           <Route path="/send-xec" element={<SendXEC />} />
           <Route path="/receive" element={<Receive />} />
           <Route path="/scan" element={<ScanQR />} />
+          <Route path="/dex" element={<DEX />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/backup" element={<BackupSeed />} />
