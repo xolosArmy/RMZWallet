@@ -3,7 +3,14 @@ import { useEffect, useState } from 'react'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/WalletContext'
 import { getChronik } from '../services/ChronikClient'
-import { XEC_COMMISSION_ADDRESS, XEC_COMMISSION_SATS, XEC_FIXED_FEE_SATS } from '../config/xecFees'
+import {
+  NETWORK_FEE_SATS,
+  NETWORK_FEE_XEC,
+  TONALLI_SERVICE_FEE_SATS,
+  TONALLI_SERVICE_FEE_XEC,
+  XEC_SATS_PER_XEC,
+  XEC_TONALLI_TREASURY_ADDRESS
+} from '../config/xecFees'
 
 function SendXEC() {
   const { sendXEC, initialized, backupVerified, loading, error, balance } = useWallet()
@@ -13,10 +20,11 @@ function SendXEC() {
   const [confirmed, setConfirmed] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
 
-  const amountInSats = Math.round(amount * 100)
-  const totalInSats = amountInSats + XEC_FIXED_FEE_SATS + XEC_COMMISSION_SATS
-  const formatXec = (sats: number) => (sats / 100).toFixed(2)
-  const shortenedCommission = `${XEC_COMMISSION_ADDRESS.slice(0, 12)}...${XEC_COMMISSION_ADDRESS.slice(-6)}`
+  const amountInSats = Math.round(amount * XEC_SATS_PER_XEC)
+  const totalInSats = amountInSats + NETWORK_FEE_SATS + TONALLI_SERVICE_FEE_SATS
+  const formatXecFromSats = (sats: number) => (sats / XEC_SATS_PER_XEC).toFixed(2)
+  const formatXecValue = (xec: number) => xec.toFixed(2)
+  const shortenedCommission = `${XEC_TONALLI_TREASURY_ADDRESS.slice(0, 12)}...${XEC_TONALLI_TREASURY_ADDRESS.slice(-6)}`
 
   useEffect(() => {
     if (!txid) return
@@ -71,7 +79,7 @@ function SendXEC() {
 
     if (totalInSats > balance.xec) {
       setLocalError(
-        `Saldo insuficiente. Se requieren ${formatXec(totalInSats)} XEC incluyendo tarifa fija y comisión.`
+        `Saldo insuficiente. Se requieren ${formatXecFromSats(totalInSats)} XEC incluyendo tarifa de red y servicio.`
       )
       return
     }
@@ -91,7 +99,7 @@ function SendXEC() {
         <div>
           <p className="eyebrow">Enviar</p>
           <h1 className="section-title">XEC hacia otra dirección</h1>
-          <p className="muted">Envía eCash con tarifa fija y comisión RMZArmy.</p>
+          <p className="muted">Envía eCash con tarifa de red y servicio Tonalli.</p>
         </div>
       </header>
 
@@ -124,25 +132,25 @@ function SendXEC() {
         <div className="fee-breakdown">
           <div>
             <span>Monto a enviar</span>
-            <strong>{amountInSats > 0 ? `${formatXec(amountInSats)} XEC` : '—'}</strong>
+            <strong>{amountInSats > 0 ? `${formatXecFromSats(amountInSats)} XEC` : '—'}</strong>
           </div>
           <div>
-            <span>Tarifa de transacción (fija)</span>
-            <strong>{formatXec(XEC_FIXED_FEE_SATS)} XEC</strong>
+            <span>Tarifa de red</span>
+            <strong>{formatXecValue(NETWORK_FEE_XEC)} XEC</strong>
           </div>
           <div>
-            <span>Comisión RMZArmy</span>
-            <strong>{formatXec(XEC_COMMISSION_SATS)} XEC</strong>
+            <span>Tarifa de servicio Tonalli</span>
+            <strong>{formatXecValue(TONALLI_SERVICE_FEE_XEC)} XEC</strong>
           </div>
           <div className="muted">
-            Dirección de comisión: <span className="address-box">{shortenedCommission}</span>
+            Tesorería Tonalli: <span className="address-box">{shortenedCommission}</span>
           </div>
           <div className="total-line">
             <span>Total a deducir</span>
-            <strong>{amountInSats > 0 ? `${formatXec(totalInSats)} XEC` : '—'}</strong>
+            <strong>{amountInSats > 0 ? `${formatXecFromSats(totalInSats)} XEC` : '—'}</strong>
           </div>
           <p className="muted note">
-            La comisión es fija y no se puede modificar. Se enviarán dos salidas: destinatario y comisión.
+            Las tarifas son fijas y no se pueden modificar. Se enviarán dos salidas: destinatario y tesorería Tonalli.
           </p>
         </div>
 

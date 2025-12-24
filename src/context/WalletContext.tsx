@@ -5,7 +5,13 @@ import type { TxBuilderInput, TxBuilderOutput } from 'ecash-lib'
 import { xolosWalletService } from '../services/XolosWalletService'
 import type { WalletBalance } from '../services/XolosWalletService'
 import { getChronik } from '../services/ChronikClient'
-import { XEC_COMMISSION_ADDRESS, XEC_COMMISSION_SATS, XEC_DUST_SATS, XEC_FIXED_FEE_SATS } from '../config/xecFees'
+import {
+  NETWORK_FEE_SATS,
+  TONALLI_SERVICE_FEE_SATS,
+  XEC_DUST_SATS,
+  XEC_SATS_PER_XEC,
+  XEC_TONALLI_TREASURY_ADDRESS
+} from '../config/xecFees'
 
 const BACKUP_KEY = 'xoloswallet_backup_verified'
 
@@ -184,12 +190,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setLoading(true)
       setError(null)
       try {
-        const amountSat = Math.round(amount * 100)
-        const totalSat = amountSat + XEC_FIXED_FEE_SATS + XEC_COMMISSION_SATS
+        const amountSat = Math.round(amount * XEC_SATS_PER_XEC)
+        const totalSat = amountSat + NETWORK_FEE_SATS + TONALLI_SERVICE_FEE_SATS
         const balanceInfo = await xolosWalletService.getBalances()
         if (balanceInfo.xec < totalSat) {
           throw new Error(
-            `Saldo insuficiente: necesitas ${(totalSat / 100).toFixed(2)} XEC (incluye tarifa fija y comisión).`
+            `Saldo insuficiente: necesitas ${(totalSat / XEC_SATS_PER_XEC).toFixed(2)} XEC (incluye tarifa de red y servicio).`
           )
         }
 
@@ -245,7 +251,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
         const outputs: TxBuilderOutput[] = [
           { sats: BigInt(amountSat), script: destinationScript },
-          { sats: BigInt(XEC_COMMISSION_SATS), script: Script.fromAddress(XEC_COMMISSION_ADDRESS) }
+          { sats: BigInt(TONALLI_SERVICE_FEE_SATS), script: Script.fromAddress(XEC_TONALLI_TREASURY_ADDRESS) }
         ]
 
         if (changeSat > 0n) {
