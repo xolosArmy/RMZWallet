@@ -446,6 +446,40 @@ textarea:focus {
   margin-top: 10px;
 }
 
+.fee-breakdown {
+  margin-top: 16px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px dashed rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.03);
+  display: grid;
+  gap: 10px;
+}
+
+.fee-breakdown div {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.fee-breakdown .address-box {
+  padding: 6px 10px;
+  border-radius: 12px;
+  font-size: 13px;
+}
+
+.fee-breakdown .total-line {
+  font-weight: 700;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 8px;
+}
+
+.fee-breakdown .note {
+  margin: 0;
+  font-size: 13px;
+}
+
 .onboarding-grid {
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
 }

@@ -17,6 +17,7 @@ export function ScanQR() {
 
     const qr = new Html5Qrcode('qr-reader')
     scannerRef.current = qr
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setCameraError(null)
     setIsScanning(true)
     setStatusMessage('Activando cámara... apunta al código de guardianía.')
@@ -32,7 +33,7 @@ export function ScanQR() {
           } catch {
             // ignorar errores de stop, incluido "Cannot stop, scanner is not running or paused"
           }
-          let text = decodedText.trim()
+          const text = decodedText.trim()
 
           const [mainPart] = text.split('?')
 

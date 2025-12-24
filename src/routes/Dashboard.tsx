@@ -42,6 +42,12 @@ function Dashboard() {
           <Link className="cta primary" to="/send">
             Enviar RMZ
           </Link>
+          <Link className="cta outline" to="/send-xec">
+            Enviar XEC
+          </Link>
+          <Link className="cta outline" to="/dex">
+            DEX (Phase 1)
+          </Link>
           <Link className="cta outline" to="/receive">
             Recibir
           </Link>

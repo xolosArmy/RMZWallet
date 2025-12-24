@@ -1,12 +1,14 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
 import Dashboard from './routes/Dashboard'
 import SendRMZ from './routes/SendRMZ'
+import SendXEC from './routes/SendXEC'
 import Receive from './routes/Receive'
 import Settings from './routes/Settings'
 import Onboarding from './routes/Onboarding'
 import BackupSeed from './routes/BackupSeed'
 import { ScanQR } from './routes/ScanQR'
 import RevealSeed from './routes/RevealSeed'
+import DEX from './routes/DEX'
 
 function App() {
   return (
@@ -16,8 +18,10 @@ function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/send" element={<SendRMZ />} />
+          <Route path="/send-xec" element={<SendXEC />} />
           <Route path="/receive" element={<Receive />} />
           <Route path="/scan" element={<ScanQR />} />
+          <Route path="/dex" element={<DEX />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/backup" element={<BackupSeed />} />
