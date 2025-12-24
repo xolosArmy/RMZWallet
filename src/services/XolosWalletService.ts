@@ -3,6 +3,10 @@ import type { MinimalXECWallet as MinimalXECWalletInstance } from 'minimal-xec-w
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 
+const CHRONIK_ENDPOINTS = ['https://chronik.e.cash', 'https://chronik.paybutton.org']
+const DERIVATION_PATH = "m/44'/899'/0'/0/0"
+const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
+
 type MinimalXECWalletCtor = new (mnemonic?: string, options?: Record<string, unknown>) => MinimalXECWalletInstance
 
 type MinimalXecWalletModuleType = {
@@ -12,17 +16,18 @@ type MinimalXecWalletModuleType = {
 
 // The package ships a UMD/CJS build without an ES default export; grab whatever
 // is available (named export, default from CJS transform, or browser global).
-const MinimalXECWallet = (
-  (MinimalXecWalletModule as MinimalXecWalletModuleType).MinimalXECWallet ||
-  (MinimalXecWalletModule as MinimalXecWalletModuleType).default ||
+const MinimalXECWallet: MinimalXECWalletCtor | undefined =
+  (MinimalXecWalletModule as MinimalXecWalletModuleType).MinimalXECWallet ??
+  (MinimalXecWalletModule as MinimalXecWalletModuleType).default ??
   (typeof window !== 'undefined'
-    ? (window as Window & { MinimalXecWallet?: MinimalXECWalletCtor }).MinimalXecWallet
+    ? ((window as Window & { MinimalXecWallet?: MinimalXECWalletCtor }).MinimalXecWallet as
+        | MinimalXECWalletCtor
+        | undefined)
     : undefined)
-) as MinimalXECWalletCtor
 
-const CHRONIK_ENDPOINTS = ['https://chronik.e.cash', 'https://chronik.paybutton.org']
-const DERIVATION_PATH = "m/44'/899'/0'/0/0"
-const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
+if (!MinimalXECWallet) {
+  throw new Error('MinimalXECWallet constructor not found (module export mismatch)')
+}
 
 export interface WalletBalance {
   xec: number // satoshis
@@ -171,31 +176,6 @@ class XolosWalletService {
     return wallet.sendXec([{ address: destination, amountSat: amountInSats }])
   }
 
-    
-type MinimalXECWalletCtor = new (
-  mnemonic?: string,
-  options?: Record<string, unknown>
-) => MinimalXECWalletInstance;
-
-type MinimalXecWalletModuleType = {
-  MinimalXECWallet?: MinimalXECWalletCtor;
-  default?: MinimalXECWalletCtor;
-};
-
-// The package ships a UMD/CJS build without an ES default export; grab whatever
-// is available (named export, default from CJS transform, or browser global).
-const MinimalXECWallet: MinimalXECWalletCtor | undefined =
-  (MinimalXecWalletModule as MinimalXecWalletModuleType).MinimalXECWallet ??
-  (MinimalXecWalletModule as MinimalXecWalletModuleType).default ??
-  (typeof window !== 'undefined'
-    ? ((window as any).MinimalXecWallet as MinimalXECWalletCtor | undefined)
-    : undefined);
-
-if (!MinimalXECWallet) {
-  throw new Error('MinimalXECWallet constructor not found (module export mismatch)');
-}
-
- e0d729f (Fix lint errors (no behavior change))
   getMnemonic(): string | null {
     return this.decryptedMnemonic
   }
