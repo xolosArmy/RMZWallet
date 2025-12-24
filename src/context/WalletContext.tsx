@@ -18,6 +18,7 @@ export interface WalletContextValue {
   encryptAndStore: (password: string) => void
   refreshBalances: () => Promise<void>
   sendRMZ: (to: string, amount: number) => Promise<string>
+  sendXEC: (to: string, amount: number) => Promise<string>
   getMnemonic: () => string | null
   unlockEncryptedWallet: (password: string) => Promise<void>
   setBackupVerified?: (value: boolean) => void
@@ -168,6 +169,29 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     [backupVerified, initialized, syncAddressAndBalance]
   )
 
+  const sendXEC = useCallback(
+    async (to: string, amount: number) => {
+      if (!initialized || !backupVerified) {
+        throw new Error('La billetera no está lista: termina el onboarding y el respaldo de la seed.')
+      }
+      setLoading(true)
+      setError(null)
+      try {
+        const sats = Math.round(amount * 100)
+        const txid = await xolosWalletService.sendXEC(to, sats)
+        await syncAddressAndBalance()
+        return txid
+      } catch (err) {
+        const message = (err as Error).message || 'No se pudo enviar XEC.'
+        setError(message)
+        throw new Error(message)
+      } finally {
+        setLoading(false)
+      }
+    },
+    [backupVerified, initialized, syncAddressAndBalance]
+  )
+
   const getMnemonic = useCallback(() => xolosWalletService.getMnemonic(), [])
 
   const value = useMemo(
@@ -184,6 +208,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       encryptAndStore,
       refreshBalances,
       sendRMZ,
+      sendXEC,
       getMnemonic,
       unlockEncryptedWallet,
       setBackupVerified: setBackupVerifiedState
@@ -201,6 +226,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       encryptAndStore,
       refreshBalances,
       sendRMZ,
+      sendXEC,
       getMnemonic,
       unlockEncryptedWallet
     ]
