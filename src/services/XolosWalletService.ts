@@ -3,7 +3,7 @@ import type { MinimalXECWallet as MinimalXECWalletInstance } from 'minimal-xec-w
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 
-const CHRONIK_ENDPOINTS = ['https://chronik.e.cash', 'https://chronik.paybutton.org']
+const CHRONIK_ENDPOINTS = ['https://chronik.xolosarmy.xyz', 'https://chronik.e.cash', 'https://chronik.paybutton.org']
 const DERIVATION_PATH = "m/44'/899'/0'/0/0"
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
 
