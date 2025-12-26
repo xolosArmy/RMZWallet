@@ -1,12 +1,12 @@
 import type { FormEvent } from 'react'
 import { useState } from 'react'
-import { useWallet } from '../context/WalletContext'
+import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
 
 function SendRMZ() {
   const { sendRMZ, initialized, backupVerified, loading, error } = useWallet()
   const [destination, setDestination] = useState('')
-  const [amount, setAmount] = useState<number>(0)
+  const [amount, setAmount] = useState<string>('')
   const [txid, setTxid] = useState<string | null>(null)
   const [localError, setLocalError] = useState<string | null>(null)
 
@@ -25,7 +25,7 @@ function SendRMZ() {
       return
     }
 
-    if (!amount || amount <= 0) {
+    if (!amount.trim()) {
       setLocalError('Ingresa un monto válido mayor a cero.')
       return
     }
@@ -67,11 +67,11 @@ function SendRMZ() {
         <label htmlFor="amount">Monto RMZ</label>
         <input
           id="amount"
-          type="number"
-          min={0}
+          type="text"
           value={amount}
-          onChange={(e) => setAmount(Number(e.target.value))}
+          onChange={(e) => setAmount(e.target.value)}
           placeholder="Ej. 10"
+          inputMode="decimal"
         />
 
         <div className="actions">

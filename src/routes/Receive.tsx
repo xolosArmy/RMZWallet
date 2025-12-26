@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { QRCodeCanvas } from 'qrcode.react'
-import { useWallet } from '../context/WalletContext'
+import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
 
 function Receive() {

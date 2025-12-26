@@ -13,7 +13,7 @@ import {
 } from 'ecash-lib'
 import type { ScriptUtxo } from 'chronik-client'
 import TopBar from '../components/TopBar'
-import { useWallet } from '../context/WalletContext'
+import { useWallet } from '../context/useWallet'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { getChronik } from '../services/ChronikClient'
 import { xolosWalletService } from '../services/XolosWalletService'
@@ -66,6 +66,7 @@ function DEX() {
   const [offerBusy, setOfferBusy] = useState(false)
   const [buyBusy, setBuyBusy] = useState(false)
   const [buyTxid, setBuyTxid] = useState<string | null>(null)
+  const [agoraPluginReady, setAgoraPluginReady] = useState(true)
 
   useEffect(() => {
     if (initialized) {
@@ -93,6 +94,25 @@ function DEX() {
     }
   }, [initialized])
 
+  useEffect(() => {
+    let active = true
+    const checkAgoraPlugin = async () => {
+      try {
+        await getChronik().plugin('agora').groups()
+        if (active) {
+          setAgoraPluginReady(true)
+        }
+      } catch {
+        if (active) {
+          setAgoraPluginReady(false)
+        }
+      }
+    }
+    checkAgoraPlugin()
+    return () => {
+      active = false
+    }
+  }, [])
   const atomsPerToken = useMemo(() => (rmzDecimals === null ? null : pow10(rmzDecimals)), [rmzDecimals])
 
   const computedTotalXec = useMemo(() => {
@@ -421,6 +441,11 @@ function DEX() {
       <TopBar />
       <div className="card">
         <p className="muted">DEX (Phase 1)</p>
+        {!agoraPluginReady && (
+          <div className="muted" style={{ marginTop: 8 }}>
+            DEX en modo solo lectura · Plugin agora not loaded
+          </div>
+        )}
         <div className="actions" style={{ marginTop: 8 }}>
           <button
             className={`cta ${dexTab === 'maker' ? 'primary' : 'ghost'}`}

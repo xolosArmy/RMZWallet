@@ -1,20 +1,36 @@
 import type { FormEvent } from 'react'
 import { useEffect, useState } from 'react'
+import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
-import { useWallet } from '../context/WalletContext'
-import { getChronik } from '../services/ChronikClient'
-import {
-  TONALLI_SERVICE_FEE_XEC,
-  XEC_SATS_PER_XEC,
-  XEC_TONALLI_TREASURY_ADDRESS
-} from '../config/xecFees'
+import { TONALLI_SERVICE_FEE_XEC, XEC_SATS_PER_XEC, XEC_TONALLI_TREASURY_ADDRESS } from '../config/xecFees'
+
+const MAX_OP_RETURN_BYTES = 221
+
+const sanitizeOpReturnMessage = (value: string) => {
+  let sanitized = ''
+  let byteCount = 0
+
+  for (const char of value) {
+    const code = char.charCodeAt(0)
+    if (code < 0x20 || code > 0x7e) {
+      continue
+    }
+    if (byteCount >= MAX_OP_RETURN_BYTES) {
+      break
+    }
+    sanitized += char
+    byteCount += 1
+  }
+
+  return sanitized
+}
 
 function SendXEC() {
   const { sendXEC, estimateXecSend, initialized, backupVerified, loading, error, balance } = useWallet()
   const [destination, setDestination] = useState('')
   const [amount, setAmount] = useState<number>(0)
+  const [message, setMessage] = useState('')
   const [txid, setTxid] = useState<string | null>(null)
-  const [confirmed, setConfirmed] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
   const [estimatedFeeSats, setEstimatedFeeSats] = useState<number | null>(null)
   const [estimatedTotalSats, setEstimatedTotalSats] = useState<number | null>(null)
@@ -26,63 +42,38 @@ function SendXEC() {
 
   useEffect(() => {
     let cancelled = false
-    if (!initialized || !backupVerified || !amount || amount <= 0) {
-      setEstimatedFeeSats(null)
-      setEstimatedTotalSats(null)
-      return
-    }
+    const runEstimate = async () => {
+      if (!initialized || !backupVerified || !amountInSats || amountInSats <= 0) {
+        if (!cancelled) {
+          setEstimatedFeeSats(null)
+          setEstimatedTotalSats(null)
+        }
+        return
+      }
 
-    estimateXecSend(amount)
-      .then((quote) => {
+      try {
+        const quote = await estimateXecSend(amountInSats, message)
         if (cancelled) return
         setEstimatedFeeSats(quote.networkFeeSats)
         setEstimatedTotalSats(quote.totalCostSats)
-      })
-      .catch(() => {
+      } catch {
         if (cancelled) return
         setEstimatedFeeSats(null)
         setEstimatedTotalSats(null)
-      })
+      }
+    }
+
+    void runEstimate()
 
     return () => {
       cancelled = true
     }
-  }, [amount, backupVerified, estimateXecSend, initialized])
+  }, [amountInSats, backupVerified, estimateXecSend, initialized, message])
 
-  useEffect(() => {
-    if (!txid) return
-    const chronik = getChronik()
-    const ws = chronik.ws({
-      onMessage: (msg: unknown) => {
-        if (msg instanceof Error) {
-          console.error(msg)
-          return
-        }
-        if (typeof msg !== 'object' || msg === null) {
-          return
-        }
-        const payload = msg as { type?: string; msgType?: string; txid?: string }
-        if (payload.type === 'Tx' && payload.msgType === 'TX_CONFIRMED' && payload.txid === txid) {
-          setConfirmed(true)
-          ws.close()
-        }
-      },
-      onError: (err: unknown) => {
-        console.error(err)
-      }
-    })
-    ws.subscribeToTxid(txid)
-
-    return () => {
-      ws.close()
-    }
-  }, [txid])
-
-  const handleSubmit = async (event: FormEvent) => {
-    event.preventDefault()
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault()
     setLocalError(null)
     setTxid(null)
-    setConfirmed(false)
 
     if (!initialized || !backupVerified) {
       setLocalError('Debes completar el onboarding y el respaldo de tu frase semilla antes de poder enviar XEC.')
@@ -99,6 +90,11 @@ function SendXEC() {
       return
     }
 
+    if (amountInSats <= 0) {
+      setLocalError('El monto en XEC es demasiado pequeño.')
+      return
+    }
+
     if (!balance) {
       setLocalError('No pudimos cargar tu saldo de XEC. Intenta de nuevo.')
       return
@@ -107,7 +103,7 @@ function SendXEC() {
     let totalToCheck = estimatedTotalSats
     if (!totalToCheck) {
       try {
-        const quote = await estimateXecSend(amount)
+        const quote = await estimateXecSend(amountInSats, message)
         totalToCheck = quote.totalCostSats
         setEstimatedFeeSats(quote.networkFeeSats)
         setEstimatedTotalSats(quote.totalCostSats)
@@ -117,7 +113,8 @@ function SendXEC() {
       }
     }
 
-    if (totalToCheck > balance.xec) {
+    const totalToCheckBig = BigInt(Math.round(totalToCheck))
+    if (totalToCheckBig > balance.xec) {
       setLocalError(
         `Saldo insuficiente. Se requieren ${formatXecFromSats(totalToCheck)} XEC incluyendo tarifa de red y servicio.`
       )
@@ -125,11 +122,15 @@ function SendXEC() {
     }
 
     try {
-      const tx = await sendXEC(destination.trim(), amount)
+      const tx = await sendXEC(destination.trim(), amountInSats, message)
       setTxid(tx)
     } catch (err) {
       setLocalError((err as Error).message)
     }
+  }
+
+  const handleMessageChange = (value: string) => {
+    setMessage(sanitizeOpReturnMessage(value))
   }
 
   return (
@@ -139,7 +140,7 @@ function SendXEC() {
         <div>
           <p className="eyebrow">Enviar</p>
           <h1 className="section-title">XEC hacia otra dirección</h1>
-          <p className="muted">Envía eCash con tarifa de red y servicio Tonalli.</p>
+          <p className="muted">Mueve XEC con confianza sobre la red eCash.</p>
         </div>
       </header>
 
@@ -154,7 +155,7 @@ function SendXEC() {
         <input
           id="destination"
           value={destination}
-          onChange={(event) => setDestination(event.target.value)}
+          onChange={(e) => setDestination(e.target.value)}
           placeholder="ecash:..."
         />
 
@@ -163,11 +164,21 @@ function SendXEC() {
           id="amount"
           type="number"
           min={0}
-          step={0.01}
+          step="0.01"
           value={amount}
-          onChange={(event) => setAmount(Number(event.target.value))}
-          placeholder="Ej. 10.00"
+          onChange={(e) => setAmount(Number(e.target.value))}
+          placeholder="Ej. 10"
         />
+
+        <label htmlFor="opreturn-message">Mensaje público OP_RETURN</label>
+        <textarea
+          id="opreturn-message"
+          value={message}
+          onChange={(e) => handleMessageChange(e.target.value)}
+          placeholder="(opcional) Mensaje público OP_RETURN"
+          rows={3}
+        />
+        <p className="muted">Este mensaje será público y quedará grabado en la blockchain de eCash.</p>
 
         <div className="fee-breakdown">
           <div>
@@ -197,7 +208,7 @@ function SendXEC() {
 
         <div className="actions">
           <button className="cta" type="submit" disabled={!initialized || !backupVerified || loading}>
-            Enviar XEC
+            Enviar
           </button>
         </div>
 
@@ -207,7 +218,6 @@ function SendXEC() {
             Transacción enviada: <span className="address-box">{txid}</span>
           </div>
         )}
-        {confirmed && <div className="success">Transacción confirmada on-chain.</div>}
       </form>
     </div>
   )

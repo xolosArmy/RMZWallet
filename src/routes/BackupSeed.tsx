@@ -1,7 +1,7 @@
 import type { FormEvent } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { useWallet } from '../context/WalletContext'
+import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
 
 interface BackupState {
