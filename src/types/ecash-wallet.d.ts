@@ -1,3 +1,3 @@
 declare module 'ecash-wallet' {
-  export interface Wallet {}
+  export class Wallet {}
 }

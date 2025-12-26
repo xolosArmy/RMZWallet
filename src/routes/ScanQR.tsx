@@ -5,8 +5,10 @@ import TopBar from '../components/TopBar'
 
 export function ScanQR() {
   const [scannedAddress, setScannedAddress] = useState<string>('')
-  const [statusMessage, setStatusMessage] = useState<string | null>(null)
-  const [isScanning, setIsScanning] = useState<boolean>(false)
+  const [statusMessage, setStatusMessage] = useState<string | null>(
+    'Activando cámara... apunta al código de guardianía.'
+  )
+  const [isScanning, setIsScanning] = useState<boolean>(true)
   const [cameraError, setCameraError] = useState<string | null>(null)
   const scannerRef = useRef<Html5Qrcode | null>(null)
 
@@ -21,7 +23,6 @@ export function ScanQR() {
     setCameraError(null)
     setIsScanning(true)
     setStatusMessage('Activando cámara... apunta al código de guardianía.')
-
     qr
       .start(
         { facingMode: 'environment' },

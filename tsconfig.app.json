@@ -14,6 +14,11 @@
 
     /* Bundler mode */
     "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "paths": {
+      "ecash-agora": ["src/types/ecash-agora.d.ts"],
+      "ecash-wallet": ["src/types/ecash-wallet.d.ts"]
+    },
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",

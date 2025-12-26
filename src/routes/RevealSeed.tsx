@@ -1,7 +1,7 @@
 import type { FormEvent } from 'react'
 import { useState } from 'react'
 import TopBar from '../components/TopBar'
-import { useWallet } from '../context/WalletContext'
+import { useWallet } from '../context/useWallet'
 
 function RevealSeed() {
   const { unlockEncryptedWallet, getMnemonic } = useWallet()

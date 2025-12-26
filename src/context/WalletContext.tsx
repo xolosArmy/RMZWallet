@@ -1,19 +1,11 @@
 import type { ReactNode } from 'react'
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
-import { ALL_BIP143, P2PKHSignatory, Script, TxBuilder, fromHex } from 'ecash-lib'
-import type { TxBuilderInput, TxBuilderOutput } from 'ecash-lib'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { xolosWalletService } from '../services/XolosWalletService'
-import type { WalletBalance } from '../services/XolosWalletService'
+import type { WalletBalance, WalletRescanOptions } from '../services/XolosWalletService'
 import { getChronik } from '../services/ChronikClient'
-import {
-  computeNetworkFeeSats,
-  MIN_NETWORK_FEE_SATS,
-  TONALLI_SERVICE_FEE_SATS,
-  XEC_DUST_SATS,
-  XEC_SATS_PER_XEC,
-  XEC_TONALLI_TREASURY_ADDRESS,
-  xecToSats
-} from '../config/xecFees'
+import { computeNetworkFeeSats, MIN_NETWORK_FEE_SATS, TONALLI_SERVICE_FEE_SATS, XEC_DUST_SATS } from '../config/xecFees'
+import { parseTokenAmount } from '../utils/tokenFormat'
+import { WalletContext } from './walletContext'
 
 const BACKUP_KEY = 'xoloswallet_backup_verified'
 
@@ -21,6 +13,7 @@ const P2PKH_INPUT_BYTES = 148
 const P2PKH_OUTPUT_BYTES = 34
 const TX_OVERHEAD_BYTES = 10
 const MAX_FEE_ITERATIONS = 5
+const OP_RETURN_PREFIX_HEX = '6d02'
 
 type SpendableUtxo = {
   sats: bigint
@@ -37,8 +30,8 @@ type XecPlan = {
   totalCostSats: number
 }
 
-const estimateTxBytes = (inputsCount: number, outputsCount: number) =>
-  TX_OVERHEAD_BYTES + inputsCount * P2PKH_INPUT_BYTES + outputsCount * P2PKH_OUTPUT_BYTES
+const estimateTxBytes = (inputsCount: number, p2pkhOutputsCount: number, opReturnOutputBytes = 0) =>
+  TX_OVERHEAD_BYTES + inputsCount * P2PKH_INPUT_BYTES + p2pkhOutputsCount * P2PKH_OUTPUT_BYTES + opReturnOutputBytes
 
 const selectUtxos = (utxos: SpendableUtxo[], requiredSats: bigint) => {
   const selected: SpendableUtxo[] = []
@@ -55,7 +48,24 @@ const selectUtxos = (utxos: SpendableUtxo[], requiredSats: bigint) => {
   return { selected, accumulated }
 }
 
-const buildXecPlan = (amountSats: number, utxos: SpendableUtxo[]): XecPlan => {
+const calcPushdataBytes = (length: number) => {
+  if (length <= 75) return 1 + length
+  if (length <= 255) return 2 + length
+  if (length <= 65535) return 3 + length
+  return 5 + length
+}
+
+const calcOpReturnOutputBytes = (message: string, prefixHex: string) => {
+  if (!message.trim()) return 0
+  const messageBytes = new TextEncoder().encode(message).length
+  const prefixBytes = Math.ceil(prefixHex.length / 2)
+  const payloadBytes = prefixBytes + messageBytes
+  const scriptBytes = 1 + calcPushdataBytes(payloadBytes)
+  const scriptLenBytes = scriptBytes < 253 ? 1 : scriptBytes <= 0xffff ? 3 : 5
+  return 8 + scriptLenBytes + scriptBytes
+}
+
+const buildXecPlan = (amountSats: number, utxos: SpendableUtxo[], opReturnOutputBytes = 0): XecPlan => {
   const amountSatBig = BigInt(amountSats)
   const tonalliFeeBig = BigInt(TONALLI_SERVICE_FEE_SATS)
   const dustBig = BigInt(XEC_DUST_SATS)
@@ -77,7 +87,8 @@ const buildXecPlan = (amountSats: number, utxos: SpendableUtxo[]): XecPlan => {
 
     changeSats = accumulated - requiredSats
     includeChange = changeSats >= dustBig
-    txBytes = estimateTxBytes(selected.length, includeChange ? 3 : 2)
+    const p2pkhOutputs = includeChange ? 3 : 2
+    txBytes = estimateTxBytes(selected.length, p2pkhOutputs, opReturnOutputBytes)
 
     const nextFeeSats = computeNetworkFeeSats(txBytes)
     if (nextFeeSats === feeSats) {
@@ -95,7 +106,8 @@ const buildXecPlan = (amountSats: number, utxos: SpendableUtxo[]): XecPlan => {
 
   changeSats = accumulated - requiredFinal
   includeChange = changeSats >= dustBig
-  txBytes = estimateTxBytes(selected.length, includeChange ? 3 : 2)
+  const p2pkhOutputsFinal = includeChange ? 3 : 2
+  txBytes = estimateTxBytes(selected.length, p2pkhOutputsFinal, opReturnOutputBytes)
 
   const finalFeeSats = computeNetworkFeeSats(txBytes)
   if (finalFeeSats !== feeSats) {
@@ -107,7 +119,8 @@ const buildXecPlan = (amountSats: number, utxos: SpendableUtxo[]): XecPlan => {
     }
     changeSats = accumulated - requiredRetry
     includeChange = changeSats >= dustBig
-    txBytes = estimateTxBytes(selected.length, includeChange ? 3 : 2)
+    const p2pkhOutputsRetry = includeChange ? 3 : 2
+    txBytes = estimateTxBytes(selected.length, p2pkhOutputsRetry, opReturnOutputBytes)
   }
 
   const outputsTotal = amountSatBig + tonalliFeeBig + (includeChange ? changeSats : 0n)
@@ -124,28 +137,6 @@ const buildXecPlan = (amountSats: number, utxos: SpendableUtxo[]): XecPlan => {
     totalCostSats
   }
 }
-
-export interface WalletContextValue {
-  address: string | null
-  balance: WalletBalance | null
-  loading: boolean
-  error: string | null
-  initialized: boolean
-  backupVerified: boolean
-  createNewWallet: () => Promise<string>
-  restoreWallet: (mnemonic: string) => Promise<void>
-  loadExistingWallet: (password: string) => Promise<void>
-  encryptAndStore: (password: string) => void
-  refreshBalances: () => Promise<void>
-  sendRMZ: (to: string, amount: number) => Promise<string>
-  sendXEC: (to: string, amount: number) => Promise<string>
-  estimateXecSend: (amount: number) => Promise<{ networkFeeSats: number; totalCostSats: number }>
-  getMnemonic: () => string | null
-  unlockEncryptedWallet: (password: string) => Promise<void>
-  setBackupVerified?: (value: boolean) => void
-}
-
-const WalletContext = createContext<WalletContextValue | undefined>(undefined)
 
 export function WalletProvider({ children }: { children: ReactNode }) {
   const [address, setAddress] = useState<string | null>(null)
@@ -182,6 +173,28 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setLoading(false)
     }
   }, [initialized, syncAddressAndBalance])
+
+  const rescanWallet = useCallback(
+    async (options?: WalletRescanOptions) => {
+      if (!initialized) {
+        throw new Error('La billetera no está lista.')
+      }
+      setLoading(true)
+      setError(null)
+      try {
+        const balances = await xolosWalletService.rescanWallet(options)
+        setAddress(xolosWalletService.getAddress())
+        setBalance(balances)
+      } catch (err) {
+        const message = (err as Error).message || 'No se pudo re-escanear la billetera.'
+        setError(message)
+        throw new Error(message)
+      } finally {
+        setLoading(false)
+      }
+    },
+    [initialized, syncAddressAndBalance]
+  )
 
   const createNewWallet = useCallback(async (): Promise<string> => {
     setLoading(true)
@@ -269,14 +282,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   )
 
   const sendRMZ = useCallback(
-    async (to: string, amount: number) => {
+    async (to: string, amount: string) => {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no está lista: termina el onboarding y el respaldo de la seed.')
       }
       setLoading(true)
       setError(null)
       try {
-        const txid = await xolosWalletService.sendRMZ(to, amount)
+        const decimals = balance?.rmzDecimals ?? (await xolosWalletService.getRmzDecimals())
+        const atoms = parseTokenAmount(amount, decimals)
+        const txid = await xolosWalletService.sendRMZ(to, atoms)
         await syncAddressAndBalance()
         return txid
       } catch (err) {
@@ -287,25 +302,27 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setLoading(false)
       }
     },
-    [backupVerified, initialized, syncAddressAndBalance]
+    [backupVerified, initialized, syncAddressAndBalance, balance]
   )
 
   const estimateXecSend = useCallback(
-    async (amount: number) => {
+    async (amountInSats: number, message = '') => {
       if (!initialized) {
         throw new Error('La billetera no está lista.')
       }
-      if (!amount || amount <= 0) {
+      if (!amountInSats || amountInSats <= 0) {
         throw new Error('El monto debe ser mayor a cero.')
       }
 
-      const amountSat = xecToSats(amount)
-      const keyInfo = xolosWalletService.getKeyInfo()
-      const changeAddress = keyInfo.xecAddress
-
+      const walletKeyInfo = xolosWalletService.getKeyInfo()
+      const changeAddress = walletKeyInfo.address ?? walletKeyInfo.xecAddress
       if (!changeAddress) {
-        throw new Error('La billetera no está lista.')
+        throw new Error('No se encontró la dirección de la billetera.')
       }
+
+      const opReturnOutputBytes = message.trim()
+        ? calcOpReturnOutputBytes(message, OP_RETURN_PREFIX_HEX)
+        : 0
 
       const chronik = getChronik()
       const scriptUtxos = await chronik.address(changeAddress).utxos()
@@ -313,7 +330,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         .filter((utxo: SpendableUtxo) => !utxo.token)
         .sort((a: SpendableUtxo, b: SpendableUtxo) => (a.sats > b.sats ? -1 : 1))
 
-      const plan = buildXecPlan(amountSat, spendableUtxos)
+      const plan = buildXecPlan(amountInSats, spendableUtxos, opReturnOutputBytes)
       return {
         networkFeeSats: plan.networkFeeSats,
         totalCostSats: plan.totalCostSats
@@ -323,96 +340,20 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   )
 
   const sendXEC = useCallback(
-    async (to: string, amount: number) => {
+    async (to: string, amountInSats: number, message?: string) => {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no está lista: termina el onboarding y el respaldo de la seed.')
-      }
-      if (!amount || amount <= 0) {
-        throw new Error('El monto debe ser mayor a cero.')
       }
       setLoading(true)
       setError(null)
       try {
-        const amountSat = xecToSats(amount)
-        const balanceInfo = await xolosWalletService.getBalances()
-
-        let destinationScript: Script
-        try {
-          destinationScript = Script.fromAddress(to)
-        } catch {
-          throw new Error('La dirección de destino no es válida.')
-        }
-
-        const keyInfo = xolosWalletService.getKeyInfo()
-        const changeAddress = keyInfo.xecAddress
-        const publicKeyHex = xolosWalletService.getPublicKeyHex()
-        const privateKeyHex = xolosWalletService.getPrivateKeyHex()
-
-        if (!changeAddress || !publicKeyHex || !privateKeyHex) {
-          throw new Error('La billetera no está lista.')
-        }
-
-        const publicKey = fromHex(publicKeyHex)
-        const privateKey = fromHex(privateKeyHex)
-        const changeScript = Script.fromAddress(changeAddress)
-
-        const chronik = getChronik()
-        const scriptUtxos = await chronik.address(changeAddress).utxos()
-        const spendableUtxos = scriptUtxos.utxos
-          .filter((utxo: SpendableUtxo) => !utxo.token)
-          .sort((a: SpendableUtxo, b: SpendableUtxo) => (a.sats > b.sats ? -1 : 1))
-
-        const plan = buildXecPlan(amountSat, spendableUtxos)
-
-        if (balanceInfo.xec < plan.totalCostSats) {
-          throw new Error(
-            `Saldo insuficiente: necesitas ${(plan.totalCostSats / XEC_SATS_PER_XEC).toFixed(2)} XEC (incluye tarifa de red y servicio).`
-          )
-        }
-
-        const inputs: TxBuilderInput[] = plan.selectedUtxos.map((utxo) => ({
-          input: {
-            prevOut: utxo.outpoint,
-            signData: {
-              sats: utxo.sats,
-              outputScript: changeScript
-            }
-          },
-          signatory: P2PKHSignatory(privateKey, publicKey, ALL_BIP143)
-        }))
-
-        const outputs: TxBuilderOutput[] = [
-          { sats: BigInt(amountSat), script: destinationScript },
-          { sats: BigInt(TONALLI_SERVICE_FEE_SATS), script: Script.fromAddress(XEC_TONALLI_TREASURY_ADDRESS) }
-        ]
-
-        if (plan.includeChange) {
-          outputs.push({ sats: plan.changeSats, script: changeScript })
-        }
-
-        const txBuilder = new TxBuilder({ inputs, outputs })
-        const signedTx = txBuilder.sign()
-        const rawTxHex = signedTx.toHex()
-        let txid: string
-        try {
-          ;({ txid } = await chronik.broadcastTx(rawTxHex))
-        } catch (broadcastError) {
-          const broadcastMessage = (broadcastError as Error).message || 'No se pudo enviar XEC.'
-          if (broadcastMessage.includes('min relay fee not met')) {
-            throw new Error(
-              `${broadcastMessage}. Tarifa calculada: ${plan.networkFeeSats} sats (~${(
-                plan.networkFeeSats / XEC_SATS_PER_XEC
-              ).toFixed(2)} XEC), tamano estimado: ${plan.txBytes} bytes.`
-            )
-          }
-          throw broadcastError
-        }
+        const txid = await xolosWalletService.sendXEC(to, amountInSats, message || '')
         await syncAddressAndBalance()
         return txid
       } catch (err) {
-        const message = (err as Error).message || 'No se pudo enviar XEC.'
-        setError(message)
-        throw new Error(message)
+        const messageText = (err as Error).message || 'No se pudo enviar XEC.'
+        setError(messageText)
+        throw new Error(messageText)
       } finally {
         setLoading(false)
       }
@@ -435,6 +376,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       loadExistingWallet,
       encryptAndStore,
       refreshBalances,
+      rescanWallet,
       sendRMZ,
       sendXEC,
       estimateXecSend,
@@ -454,6 +396,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       loadExistingWallet,
       encryptAndStore,
       refreshBalances,
+      rescanWallet,
       sendRMZ,
       sendXEC,
       estimateXecSend,
@@ -463,13 +406,4 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   )
 
   return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>
-}
-
-// eslint-disable-next-line react-refresh/only-export-components
-export function useWallet(): WalletContextValue {
-  const context = useContext(WalletContext)
-  if (!context) {
-    throw new Error('useWallet debe usarse dentro de WalletProvider')
-  }
-  return context
 }
