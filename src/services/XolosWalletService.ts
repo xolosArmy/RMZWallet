@@ -35,7 +35,6 @@ if (!MinimalXECWallet) {
 const MinimalXECWalletResolved = MinimalXECWallet as MinimalXECWalletConstructor
 
 const CHRONIK_ENDPOINTS = [
-  'https://chronik.xolosarmy.xyz',
   'https://chronik.e.cash',
   'https://chronik.paybutton.org'
 ]
