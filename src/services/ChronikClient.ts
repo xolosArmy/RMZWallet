@@ -1,6 +1,6 @@
 import { ChronikClient } from 'chronik-client'
 
-const DEFAULT_CHRONIK_URLS = ['https://chronik.e.cash', 'https://chronik.paybutton.org']
+const DEFAULT_CHRONIK_URLS = ['https://chronik.e.cash', 'https://chronik.xolosarmy.xyz']
 
 const resolveChronikUrls = (): string[] => {
   const configured = import.meta.env?.VITE_CHRONIK_URL
