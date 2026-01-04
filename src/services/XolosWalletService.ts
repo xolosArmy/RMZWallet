@@ -36,7 +36,7 @@ const MinimalXECWalletResolved = MinimalXECWallet as MinimalXECWalletConstructor
 
 const CHRONIK_ENDPOINTS = [
   'https://chronik.e.cash',
-  'https://chronik.paybutton.org'
+  'https://chronik.xolosarmy.xyz'
 ]
 const DERIVATION_PATH = "m/44'/899'/0'/0/0"
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
