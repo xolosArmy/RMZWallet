@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { AgoraOffer, AgoraPartial } from 'ecash-agora'
 import {
@@ -15,6 +15,7 @@ import type { ScriptUtxo } from 'chronik-client'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
+import { XOLOSARMY_NFT_PARENT_TOKEN_ID } from '../config/nfts'
 import { getChronik } from '../services/ChronikClient'
 import { xolosWalletService } from '../services/XolosWalletService'
 import { fetchOwnedNfts, type NftAsset } from '../services/nftService'
@@ -37,6 +38,7 @@ const FEE_PER_KB = 1200n
 const P2PKH_INPUT_SIZE = 148
 const OUTPUT_SIZE = 34
 const TX_OVERHEAD = 10
+const SLP_NFT1_GROUP = 129
 
 const estimateFee = (inputCount: number, outputCount: number): bigint => {
   const txSize = TX_OVERHEAD + inputCount * P2PKH_INPUT_SIZE + outputCount * OUTPUT_SIZE
@@ -48,7 +50,7 @@ const pow10 = (decimals: number): bigint => 10n ** BigInt(decimals)
 function DEX() {
   const { address, initialized, refreshBalances, loading, error, backupVerified } = useWallet()
   const [rmzDecimals, setRmzDecimals] = useState<number | null>(null)
-  const [dexTab, setDexTab] = useState<'maker' | 'taker' | 'nft'>('maker')
+  const [dexTab, setDexTab] = useState<'maker' | 'taker' | 'nft' | 'mintpass'>('maker')
   const [searchParams] = useSearchParams()
 
   const [sellAmount, setSellAmount] = useState('')
@@ -82,6 +84,16 @@ function DEX() {
   const [nftSellTxid, setNftSellTxid] = useState<string | null>(null)
   const [nftBuyBusy, setNftBuyBusy] = useState(false)
   const [nftBuyTxid, setNftBuyTxid] = useState<string | null>(null)
+
+  const [mintPassOffers, setMintPassOffers] = useState<AgoraOffer[]>([])
+  const [mintPassError, setMintPassError] = useState<string | null>(null)
+  const [mintPassOffersLoading, setMintPassOffersLoading] = useState(false)
+  const [mintPassSellAmount, setMintPassSellAmount] = useState('')
+  const [mintPassSellPrice, setMintPassSellPrice] = useState('')
+  const [mintPassSellBusy, setMintPassSellBusy] = useState(false)
+  const [mintPassSellTxid, setMintPassSellTxid] = useState<string | null>(null)
+  const [mintPassBuyBusy, setMintPassBuyBusy] = useState(false)
+  const [mintPassBuyTxid, setMintPassBuyTxid] = useState<string | null>(null)
 
   useEffect(() => {
     if (initialized) {
@@ -129,13 +141,46 @@ function DEX() {
     }
   }, [])
 
-  useEffect(() => {
-    const tokenId = searchParams.get('nftTokenId') || ''
-    if (tokenId) {
-      setDexTab('nft')
-      setNftTokenIdInput(tokenId)
+  const loadMintPassOffers = useCallback(async () => {
+    setMintPassError(null)
+    setMintPassOffers([])
+    setMintPassBuyTxid(null)
+
+    if (!agoraPluginReady) {
+      setMintPassError('El plugin Agora no está disponible en este nodo.')
+      return
     }
-  }, [searchParams])
+    if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) {
+      setMintPassError('No se configuró el token padre para Mint Pass.')
+      return
+    }
+
+    setMintPassOffersLoading(true)
+    try {
+      const offers = await fetchOrderbookByTokenId(XOLOSARMY_NFT_PARENT_TOKEN_ID)
+      setMintPassOffers(offers)
+    } catch (err) {
+      setMintPassError((err as Error).message || 'No pudimos cargar ofertas del Mint Pass.')
+    } finally {
+      setMintPassOffersLoading(false)
+    }
+  }, [agoraPluginReady])
+
+  useEffect(() => {
+    const mode = searchParams.get('mode') || ''
+    const tokenId = searchParams.get('tokenId') || ''
+    if (mode === 'mintpass' && tokenId === XOLOSARMY_NFT_PARENT_TOKEN_ID) {
+      setDexTab('mintpass')
+      loadMintPassOffers()
+      return
+    }
+
+    const nftTokenId = searchParams.get('nftTokenId') || ''
+    if (nftTokenId) {
+      setDexTab('nft')
+      setNftTokenIdInput(nftTokenId)
+    }
+  }, [loadMintPassOffers, searchParams])
 
   useEffect(() => {
     let active = true
@@ -180,6 +225,18 @@ function DEX() {
       return ''
     }
   }, [sellAmount, pricingMode, rmzDecimals, atomsPerToken, totalXecWanted])
+
+  const computedMintPassTotal = useMemo(() => {
+    if (!mintPassSellAmount || !mintPassSellPrice) return ''
+    try {
+      const amount = parseDecimalToAtoms(mintPassSellAmount, 0)
+      const priceSats = parseXecToSats(mintPassSellPrice)
+      const totalSats = priceSats * amount
+      return formatSatsToXec(totalSats)
+    } catch {
+      return ''
+    }
+  }, [mintPassSellAmount, mintPassSellPrice])
 
   const handleCreateOffer = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -536,6 +593,78 @@ function DEX() {
     }
   }
 
+  const handleSellMintPass = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setMintPassError(null)
+    setMintPassSellTxid(null)
+
+    if (!initialized || !backupVerified) {
+      setMintPassError('Debes completar el onboarding y respaldar tu seed antes de listar.')
+      return
+    }
+
+    if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) {
+      setMintPassError('No se configuró el token padre para Mint Pass.')
+      return
+    }
+
+    let tokenAmount: bigint
+    try {
+      tokenAmount = parseDecimalToAtoms(mintPassSellAmount, 0)
+    } catch (err) {
+      setMintPassError((err as Error).message)
+      return
+    }
+
+    if (tokenAmount <= 0n) {
+      setMintPassError('La cantidad debe ser mayor a cero.')
+      return
+    }
+
+    let pricePerUnitSats: bigint
+    try {
+      pricePerUnitSats = parseXecToSats(mintPassSellPrice)
+    } catch (err) {
+      setMintPassError((err as Error).message)
+      return
+    }
+
+    if (pricePerUnitSats <= 0n) {
+      setMintPassError('El precio por unidad debe ser mayor a cero.')
+      return
+    }
+
+    const walletKeyInfo = xolosWalletService.getKeyInfo()
+    const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
+    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+      setMintPassError('No pudimos acceder a las llaves de tu billetera.')
+      return
+    }
+
+    setMintPassSellBusy(true)
+    try {
+      const receiveXecSats = pricePerUnitSats * tokenAmount
+      const { offerTxid } = await createSellTokenOffer({
+        tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        tokenType: SLP_NFT1_GROUP,
+        tokenAmount,
+        receiveXecSats,
+        makerAddress: xecAddress,
+        keyInfo: {
+          privateKeyHex: walletKeyInfo.privateKeyHex,
+          publicKeyHex: walletKeyInfo.publicKeyHex
+        }
+      })
+      setMintPassSellTxid(offerTxid)
+      await refreshBalances()
+      await loadMintPassOffers()
+    } catch (err) {
+      setMintPassError((err as Error).message || 'No se pudo listar el Mint Pass.')
+    } finally {
+      setMintPassSellBusy(false)
+    }
+  }
+
   const handleBuyNftOffer = async (offer: AgoraOffer) => {
     if (!initialized || !backupVerified || !address) {
       setNftOfferError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
@@ -566,6 +695,39 @@ function DEX() {
       setNftOfferError((err as Error).message || 'No se pudo comprar el NFT.')
     } finally {
       setNftBuyBusy(false)
+    }
+  }
+
+  const handleBuyMintPassOffer = async (offer: AgoraOffer) => {
+    if (!initialized || !backupVerified || !address) {
+      setMintPassError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
+      return
+    }
+
+    setMintPassError(null)
+    setMintPassBuyTxid(null)
+    setMintPassBuyBusy(true)
+    try {
+      const walletKeyInfo = xolosWalletService.getKeyInfo()
+      const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
+      if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+        setMintPassError('No pudimos acceder a las llaves de tu billetera.')
+        return
+      }
+      const { txid } = await acceptTokenOffer({
+        offer,
+        recipientAddress: xecAddress,
+        keyInfo: {
+          privateKeyHex: walletKeyInfo.privateKeyHex,
+          publicKeyHex: walletKeyInfo.publicKeyHex
+        }
+      })
+      setMintPassBuyTxid(txid)
+      await refreshBalances()
+    } catch (err) {
+      setMintPassError((err as Error).message || 'No se pudo comprar el Mint Pass.')
+    } finally {
+      setMintPassBuyBusy(false)
     }
   }
 
@@ -624,6 +786,13 @@ function DEX() {
             onClick={() => setDexTab('nft')}
           >
             NFT Market
+          </button>
+          <button
+            className={`cta ${dexTab === 'mintpass' ? 'primary' : 'ghost'}`}
+            type="button"
+            onClick={() => setDexTab('mintpass')}
+          >
+            Mint Pass
           </button>
         </div>
 
@@ -884,6 +1053,113 @@ function DEX() {
                 {nftBuyTxid && (
                   <div className="success" style={{ marginTop: 12 }}>
                     Compra completada: <span className="address-box">{nftBuyTxid}</span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {dexTab === 'mintpass' && (
+          <div style={{ marginTop: 16 }}>
+            <div className="card" style={{ marginBottom: 12 }}>
+              <p className="card-kicker">Mint Pass (Parent Token)</p>
+              <p className="muted">Compra Mint Pass para poder mintear.</p>
+              <div className="address-box" style={{ marginTop: 12 }}>
+                {XOLOSARMY_NFT_PARENT_TOKEN_ID || 'Sin configurar'}
+              </div>
+              <div className="actions" style={{ marginTop: 12 }}>
+                <button
+                  className="cta outline"
+                  type="button"
+                  onClick={loadMintPassOffers}
+                  disabled={mintPassOffersLoading}
+                >
+                  {mintPassOffersLoading ? 'Cargando...' : 'Cargar ofertas'}
+                </button>
+              </div>
+            </div>
+
+            <form onSubmit={handleSellMintPass} className="card" style={{ marginBottom: 12 }}>
+              <p className="card-kicker">Vender Parent Token</p>
+              <label htmlFor="mintPassAmount">Cantidad</label>
+              <input
+                id="mintPassAmount"
+                value={mintPassSellAmount}
+                onChange={(event) => setMintPassSellAmount(event.target.value)}
+                placeholder="Ej. 1"
+              />
+              <label htmlFor="mintPassPrice" style={{ marginTop: 12 }}>
+                Precio por unidad (XEC)
+              </label>
+              <input
+                id="mintPassPrice"
+                value={mintPassSellPrice}
+                onChange={(event) => setMintPassSellPrice(event.target.value)}
+                placeholder="Ej. 2500"
+              />
+              <label htmlFor="mintPassTotal" style={{ marginTop: 12 }}>
+                Total XEC deseado
+              </label>
+              <input id="mintPassTotal" value={computedMintPassTotal} readOnly placeholder="Se calcula automáticamente" />
+              <div className="actions" style={{ marginTop: 12 }}>
+                <button className="cta primary" type="submit" disabled={mintPassSellBusy}>
+                  {mintPassSellBusy ? 'Publicando...' : 'Publicar'}
+                </button>
+              </div>
+              {mintPassSellTxid && (
+                <div className="success" style={{ marginTop: 12 }}>
+                  Oferta publicada: <span className="address-box">{mintPassSellTxid}</span>
+                </div>
+              )}
+            </form>
+
+            {mintPassError && <div className="error">{mintPassError}</div>}
+            {mintPassOffersLoading && <div className="muted">Cargando ofertas...</div>}
+            {!mintPassOffersLoading && mintPassOffers.length === 0 && !mintPassError && (
+              <div className="muted">No hay ofertas activas.</div>
+            )}
+
+            {mintPassOffers.length > 0 && (
+              <div className="card">
+                <p className="card-kicker">Ofertas activas</p>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: 'left', padding: '8px 6px' }}>Cantidad</th>
+                      <th style={{ textAlign: 'left', padding: '8px 6px' }}>Total XEC</th>
+                      <th style={{ textAlign: 'left', padding: '8px 6px' }}>XEC por Mint Pass</th>
+                      <th style={{ textAlign: 'left', padding: '8px 6px' }} />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {mintPassOffers.map((offer, index) => {
+                      const offeredAtoms = offer.token.atoms
+                      const askedSats = offer.askedSats(offeredAtoms)
+                      const perUnitSats = offeredAtoms > 0n ? askedSats / offeredAtoms : 0n
+                      return (
+                        <tr key={`${offer.outpoint.txid}-${index}`}>
+                          <td style={{ padding: '8px 6px' }}>{offeredAtoms.toString()}</td>
+                          <td style={{ padding: '8px 6px' }}>{formatSatsToXec(askedSats)} XEC</td>
+                          <td style={{ padding: '8px 6px' }}>{formatSatsToXec(perUnitSats)} XEC</td>
+                          <td style={{ padding: '8px 6px' }}>
+                            <button
+                              className="cta primary"
+                              type="button"
+                              onClick={() => handleBuyMintPassOffer(offer)}
+                              disabled={mintPassBuyBusy}
+                            >
+                              {mintPassBuyBusy ? 'Comprando...' : 'Comprar'}
+                            </button>
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+                {mintPassBuyTxid && (
+                  <div className="success" style={{ marginTop: 12 }}>
+                    Compra completada: <span className="address-box">{mintPassBuyTxid}</span>
                   </div>
                 )}
               </div>
