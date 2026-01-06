@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { AgoraOffer, AgoraPartial } from 'ecash-agora'
 import {
   ALP_STANDARD,
@@ -17,6 +17,8 @@ import { useWallet } from '../context/useWallet'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { getChronik } from '../services/ChronikClient'
 import { xolosWalletService } from '../services/XolosWalletService'
+import { fetchOwnedNfts, type NftAsset } from '../services/nftService'
+import { acceptTokenOffer, createSellTokenOffer, fetchOrderbookByTokenId } from '../services/agoraExchange'
 import {
   TOKEN_DUST_SATS,
   buildAlpAgoraListOutputs,
@@ -46,7 +48,8 @@ const pow10 = (decimals: number): bigint => 10n ** BigInt(decimals)
 function DEX() {
   const { address, initialized, refreshBalances, loading, error, backupVerified } = useWallet()
   const [rmzDecimals, setRmzDecimals] = useState<number | null>(null)
-  const [dexTab, setDexTab] = useState<'maker' | 'taker'>('maker')
+  const [dexTab, setDexTab] = useState<'maker' | 'taker' | 'nft'>('maker')
+  const [searchParams] = useSearchParams()
 
   const [sellAmount, setSellAmount] = useState('')
   const [pricingMode, setPricingMode] = useState<'perUnit' | 'total'>('perUnit')
@@ -67,6 +70,18 @@ function DEX() {
   const [buyBusy, setBuyBusy] = useState(false)
   const [buyTxid, setBuyTxid] = useState<string | null>(null)
   const [agoraPluginReady, setAgoraPluginReady] = useState(true)
+
+  const [ownedNfts, setOwnedNfts] = useState<NftAsset[]>([])
+  const [nftTokenIdInput, setNftTokenIdInput] = useState('')
+  const [nftOffers, setNftOffers] = useState<AgoraOffer[]>([])
+  const [nftOfferError, setNftOfferError] = useState<string | null>(null)
+  const [nftOffersLoading, setNftOffersLoading] = useState(false)
+  const [nftSellPrice, setNftSellPrice] = useState('')
+  const [nftSellTokenId, setNftSellTokenId] = useState('')
+  const [nftSellBusy, setNftSellBusy] = useState(false)
+  const [nftSellTxid, setNftSellTxid] = useState<string | null>(null)
+  const [nftBuyBusy, setNftBuyBusy] = useState(false)
+  const [nftBuyTxid, setNftBuyTxid] = useState<string | null>(null)
 
   useEffect(() => {
     if (initialized) {
@@ -113,6 +128,31 @@ function DEX() {
       active = false
     }
   }, [])
+
+  useEffect(() => {
+    const tokenId = searchParams.get('nftTokenId') || ''
+    if (tokenId) {
+      setDexTab('nft')
+      setNftTokenIdInput(tokenId)
+    }
+  }, [searchParams])
+
+  useEffect(() => {
+    let active = true
+    const loadOwnedNfts = async () => {
+      if (!initialized || !address || dexTab !== 'nft') return
+      try {
+        const owned = await fetchOwnedNfts(address)
+        if (active) setOwnedNfts(owned)
+      } catch (err) {
+        if (active) setOwnedNfts([])
+      }
+    }
+    loadOwnedNfts()
+    return () => {
+      active = false
+    }
+  }, [address, dexTab, initialized])
   const atomsPerToken = useMemo(() => (rmzDecimals === null ? null : pow10(rmzDecimals)), [rmzDecimals])
 
   const computedTotalXec = useMemo(() => {
@@ -412,6 +452,123 @@ function DEX() {
     }
   }
 
+  const handleLoadNftOffers = async () => {
+    setNftOfferError(null)
+    setNftOffers([])
+    setNftBuyTxid(null)
+
+    if (!agoraPluginReady) {
+      setNftOfferError('El plugin Agora no está disponible en este nodo.')
+      return
+    }
+
+    const tokenId = nftTokenIdInput.trim()
+    if (!tokenId) {
+      setNftOfferError('Ingresa un tokenId de NFT válido.')
+      return
+    }
+
+    setNftOffersLoading(true)
+    try {
+      const offers = await fetchOrderbookByTokenId(tokenId)
+      setNftOffers(offers)
+    } catch (err) {
+      setNftOfferError((err as Error).message || 'No pudimos cargar ofertas para este NFT.')
+    } finally {
+      setNftOffersLoading(false)
+    }
+  }
+
+  const handleSellNft = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setNftOfferError(null)
+    setNftSellTxid(null)
+
+    if (!initialized || !backupVerified) {
+      setNftOfferError('Debes completar el onboarding y respaldar tu seed antes de listar.')
+      return
+    }
+
+    const tokenId = nftSellTokenId || nftTokenIdInput.trim()
+    if (!tokenId) {
+      setNftOfferError('Selecciona un NFT para vender.')
+      return
+    }
+
+    let receiveXecSats: bigint
+    try {
+      receiveXecSats = parseXecToSats(nftSellPrice)
+    } catch (err) {
+      setNftOfferError((err as Error).message)
+      return
+    }
+
+    if (receiveXecSats <= 0n) {
+      setNftOfferError('El precio debe ser mayor a cero.')
+      return
+    }
+
+    const walletKeyInfo = xolosWalletService.getKeyInfo()
+    const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
+    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+      setNftOfferError('No pudimos acceder a las llaves de tu billetera.')
+      return
+    }
+
+    setNftSellBusy(true)
+    try {
+      const { offerTxid } = await createSellTokenOffer({
+        tokenId,
+        receiveXecSats,
+        makerAddress: xecAddress,
+        keyInfo: {
+          privateKeyHex: walletKeyInfo.privateKeyHex,
+          publicKeyHex: walletKeyInfo.publicKeyHex
+        }
+      })
+      setNftSellTxid(offerTxid)
+      await refreshBalances()
+      await handleLoadNftOffers()
+    } catch (err) {
+      setNftOfferError((err as Error).message || 'No se pudo listar el NFT.')
+    } finally {
+      setNftSellBusy(false)
+    }
+  }
+
+  const handleBuyNftOffer = async (offer: AgoraOffer) => {
+    if (!initialized || !backupVerified || !address) {
+      setNftOfferError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
+      return
+    }
+
+    setNftOfferError(null)
+    setNftBuyTxid(null)
+    setNftBuyBusy(true)
+    try {
+      const walletKeyInfo = xolosWalletService.getKeyInfo()
+      const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
+      if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+        setNftOfferError('No pudimos acceder a las llaves de tu billetera.')
+        return
+      }
+      const { txid } = await acceptTokenOffer({
+        offer,
+        recipientAddress: xecAddress,
+        keyInfo: {
+          privateKeyHex: walletKeyInfo.privateKeyHex,
+          publicKeyHex: walletKeyInfo.publicKeyHex
+        }
+      })
+      setNftBuyTxid(txid)
+      await refreshBalances()
+    } catch (err) {
+      setNftOfferError((err as Error).message || 'No se pudo comprar el NFT.')
+    } finally {
+      setNftBuyBusy(false)
+    }
+  }
+
   if (!initialized) {
     return (
       <div className="page">
@@ -460,6 +617,13 @@ function DEX() {
             onClick={() => setDexTab('taker')}
           >
             Comprar Offer (Pegar ID)
+          </button>
+          <button
+            className={`cta ${dexTab === 'nft' ? 'primary' : 'ghost'}`}
+            type="button"
+            onClick={() => setDexTab('nft')}
+          >
+            NFT Market
           </button>
         </div>
 
@@ -627,6 +791,101 @@ function DEX() {
                     ].join('\n')}
                   </div>
                 </details>
+              </div>
+            )}
+          </div>
+        )}
+
+        {dexTab === 'nft' && (
+          <div style={{ marginTop: 16 }}>
+            <div className="card" style={{ marginBottom: 12 }}>
+              <p className="card-kicker">NFT Market</p>
+              <p className="muted">Lista o compra NFTs de la colección xolosArmy.</p>
+            </div>
+
+            <form onSubmit={handleSellNft} className="card" style={{ marginBottom: 12 }}>
+              <label htmlFor="nftOwned">NFT propio</label>
+              <select
+                id="nftOwned"
+                value={nftSellTokenId}
+                onChange={(event) => {
+                  const next = event.target.value
+                  setNftSellTokenId(next)
+                  if (next) setNftTokenIdInput(next)
+                }}
+              >
+                <option value="">Selecciona un NFT de tu guardianía</option>
+                {ownedNfts.map((nft) => (
+                  <option key={nft.tokenId} value={nft.tokenId}>
+                    {nft.name} · {nft.tokenId.slice(0, 8)}...
+                  </option>
+                ))}
+              </select>
+
+              <label htmlFor="nftSellPrice" style={{ marginTop: 12 }}>
+                Precio en XEC
+              </label>
+              <input
+                id="nftSellPrice"
+                value={nftSellPrice}
+                onChange={(event) => setNftSellPrice(event.target.value)}
+                placeholder="Ej. 2500"
+              />
+              <div className="actions" style={{ marginTop: 12 }}>
+                <button className="cta primary" type="submit" disabled={nftSellBusy}>
+                  {nftSellBusy ? 'Publicando...' : 'Publicar oferta'}
+                </button>
+              </div>
+              {nftSellTxid && (
+                <div className="success" style={{ marginTop: 12 }}>
+                  Oferta publicada: <span className="address-box">{nftSellTxid}</span>
+                </div>
+              )}
+            </form>
+
+            <div className="card" style={{ marginBottom: 12 }}>
+              <label htmlFor="nftTokenId">TokenId del NFT</label>
+              <input
+                id="nftTokenId"
+                value={nftTokenIdInput}
+                onChange={(event) => setNftTokenIdInput(event.target.value)}
+                placeholder="Pega el tokenId del NFT"
+              />
+              <div className="actions" style={{ marginTop: 12 }}>
+                <button className="cta outline" type="button" onClick={handleLoadNftOffers} disabled={nftOffersLoading}>
+                  {nftOffersLoading ? 'Cargando...' : 'Cargar ofertas'}
+                </button>
+              </div>
+            </div>
+
+            {nftOfferError && <div className="error">{nftOfferError}</div>}
+
+            {nftOffers.length > 0 && (
+              <div className="card">
+                <p className="card-kicker">Ofertas activas</p>
+                {nftOffers.map((offer, index) => {
+                  const askedSats = offer.askedSats(offer.token.atoms)
+                  return (
+                    <div className="tx-item" key={`${offer.outpoint.txid}-${index}`}>
+                      <p>Precio: {formatSatsToXec(askedSats)} XEC</p>
+                      <div className="actions" style={{ marginTop: 8 }}>
+                        <button
+                          className="cta primary"
+                          type="button"
+                          onClick={() => handleBuyNftOffer(offer)}
+                          disabled={nftBuyBusy}
+                        >
+                          {nftBuyBusy ? 'Comprando...' : 'Comprar'}
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+                {nftBuyTxid && (
+                  <div className="success" style={{ marginTop: 12 }}>
+                    Compra completada: <span className="address-box">{nftBuyTxid}</span>
+                  </div>
+                )}
               </div>
             )}
           </div>
