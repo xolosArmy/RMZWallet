@@ -193,7 +193,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setLoading(false)
       }
     },
-    [initialized, syncAddressAndBalance]
+    [initialized]
   )
 
   const createNewWallet = useCallback(async (): Promise<string> => {

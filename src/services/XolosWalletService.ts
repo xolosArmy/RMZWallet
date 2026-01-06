@@ -118,7 +118,7 @@ export interface WalletKeyInfo {
   privateKeyHex: string | null
 }
 
-class XolosWalletService {
+export class XolosWalletService {
   private static instance: XolosWalletService
   private wallet: MinimalXecWallet | null = null
   private isReady = false

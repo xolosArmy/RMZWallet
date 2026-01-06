@@ -19,7 +19,13 @@ import { XOLOSARMY_NFT_PARENT_TOKEN_ID } from '../config/nfts'
 import { getChronik } from '../services/ChronikClient'
 import { xolosWalletService } from '../services/XolosWalletService'
 import { fetchOwnedNfts, type NftAsset } from '../services/nftService'
-import { acceptTokenOffer, createSellTokenOffer, fetchOrderbookByTokenId } from '../services/agoraExchange'
+import {
+  acceptOfferByOfferId,
+  checkAgoraAvailability,
+  createSellOfferForTokenId,
+  fetchOrderbookByTokenId,
+  type AgoraOrder
+} from '../services/agoraExchange'
 import {
   TOKEN_DUST_SATS,
   buildAlpAgoraListOutputs,
@@ -38,8 +44,6 @@ const FEE_PER_KB = 1200n
 const P2PKH_INPUT_SIZE = 148
 const OUTPUT_SIZE = 34
 const TX_OVERHEAD = 10
-const SLP_NFT1_GROUP = 129
-
 const estimateFee = (inputCount: number, outputCount: number): bigint => {
   const txSize = TX_OVERHEAD + inputCount * P2PKH_INPUT_SIZE + outputCount * OUTPUT_SIZE
   return calcTxFee(txSize, FEE_PER_KB)
@@ -72,10 +76,16 @@ function DEX() {
   const [buyBusy, setBuyBusy] = useState(false)
   const [buyTxid, setBuyTxid] = useState<string | null>(null)
   const [agoraPluginReady, setAgoraPluginReady] = useState(true)
+  const [agoraPluginMessage, setAgoraPluginMessage] = useState<string | null>(null)
+  const [agoraCheckStatus, setAgoraCheckStatus] = useState<number | null>(null)
+  const [agoraCheckDetails, setAgoraCheckDetails] = useState<string | null>(null)
+  const [agoraCheckEndpoint, setAgoraCheckEndpoint] = useState<string | null>(null)
+  const [agoraCheckUrl, setAgoraCheckUrl] = useState<string | null>(null)
+  const [agoraCheckBusy, setAgoraCheckBusy] = useState(false)
 
   const [ownedNfts, setOwnedNfts] = useState<NftAsset[]>([])
   const [nftTokenIdInput, setNftTokenIdInput] = useState('')
-  const [nftOffers, setNftOffers] = useState<AgoraOffer[]>([])
+  const [nftOffers, setNftOffers] = useState<AgoraOrder[]>([])
   const [nftOfferError, setNftOfferError] = useState<string | null>(null)
   const [nftOffersLoading, setNftOffersLoading] = useState(false)
   const [nftSellPrice, setNftSellPrice] = useState('')
@@ -85,7 +95,7 @@ function DEX() {
   const [nftBuyBusy, setNftBuyBusy] = useState(false)
   const [nftBuyTxid, setNftBuyTxid] = useState<string | null>(null)
 
-  const [mintPassOffers, setMintPassOffers] = useState<AgoraOffer[]>([])
+  const [mintPassOffers, setMintPassOffers] = useState<AgoraOrder[]>([])
   const [mintPassError, setMintPassError] = useState<string | null>(null)
   const [mintPassOffersLoading, setMintPassOffersLoading] = useState(false)
   const [mintPassSellAmount, setMintPassSellAmount] = useState('')
@@ -124,15 +134,16 @@ function DEX() {
   useEffect(() => {
     let active = true
     const checkAgoraPlugin = async () => {
-      try {
-        await getChronik().plugin('agora').groups()
-        if (active) {
-          setAgoraPluginReady(true)
-        }
-      } catch {
-        if (active) {
-          setAgoraPluginReady(false)
-        }
+      setAgoraCheckBusy(true)
+      const status = await checkAgoraAvailability()
+      if (active) {
+        setAgoraPluginReady(status.ok)
+        setAgoraPluginMessage(status.ok ? null : status.message || 'El plugin Agora no está disponible en este nodo.')
+        setAgoraCheckStatus(status.status ?? null)
+        setAgoraCheckDetails(status.details ?? null)
+        setAgoraCheckEndpoint(status.endpointPath ?? null)
+        setAgoraCheckUrl(status.chronikUrl ?? null)
+        setAgoraCheckBusy(false)
       }
     }
     checkAgoraPlugin()
@@ -147,7 +158,7 @@ function DEX() {
     setMintPassBuyTxid(null)
 
     if (!agoraPluginReady) {
-      setMintPassError('El plugin Agora no está disponible en este nodo.')
+      setMintPassError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
       return
     }
     if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) {
@@ -164,7 +175,19 @@ function DEX() {
     } finally {
       setMintPassOffersLoading(false)
     }
-  }, [agoraPluginReady])
+  }, [agoraPluginMessage, agoraPluginReady])
+
+  const handleRetryAgoraCheck = useCallback(async () => {
+    setAgoraCheckBusy(true)
+    const status = await checkAgoraAvailability()
+    setAgoraPluginReady(status.ok)
+    setAgoraPluginMessage(status.ok ? null : status.message || 'El plugin Agora no está disponible en este nodo.')
+    setAgoraCheckStatus(status.status ?? null)
+    setAgoraCheckDetails(status.details ?? null)
+    setAgoraCheckEndpoint(status.endpointPath ?? null)
+    setAgoraCheckUrl(status.chronikUrl ?? null)
+    setAgoraCheckBusy(false)
+  }, [])
 
   useEffect(() => {
     const mode = searchParams.get('mode') || ''
@@ -175,12 +198,15 @@ function DEX() {
       return
     }
 
-    const nftTokenId = searchParams.get('nftTokenId') || ''
+    const nftTokenId = tokenId || searchParams.get('nftTokenId') || ''
     if (nftTokenId) {
       setDexTab('nft')
       setNftTokenIdInput(nftTokenId)
+      if (mode === 'nft') {
+        handleLoadNftOffers(nftTokenId)
+      }
     }
-  }, [loadMintPassOffers, searchParams])
+  }, [handleLoadNftOffers, loadMintPassOffers, searchParams])
 
   useEffect(() => {
     let active = true
@@ -189,7 +215,7 @@ function DEX() {
       try {
         const owned = await fetchOwnedNfts(address)
         if (active) setOwnedNfts(owned)
-      } catch (err) {
+      } catch {
         if (active) setOwnedNfts([])
       }
     }
@@ -245,6 +271,10 @@ function DEX() {
     setMakerOfferId(null)
     setMakerAdvanced(null)
 
+    if (!agoraPluginReady) {
+      setMakerError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
+      return
+    }
     if (!initialized || !backupVerified) {
       setMakerError('Debes completar el onboarding y respaldar tu seed antes de crear una oferta.')
       return
@@ -448,6 +478,10 @@ function DEX() {
     setBuyTxid(null)
     setOfferLookupError(null)
 
+    if (!agoraPluginReady) {
+      setOfferLookupError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
+      return
+    }
     if (!initialized || !backupVerified) {
       setOfferLookupError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
       return
@@ -509,17 +543,17 @@ function DEX() {
     }
   }
 
-  const handleLoadNftOffers = async () => {
+  const handleLoadNftOffers = useCallback(async (overrideTokenId?: string) => {
     setNftOfferError(null)
     setNftOffers([])
     setNftBuyTxid(null)
 
     if (!agoraPluginReady) {
-      setNftOfferError('El plugin Agora no está disponible en este nodo.')
+      setNftOfferError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
       return
     }
 
-    const tokenId = nftTokenIdInput.trim()
+    const tokenId = (overrideTokenId ?? nftTokenIdInput).trim()
     if (!tokenId) {
       setNftOfferError('Ingresa un tokenId de NFT válido.')
       return
@@ -534,13 +568,17 @@ function DEX() {
     } finally {
       setNftOffersLoading(false)
     }
-  }
+  }, [agoraPluginMessage, agoraPluginReady, nftTokenIdInput])
 
   const handleSellNft = async (event: React.FormEvent) => {
     event.preventDefault()
     setNftOfferError(null)
     setNftSellTxid(null)
 
+    if (!agoraPluginReady) {
+      setNftOfferError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
+      return
+    }
     if (!initialized || !backupVerified) {
       setNftOfferError('Debes completar el onboarding y respaldar tu seed antes de listar.')
       return
@@ -574,16 +612,14 @@ function DEX() {
 
     setNftSellBusy(true)
     try {
-      const { offerTxid } = await createSellTokenOffer({
+      const { txid } = await createSellOfferForTokenId({
         tokenId,
-        receiveXecSats,
-        makerAddress: xecAddress,
-        keyInfo: {
-          privateKeyHex: walletKeyInfo.privateKeyHex,
-          publicKeyHex: walletKeyInfo.publicKeyHex
-        }
+        tokenAtoms: 1n,
+        askXecSats: receiveXecSats,
+        payoutAddress: xecAddress,
+        wallet: xolosWalletService
       })
-      setNftSellTxid(offerTxid)
+      setNftSellTxid(txid)
       await refreshBalances()
       await handleLoadNftOffers()
     } catch (err) {
@@ -598,6 +634,10 @@ function DEX() {
     setMintPassError(null)
     setMintPassSellTxid(null)
 
+    if (!agoraPluginReady) {
+      setMintPassError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
+      return
+    }
     if (!initialized || !backupVerified) {
       setMintPassError('Debes completar el onboarding y respaldar tu seed antes de listar.')
       return
@@ -644,18 +684,14 @@ function DEX() {
     setMintPassSellBusy(true)
     try {
       const receiveXecSats = pricePerUnitSats * tokenAmount
-      const { offerTxid } = await createSellTokenOffer({
+      const { txid } = await createSellOfferForTokenId({
         tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
-        tokenType: SLP_NFT1_GROUP,
-        tokenAmount,
-        receiveXecSats,
-        makerAddress: xecAddress,
-        keyInfo: {
-          privateKeyHex: walletKeyInfo.privateKeyHex,
-          publicKeyHex: walletKeyInfo.publicKeyHex
-        }
+        tokenAtoms: tokenAmount,
+        askXecSats: receiveXecSats,
+        payoutAddress: xecAddress,
+        wallet: xolosWalletService
       })
-      setMintPassSellTxid(offerTxid)
+      setMintPassSellTxid(txid)
       await refreshBalances()
       await loadMintPassOffers()
     } catch (err) {
@@ -665,29 +701,24 @@ function DEX() {
     }
   }
 
-  const handleBuyNftOffer = async (offer: AgoraOffer) => {
+  const handleBuyNftOffer = async (offer: AgoraOrder) => {
     if (!initialized || !backupVerified || !address) {
       setNftOfferError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
       return
     }
 
+    if (!agoraPluginReady) {
+      setNftOfferError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
+      return
+    }
     setNftOfferError(null)
     setNftBuyTxid(null)
     setNftBuyBusy(true)
     try {
-      const walletKeyInfo = xolosWalletService.getKeyInfo()
-      const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-      if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
-        setNftOfferError('No pudimos acceder a las llaves de tu billetera.')
-        return
-      }
-      const { txid } = await acceptTokenOffer({
-        offer,
-        recipientAddress: xecAddress,
-        keyInfo: {
-          privateKeyHex: walletKeyInfo.privateKeyHex,
-          publicKeyHex: walletKeyInfo.publicKeyHex
-        }
+      const { txid } = await acceptOfferByOfferId({
+        offerId: offer.offerId,
+        tokenId: offer.tokenId,
+        wallet: xolosWalletService
       })
       setNftBuyTxid(txid)
       await refreshBalances()
@@ -698,29 +729,24 @@ function DEX() {
     }
   }
 
-  const handleBuyMintPassOffer = async (offer: AgoraOffer) => {
+  const handleBuyMintPassOffer = async (offer: AgoraOrder) => {
     if (!initialized || !backupVerified || !address) {
       setMintPassError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
       return
     }
 
+    if (!agoraPluginReady) {
+      setMintPassError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
+      return
+    }
     setMintPassError(null)
     setMintPassBuyTxid(null)
     setMintPassBuyBusy(true)
     try {
-      const walletKeyInfo = xolosWalletService.getKeyInfo()
-      const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-      if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
-        setMintPassError('No pudimos acceder a las llaves de tu billetera.')
-        return
-      }
-      const { txid } = await acceptTokenOffer({
-        offer,
-        recipientAddress: xecAddress,
-        keyInfo: {
-          privateKeyHex: walletKeyInfo.privateKeyHex,
-          publicKeyHex: walletKeyInfo.publicKeyHex
-        }
+      const { txid } = await acceptOfferByOfferId({
+        offerId: offer.offerId,
+        tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        wallet: xolosWalletService
       })
       setMintPassBuyTxid(txid)
       await refreshBalances()
@@ -762,7 +788,23 @@ function DEX() {
         <p className="muted">DEX (Phase 1)</p>
         {!agoraPluginReady && (
           <div className="muted" style={{ marginTop: 8 }}>
-            DEX en modo solo lectura · Plugin agora not loaded
+            <div>DEX en modo solo lectura · {agoraPluginMessage || 'Plugin agora not loaded'}</div>
+            <div style={{ marginTop: 6 }}>Chronik: {agoraCheckUrl || 'desconocida'}</div>
+            <div>Endpoint: {agoraCheckEndpoint || '/plugin/agora/groups'}</div>
+            {agoraCheckStatus !== null && <div>HTTP {agoraCheckStatus}</div>}
+            {agoraCheckDetails && (
+              <details style={{ marginTop: 6 }}>
+                <summary>Detalles</summary>
+                <div className="address-box" style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>
+                  {agoraCheckDetails}
+                </div>
+              </details>
+            )}
+            <div className="actions" style={{ marginTop: 8 }}>
+              <button className="cta ghost" type="button" onClick={handleRetryAgoraCheck} disabled={agoraCheckBusy}>
+                {agoraCheckBusy ? 'Reintentando...' : 'Reintentar'}
+              </button>
+            </div>
           </div>
         )}
         <div className="actions" style={{ marginTop: 8 }}>
@@ -1001,7 +1043,7 @@ function DEX() {
                 placeholder="Ej. 2500"
               />
               <div className="actions" style={{ marginTop: 12 }}>
-                <button className="cta primary" type="submit" disabled={nftSellBusy}>
+                <button className="cta primary" type="submit" disabled={nftSellBusy || !agoraPluginReady}>
                   {nftSellBusy ? 'Publicando...' : 'Publicar oferta'}
                 </button>
               </div>
@@ -1021,7 +1063,12 @@ function DEX() {
                 placeholder="Pega el tokenId del NFT"
               />
               <div className="actions" style={{ marginTop: 12 }}>
-                <button className="cta outline" type="button" onClick={handleLoadNftOffers} disabled={nftOffersLoading}>
+                <button
+                  className="cta outline"
+                  type="button"
+                  onClick={handleLoadNftOffers}
+                  disabled={nftOffersLoading || !agoraPluginReady}
+                >
                   {nftOffersLoading ? 'Cargando...' : 'Cargar ofertas'}
                 </button>
               </div>
@@ -1033,16 +1080,18 @@ function DEX() {
               <div className="card">
                 <p className="card-kicker">Ofertas activas</p>
                 {nftOffers.map((offer, index) => {
-                  const askedSats = offer.askedSats(offer.token.atoms)
                   return (
-                    <div className="tx-item" key={`${offer.outpoint.txid}-${index}`}>
-                      <p>Precio: {formatSatsToXec(askedSats)} XEC</p>
+                    <div className="tx-item" key={`${offer.offerId}-${index}`}>
+                      <p>Precio: {offer.priceXec} XEC</p>
+                      <div className="muted" style={{ marginTop: 6 }}>
+                        Offer ID: {offer.offerId}
+                      </div>
                       <div className="actions" style={{ marginTop: 8 }}>
                         <button
                           className="cta primary"
                           type="button"
                           onClick={() => handleBuyNftOffer(offer)}
-                          disabled={nftBuyBusy}
+                          disabled={nftBuyBusy || !agoraPluginReady}
                         >
                           {nftBuyBusy ? 'Comprando...' : 'Comprar'}
                         </button>
@@ -1073,7 +1122,7 @@ function DEX() {
                   className="cta outline"
                   type="button"
                   onClick={loadMintPassOffers}
-                  disabled={mintPassOffersLoading}
+                  disabled={mintPassOffersLoading || !agoraPluginReady}
                 >
                   {mintPassOffersLoading ? 'Cargando...' : 'Cargar ofertas'}
                 </button>
@@ -1103,7 +1152,7 @@ function DEX() {
               </label>
               <input id="mintPassTotal" value={computedMintPassTotal} readOnly placeholder="Se calcula automáticamente" />
               <div className="actions" style={{ marginTop: 12 }}>
-                <button className="cta primary" type="submit" disabled={mintPassSellBusy}>
+                <button className="cta primary" type="submit" disabled={mintPassSellBusy || !agoraPluginReady}>
                   {mintPassSellBusy ? 'Publicando...' : 'Publicar'}
                 </button>
               </div>
@@ -1134,11 +1183,11 @@ function DEX() {
                   </thead>
                   <tbody>
                     {mintPassOffers.map((offer, index) => {
-                      const offeredAtoms = offer.token.atoms
-                      const askedSats = offer.askedSats(offeredAtoms)
+                      const offeredAtoms = offer.tokenAtoms
+                      const askedSats = offer.priceSats
                       const perUnitSats = offeredAtoms > 0n ? askedSats / offeredAtoms : 0n
                       return (
-                        <tr key={`${offer.outpoint.txid}-${index}`}>
+                        <tr key={`${offer.offerId}-${index}`}>
                           <td style={{ padding: '8px 6px' }}>{offeredAtoms.toString()}</td>
                           <td style={{ padding: '8px 6px' }}>{formatSatsToXec(askedSats)} XEC</td>
                           <td style={{ padding: '8px 6px' }}>{formatSatsToXec(perUnitSats)} XEC</td>
@@ -1147,7 +1196,7 @@ function DEX() {
                               className="cta primary"
                               type="button"
                               onClick={() => handleBuyMintPassOffer(offer)}
-                              disabled={mintPassBuyBusy}
+                              disabled={mintPassBuyBusy || !agoraPluginReady}
                             >
                               {mintPassBuyBusy ? 'Comprando...' : 'Comprar'}
                             </button>

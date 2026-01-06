@@ -257,7 +257,7 @@ function Nfts() {
                     <Link className="cta outline" to={`/send-nft?tokenId=${nft.tokenId}`}>
                       Enviar
                     </Link>
-                    <Link className="cta ghost" to={`/dex?nftTokenId=${nft.tokenId}`}>
+                    <Link className="cta ghost" to={`/dex?mode=nft&tokenId=${nft.tokenId}`}>
                       Vender en DEX
                     </Link>
                   </div>
