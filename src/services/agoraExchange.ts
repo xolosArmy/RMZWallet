@@ -10,37 +10,26 @@ import {
   shaRmd160,
   slpSend
 } from 'ecash-lib'
-import { Agora, AgoraOffer, AgoraPartial, AgoraPartialAdSignatory } from 'ecash-agora'
-import type { ScriptUtxo } from 'chronik-client'
+import { AgoraOffer, AgoraOneshot, AgoraOneshotAdSignatory, parseAgoraTx } from 'ecash-agora'
+import type { ScriptUtxo, Tx } from 'chronik-client'
 import { getChronik } from './ChronikClient'
 import type { XolosWalletService } from './XolosWalletService'
 import { XEC_DUST_SATS } from '../config/xecFees'
 
 const SLP_NFT1_CHILD = 65
-const SLP_NFT1_GROUP = 129
 const FEE_PER_KB = 1200n
 const P2PKH_INPUT_SIZE = 148
 const OUTPUT_SIZE = 34
 const TX_OVERHEAD = 10
-const NANO_SATS_PER_SAT = 1_000_000_000n
 
-export type AgoraOrder = {
+export type OneshotOfferSummary = {
   offerId: string
   tokenId: string
   tokenAtoms: bigint
   priceSats: bigint
   priceXec: string
-  makerAddress?: string
-  rawOffer?: AgoraOffer
-}
-
-export type AgoraAvailability = {
-  ok: boolean
-  status?: number
-  message?: string
-  details?: string
-  chronikUrl?: string
-  endpointPath?: string
+  payoutAddress?: string
+  tokenType?: number
 }
 
 const estimateFee = (inputCount: number, outputCount: number): bigint => {
@@ -142,62 +131,6 @@ const getAgoraAdFuelSats = (redeemScript: Script, signatory: unknown, offerOutpu
   return BigInt(Math.ceil((measureTx.serSize() * Number(FEE_PER_KB)) / 1000))
 }
 
-let agoraInstance: Agora | null = null
-const getAgora = () => {
-  if (!agoraInstance) {
-    agoraInstance = new Agora(getChronik(), BigInt(XEC_DUST_SATS))
-  }
-  return agoraInstance
-}
-
-const CHRONIK_AGORA_ENDPOINT = '/plugin/agora/groups'
-
-const truncateDetails = (value: string, max = 200) => {
-  if (value.length <= max) return value
-  return `${value.slice(0, max)}...`
-}
-
-const getChronikDiagnostics = () => {
-  const chronik = getChronik()
-  const proxy = chronik.proxyInterface()
-  const endpoints = proxy.getEndpointArray()
-  const workingIndex = (proxy as { _workingIndex?: number })._workingIndex ?? 0
-  const fallbackIndex = Math.min(Math.max(workingIndex, 0), endpoints.length - 1)
-  const chronikUrl = endpoints[fallbackIndex]?.url || endpoints[0]?.url || ''
-  return { chronikUrl, endpointPath: CHRONIK_AGORA_ENDPOINT }
-}
-
-export const checkAgoraAvailability = async (): Promise<AgoraAvailability> => {
-  const { chronikUrl, endpointPath } = getChronikDiagnostics()
-  const targetUrl = chronikUrl ? `${chronikUrl}${endpointPath}` : endpointPath
-
-  try {
-    const response = await fetch(targetUrl, { method: 'GET' })
-    const bodyText = truncateDetails(await response.text())
-    if (response.ok) {
-      return { ok: true, status: response.status, chronikUrl, endpointPath }
-    }
-    return {
-      ok: false,
-      status: response.status,
-      message: 'El plugin Agora no está disponible en este nodo.',
-      details: bodyText || 'Respuesta vacía del servidor.',
-      chronikUrl,
-      endpointPath
-    }
-  } catch (err) {
-    const message = (err as Error).message || 'No pudimos verificar el plugin Agora en este nodo.'
-    const stack = (err as Error).stack || message
-    return {
-      ok: false,
-      message,
-      details: truncateDetails(stack),
-      chronikUrl,
-      endpointPath
-    }
-  }
-}
-
 const formatSatsToXec = (sats: bigint) => {
   const whole = sats / 100n
   const fraction = (sats % 100n).toString().padStart(2, '0')
@@ -224,58 +157,13 @@ const parseOfferId = (offerId: string): { txid: string; vout: number } => {
   return { txid, vout }
 }
 
-const fetchAgoraOffersForTokenId = async (tokenId: string): Promise<AgoraOffer[]> => {
-  const chronik = getChronik()
-  const tokenInfo = await chronik.token(tokenId)
-  if (tokenInfo?.tokenType?.protocol !== 'SLP') {
-    return getAgora().activeOffersByTokenId(tokenId)
-  }
-  if (tokenInfo.tokenType.number === SLP_NFT1_GROUP) {
-    return getAgora().activeOffersByGroupTokenId(tokenId)
-  }
-  return getAgora().activeOffersByTokenId(tokenId)
-}
-
-export const fetchOrderbookByTokenId = async (tokenId: string): Promise<AgoraOrder[]> => {
-  const availability = await checkAgoraAvailability()
-  if (!availability.ok) {
-    throw new Error(availability.message || 'El plugin Agora no está disponible.')
-  }
-
-  const offers = await fetchAgoraOffersForTokenId(tokenId)
-  return offers.map((offer) => {
-    const tokenAtoms = offer.token.atoms
-    const priceSats = offer.askedSats(tokenAtoms)
-    const makerAddress =
-      offer.variant.type === 'PARTIAL'
-        ? Address.p2pkh(shaRmd160(offer.variant.params.makerPk)).toString()
-        : undefined
-    return {
-      offerId: `${offer.outpoint.txid}:${offer.outpoint.outIdx}`,
-      tokenId: offer.token.tokenId,
-      tokenAtoms,
-      priceSats,
-      priceXec: formatSatsToXec(priceSats),
-      makerAddress,
-      rawOffer: offer
-    }
-  })
-}
-
-const selectTokenUtxo = (params: {
-  utxos: ScriptUtxo[]
-  tokenId: string
-  tokenProtocol: string
-  tokenType: number
-  tokenAmount: bigint
-}): ScriptUtxo => {
+const selectTokenUtxo = (params: { utxos: ScriptUtxo[]; tokenId: string; tokenAmount: bigint }): ScriptUtxo => {
   const sorted = params.utxos
     .filter(
       (utxo) =>
         utxo.token &&
         utxo.token.tokenId === params.tokenId &&
-        utxo.token.tokenType.protocol === params.tokenProtocol &&
-        utxo.token.tokenType.number === params.tokenType &&
+        utxo.token.tokenType.protocol === 'SLP' &&
         !utxo.token.isMintBaton
     )
     .sort((a, b) => {
@@ -305,16 +193,13 @@ const createSellOfferInternal = async (params: {
   const chronik = getChronik()
   const utxos = await chronik.address(params.payoutAddress).utxos()
   const tokenInfo = await chronik.token(params.tokenId)
-  const tokenProtocol = tokenInfo?.tokenType?.protocol ?? 'SLP'
-  const tokenType = tokenInfo?.tokenType?.number ?? SLP_NFT1_CHILD
-  if (tokenProtocol !== 'SLP') {
+  if (tokenInfo?.tokenType?.protocol !== 'SLP') {
     throw new Error('Este flujo solo soporta tokens SLP.')
   }
+  const tokenType = tokenInfo?.tokenType?.number ?? SLP_NFT1_CHILD
   const tokenUtxo = selectTokenUtxo({
     utxos: utxos.utxos,
     tokenId: params.tokenId,
-    tokenProtocol,
-    tokenType,
     tokenAmount: params.tokenAtoms
   })
   const tokenAtoms = tokenUtxo.token?.atoms ?? 0n
@@ -322,45 +207,43 @@ const createSellOfferInternal = async (params: {
     throw new Error('No encontramos suficientes tokens para listar esta oferta.')
   }
   const offeredAtoms = params.tokenAtoms
-  const priceNanoSatsPerAtom = (params.askXecSats * NANO_SATS_PER_SAT) / offeredAtoms
+  const changeAtoms = tokenAtoms - offeredAtoms
 
-  const agoraPartial = AgoraPartial.approximateParams({
-    offeredAtoms,
-    priceNanoSatsPerAtom,
-    makerPk: fromHex(params.keyInfo.publicKeyHex),
-    minAcceptedAtoms: offeredAtoms,
-    tokenId: params.tokenId,
-    tokenType,
-    tokenProtocol: 'SLP',
-    enforcedLockTime: Math.floor(Date.now() / 1000),
-    dustSats: BigInt(XEC_DUST_SATS)
+  const enforcedOutputs = [
+    {
+      sats: 0n,
+      script: slpSend(params.tokenId, tokenType, [0n, offeredAtoms])
+    },
+    {
+      sats: params.askXecSats,
+      script: makerScript
+    }
+  ]
+
+  const agoraOneshot = new AgoraOneshot({
+    enforcedOutputs,
+    cancelPk: fromHex(params.keyInfo.publicKeyHex)
   })
-  const actualOfferedAtoms = agoraPartial.offeredAtoms()
-  if (actualOfferedAtoms > offeredAtoms) {
-    throw new Error('No se pudo preparar la oferta con los tokens disponibles.')
-  }
-  const changeAtoms = tokenAtoms - actualOfferedAtoms
-
-  const agoraAdScript = new Script(agoraPartial.adScript().bytecode)
+  const agoraAdScript = new Script(agoraOneshot.adScript().bytecode)
   const agoraAdP2sh = Script.p2sh(shaRmd160(agoraAdScript.bytecode))
 
-  const offerScript = new Script(agoraPartial.script().bytecode)
+  const offerScript = new Script(agoraOneshot.script().bytecode)
   const offerP2sh = Script.p2sh(shaRmd160(offerScript.bytecode))
 
   const offerOutputs = [
-    { sats: 0n, script: slpSend(params.tokenId, tokenType, [actualOfferedAtoms]) },
+    { sats: 0n, script: slpSend(params.tokenId, tokenType, [offeredAtoms]) },
     { sats: BigInt(XEC_DUST_SATS), script: offerP2sh }
   ]
 
   const offerTxFuelSats = getAgoraAdFuelSats(
     agoraAdScript,
-    AgoraPartialAdSignatory(fromHex(params.keyInfo.privateKeyHex)),
+    AgoraOneshotAdSignatory(fromHex(params.keyInfo.privateKeyHex)),
     offerOutputs
   )
 
   const adFuelOutputSats = BigInt(XEC_DUST_SATS) + offerTxFuelSats
 
-  const adSendAmounts = changeAtoms > 0n ? [actualOfferedAtoms, changeAtoms] : [actualOfferedAtoms]
+  const adSendAmounts = changeAtoms > 0n ? [offeredAtoms, changeAtoms] : [offeredAtoms]
   const adSetupOutputs = [
     { sats: 0n, script: slpSend(params.tokenId, tokenType, adSendAmounts) },
     { sats: adFuelOutputSats, script: agoraAdP2sh }
@@ -402,7 +285,7 @@ const createSellOfferInternal = async (params: {
           redeemScript: agoraAdScript
         }
       },
-      signatory: AgoraPartialAdSignatory(fromHex(params.keyInfo.privateKeyHex)) as never
+      signatory: AgoraOneshotAdSignatory(fromHex(params.keyInfo.privateKeyHex)) as never
     }
   ]
 
@@ -420,18 +303,40 @@ const createSellOfferInternal = async (params: {
   }
 }
 
-export const createSellOfferForTokenId = async (params: {
+const buildOneshotSummary = (offerId: string, tx: Tx, offerVout: number, agoraOneshot: AgoraOneshot) => {
+  const offerOutput = tx.outputs[offerVout]
+  const token = offerOutput?.token
+  if (!offerOutput || !token) {
+    throw new Error('La transacción no contiene el output de oferta esperado.')
+  }
+  const payoutOutput = agoraOneshot.enforcedOutputs[1]
+  let payoutAddress: string | undefined
+  if (payoutOutput?.script) {
+    try {
+      payoutAddress = Address.fromScript(payoutOutput.script).toString()
+    } catch {
+      payoutAddress = undefined
+    }
+  }
+  const priceSats = agoraOneshot.askedSats()
+  return {
+    offerId,
+    tokenId: token.tokenId,
+    tokenAtoms: token.atoms,
+    priceSats,
+    priceXec: formatSatsToXec(priceSats),
+    payoutAddress,
+    tokenType: token.tokenType.number
+  }
+}
+
+export const createSellOfferToken = async (params: {
   tokenId: string
   tokenAtoms: bigint
   askXecSats: bigint
   payoutAddress: string
   wallet: XolosWalletService
 }): Promise<{ txid: string; offerId: string }> => {
-  const availability = await checkAgoraAvailability()
-  if (!availability.ok) {
-    throw new Error(availability.message || 'El plugin Agora no está disponible.')
-  }
-
   const walletKeyInfo = params.wallet.getKeyInfo()
   if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex) {
     throw new Error('No pudimos acceder a las llaves de tu billetera.')
@@ -449,26 +354,43 @@ export const createSellOfferForTokenId = async (params: {
   return { txid: result.offerTxid, offerId: result.offerId }
 }
 
-export const acceptOfferByOfferId = async (params: {
+export const loadOfferById = async (params: {
   offerId: string
-  tokenId: string
-  wallet: XolosWalletService
-}): Promise<{ txid: string }> => {
-  const availability = await checkAgoraAvailability()
-  if (!availability.ok) {
-    throw new Error(availability.message || 'El plugin Agora no está disponible.')
-  }
-
+  tokenId?: string
+}): Promise<{ offer: AgoraOffer; summary: OneshotOfferSummary }> => {
   const outpoint = parseOfferId(params.offerId)
   const chronik = getChronik()
-  await chronik.tx(outpoint.txid)
-
-  const offers = await fetchAgoraOffersForTokenId(params.tokenId)
-  const offer = offers.find((candidate) => candidate.outpoint.txid === outpoint.txid && candidate.outpoint.outIdx === outpoint.vout)
-  if (!offer) {
-    throw new Error('No encontramos esta oferta activa para el token seleccionado.')
+  const tx = await chronik.tx(outpoint.txid)
+  const parsed = parseAgoraTx(tx)
+  if (!parsed || parsed.type !== 'ONESHOT') {
+    throw new Error('No pudimos interpretar esta oferta como oneshot.')
   }
+  if (parsed.outpoint.outIdx !== outpoint.vout) {
+    throw new Error('El Offer ID no coincide con el output oneshot.')
+  }
+  const offerOutput = tx.outputs[outpoint.vout]
+  if (!offerOutput?.token) {
+    throw new Error('La transacción no contiene el token esperado.')
+  }
+  if (params.tokenId && offerOutput.token.tokenId !== params.tokenId) {
+    throw new Error('El Offer ID no corresponde al token esperado.')
+  }
+  const summary = buildOneshotSummary(params.offerId, tx, outpoint.vout, parsed.params)
+  const offer = new AgoraOffer({
+    variant: { type: 'ONESHOT', params: parsed.params },
+    outpoint: parsed.outpoint,
+    txBuilderInput: parsed.txBuilderInput,
+    token: offerOutput.token,
+    status: 'OPEN'
+  })
+  return { offer, summary }
+}
 
+export const acceptOfferById = async (params: {
+  offerId: string
+  wallet: XolosWalletService
+}): Promise<{ txid: string }> => {
+  const { offer } = await loadOfferById({ offerId: params.offerId })
   const walletKeyInfo = params.wallet.getKeyInfo()
   const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
   if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
@@ -476,11 +398,11 @@ export const acceptOfferByOfferId = async (params: {
   }
   const recipientScript = Script.fromAddress(Address.parse(xecAddress).cash().toString())
 
-  const acceptedAtoms = offer.token.atoms
-  const askedSats = offer.askedSats(acceptedAtoms)
-  const feeSats = offer.acceptFeeSats({ recipientScript, acceptedAtoms, feePerKb: FEE_PER_KB })
+  const askedSats = offer.askedSats()
+  const feeSats = offer.acceptFeeSats({ recipientScript, feePerKb: FEE_PER_KB, acceptedAtoms: offer.token.atoms })
   const totalNeeded = askedSats + feeSats
 
+  const chronik = getChronik()
   const addressUtxos = await chronik.address(xecAddress).utxos()
   const xecUtxos = addressUtxos.utxos.filter((utxo) => !utxo.token)
   const funding = selectXecUtxosForTarget(xecUtxos, totalNeeded)
@@ -493,62 +415,6 @@ export const acceptOfferByOfferId = async (params: {
     covenantPk: fromHex(walletKeyInfo.publicKeyHex),
     fuelInputs,
     recipientScript,
-    acceptedAtoms,
-    dustSats: BigInt(XEC_DUST_SATS),
-    feePerKb: FEE_PER_KB
-  })
-
-  const broadcast = await chronik.broadcastTx(acceptTx.ser())
-  return { txid: broadcast.txid }
-}
-
-// Compatibilidad con el flujo actual basado en tokenId.
-export const createSellTokenOffer = async (params: {
-  tokenId: string
-  receiveXecSats: bigint
-  makerAddress: string
-  keyInfo: { privateKeyHex: string; publicKeyHex: string }
-  tokenType?: number
-  tokenAmount?: bigint
-}): Promise<{ offerTxid: string; adTxid: string }> => {
-  void params.tokenType
-  const tokenAtoms = params.tokenAmount ?? 1n
-  const result = await createSellOfferInternal({
-    tokenId: params.tokenId,
-    tokenAtoms,
-    askXecSats: params.receiveXecSats,
-    payoutAddress: params.makerAddress,
-    keyInfo: params.keyInfo
-  })
-  return { offerTxid: result.offerTxid, adTxid: result.adTxid }
-}
-
-export const acceptTokenOffer = async (params: {
-  offer: AgoraOffer
-  recipientAddress: string
-  keyInfo: { privateKeyHex: string; publicKeyHex: string }
-}): Promise<{ txid: string }> => {
-  const recipientScript = Script.fromAddress(Address.parse(params.recipientAddress).cash().toString())
-  const chronik = getChronik()
-
-  const acceptedAtoms = params.offer.token.atoms
-  const askedSats = params.offer.askedSats(acceptedAtoms)
-  const feeSats = params.offer.acceptFeeSats({ recipientScript, acceptedAtoms, feePerKb: FEE_PER_KB })
-  const totalNeeded = askedSats + feeSats
-
-  const addressUtxos = await chronik.address(params.recipientAddress).utxos()
-  const xecUtxos = addressUtxos.utxos.filter((utxo) => !utxo.token)
-  const funding = selectXecUtxosForTarget(xecUtxos, totalNeeded)
-
-  const signer = P2PKHSignatory(fromHex(params.keyInfo.privateKeyHex), fromHex(params.keyInfo.publicKeyHex), ALL_BIP143)
-  const fuelInputs = funding.map((utxo) => buildInput(utxo, recipientScript, signer))
-
-  const acceptTx = params.offer.acceptTx({
-    covenantSk: fromHex(params.keyInfo.privateKeyHex),
-    covenantPk: fromHex(params.keyInfo.publicKeyHex),
-    fuelInputs,
-    recipientScript,
-    acceptedAtoms,
     dustSats: BigInt(XEC_DUST_SATS),
     feePerKb: FEE_PER_KB
   })

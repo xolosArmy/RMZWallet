@@ -18,14 +18,8 @@ import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { XOLOSARMY_NFT_PARENT_TOKEN_ID } from '../config/nfts'
 import { getChronik } from '../services/ChronikClient'
 import { xolosWalletService } from '../services/XolosWalletService'
-import { fetchOwnedNfts, type NftAsset } from '../services/nftService'
-import {
-  acceptOfferByOfferId,
-  checkAgoraAvailability,
-  createSellOfferForTokenId,
-  fetchOrderbookByTokenId,
-  type AgoraOrder
-} from '../services/agoraExchange'
+import { fetchNftDetails, fetchOwnedNfts, type NftAsset } from '../services/nftService'
+import { acceptOfferById, createSellOfferToken, loadOfferById, type OneshotOfferSummary } from '../services/agoraExchange'
 import {
   TOKEN_DUST_SATS,
   buildAlpAgoraListOutputs,
@@ -44,12 +38,39 @@ const FEE_PER_KB = 1200n
 const P2PKH_INPUT_SIZE = 148
 const OUTPUT_SIZE = 34
 const TX_OVERHEAD = 10
+
+const OFFER_STORAGE_KEY = 'tonalli_dex_offers'
+
+type SavedOffer = {
+  offerId: string
+  tokenId: string
+  kind: 'nft' | 'mintpass' | 'token'
+  createdAt: number
+  askXec: string
+}
 const estimateFee = (inputCount: number, outputCount: number): bigint => {
   const txSize = TX_OVERHEAD + inputCount * P2PKH_INPUT_SIZE + outputCount * OUTPUT_SIZE
   return calcTxFee(txSize, FEE_PER_KB)
 }
 
 const pow10 = (decimals: number): bigint => 10n ** BigInt(decimals)
+
+const loadSavedOffers = (): SavedOffer[] => {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = localStorage.getItem(OFFER_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as SavedOffer[]
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+const persistSavedOffers = (offers: SavedOffer[]) => {
+  if (typeof window === 'undefined') return
+  localStorage.setItem(OFFER_STORAGE_KEY, JSON.stringify(offers))
+}
 
 function DEX() {
   const { address, initialized, refreshBalances, loading, error, backupVerified } = useWallet()
@@ -75,35 +96,34 @@ function DEX() {
   const [offerBusy, setOfferBusy] = useState(false)
   const [buyBusy, setBuyBusy] = useState(false)
   const [buyTxid, setBuyTxid] = useState<string | null>(null)
-  const [agoraPluginReady, setAgoraPluginReady] = useState(true)
-  const [agoraPluginMessage, setAgoraPluginMessage] = useState<string | null>(null)
-  const [agoraCheckStatus, setAgoraCheckStatus] = useState<number | null>(null)
-  const [agoraCheckDetails, setAgoraCheckDetails] = useState<string | null>(null)
-  const [agoraCheckEndpoint, setAgoraCheckEndpoint] = useState<string | null>(null)
-  const [agoraCheckUrl, setAgoraCheckUrl] = useState<string | null>(null)
-  const [agoraCheckBusy, setAgoraCheckBusy] = useState(false)
 
   const [ownedNfts, setOwnedNfts] = useState<NftAsset[]>([])
   const [nftTokenIdInput, setNftTokenIdInput] = useState('')
-  const [nftOffers, setNftOffers] = useState<AgoraOrder[]>([])
+  const [nftOfferIdInput, setNftOfferIdInput] = useState('')
+  const [nftOfferSummary, setNftOfferSummary] = useState<OneshotOfferSummary | null>(null)
+  const [nftOfferPreview, setNftOfferPreview] = useState<{ name: string; imageUrl: string } | null>(null)
   const [nftOfferError, setNftOfferError] = useState<string | null>(null)
-  const [nftOffersLoading, setNftOffersLoading] = useState(false)
+  const [nftOfferLoading, setNftOfferLoading] = useState(false)
   const [nftSellPrice, setNftSellPrice] = useState('')
   const [nftSellTokenId, setNftSellTokenId] = useState('')
   const [nftSellBusy, setNftSellBusy] = useState(false)
   const [nftSellTxid, setNftSellTxid] = useState<string | null>(null)
+  const [nftSellOfferId, setNftSellOfferId] = useState<string | null>(null)
   const [nftBuyBusy, setNftBuyBusy] = useState(false)
   const [nftBuyTxid, setNftBuyTxid] = useState<string | null>(null)
 
-  const [mintPassOffers, setMintPassOffers] = useState<AgoraOrder[]>([])
+  const [mintPassOfferIdInput, setMintPassOfferIdInput] = useState('')
+  const [mintPassOfferSummary, setMintPassOfferSummary] = useState<OneshotOfferSummary | null>(null)
   const [mintPassError, setMintPassError] = useState<string | null>(null)
-  const [mintPassOffersLoading, setMintPassOffersLoading] = useState(false)
+  const [mintPassOfferLoading, setMintPassOfferLoading] = useState(false)
   const [mintPassSellAmount, setMintPassSellAmount] = useState('')
   const [mintPassSellPrice, setMintPassSellPrice] = useState('')
   const [mintPassSellBusy, setMintPassSellBusy] = useState(false)
   const [mintPassSellTxid, setMintPassSellTxid] = useState<string | null>(null)
+  const [mintPassSellOfferId, setMintPassSellOfferId] = useState<string | null>(null)
   const [mintPassBuyBusy, setMintPassBuyBusy] = useState(false)
   const [mintPassBuyTxid, setMintPassBuyTxid] = useState<string | null>(null)
+  const [savedOffers, setSavedOffers] = useState<SavedOffer[]>(() => loadSavedOffers())
 
   useEffect(() => {
     if (initialized) {
@@ -131,70 +151,12 @@ function DEX() {
     }
   }, [initialized])
 
-  useEffect(() => {
-    let active = true
-    const checkAgoraPlugin = async () => {
-      setAgoraCheckBusy(true)
-      const status = await checkAgoraAvailability()
-      if (active) {
-        setAgoraPluginReady(status.ok)
-        setAgoraPluginMessage(status.ok ? null : status.message || 'El plugin Agora no está disponible en este nodo.')
-        setAgoraCheckStatus(status.status ?? null)
-        setAgoraCheckDetails(status.details ?? null)
-        setAgoraCheckEndpoint(status.endpointPath ?? null)
-        setAgoraCheckUrl(status.chronikUrl ?? null)
-        setAgoraCheckBusy(false)
-      }
-    }
-    checkAgoraPlugin()
-    return () => {
-      active = false
-    }
-  }, [])
-
-  const loadMintPassOffers = useCallback(async () => {
-    setMintPassError(null)
-    setMintPassOffers([])
-    setMintPassBuyTxid(null)
-
-    if (!agoraPluginReady) {
-      setMintPassError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
-      return
-    }
-    if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) {
-      setMintPassError('No se configuró el token padre para Mint Pass.')
-      return
-    }
-
-    setMintPassOffersLoading(true)
-    try {
-      const offers = await fetchOrderbookByTokenId(XOLOSARMY_NFT_PARENT_TOKEN_ID)
-      setMintPassOffers(offers)
-    } catch (err) {
-      setMintPassError((err as Error).message || 'No pudimos cargar ofertas del Mint Pass.')
-    } finally {
-      setMintPassOffersLoading(false)
-    }
-  }, [agoraPluginMessage, agoraPluginReady])
-
-  const handleRetryAgoraCheck = useCallback(async () => {
-    setAgoraCheckBusy(true)
-    const status = await checkAgoraAvailability()
-    setAgoraPluginReady(status.ok)
-    setAgoraPluginMessage(status.ok ? null : status.message || 'El plugin Agora no está disponible en este nodo.')
-    setAgoraCheckStatus(status.status ?? null)
-    setAgoraCheckDetails(status.details ?? null)
-    setAgoraCheckEndpoint(status.endpointPath ?? null)
-    setAgoraCheckUrl(status.chronikUrl ?? null)
-    setAgoraCheckBusy(false)
-  }, [])
 
   useEffect(() => {
     const mode = searchParams.get('mode') || ''
     const tokenId = searchParams.get('tokenId') || ''
     if (mode === 'mintpass' && tokenId === XOLOSARMY_NFT_PARENT_TOKEN_ID) {
       setDexTab('mintpass')
-      loadMintPassOffers()
       return
     }
 
@@ -202,11 +164,9 @@ function DEX() {
     if (nftTokenId) {
       setDexTab('nft')
       setNftTokenIdInput(nftTokenId)
-      if (mode === 'nft') {
-        handleLoadNftOffers(nftTokenId)
-      }
+      setNftSellTokenId(nftTokenId)
     }
-  }, [handleLoadNftOffers, loadMintPassOffers, searchParams])
+  }, [searchParams])
 
   useEffect(() => {
     let active = true
@@ -264,6 +224,25 @@ function DEX() {
     }
   }, [mintPassSellAmount, mintPassSellPrice])
 
+  const saveOffer = useCallback((offer: SavedOffer) => {
+    setSavedOffers((prev) => {
+      const next = [offer, ...prev.filter((item) => item.offerId !== offer.offerId)]
+      persistSavedOffers(next)
+      return next
+    })
+  }, [])
+
+  const savedNftOffers = useMemo(() => savedOffers.filter((offer) => offer.kind === 'nft'), [savedOffers])
+  const savedMintPassOffers = useMemo(() => savedOffers.filter((offer) => offer.kind === 'mintpass'), [savedOffers])
+
+  const handleCopyText = useCallback(async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value)
+    } catch (err) {
+      console.error(err)
+    }
+  }, [])
+
   const handleCreateOffer = async (event: React.FormEvent) => {
     event.preventDefault()
     setMakerError(null)
@@ -271,10 +250,6 @@ function DEX() {
     setMakerOfferId(null)
     setMakerAdvanced(null)
 
-    if (!agoraPluginReady) {
-      setMakerError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
-      return
-    }
     if (!initialized || !backupVerified) {
       setMakerError('Debes completar el onboarding y respaldar tu seed antes de crear una oferta.')
       return
@@ -478,10 +453,6 @@ function DEX() {
     setBuyTxid(null)
     setOfferLookupError(null)
 
-    if (!agoraPluginReady) {
-      setOfferLookupError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
-      return
-    }
     if (!initialized || !backupVerified) {
       setOfferLookupError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
       return
@@ -543,42 +514,40 @@ function DEX() {
     }
   }
 
-  const handleLoadNftOffers = useCallback(async (overrideTokenId?: string) => {
+  const handleLoadNftOffer = useCallback(async (overrideOfferId?: string) => {
     setNftOfferError(null)
-    setNftOffers([])
+    setNftOfferSummary(null)
+    setNftOfferPreview(null)
     setNftBuyTxid(null)
 
-    if (!agoraPluginReady) {
-      setNftOfferError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
+    const offerId = (overrideOfferId ?? nftOfferIdInput).trim()
+    if (!offerId) {
+      setNftOfferError('Ingresa un Offer ID de NFT válido.')
       return
     }
 
-    const tokenId = (overrideTokenId ?? nftTokenIdInput).trim()
-    if (!tokenId) {
-      setNftOfferError('Ingresa un tokenId de NFT válido.')
-      return
-    }
-
-    setNftOffersLoading(true)
+    setNftOfferLoading(true)
     try {
-      const offers = await fetchOrderbookByTokenId(tokenId)
-      setNftOffers(offers)
+      const result = await loadOfferById({ offerId })
+      setNftOfferSummary(result.summary)
+      const nftDetails = await fetchNftDetails(result.summary.tokenId)
+      setNftOfferPreview({
+        name: String(nftDetails.metadata?.name || nftDetails.genesisInfo?.tokenName || 'NFT'),
+        imageUrl: nftDetails.imageUrl || ''
+      })
     } catch (err) {
-      setNftOfferError((err as Error).message || 'No pudimos cargar ofertas para este NFT.')
+      setNftOfferError((err as Error).message || 'No pudimos cargar esta oferta de NFT.')
     } finally {
-      setNftOffersLoading(false)
+      setNftOfferLoading(false)
     }
-  }, [agoraPluginMessage, agoraPluginReady, nftTokenIdInput])
+  }, [nftOfferIdInput])
 
   const handleSellNft = async (event: React.FormEvent) => {
     event.preventDefault()
     setNftOfferError(null)
     setNftSellTxid(null)
+    setNftSellOfferId(null)
 
-    if (!agoraPluginReady) {
-      setNftOfferError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
-      return
-    }
     if (!initialized || !backupVerified) {
       setNftOfferError('Debes completar el onboarding y respaldar tu seed antes de listar.')
       return
@@ -603,16 +572,15 @@ function DEX() {
       return
     }
 
-    const walletKeyInfo = xolosWalletService.getKeyInfo()
-    const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
-      setNftOfferError('No pudimos acceder a las llaves de tu billetera.')
-      return
-    }
-
     setNftSellBusy(true)
     try {
-      const { txid } = await createSellOfferForTokenId({
+      const walletKeyInfo = xolosWalletService.getKeyInfo()
+      const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
+      if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+        setNftOfferError('No pudimos acceder a las llaves de tu billetera.')
+        return
+      }
+      const { txid, offerId } = await createSellOfferToken({
         tokenId,
         tokenAtoms: 1n,
         askXecSats: receiveXecSats,
@@ -620,8 +588,15 @@ function DEX() {
         wallet: xolosWalletService
       })
       setNftSellTxid(txid)
+      setNftSellOfferId(offerId)
+      saveOffer({
+        offerId,
+        tokenId,
+        kind: 'nft',
+        createdAt: Date.now(),
+        askXec: nftSellPrice
+      })
       await refreshBalances()
-      await handleLoadNftOffers()
     } catch (err) {
       setNftOfferError((err as Error).message || 'No se pudo listar el NFT.')
     } finally {
@@ -633,11 +608,8 @@ function DEX() {
     event.preventDefault()
     setMintPassError(null)
     setMintPassSellTxid(null)
+    setMintPassSellOfferId(null)
 
-    if (!agoraPluginReady) {
-      setMintPassError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
-      return
-    }
     if (!initialized || !backupVerified) {
       setMintPassError('Debes completar el onboarding y respaldar tu seed antes de listar.')
       return
@@ -684,7 +656,7 @@ function DEX() {
     setMintPassSellBusy(true)
     try {
       const receiveXecSats = pricePerUnitSats * tokenAmount
-      const { txid } = await createSellOfferForTokenId({
+      const { txid, offerId } = await createSellOfferToken({
         tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
         tokenAtoms: tokenAmount,
         askXecSats: receiveXecSats,
@@ -692,8 +664,15 @@ function DEX() {
         wallet: xolosWalletService
       })
       setMintPassSellTxid(txid)
+      setMintPassSellOfferId(offerId)
+      saveOffer({
+        offerId,
+        tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        kind: 'mintpass',
+        createdAt: Date.now(),
+        askXec: mintPassSellPrice
+      })
       await refreshBalances()
-      await loadMintPassOffers()
     } catch (err) {
       setMintPassError((err as Error).message || 'No se pudo listar el Mint Pass.')
     } finally {
@@ -701,23 +680,22 @@ function DEX() {
     }
   }
 
-  const handleBuyNftOffer = async (offer: AgoraOrder) => {
+  const handleBuyNftOffer = async () => {
     if (!initialized || !backupVerified || !address) {
       setNftOfferError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
       return
     }
-
-    if (!agoraPluginReady) {
-      setNftOfferError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
+    if (!nftOfferSummary) {
+      setNftOfferError('Primero carga un Offer ID válido.')
       return
     }
+
     setNftOfferError(null)
     setNftBuyTxid(null)
     setNftBuyBusy(true)
     try {
-      const { txid } = await acceptOfferByOfferId({
-        offerId: offer.offerId,
-        tokenId: offer.tokenId,
+      const { txid } = await acceptOfferById({
+        offerId: nftOfferSummary.offerId,
         wallet: xolosWalletService
       })
       setNftBuyTxid(txid)
@@ -729,23 +707,44 @@ function DEX() {
     }
   }
 
-  const handleBuyMintPassOffer = async (offer: AgoraOrder) => {
+  const handleLoadMintPassOffer = async (overrideOfferId?: string) => {
+    setMintPassError(null)
+    setMintPassOfferSummary(null)
+    setMintPassBuyTxid(null)
+
+    const offerId = (overrideOfferId ?? mintPassOfferIdInput).trim()
+    if (!offerId) {
+      setMintPassError('Ingresa un Offer ID válido para Mint Pass.')
+      return
+    }
+
+    setMintPassOfferLoading(true)
+    try {
+      const result = await loadOfferById({ offerId, tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID })
+      setMintPassOfferSummary(result.summary)
+    } catch (err) {
+      setMintPassError((err as Error).message || 'No pudimos cargar esta oferta de Mint Pass.')
+    } finally {
+      setMintPassOfferLoading(false)
+    }
+  }
+
+  const handleBuyMintPassOffer = async () => {
     if (!initialized || !backupVerified || !address) {
       setMintPassError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
       return
     }
-
-    if (!agoraPluginReady) {
-      setMintPassError(agoraPluginMessage || 'El plugin Agora no está disponible en este nodo.')
+    if (!mintPassOfferSummary) {
+      setMintPassError('Primero carga un Offer ID válido.')
       return
     }
+
     setMintPassError(null)
     setMintPassBuyTxid(null)
     setMintPassBuyBusy(true)
     try {
-      const { txid } = await acceptOfferByOfferId({
-        offerId: offer.offerId,
-        tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+      const { txid } = await acceptOfferById({
+        offerId: mintPassOfferSummary.offerId,
         wallet: xolosWalletService
       })
       setMintPassBuyTxid(txid)
@@ -786,27 +785,9 @@ function DEX() {
       <TopBar />
       <div className="card">
         <p className="muted">DEX (Phase 1)</p>
-        {!agoraPluginReady && (
-          <div className="muted" style={{ marginTop: 8 }}>
-            <div>DEX en modo solo lectura · {agoraPluginMessage || 'Plugin agora not loaded'}</div>
-            <div style={{ marginTop: 6 }}>Chronik: {agoraCheckUrl || 'desconocida'}</div>
-            <div>Endpoint: {agoraCheckEndpoint || '/plugin/agora/groups'}</div>
-            {agoraCheckStatus !== null && <div>HTTP {agoraCheckStatus}</div>}
-            {agoraCheckDetails && (
-              <details style={{ marginTop: 6 }}>
-                <summary>Detalles</summary>
-                <div className="address-box" style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>
-                  {agoraCheckDetails}
-                </div>
-              </details>
-            )}
-            <div className="actions" style={{ marginTop: 8 }}>
-              <button className="cta ghost" type="button" onClick={handleRetryAgoraCheck} disabled={agoraCheckBusy}>
-                {agoraCheckBusy ? 'Reintentando...' : 'Reintentar'}
-              </button>
-            </div>
-          </div>
-        )}
+        <div className="muted" style={{ marginTop: 8 }}>
+          Atomic DEX (oneshot): funciona por Offer ID (txid:vout). No hay orderbook en la red.
+        </div>
         <div className="actions" style={{ marginTop: 8 }}>
           <button
             className={`cta ${dexTab === 'maker' ? 'primary' : 'ghost'}`}
@@ -1011,10 +992,65 @@ function DEX() {
           <div style={{ marginTop: 16 }}>
             <div className="card" style={{ marginBottom: 12 }}>
               <p className="card-kicker">NFT Market</p>
-              <p className="muted">Lista o compra NFTs de la colección xolosArmy.</p>
+              <p className="muted">Crea o acepta ofertas oneshot con Offer ID.</p>
+            </div>
+
+            <div className="card" style={{ marginBottom: 12 }}>
+              <p className="card-kicker">Comprar NFT (Offer ID)</p>
+              <label htmlFor="nftOfferId">Offer ID</label>
+              <input
+                id="nftOfferId"
+                value={nftOfferIdInput}
+                onChange={(event) => setNftOfferIdInput(event.target.value)}
+                placeholder="txid:vout"
+              />
+              <div className="actions" style={{ marginTop: 12 }}>
+                <button
+                  className="cta outline"
+                  type="button"
+                  onClick={() => handleLoadNftOffer()}
+                  disabled={nftOfferLoading}
+                >
+                  {nftOfferLoading ? 'Cargando...' : 'Cargar oferta NFT'}
+                </button>
+                <button className="cta primary" type="button" onClick={handleBuyNftOffer} disabled={nftBuyBusy}>
+                  {nftBuyBusy ? 'Comprando...' : 'Comprar'}
+                </button>
+              </div>
+              {nftOfferSummary && (
+                <div style={{ marginTop: 12 }}>
+                  <div className="nft-inline">
+                    <div className="nft-thumb small">
+                      {nftOfferPreview?.imageUrl ? (
+                        <img src={nftOfferPreview.imageUrl} alt={nftOfferPreview.name} />
+                      ) : (
+                        <div className="nft-placeholder">Sin imagen</div>
+                      )}
+                    </div>
+                    <div>
+                      <h3>{nftOfferPreview?.name || 'NFT'}</h3>
+                      <p className="muted">{nftOfferSummary.tokenId}</p>
+                    </div>
+                  </div>
+                  <div className="muted" style={{ marginTop: 8 }}>
+                    Precio: {nftOfferSummary.priceXec} XEC
+                  </div>
+                  {nftOfferSummary.payoutAddress && (
+                    <div className="muted" style={{ marginTop: 6 }}>
+                      Pago a: {nftOfferSummary.payoutAddress}
+                    </div>
+                  )}
+                </div>
+              )}
+              {nftBuyTxid && (
+                <div className="success" style={{ marginTop: 12 }}>
+                  Compra completada: <span className="address-box">{nftBuyTxid}</span>
+                </div>
+              )}
             </div>
 
             <form onSubmit={handleSellNft} className="card" style={{ marginBottom: 12 }}>
+              <p className="card-kicker">Crear oferta de NFT</p>
               <label htmlFor="nftOwned">NFT propio</label>
               <select
                 id="nftOwned"
@@ -1033,6 +1069,16 @@ function DEX() {
                 ))}
               </select>
 
+              <label htmlFor="nftTokenId" style={{ marginTop: 12 }}>
+                TokenId del NFT (manual)
+              </label>
+              <input
+                id="nftTokenId"
+                value={nftTokenIdInput}
+                onChange={(event) => setNftTokenIdInput(event.target.value)}
+                placeholder="Pega el tokenId del NFT"
+              />
+
               <label htmlFor="nftSellPrice" style={{ marginTop: 12 }}>
                 Precio en XEC
               </label>
@@ -1043,67 +1089,56 @@ function DEX() {
                 placeholder="Ej. 2500"
               />
               <div className="actions" style={{ marginTop: 12 }}>
-                <button className="cta primary" type="submit" disabled={nftSellBusy || !agoraPluginReady}>
+                <button className="cta primary" type="submit" disabled={nftSellBusy}>
                   {nftSellBusy ? 'Publicando...' : 'Publicar oferta'}
                 </button>
               </div>
+              {nftSellOfferId && (
+                <div className="success" style={{ marginTop: 12 }}>
+                  Offer ID: <span className="address-box">{nftSellOfferId}</span>
+                  <div className="actions" style={{ marginTop: 8 }}>
+                    <button className="cta ghost" type="button" onClick={() => handleCopyText(nftSellOfferId)}>
+                      Copiar Offer ID
+                    </button>
+                  </div>
+                  <div className="muted" style={{ marginTop: 6 }}>
+                    Comparte este Offer ID para que alguien lo compre.
+                  </div>
+                </div>
+              )}
               {nftSellTxid && (
                 <div className="success" style={{ marginTop: 12 }}>
-                  Oferta publicada: <span className="address-box">{nftSellTxid}</span>
+                  Txid publicado: <span className="address-box">{nftSellTxid}</span>
                 </div>
               )}
             </form>
 
-            <div className="card" style={{ marginBottom: 12 }}>
-              <label htmlFor="nftTokenId">TokenId del NFT</label>
-              <input
-                id="nftTokenId"
-                value={nftTokenIdInput}
-                onChange={(event) => setNftTokenIdInput(event.target.value)}
-                placeholder="Pega el tokenId del NFT"
-              />
-              <div className="actions" style={{ marginTop: 12 }}>
-                <button
-                  className="cta outline"
-                  type="button"
-                  onClick={handleLoadNftOffers}
-                  disabled={nftOffersLoading || !agoraPluginReady}
-                >
-                  {nftOffersLoading ? 'Cargando...' : 'Cargar ofertas'}
-                </button>
-              </div>
-            </div>
-
             {nftOfferError && <div className="error">{nftOfferError}</div>}
 
-            {nftOffers.length > 0 && (
+            {savedNftOffers.length > 0 && (
               <div className="card">
-                <p className="card-kicker">Ofertas activas</p>
-                {nftOffers.map((offer, index) => {
-                  return (
-                    <div className="tx-item" key={`${offer.offerId}-${index}`}>
-                      <p>Precio: {offer.priceXec} XEC</p>
-                      <div className="muted" style={{ marginTop: 6 }}>
-                        Offer ID: {offer.offerId}
-                      </div>
-                      <div className="actions" style={{ marginTop: 8 }}>
-                        <button
-                          className="cta primary"
-                          type="button"
-                          onClick={() => handleBuyNftOffer(offer)}
-                          disabled={nftBuyBusy || !agoraPluginReady}
-                        >
-                          {nftBuyBusy ? 'Comprando...' : 'Comprar'}
-                        </button>
-                      </div>
+                <p className="card-kicker">Mis ofertas guardadas</p>
+                {savedNftOffers.map((offer) => (
+                  <div className="tx-item" key={offer.offerId}>
+                    <p>Offer ID: {offer.offerId}</p>
+                    <p className="muted">Precio: {offer.askXec} XEC</p>
+                    <div className="actions" style={{ marginTop: 8 }}>
+                      <button className="cta ghost" type="button" onClick={() => handleCopyText(offer.offerId)}>
+                        Copiar
+                      </button>
+                      <button
+                        className="cta outline"
+                        type="button"
+                        onClick={() => {
+                          setNftOfferIdInput(offer.offerId)
+                          handleLoadNftOffer(offer.offerId)
+                        }}
+                      >
+                        Abrir
+                      </button>
                     </div>
-                  )
-                })}
-                {nftBuyTxid && (
-                  <div className="success" style={{ marginTop: 12 }}>
-                    Compra completada: <span className="address-box">{nftBuyTxid}</span>
                   </div>
-                )}
+                ))}
               </div>
             )}
           </div>
@@ -1113,24 +1148,56 @@ function DEX() {
           <div style={{ marginTop: 16 }}>
             <div className="card" style={{ marginBottom: 12 }}>
               <p className="card-kicker">Mint Pass (Parent Token)</p>
-              <p className="muted">Compra Mint Pass para poder mintear.</p>
+              <p className="muted">Para comprar Mint Pass necesitas un Offer ID compartido.</p>
               <div className="address-box" style={{ marginTop: 12 }}>
                 {XOLOSARMY_NFT_PARENT_TOKEN_ID || 'Sin configurar'}
               </div>
+            </div>
+
+            <div className="card" style={{ marginBottom: 12 }}>
+              <p className="card-kicker">Comprar Mint Pass (Offer ID)</p>
+              <label htmlFor="mintPassOfferId">Offer ID</label>
+              <input
+                id="mintPassOfferId"
+                value={mintPassOfferIdInput}
+                onChange={(event) => setMintPassOfferIdInput(event.target.value)}
+                placeholder="txid:vout"
+              />
               <div className="actions" style={{ marginTop: 12 }}>
                 <button
                   className="cta outline"
                   type="button"
-                  onClick={loadMintPassOffers}
-                  disabled={mintPassOffersLoading || !agoraPluginReady}
+                  onClick={() => handleLoadMintPassOffer()}
+                  disabled={mintPassOfferLoading}
                 >
-                  {mintPassOffersLoading ? 'Cargando...' : 'Cargar ofertas'}
+                  {mintPassOfferLoading ? 'Cargando...' : 'Cargar oferta'}
+                </button>
+                <button className="cta primary" type="button" onClick={handleBuyMintPassOffer} disabled={mintPassBuyBusy}>
+                  {mintPassBuyBusy ? 'Comprando...' : 'Comprar'}
                 </button>
               </div>
+              {mintPassOfferSummary && (
+                <div style={{ marginTop: 12 }}>
+                  <div className="muted">Cantidad: {mintPassOfferSummary.tokenAtoms.toString()}</div>
+                  <div className="muted" style={{ marginTop: 6 }}>
+                    Total: {mintPassOfferSummary.priceXec} XEC
+                  </div>
+                  {mintPassOfferSummary.payoutAddress && (
+                    <div className="muted" style={{ marginTop: 6 }}>
+                      Pago a: {mintPassOfferSummary.payoutAddress}
+                    </div>
+                  )}
+                </div>
+              )}
+              {mintPassBuyTxid && (
+                <div className="success" style={{ marginTop: 12 }}>
+                  Compra completada: <span className="address-box">{mintPassBuyTxid}</span>
+                </div>
+              )}
             </div>
 
             <form onSubmit={handleSellMintPass} className="card" style={{ marginBottom: 12 }}>
-              <p className="card-kicker">Vender Parent Token</p>
+              <p className="card-kicker">Crear oferta de Mint Pass</p>
               <label htmlFor="mintPassAmount">Cantidad</label>
               <input
                 id="mintPassAmount"
@@ -1152,65 +1219,56 @@ function DEX() {
               </label>
               <input id="mintPassTotal" value={computedMintPassTotal} readOnly placeholder="Se calcula automáticamente" />
               <div className="actions" style={{ marginTop: 12 }}>
-                <button className="cta primary" type="submit" disabled={mintPassSellBusy || !agoraPluginReady}>
+                <button className="cta primary" type="submit" disabled={mintPassSellBusy}>
                   {mintPassSellBusy ? 'Publicando...' : 'Publicar'}
                 </button>
               </div>
+              {mintPassSellOfferId && (
+                <div className="success" style={{ marginTop: 12 }}>
+                  Offer ID: <span className="address-box">{mintPassSellOfferId}</span>
+                  <div className="actions" style={{ marginTop: 8 }}>
+                    <button className="cta ghost" type="button" onClick={() => handleCopyText(mintPassSellOfferId)}>
+                      Copiar Offer ID
+                    </button>
+                  </div>
+                  <div className="muted" style={{ marginTop: 6 }}>
+                    Comparte este Offer ID para que alguien lo compre.
+                  </div>
+                </div>
+              )}
               {mintPassSellTxid && (
                 <div className="success" style={{ marginTop: 12 }}>
-                  Oferta publicada: <span className="address-box">{mintPassSellTxid}</span>
+                  Txid publicado: <span className="address-box">{mintPassSellTxid}</span>
                 </div>
               )}
             </form>
 
             {mintPassError && <div className="error">{mintPassError}</div>}
-            {mintPassOffersLoading && <div className="muted">Cargando ofertas...</div>}
-            {!mintPassOffersLoading && mintPassOffers.length === 0 && !mintPassError && (
-              <div className="muted">No hay ofertas activas.</div>
-            )}
 
-            {mintPassOffers.length > 0 && (
+            {savedMintPassOffers.length > 0 && (
               <div className="card">
-                <p className="card-kicker">Ofertas activas</p>
-                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                  <thead>
-                    <tr>
-                      <th style={{ textAlign: 'left', padding: '8px 6px' }}>Cantidad</th>
-                      <th style={{ textAlign: 'left', padding: '8px 6px' }}>Total XEC</th>
-                      <th style={{ textAlign: 'left', padding: '8px 6px' }}>XEC por Mint Pass</th>
-                      <th style={{ textAlign: 'left', padding: '8px 6px' }} />
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {mintPassOffers.map((offer, index) => {
-                      const offeredAtoms = offer.tokenAtoms
-                      const askedSats = offer.priceSats
-                      const perUnitSats = offeredAtoms > 0n ? askedSats / offeredAtoms : 0n
-                      return (
-                        <tr key={`${offer.offerId}-${index}`}>
-                          <td style={{ padding: '8px 6px' }}>{offeredAtoms.toString()}</td>
-                          <td style={{ padding: '8px 6px' }}>{formatSatsToXec(askedSats)} XEC</td>
-                          <td style={{ padding: '8px 6px' }}>{formatSatsToXec(perUnitSats)} XEC</td>
-                          <td style={{ padding: '8px 6px' }}>
-                            <button
-                              className="cta primary"
-                              type="button"
-                              onClick={() => handleBuyMintPassOffer(offer)}
-                              disabled={mintPassBuyBusy || !agoraPluginReady}
-                            >
-                              {mintPassBuyBusy ? 'Comprando...' : 'Comprar'}
-                            </button>
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-                {mintPassBuyTxid && (
-                  <div className="success" style={{ marginTop: 12 }}>
-                    Compra completada: <span className="address-box">{mintPassBuyTxid}</span>
+                <p className="card-kicker">Mis ofertas guardadas</p>
+                {savedMintPassOffers.map((offer) => (
+                  <div className="tx-item" key={offer.offerId}>
+                    <p>Offer ID: {offer.offerId}</p>
+                    <p className="muted">Precio: {offer.askXec} XEC</p>
+                    <div className="actions" style={{ marginTop: 8 }}>
+                      <button className="cta ghost" type="button" onClick={() => handleCopyText(offer.offerId)}>
+                        Copiar
+                      </button>
+                      <button
+                        className="cta outline"
+                        type="button"
+                        onClick={() => {
+                          setMintPassOfferIdInput(offer.offerId)
+                          handleLoadMintPassOffer(offer.offerId)
+                        }}
+                      >
+                        Abrir
+                      </button>
+                    </div>
                   </div>
-                )}
+                ))}
               </div>
             )}
           </div>
