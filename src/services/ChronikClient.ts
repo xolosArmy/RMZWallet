@@ -2,8 +2,19 @@ import { ChronikClient } from 'chronik-client'
 
 const DEFAULT_CHRONIK_URLS = ['https://chronik.xolosarmy.xyz', 'https://chronik.e.cash']
 
+const getEnv = (name: string): string | undefined => {
+  const viteEnv = (import.meta as any)?.env
+  if (viteEnv && typeof viteEnv === 'object' && name in viteEnv) {
+    return viteEnv[name]
+  }
+  if (typeof process !== 'undefined' && process?.env) {
+    return process.env[name]
+  }
+  return undefined
+}
+
 const resolveChronikUrls = (): string[] => {
-  const configured = import.meta.env?.VITE_CHRONIK_URL
+  const configured = getEnv('VITE_CHRONIK_URL') || getEnv('CHRONIK_URL')
   if (!configured) {
     return DEFAULT_CHRONIK_URLS
   }

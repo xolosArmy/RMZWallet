@@ -76,6 +76,18 @@ const resolveBasePath = (path: string) => {
   return segments.slice(0, -2).join('/')
 }
 
+export const WALLET_DERIVATION_PATH = DERIVATION_PATH
+
+export const getWalletReceivePath = (index: number) => {
+  const basePath = resolveBasePath(DERIVATION_PATH)
+  return `${basePath}/0/${index}`
+}
+
+export const getWalletChangePath = (index: number) => {
+  const basePath = resolveBasePath(DERIVATION_PATH)
+  return `${basePath}/1/${index}`
+}
+
 const runWithConcurrency = async <T, R>(
   items: T[],
   limit: number,
