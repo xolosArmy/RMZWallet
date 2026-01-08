@@ -151,7 +151,7 @@ function Nfts() {
       return
     }
     if (!hasParentToken) {
-      setMintError('Necesitas al menos 1 Mint Pass (Parent Token) para mintear un NFT.')
+      setMintError('Necesitas 1 Mint Pass (Parent Token) para mintear un NFT.')
       return
     }
     if (!hasEnoughXec) {

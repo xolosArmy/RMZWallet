@@ -5,6 +5,11 @@ Flujo recomendado:
 2) Mint NFT child en /nfts (1 Mint Pass = 1 NFT).
 3) Crear y compartir ofertas por Offer ID desde /dex.
 
+Father / Parent Token ID (xolosArmy NFTs):
+- 170aa1303e761e132f40c861751905fee1148c213b8352435c89950d721909e9
+- 1 Parent Token = 1 mint (se consume al mintear).
+- Fee de minteo: 5500 XEC a ecash:qq7qn90ev23ecastqmn8as00u8mcp4tzsspvt5dtlk
+
 1) Mint NFT child con imagen
 - Abrir /nfts, ir a “Mintear NFT”.
 - Subir imagen, completar nombre y descripcion.
