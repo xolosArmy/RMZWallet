@@ -47,6 +47,13 @@ export default defineConfig({
       // COOP/COEP necesarios para WASM/SharedArrayBuffer seguro en el navegador.
       'Cross-Origin-Embedder-Policy': 'require-corp',
       'Cross-Origin-Opener-Policy': 'same-origin'
+    },
+    proxy: {
+      '/ipfs': {
+        target: 'https://tomato-rational-rat-921.mypinata.cloud',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/ipfs/, '/ipfs')
+      }
     }
   },
   optimizeDeps: {

@@ -2,13 +2,16 @@ import { ChronikClient } from 'chronik-client'
 
 const DEFAULT_CHRONIK_URLS = ['https://chronik.xolosarmy.xyz', 'https://chronik.e.cash']
 
+type ViteEnv = Record<string, string | undefined> & { DEV?: boolean }
+
 const getEnv = (name: string): string | undefined => {
-  const viteEnv = (import.meta as any)?.env
-  if (viteEnv && typeof viteEnv === 'object' && name in viteEnv) {
+  const viteEnv = (import.meta as unknown as { env?: ViteEnv }).env ?? {}
+  if (name in viteEnv) {
     return viteEnv[name]
   }
-  if (typeof process !== 'undefined' && process?.env) {
-    return process.env[name]
+  const nodeEnv = (typeof process !== 'undefined' ? (process as { env?: ViteEnv }).env : undefined) ?? {}
+  if (name in nodeEnv) {
+    return nodeEnv[name]
   }
   return undefined
 }

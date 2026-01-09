@@ -9,6 +9,8 @@ import BackupSeed from './routes/BackupSeed'
 import { ScanQR } from './routes/ScanQR'
 import RevealSeed from './routes/RevealSeed'
 import DEX from './routes/DEX'
+import Nfts from './routes/Nfts'
+import SendNft from './routes/SendNft'
 
 function App() {
   return (
@@ -22,6 +24,8 @@ function App() {
           <Route path="/receive" element={<Receive />} />
           <Route path="/scan" element={<ScanQR />} />
           <Route path="/dex" element={<DEX />} />
+          <Route path="/nfts" element={<Nfts />} />
+          <Route path="/send-nft" element={<SendNft />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/backup" element={<BackupSeed />} />

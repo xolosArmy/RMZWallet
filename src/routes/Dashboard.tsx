@@ -316,6 +316,9 @@ function Dashboard() {
           <Link className="cta outline" to="/dex">
             DEX (Phase 1)
           </Link>
+          <Link className="cta outline" to="/nfts">
+            NFTs
+          </Link>
           <Link className="cta outline" to="/receive">
             Recibir
           </Link>

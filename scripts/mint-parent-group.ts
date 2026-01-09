@@ -1,6 +1,7 @@
 import type { GenesisInfo } from 'chronik-client'
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
 import { getWalletReceivePath } from '../src/services/XolosWalletService'
+import { getChronik } from '../src/services/ChronikClient'
 import { mintSlpNft1GroupParentGenesis } from '../src/services/slpNftTxBuilder'
 
 const addressEnv = process.env.ADDR
@@ -18,9 +19,10 @@ if (!Number.isFinite(addrIndex) || addrIndex < 0) {
 type KeyInfo = { privateKeyHex: string; publicKeyHex: string }
 
 const MinimalXECWallet = (() => {
+  type MinimalXECWalletCtor = new (...args: unknown[]) => unknown
   const moduleExports = MinimalXecWalletModule as unknown as {
-    MinimalXECWallet?: new (...args: any[]) => any
-    default?: new (...args: any[]) => any
+    MinimalXECWallet?: MinimalXECWalletCtor
+    default?: MinimalXECWalletCtor
   }
   if (moduleExports.MinimalXECWallet) return moduleExports.MinimalXECWallet
   if (moduleExports.default) return moduleExports.default
@@ -87,7 +89,8 @@ const genesisInfo: GenesisInfo = {
   decimals: 0
 }
 
-const { txid, tokenId } = await mintSlpNft1GroupParentGenesis({
+// Do NOT spend the baton UTXO except when minting new Mint Pass.
+const { txid, tokenId, batonVout } = await mintSlpNft1GroupParentGenesis({
   address: resolvedAddress,
   genesisInfo,
   keyInfo
@@ -95,3 +98,15 @@ const { txid, tokenId } = await mintSlpNft1GroupParentGenesis({
 
 console.log(`txid: ${txid}`)
 console.log(`tokenId: ${tokenId}`)
+console.log(`parentTokenId: ${tokenId}`)
+console.log(`batonOutpoint: ${tokenId}:${batonVout}`)
+console.log(`address: ${resolvedAddress}`)
+
+const chronik = getChronik()
+const tx = await chronik.tx(tokenId)
+const hasBaton = tx.outputs.some(
+  (output) => output.token?.tokenId === tokenId && output.token?.isMintBaton === true
+)
+if (!hasBaton) {
+  throw new Error('No se encontró el mint baton en el genesis del token padre.')
+}

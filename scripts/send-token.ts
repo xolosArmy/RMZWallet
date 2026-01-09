@@ -56,9 +56,10 @@ const toAddrRaw = toAddrEnv.trim()
 type KeyInfo = { privateKeyHex: string; publicKeyHex: string }
 
 const MinimalXECWallet = (() => {
+  type MinimalXECWalletCtor = new (...args: unknown[]) => unknown
   const moduleExports = MinimalXecWalletModule as unknown as {
-    MinimalXECWallet?: new (...args: any[]) => any
-    default?: new (...args: any[]) => any
+    MinimalXECWallet?: MinimalXECWalletCtor
+    default?: MinimalXECWalletCtor
   }
   if (moduleExports.MinimalXECWallet) return moduleExports.MinimalXECWallet
   if (moduleExports.default) return moduleExports.default
@@ -206,7 +207,7 @@ resolvedAddress = normalizeAddress(resolvedAddress)
 const toAddress = (() => {
   try {
     return normalizeAddress(toAddrRaw)
-  } catch (err) {
+  } catch {
     throw new Error('TO_ADDR no es una dirección eCash válida.')
   }
 })()

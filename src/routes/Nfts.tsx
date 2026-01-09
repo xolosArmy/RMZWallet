@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { calcTxFee } from 'ecash-lib'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { getChronik } from '../services/ChronikClient'
+import { EXTENDED_GAP_LIMIT } from '../services/XolosWalletService'
 import {
   fetchOwnedNfts,
   mintXolosarmyNftChild,
@@ -12,9 +13,18 @@ import {
 import {
   NFT_MINT_PLATFORM_FEE_SATS,
   NFT_MINT_PLATFORM_FEE_XEC,
-  XOLOSARMY_NFT_PARENT_TOKEN_ID
+  NFT_RESCAN_STORAGE_KEY,
+  XOLOSARMY_NFT_PARENT_TOKEN_ID,
+  XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR
 } from '../config/nfts'
 import { XEC_DUST_SATS, XEC_SATS_PER_XEC } from '../config/xecFees'
+import {
+  DEFAULT_IPFS_GATEWAY_BASE,
+  getIpfsAssetUrl,
+  ipfsToCid,
+  ipfsToGatewayUrl,
+  resolveIpfsGatewayBase
+} from '../utils/ipfs'
 
 const SLP_NFT1_GROUP = 129
 const FEE_PER_KB = 1200n
@@ -30,11 +40,13 @@ const estimateMintFeeSats = (inputCount = 2, outputCount = 4) => {
 const formatTokenId = (tokenId: string) => `${tokenId.slice(0, 6)}...${tokenId.slice(-6)}`
 
 function Nfts() {
-  const { address, initialized, backupVerified, loading, error, refreshBalances } = useWallet()
+  const { address, initialized, backupVerified, loading, error, refreshBalances, rescanWallet } = useWallet()
   const [activeTab, setActiveTab] = useState<'owned' | 'mint' | 'collection'>('owned')
   const [nfts, setNfts] = useState<NftAsset[]>([])
   const [nftsLoading, setNftsLoading] = useState(false)
   const [nftsError, setNftsError] = useState<string | null>(null)
+  const [imageObjectUrls, setImageObjectUrls] = useState<Record<string, string>>({})
+  const [rescanBusy, setRescanBusy] = useState(false)
 
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
@@ -49,6 +61,7 @@ function Nfts() {
   const [parentBalance, setParentBalance] = useState<bigint>(0n)
   const [xecAvailableSats, setXecAvailableSats] = useState<bigint>(0n)
   const [parentTokenCopied, setParentTokenCopied] = useState(false)
+  const didLogGateway = useRef(false)
 
   useEffect(() => {
     if (!imageFile) {
@@ -60,19 +73,22 @@ function Nfts() {
     return () => URL.revokeObjectURL(url)
   }, [imageFile])
 
-  const loadNfts = useCallback(async () => {
-    if (!address) return
-    setNftsLoading(true)
-    setNftsError(null)
-    try {
-      const owned = await fetchOwnedNfts(address)
-      setNfts(owned)
-    } catch (err) {
-      setNftsError((err as Error).message || 'No pudimos cargar tus NFTs.')
-    } finally {
-      setNftsLoading(false)
-    }
-  }, [address])
+  const loadNfts = useCallback(
+    async (options: { refreshMetadata?: boolean } = {}) => {
+      if (!address) return
+      setNftsLoading(true)
+      setNftsError(null)
+      try {
+        const owned = await fetchOwnedNfts(address, { refreshMetadata: options.refreshMetadata })
+        setNfts(owned)
+      } catch (err) {
+        setNftsError((err as Error).message || 'No pudimos cargar tus NFTs.')
+      } finally {
+        setNftsLoading(false)
+      }
+    },
+    [address]
+  )
 
   const loadBalances = useCallback(async () => {
     if (!address) return
@@ -102,17 +118,86 @@ function Nfts() {
     }
   }, [address])
 
+  const handleRescanNfts = useCallback(async () => {
+    if (!initialized) return
+    setRescanBusy(true)
+    setNftsError(null)
+    try {
+      await rescanWallet({ gapLimit: EXTENDED_GAP_LIMIT })
+      await refreshBalances()
+      await loadNfts({ refreshMetadata: true })
+      await loadBalances()
+    } catch (err) {
+      setNftsError((err as Error).message || 'No pudimos re-escanear tus NFTs.')
+    } finally {
+      setRescanBusy(false)
+    }
+  }, [initialized, loadBalances, loadNfts, refreshBalances, rescanWallet])
+
   useEffect(() => {
     if (!initialized) return
     loadNfts()
     loadBalances()
   }, [initialized, loadBalances, loadNfts])
 
+  useEffect(() => {
+    if (!initialized || typeof window === 'undefined') return
+    const pending = localStorage.getItem(NFT_RESCAN_STORAGE_KEY)
+    if (!pending) return
+    localStorage.removeItem(NFT_RESCAN_STORAGE_KEY)
+    void handleRescanNfts()
+  }, [handleRescanNfts, initialized])
+
+  const ipfsGatewayBase = useMemo(() => resolveIpfsGatewayBase(), [])
   const estimatedFeeSats = useMemo(() => estimateMintFeeSats(), [])
   const estimatedTotalSats = useMemo(
     () => BigInt(NFT_MINT_PLATFORM_FEE_SATS) + BigInt(XEC_DUST_SATS) + estimatedFeeSats,
     [estimatedFeeSats]
   )
+
+  useEffect(() => {
+    let isActive = true
+    const createdUrls: string[] = []
+    const controllers: AbortController[] = []
+
+    setImageObjectUrls({})
+
+    const loadImage = async (nft: NftAsset) => {
+      if (!nft.imageCid) return
+      const assetUrl = getIpfsAssetUrl(nft.imageCid, ipfsGatewayBase)
+      const controller = new AbortController()
+      controllers.push(controller)
+      try {
+        const response = await fetch(assetUrl, { mode: 'cors', signal: controller.signal })
+        if (!response.ok) {
+          throw new Error('Failed to load image')
+        }
+        const blob = await response.blob()
+        if (!isActive) return
+        const objectUrl = URL.createObjectURL(blob)
+        createdUrls.push(objectUrl)
+        setImageObjectUrls((prev) => ({ ...prev, [nft.tokenId]: objectUrl }))
+      } catch {
+        // Fallback to direct URL rendering.
+      }
+    }
+
+    nfts.forEach((nft) => {
+      void loadImage(nft)
+    })
+
+    return () => {
+      isActive = false
+      controllers.forEach((controller) => controller.abort())
+      createdUrls.forEach((url) => URL.revokeObjectURL(url))
+    }
+  }, [nfts, ipfsGatewayBase])
+
+  useEffect(() => {
+    if (!import.meta.env.DEV || didLogGateway.current) return
+    didLogGateway.current = true
+    console.info('IPFS gateway base:', ipfsGatewayBase, 'fallback:', DEFAULT_IPFS_GATEWAY_BASE)
+  }, [ipfsGatewayBase])
 
   const hasParentToken = parentBalance >= 1n
   const hasEnoughXec = xecAvailableSats >= estimatedTotalSats
@@ -187,6 +272,11 @@ function Nfts() {
     return (
       <div className="page">
         <TopBar />
+        {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR && (
+          <div className="error" style={{ marginBottom: 12 }}>
+            {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR}
+          </div>
+        )}
         <h1 className="section-title">NFTs</h1>
         <p className="muted">Configura tu billetera para mintear y mover NFTs.</p>
         <div className="actions">
@@ -201,6 +291,11 @@ function Nfts() {
   return (
     <div className="page">
       <TopBar />
+      {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR && (
+        <div className="error" style={{ marginBottom: 12 }}>
+          {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR}
+        </div>
+      )}
       <header className="section-header">
         <div>
           <p className="eyebrow">Guardianía</p>
@@ -233,6 +328,16 @@ function Nfts() {
           >
             Colección
           </button>
+          {activeTab === 'owned' && (
+            <button
+              className="cta ghost"
+              type="button"
+              onClick={handleRescanNfts}
+              disabled={rescanBusy || nftsLoading}
+            >
+              {rescanBusy ? 'Re-escanear NFTs...' : 'Rescan NFTs'}
+            </button>
+          )}
         </div>
 
         {activeTab === 'owned' && (
@@ -240,19 +345,72 @@ function Nfts() {
             {nftsLoading && <div className="muted">Cargando NFTs...</div>}
             {nftsError && <div className="error">{nftsError}</div>}
             {!nftsLoading && nfts.length === 0 && <div className="muted">Aún no tienes NFTs en tu guardianía.</div>}
+            {/* Dev check: start app, open /nfts, verify token name/ticker render and Open on IPFS opens. */}
 
             <div className="grid" style={{ marginTop: 12 }}>
               {nfts.map((nft) => (
                 <div className="card nft-card" key={nft.tokenId}>
                   <div className="nft-thumb">
-                    {nft.imageUrl ? (
-                      <img src={nft.imageUrl} alt={nft.name} />
+                    {nft.imageUrl || nft.imageCid ? (
+                      <img
+                        src={
+                          imageObjectUrls[nft.tokenId] ||
+                          (nft.imageCid
+                            ? getIpfsAssetUrl(nft.imageCid, ipfsGatewayBase)
+                            : nft.imageUrl)
+                        }
+                        alt={nft.name}
+                      />
                     ) : (
                       <div className="nft-placeholder">Sin imagen</div>
                     )}
                   </div>
                   <h3>{nft.name}</h3>
                   <p className="muted">{formatTokenId(nft.tokenId)}</p>
+                  <p className="muted">Ticker: {nft.genesisInfo?.tokenTicker || '—'}</p>
+                  <p className="muted">Nombre: {nft.genesisInfo?.tokenName || '—'}</p>
+                  <p className="muted">Decimales: {nft.genesisInfo?.decimals ?? '—'}</p>
+                  {(() => {
+                    const tokenUrl = nft.genesisInfo?.url
+                    const metadataCid = nft.metadataCid || (tokenUrl ? ipfsToCid(tokenUrl) || undefined : undefined)
+                    const metadataGateway =
+                      (tokenUrl ? ipfsToGatewayUrl(tokenUrl, ipfsGatewayBase) : null) ||
+                      (metadataCid ? getIpfsAssetUrl(metadataCid, ipfsGatewayBase) : null)
+                    const metadataLink =
+                      metadataGateway ||
+                      (tokenUrl && (tokenUrl.startsWith('http://') || tokenUrl.startsWith('https://'))
+                        ? tokenUrl
+                        : null)
+                    const metadataLinkLabel = metadataGateway ? 'Open on IPFS gateway' : 'Abrir enlace'
+                    const imageGateway = nft.imageCid ? getIpfsAssetUrl(nft.imageCid, ipfsGatewayBase) : undefined
+                    if (!tokenUrl && !metadataGateway) {
+                      return <p className="muted">Documento: —</p>
+                    }
+                    return (
+                      <div style={{ marginTop: 6 }}>
+                        {metadataLink && (
+                          <a className="cta ghost" href={metadataLink} target="_blank" rel="noreferrer">
+                            {metadataLinkLabel}
+                          </a>
+                        )}
+                        {imageGateway && (
+                          <a className="cta ghost" href={imageGateway} target="_blank" rel="noreferrer">
+                            Open image on IPFS
+                          </a>
+                        )}
+                        <div
+                          className="muted"
+                          style={{
+                            marginTop: 6,
+                            fontFamily: "'Source Code Pro', 'SFMono-Regular', monospace",
+                            fontSize: 12
+                          }}
+                        >
+                          {tokenUrl}
+                        </div>
+                      </div>
+                    )
+                  })()}
                   <div className="actions" style={{ marginTop: 12 }}>
                     <Link className="cta outline" to={`/send-nft?tokenId=${nft.tokenId}`}>
                       Enviar

@@ -6,7 +6,7 @@ Flujo recomendado:
 3) Crear y compartir ofertas por Offer ID desde /dex.
 
 Father / Parent Token ID (xolosArmy NFTs):
-- 170aa1303e761e132f40c861751905fee1148c213b8352435c89950d721909e9
+- bf8e0b5cd60fe4d6354c662b28542e0f3c3d69941eb039426d65bcdb7fe9f48c
 - 1 Parent Token = 1 mint (se consume al mintear).
 - Fee de minteo: 5500 XEC a ecash:qq7qn90ev23ecastqmn8as00u8mcp4tzsspvt5dtlk
 

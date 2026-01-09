@@ -309,6 +309,61 @@ a {
   border-color: rgba(57, 208, 194, 0.3);
 }
 
+.nft-card h3 {
+  margin: 12px 0 4px;
+}
+
+.nft-thumb {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nft-thumb.small {
+  width: 72px;
+  aspect-ratio: 1 / 1;
+  border-radius: 12px;
+}
+
+.nft-thumb img,
+.nft-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.nft-placeholder {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.nft-preview {
+  width: 180px;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.nft-inline {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.mint-cost {
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
 .tx-list {
   display: flex;
   flex-direction: column;

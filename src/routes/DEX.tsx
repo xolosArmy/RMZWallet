@@ -15,9 +15,13 @@ import type { ScriptUtxo } from 'chronik-client'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
-import { XOLOSARMY_NFT_PARENT_TOKEN_ID } from '../config/nfts'
+import {
+  NFT_RESCAN_STORAGE_KEY,
+  XOLOSARMY_NFT_PARENT_TOKEN_ID,
+  XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR
+} from '../config/nfts'
 import { getChronik } from '../services/ChronikClient'
-import { xolosWalletService } from '../services/XolosWalletService'
+import { EXTENDED_GAP_LIMIT, xolosWalletService } from '../services/XolosWalletService'
 import { fetchNftDetails, fetchOwnedNfts, type NftAsset } from '../services/nftService'
 import { acceptOfferById, createSellOfferToken, loadOfferById, type OneshotOfferSummary } from '../services/agoraExchange'
 import {
@@ -73,7 +77,7 @@ const persistSavedOffers = (offers: SavedOffer[]) => {
 }
 
 function DEX() {
-  const { address, initialized, refreshBalances, loading, error, backupVerified } = useWallet()
+  const { address, initialized, refreshBalances, rescanWallet, loading, error, backupVerified } = useWallet()
   const [rmzDecimals, setRmzDecimals] = useState<number | null>(null)
   const [dexTab, setDexTab] = useState<'maker' | 'taker' | 'nft' | 'mintpass'>('maker')
   const [searchParams] = useSearchParams()
@@ -234,6 +238,11 @@ function DEX() {
 
   const savedNftOffers = useMemo(() => savedOffers.filter((offer) => offer.kind === 'nft'), [savedOffers])
   const savedMintPassOffers = useMemo(() => savedOffers.filter((offer) => offer.kind === 'mintpass'), [savedOffers])
+
+  const markNftRescanPending = useCallback(() => {
+    if (typeof window === 'undefined') return
+    localStorage.setItem(NFT_RESCAN_STORAGE_KEY, Date.now().toString())
+  }, [])
 
   const handleCopyText = useCallback(async (value: string) => {
     try {
@@ -699,7 +708,19 @@ function DEX() {
         wallet: xolosWalletService
       })
       setNftBuyTxid(txid)
-      await refreshBalances()
+      markNftRescanPending()
+      if (address) {
+        await getChronik().address(address).utxos()
+        const owned = await fetchOwnedNfts(address, { refreshMetadata: true })
+        if (dexTab === 'nft') {
+          setOwnedNfts(owned)
+        }
+      }
+      try {
+        await rescanWallet({ gapLimit: EXTENDED_GAP_LIMIT })
+      } catch {
+        await refreshBalances()
+      }
     } catch (err) {
       setNftOfferError((err as Error).message || 'No se pudo comprar el NFT.')
     } finally {
@@ -760,6 +781,11 @@ function DEX() {
     return (
       <div className="page">
         <TopBar />
+        {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR && (
+          <div className="error" style={{ marginBottom: 12 }}>
+            {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR}
+          </div>
+        )}
         <h1 className="section-title">Bienvenido</h1>
         <p className="muted">Configura tu billetera para ver tus saldos.</p>
         <div className="actions">
@@ -783,6 +809,11 @@ function DEX() {
   return (
     <div className="page">
       <TopBar />
+      {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR && (
+        <div className="error" style={{ marginBottom: 12 }}>
+          {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR}
+        </div>
+      )}
       <div className="card">
         <p className="muted">DEX (Phase 1)</p>
         <div className="muted" style={{ marginTop: 8 }}>
