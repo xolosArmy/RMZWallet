@@ -848,6 +848,22 @@ function DEX() {
           >
             Mint Pass
           </button>
+
+          {/* Botón Marketplace Externo */}
+          <a
+            href="https://xololegend.xyz"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="cta outline"
+            style={{
+              marginLeft: 'auto',
+              borderColor: 'var(--teal)',
+              color: 'var(--teal)',
+              borderStyle: 'dashed',
+            }}
+          >
+            🛒 Adquirir RMZ en XoloLegend
+          </a>
         </div>
 
         {dexTab === 'maker' && (
