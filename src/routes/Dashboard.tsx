@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import type { WsMsgClient } from 'chronik-client'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
@@ -23,6 +23,7 @@ const ENABLE_CHRONIK_WS = (() => {
 })()
 
 function Dashboard() {
+  const navigate = useNavigate()
   const { address, balance, initialized, refreshBalances, rescanWallet, loading, error } = useWallet()
   const [txHistory, setTxHistory] = useState<TxRecord[]>([])
   const [txHistoryLoading, setTxHistoryLoading] = useState(false)
@@ -280,6 +281,38 @@ function Dashboard() {
     return new Date(timestamp * 1000).toLocaleString()
   }
 
+  const formatAddressMiddle = (value: string, head = 10, tail = 8) => {
+    if (value.length <= head + tail + 3) return value
+    return `${value.slice(0, head)}...${value.slice(-tail)}`
+  }
+
+  const buildReplyPrefill = (message?: string) => {
+    if (!message) return ''
+    const trimmed = message.trim()
+    if (!trimmed) return ''
+    const preview = trimmed.length > 40 ? `${trimmed.slice(0, 40).trim()}...` : trimmed
+    return `re: ${preview}`
+  }
+
+  const handleCopySender = async (value?: string) => {
+    if (!value) return
+    try {
+      await navigator.clipboard.writeText(value)
+    } catch {
+      // ignore clipboard failures
+    }
+  }
+
+  const handleReply = (tx: TxRecord) => {
+    if (!tx.senderAddress) return
+    const params = new URLSearchParams()
+    params.set('to', tx.senderAddress)
+    const prefill = buildReplyPrefill(tx.opReturnMessage)
+    if (prefill) params.set('msg', prefill)
+    params.set('replyTo', tx.txid)
+    navigate(`/send-xec?${params.toString()}`)
+  }
+
   if (!initialized) {
     return (
       <div className="page">
@@ -380,6 +413,28 @@ function Dashboard() {
                     {tx.opReturnApp === 'tonalli' ? 'Mensaje Tonalli' : 'OP_RETURN'}
                   </span>
                   <p className="tx-message">{tx.opReturnMessage}</p>
+                  {tx.opReturnApp === 'tonalli' && (
+                    <div className="tx-from">
+                      <span className="muted">From:</span>
+                      <span className="tx-address">
+                        {tx.senderAddress ? formatAddressMiddle(tx.senderAddress) : 'unknown'}
+                      </span>
+                      {tx.senderAddress && (
+                        <div className="tx-actions">
+                          <button
+                            className="cta outline small"
+                            type="button"
+                            onClick={() => handleCopySender(tx.senderAddress)}
+                          >
+                            Copiar
+                          </button>
+                          <button className="cta small" type="button" onClick={() => handleReply(tx)}>
+                            Responder
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

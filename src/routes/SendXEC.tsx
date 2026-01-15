@@ -1,10 +1,12 @@
 import type { FormEvent } from 'react'
 import { useEffect, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
 import { TONALLI_SERVICE_FEE_XEC, XEC_SATS_PER_XEC, XEC_TONALLI_TREASURY_ADDRESS } from '../config/xecFees'
 
 const MAX_OP_RETURN_BYTES = 221
+const MAX_PREFILL_CHARS = 140
 
 const sanitizeOpReturnMessage = (value: string) => {
   let sanitized = ''
@@ -25,12 +27,19 @@ const sanitizeOpReturnMessage = (value: string) => {
   return sanitized
 }
 
+const sanitizePrefillMessage = (value: string) => {
+  const sanitized = sanitizeOpReturnMessage(value)
+  return sanitized.slice(0, MAX_PREFILL_CHARS)
+}
+
 function SendXEC() {
+  const location = useLocation()
   const { sendXEC, estimateXecSend, initialized, backupVerified, loading, error, balance } = useWallet()
   const [destination, setDestination] = useState('')
   const [amount, setAmount] = useState<number>(0)
   const [message, setMessage] = useState('')
   const [txid, setTxid] = useState<string | null>(null)
+  const [replyToTxid, setReplyToTxid] = useState<string | null>(null)
   const [localError, setLocalError] = useState<string | null>(null)
   const [estimatedFeeSats, setEstimatedFeeSats] = useState<number | null>(null)
   const [estimatedTotalSats, setEstimatedTotalSats] = useState<number | null>(null)
@@ -39,6 +48,16 @@ function SendXEC() {
   const formatXecFromSats = (sats: number) => (sats / XEC_SATS_PER_XEC).toFixed(2)
   const formatXecValue = (xec: number) => xec.toFixed(2)
   const shortenedCommission = `${XEC_TONALLI_TREASURY_ADDRESS.slice(0, 12)}...${XEC_TONALLI_TREASURY_ADDRESS.slice(-6)}`
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search)
+    const to = params.get('to')
+    const msg = params.get('msg')
+    const replyTo = params.get('replyTo')
+    setDestination(to ? to.trim() : '')
+    setMessage(msg ? sanitizePrefillMessage(msg) : '')
+    setReplyToTxid(replyTo ? replyTo.trim() : null)
+  }, [location.search])
 
   useEffect(() => {
     let cancelled = false
@@ -151,6 +170,11 @@ function SendXEC() {
       )}
 
       <form className="card" onSubmit={handleSubmit}>
+        {replyToTxid && (
+          <div className="muted">
+            Respondiendo a: <span className="address-box">{replyToTxid}</span>
+          </div>
+        )}
         <label htmlFor="destination">Destino (ecash:...)</label>
         <input
           id="destination"

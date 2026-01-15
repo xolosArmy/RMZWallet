@@ -395,6 +395,32 @@ a {
   word-break: break-word;
 }
 
+.tx-from {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.tx-address {
+  font-family: 'Source Code Pro', 'SFMono-Regular', monospace;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px dashed rgba(255, 255, 255, 0.2);
+}
+
+.tx-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cta.small {
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
 .cta {
   display: inline-flex;
   align-items: center;

@@ -1,11 +1,13 @@
 import type { Tx } from 'chronik-client'
 import type { TxRecord } from '../types/tx'
 import { decodeOpReturn, TONALLI_PREFIX_HEX } from './opReturn'
+import { selectSenderFromInputs } from './ecashAddress'
 
 export const mapChronikTxToRecord = (tx: Tx): TxRecord => {
   const opReturnData = tx.outputs
     .map((output) => decodeOpReturn(output.outputScript))
     .find((result) => result?.message)
+  const sender = selectSenderFromInputs(tx.inputs ?? [])
 
   const opReturnMessage = opReturnData?.message
   const opReturnApp = opReturnMessage
@@ -22,6 +24,8 @@ export const mapChronikTxToRecord = (tx: Tx): TxRecord => {
     txid: tx.txid,
     timestamp,
     opReturnMessage,
-    opReturnApp
+    opReturnApp,
+    senderAddress: sender?.address,
+    senderType: sender?.type
   }
 }
