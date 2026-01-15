@@ -1,5 +1,5 @@
 import type { FormEvent } from 'react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
@@ -32,14 +32,37 @@ const sanitizePrefillMessage = (value: string) => {
   return sanitized.slice(0, MAX_PREFILL_CHARS)
 }
 
-function SendXEC() {
-  const location = useLocation()
+type SendXecPrefill = {
+  destination: string
+  message: string
+  replyToTxid: string | null
+}
+
+const parseSendXecPrefill = (search: string): SendXecPrefill => {
+  const params = new URLSearchParams(search)
+  const to = params.get('to')
+  const msg = params.get('msg')
+  const replyTo = params.get('replyTo')
+  return {
+    destination: to ? to.trim() : '',
+    message: msg ? sanitizePrefillMessage(msg) : '',
+    replyToTxid: replyTo ? replyTo.trim() : null
+  }
+}
+
+type SendXecFormProps = {
+  initialDestination: string
+  initialMessage: string
+  initialReplyToTxid: string | null
+}
+
+function SendXECForm({ initialDestination, initialMessage, initialReplyToTxid }: SendXecFormProps) {
   const { sendXEC, estimateXecSend, initialized, backupVerified, loading, error, balance } = useWallet()
-  const [destination, setDestination] = useState('')
+  const [destination, setDestination] = useState(initialDestination)
   const [amount, setAmount] = useState<number>(0)
-  const [message, setMessage] = useState('')
+  const [message, setMessage] = useState(initialMessage)
   const [txid, setTxid] = useState<string | null>(null)
-  const [replyToTxid, setReplyToTxid] = useState<string | null>(null)
+  const [replyToTxid] = useState<string | null>(initialReplyToTxid)
   const [localError, setLocalError] = useState<string | null>(null)
   const [estimatedFeeSats, setEstimatedFeeSats] = useState<number | null>(null)
   const [estimatedTotalSats, setEstimatedTotalSats] = useState<number | null>(null)
@@ -48,16 +71,6 @@ function SendXEC() {
   const formatXecFromSats = (sats: number) => (sats / XEC_SATS_PER_XEC).toFixed(2)
   const formatXecValue = (xec: number) => xec.toFixed(2)
   const shortenedCommission = `${XEC_TONALLI_TREASURY_ADDRESS.slice(0, 12)}...${XEC_TONALLI_TREASURY_ADDRESS.slice(-6)}`
-
-  useEffect(() => {
-    const params = new URLSearchParams(location.search)
-    const to = params.get('to')
-    const msg = params.get('msg')
-    const replyTo = params.get('replyTo')
-    setDestination(to ? to.trim() : '')
-    setMessage(msg ? sanitizePrefillMessage(msg) : '')
-    setReplyToTxid(replyTo ? replyTo.trim() : null)
-  }, [location.search])
 
   useEffect(() => {
     let cancelled = false
@@ -244,6 +257,19 @@ function SendXEC() {
         )}
       </form>
     </div>
+  )
+}
+
+function SendXEC() {
+  const location = useLocation()
+  const prefill = useMemo(() => parseSendXecPrefill(location.search), [location.search])
+  return (
+    <SendXECForm
+      key={location.search}
+      initialDestination={prefill.destination}
+      initialMessage={prefill.message}
+      initialReplyToTxid={prefill.replyToTxid}
+    />
   )
 }
 
