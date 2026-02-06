@@ -31,11 +31,6 @@ export default function ApproveRequestModal({
   onRejected,
   onRetry
 }: ApproveRequestModalProps) {
-  if (!open || !request) return null
-
-  const metadata = request.peer
-  const icon = metadata?.icons?.[0]
-  const params = request.params
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000))
 
   useEffect(() => {
@@ -45,7 +40,8 @@ export default function ApproveRequestModal({
     return () => window.clearInterval(interval)
   }, [])
 
-  const remainingSeconds = Math.max(0, request.expiresAt - nowSeconds)
+  const expiresAt = request?.expiresAt ?? nowSeconds
+  const remainingSeconds = Math.max(0, expiresAt - nowSeconds)
   const isExpired = remainingSeconds <= 0
   const isExpiredError = Boolean(error && /expired/i.test(error))
   const expiresSoon = remainingSeconds > 0 && remainingSeconds <= 30
@@ -54,6 +50,12 @@ export default function ApproveRequestModal({
     const seconds = remainingSeconds % 60
     return `${minutes}:${seconds.toString().padStart(2, '0')}`
   }, [remainingSeconds])
+
+  if (!open || !request) return null
+
+  const metadata = request.peer
+  const icon = metadata?.icons?.[0]
+  const params = request.params
 
   return (
     <div

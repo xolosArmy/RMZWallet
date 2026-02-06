@@ -439,12 +439,7 @@ function DEX() {
         timestamp: Math.floor(Date.now() / 1000),
         source: 'tonalli'
       }
-      if (!sessionSummary.totalSessions) {
-        console.info('[Tonalli][DEX][publish] no active sessions, queue emit')
-        wcWallet.queueOfferPublished(offerPayload, 'no-active-sessions')
-      } else {
-        void wcWallet.emitOfferPublished(offerPayload)
-      }
+      await wcWallet.publishOrQueueOffer(offerPayload)
       console.debug(
         '[Tonalli][DEX][publish] kind=',
         'rmz',
@@ -625,12 +620,7 @@ function DEX() {
         timestamp: Math.floor(Date.now() / 1000),
         source: 'tonalli'
       }
-      if (!sessionSummary.totalSessions) {
-        console.info('[Tonalli][DEX][publish] no active sessions, queue emit')
-        wcWallet.queueOfferPublished(offerPayload, 'no-active-sessions')
-      } else {
-        void wcWallet.emitOfferPublished(offerPayload)
-      }
+      await wcWallet.publishOrQueueOffer(offerPayload)
       console.debug(
         '[Tonalli][DEX][publish] kind=',
         'nft',
@@ -738,12 +728,7 @@ function DEX() {
         timestamp: Math.floor(Date.now() / 1000),
         source: 'tonalli'
       }
-      if (!sessionSummary.totalSessions) {
-        console.info('[Tonalli][DEX][publish] no active sessions, queue emit')
-        wcWallet.queueOfferPublished(offerPayload, 'no-active-sessions')
-      } else {
-        void wcWallet.emitOfferPublished(offerPayload)
-      }
+      await wcWallet.publishOrQueueOffer(offerPayload)
       console.debug(
         '[Tonalli][DEX][publish] kind=',
         'mintpass',

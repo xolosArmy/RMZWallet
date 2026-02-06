@@ -4,6 +4,7 @@ import type { IWeb3Wallet, Web3WalletTypes } from '@walletconnect/web3wallet'
 import type { SessionTypes } from '@walletconnect/types'
 import { xolosWalletService } from '../../services/XolosWalletService'
 import { updateWcDebugState } from './wcDebug'
+import * as offerQueue from './offerQueue'
 
 function normalizeEcashAddressLikeYouAlreadyDid(addr: string): string {
   return addr.startsWith('ecash:') ? addr.slice('ecash:'.length) : addr
@@ -87,6 +88,16 @@ export type OfferPublishedPayload = {
   source: 'tonalli'
 }
 
+export type OfferConsumedPayload = {
+  version: 1
+  offerId: string
+  txid: string
+  kind: 'rmz' | 'nft' | 'mintpass' | string
+  buyer?: string
+  timestamp: number
+  source: 'rmzwallet'
+}
+
 const defaultState: WcState = {
   sessions: [],
   lastError: null,
@@ -107,9 +118,6 @@ class WcWallet {
   private listeners = new Set<(state: WcState) => void>()
   private proposalListeners = new Set<(proposal: Web3WalletTypes.SessionProposal) => void>()
   private successTimer: number | null = null
-  private offerQueue: OfferPublishedPayload[] = []
-  private offerQueueIds = new Set<string>()
-  private offerQueueByTopic = new Map<string, Set<string>>()
   private pendingExpiryTimer: number | null = null
 
   getState() {
@@ -218,7 +226,7 @@ class WcWallet {
     try {
       const ecashNamespace = namespaces.ecash
       const events = Array.from(
-        new Set([...(ecashNamespace?.events ?? []), 'xolos_offer_published'])
+        new Set([...(ecashNamespace?.events ?? []), 'xolos_offer_published', 'xolos_offer_consumed'])
       )
       const chains = Array.from(new Set([...(ecashNamespace?.chains ?? []), 'ecash:mainnet']))
       const requestedMethods = ecashNamespace?.methods ?? []
@@ -259,8 +267,11 @@ class WcWallet {
         : namespaces
 
       console.info('[Tonalli][WC] approveSession namespaces', updatedNamespaces)
-      await this.web3wallet.approveSession({ id, namespaces: updatedNamespaces })
+      const approved = await this.web3wallet.approveSession({ id, namespaces: updatedNamespaces })
       this.refreshSessions()
+      if (approved?.topic) {
+        await this.replayQueuedOffersToTopic(approved.topic)
+      }
     } catch (err) {
       console.error('[Tonalli][WC] approveSession failed', err)
       throw err
@@ -309,29 +320,24 @@ class WcWallet {
     }
   }
 
-  queueOfferPublished(payload: OfferPublishedPayload, reason = 'no-active-sessions') {
-    const normalized = this.normalizeOfferPayload(payload)
-    this.enqueueOfferPayload(normalized)
-    console.info('[Tonalli][WC][offerQueue] queued', {
-      offerId: normalized.offerId,
-      reason,
-      size: this.offerQueue.length
-    })
+  getEligibleSessions(): SessionTypes.Struct[] {
+    const sessions = Object.values(this.getActiveSessions())
+    return this.getOfferEventTargets(sessions)
   }
 
   async emitOfferPublished(payload: OfferPublishedPayload) {
     if (!this.web3wallet) {
       throw new Error('WalletConnect no está listo.')
     }
+    const payloadNormalized = this.normalizeOfferPayload(payload)
     const sessions = Object.values(this.getActiveSessions())
     const targetSummary = this.getOfferEventTargetsSummary()
     console.debug('[Tonalli][WC][emitOfferPublished] sessions=', targetSummary.totalSessions)
     if (!sessions.length) {
-      console.warn('[Tonalli][WC][emitOfferPublished] no active sessions, queueing offer')
-      this.queueOfferPublished(payload, 'no-active-sessions')
+      console.warn('[Tonalli][WC] no active sessions, queue offer', payloadNormalized.offerId)
+      offerQueue.enqueue(payloadNormalized)
       return
     }
-    const payloadNormalized = this.normalizeOfferPayload(payload)
     updateWcDebugState({ lastOfferPayload: payloadNormalized })
     const targets = this.getOfferEventTargets(sessions)
     if (!targets.length) {
@@ -382,6 +388,59 @@ class WcWallet {
       const reason = rejected && rejected.status === 'rejected' ? rejected.reason : 'Failed to emit offer event'
       this.setState({ lastError: String(reason) })
     }
+  }
+
+  async emitOfferConsumed(params: {
+    offerId: string
+    txid: string
+    kind: 'rmz' | 'nft' | 'mintpass' | string
+    buyer?: string
+  }) {
+    if (!this.web3wallet) {
+      throw new Error('WalletConnect no está listo.')
+    }
+    const offerId = params.offerId?.trim?.() ?? ''
+    if (!offerId) {
+      console.warn('[RMZWallet][WC][offer_consumed] missing offerId, skip emit')
+      return
+    }
+    const sessions = Object.values(this.getActiveSessions())
+    if (!sessions.length) {
+      console.info('[RMZWallet][WC][offer_consumed] no active sessions, skip emit')
+      return
+    }
+
+    const buyer = params.buyer ? ensureEcashPrefixed(params.buyer) : undefined
+    const payload: OfferConsumedPayload = {
+      version: 1,
+      offerId,
+      txid: params.txid,
+      kind: params.kind,
+      buyer,
+      timestamp: Math.floor(Date.now() / 1000),
+      source: 'rmzwallet'
+    }
+
+    await Promise.allSettled(
+      sessions.map(async (session) => {
+        try {
+          console.info(
+            `[RMZWallet][WC][offer_consumed][EMIT] offerId=${payload.offerId} txid=${payload.txid} kind=${payload.kind} topic=${session.topic}`
+          )
+          await this.web3wallet?.emitSessionEvent({
+            topic: session.topic,
+            chainId: 'ecash:mainnet',
+            event: { name: 'xolos_offer_consumed', data: payload }
+          })
+        } catch (err) {
+          console.debug('[RMZWallet][WC][offer_consumed] emit failed', {
+            topic: session.topic,
+            offerId: payload.offerId,
+            err
+          })
+        }
+      })
+    )
   }
 
   private registerHandlers() {
@@ -532,19 +591,20 @@ class WcWallet {
       this.refreshSessions()
     })
 
-    const wcEvents = web3wallet as unknown as { on: (event: string, cb: (event: any) => void) => void }
+    type WcSessionEvent = { topic?: string; params?: { topic?: string } }
+    const wcEvents = web3wallet as unknown as { on: (event: string, cb: (event: WcSessionEvent) => void) => void }
     wcEvents.on('session_settle', (event) => {
       const topic = event?.topic ?? event?.params?.topic
       if (!topic) return
       this.refreshSessions()
-      void this.flushQueuedOffersForTopic(topic, 'session_settle')
+      void this.replayQueuedOffersToAllSessions()
     })
 
     wcEvents.on('session_update', (event) => {
       const topic = event?.topic ?? event?.params?.topic
       if (!topic) return
       this.refreshSessions()
-      void this.flushQueuedOffersForTopic(topic, 'session_update')
+      void this.replayQueuedOffersToAllSessions()
     })
   }
 
@@ -567,60 +627,86 @@ class WcWallet {
     })
   }
 
-  private enqueueOfferPayload(payload: OfferPublishedPayload) {
-    if (this.offerQueueIds.has(payload.offerId)) {
-      this.offerQueue = this.offerQueue.filter((item) => item.offerId !== payload.offerId)
+  async publishOrQueueOffer(payload: OfferPublishedPayload) {
+    if (!this.web3wallet) {
+      throw new Error('WalletConnect no está listo.')
     }
-    this.offerQueue.push(payload)
-    this.offerQueueIds.add(payload.offerId)
-    if (this.offerQueue.length > 20) {
-      const removed = this.offerQueue.shift()
-      if (removed) {
-        this.offerQueueIds.delete(removed.offerId)
-        for (const sent of this.offerQueueByTopic.values()) {
-          sent.delete(removed.offerId)
-        }
-      }
-    }
-  }
-
-  private async flushQueuedOffersForTopic(topic: string, reason: string) {
-    if (!this.web3wallet) return
-    if (!this.offerQueue.length) return
-    const session = this.getActiveSessions()[topic]
-    if (!session) return
-    const targets = this.getOfferEventTargets([session])
-    if (!targets.length) {
-      console.info('[Tonalli][WC][offerQueue] session not eligible for offers', { topic, reason })
+    const normalized = this.normalizeOfferPayload(payload)
+    const sessions = this.getEligibleSessions()
+    if (!sessions.length) {
+      console.warn('[Tonalli][WC] no active sessions, queue offer', {
+        offerId: normalized.offerId,
+        kind: normalized.kind
+      })
+      offerQueue.enqueue(normalized)
       return
     }
 
-    const sent = this.offerQueueByTopic.get(topic) ?? new Set<string>()
-    if (!this.offerQueueByTopic.has(topic)) {
-      this.offerQueueByTopic.set(topic, sent)
+    const topics = sessions.map((session) => session.topic)
+    console.info('[Tonalli][WC] emit offer', { offerId: normalized.offerId, topics })
+    let hasFailure = false
+    await Promise.all(
+      sessions.map(async (session) => {
+        try {
+          await this.web3wallet?.emitSessionEvent({
+            topic: session.topic,
+            chainId: 'ecash:mainnet',
+            event: { name: 'xolos_offer_published', data: normalized }
+          })
+        } catch (err) {
+          hasFailure = true
+          console.warn('[Tonalli][WC] emit offer failed', {
+            offerId: normalized.offerId,
+            topic: session.topic,
+            err
+          })
+        }
+      })
+    )
+    if (hasFailure) {
+      offerQueue.enqueue(normalized)
     }
+  }
 
-    const offers = [...this.offerQueue].slice().reverse()
-    console.info('[Tonalli][WC][offerQueue] flushing', {
-      topic,
-      reason,
-      queued: offers.length
-    })
+  async replayQueuedOffersToTopic(topic: string) {
+    if (!this.web3wallet) return
+    const session = this.getActiveSessions()[topic]
+    if (!session) return
+    const ecash = session.namespaces?.ecash
+    if (!ecash) return
+    if (!(ecash.chains ?? []).includes('ecash:mainnet')) return
+    if (!(ecash.events ?? []).includes('xolos_offer_published')) return
+
+    const offers = offerQueue.peekAll()
+    if (!offers.length) return
+    const countBefore = offers.length
+
+    console.info('[Tonalli][WC] replay queued offers', { topic, countBefore })
 
     for (const offer of offers) {
-      if (sent.has(offer.offerId)) continue
       try {
         await this.web3wallet.emitSessionEvent({
           topic,
           chainId: 'ecash:mainnet',
           event: { name: 'xolos_offer_published', data: offer }
         })
-        sent.add(offer.offerId)
-        console.debug('[Tonalli][WC][offerQueue] emitted', { topic, offerId: offer.offerId })
+        offerQueue.removeByOfferId(offer.offerId)
       } catch (err) {
-        console.warn('[Tonalli][WC][offerQueue] emit failed', { topic, offerId: offer.offerId, err })
+        console.warn('[Tonalli][WC] replay offer failed', {
+          topic,
+          offerId: offer.offerId,
+          err
+        })
       }
     }
+    const countAfter = offerQueue.peekAll().length
+    console.info('[Tonalli][WC] replay queued offers', { topic, countAfter })
+  }
+
+  async replayQueuedOffersToAllSessions() {
+    const sessions = this.getEligibleSessions()
+    if (!sessions.length) return
+    await Promise.all(sessions.map((session) => this.replayQueuedOffersToTopic(session.topic)))
   }
 
   async approvePendingRequest() {
@@ -671,6 +757,11 @@ class WcWallet {
           result: { txid }
         }
       })
+      const buyer = xolosWalletService.getAddress() ?? undefined
+      const rawKind = pending.params?.kind
+      const kind =
+        typeof rawKind === 'string' && rawKind.trim().length > 0 ? rawKind.trim() : 'rmz'
+      await this.emitOfferConsumed({ offerId, txid, kind, buyer })
 
       this.setState({
         pendingRequestBusy: false,

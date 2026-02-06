@@ -79,7 +79,7 @@ export default function ApproveSessionModal({
       ecash: {
         methods: ['ecash_getAddresses', 'ecash_signAndBroadcastTransaction'],
         chains: ['ecash:mainnet'],
-        events: ['accountsChanged', 'xolos_offer_published'],
+        events: ['accountsChanged', 'xolos_offer_published', 'xolos_offer_consumed'],
         accounts: normalizedAddress ? [`ecash:mainnet:${normalizedAddress}`] : []
       }
     }
