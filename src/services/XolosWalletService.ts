@@ -1,4 +1,5 @@
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
+import { fromHex, signMsg } from 'ecash-lib'
 import type { ScriptUtxo } from 'chronik-client'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { FEE_RATE_SATS_PER_BYTE, TONALLI_SERVICE_FEE_SATS, XEC_TONALLI_TREASURY_ADDRESS } from '../config/xecFees'
@@ -498,6 +499,14 @@ export class XolosWalletService {
 
   getAddress(): string | null {
     return this.wallet?.walletInfo?.xecAddress || null
+  }
+
+  async signMessage(message: string): Promise<string> {
+    const privKeyHex = this.getPrivateKeyHex()
+    if (!privKeyHex) {
+      throw new Error('WALLET_LOCKED')
+    }
+    return signMsg(message, fromHex(privKeyHex))
   }
 
   async getRmzDecimals(): Promise<number> {

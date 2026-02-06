@@ -1,18 +1,29 @@
 import type { FormEvent } from 'react'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
 
 function Onboarding() {
   const navigate = useNavigate()
-  const { createNewWallet, loadExistingWallet, restoreWallet, backupVerified, getMnemonic, loading, error } =
+  const { createNewWallet, loadExistingWallet, restoreWallet, backupVerified, initialized, getMnemonic, loading, error } =
     useWallet()
   const [passwordNew, setPasswordNew] = useState('')
   const [passwordExisting, setPasswordExisting] = useState('')
   const [seedPhrase, setSeedPhrase] = useState('')
   const [passwordImport, setPasswordImport] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
+  const resumeHandledRef = useRef(false)
+
+  useEffect(() => {
+    if (resumeHandledRef.current) return
+    if (!initialized || !backupVerified) return
+    const pendingSearch = localStorage.getItem('tonalli_pending_req_v1')
+    if (!pendingSearch) return
+    resumeHandledRef.current = true
+    localStorage.removeItem('tonalli_pending_req_v1')
+    navigate(`/connect${pendingSearch}`, { replace: true })
+  }, [backupVerified, initialized, navigate])
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault()

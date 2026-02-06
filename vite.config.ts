@@ -15,7 +15,7 @@ export default defineConfig({
       includeAssets: ['favicon.ico', 'robots.txt', 'apple-touch-icon.png', 'vite.svg'],
       workbox: {
         // El bundle WASM es grande; ampliamos límite de precache.
-        maximumFileSizeToCacheInBytes: 6 * 1024 * 1024
+        maximumFileSizeToCacheInBytes: 12 * 1024 * 1024
       },
       manifest: {
         name: 'xolosArmy Wallet',

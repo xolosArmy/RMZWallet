@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { AgoraOffer, AgoraPartial } from 'ecash-agora'
+import { AgoraPartial } from 'ecash-agora'
 import {
   ALP_STANDARD,
   ALL_BIP143,
@@ -24,6 +24,10 @@ import { getChronik } from '../services/ChronikClient'
 import { EXTENDED_GAP_LIMIT, xolosWalletService } from '../services/XolosWalletService'
 import { fetchNftDetails, fetchOwnedNfts, type NftAsset } from '../services/nftService'
 import { acceptOfferById, createSellOfferToken, loadOfferById, type OneshotOfferSummary } from '../services/agoraExchange'
+import { buyOfferById } from '../services/buyOfferById'
+import { wcWallet } from '../lib/walletconnect/WcWallet'
+import type { OfferPublishedPayload } from '../lib/walletconnect/WcWallet'
+import WcDebugPanel from '../components/WcDebugPanel'
 import {
   TOKEN_DUST_SATS,
   buildAlpAgoraListOutputs,
@@ -81,6 +85,7 @@ function DEX() {
   const [rmzDecimals, setRmzDecimals] = useState<number | null>(null)
   const [dexTab, setDexTab] = useState<'maker' | 'taker' | 'nft' | 'mintpass'>('maker')
   const [searchParams] = useSearchParams()
+  const debugEnabled = useMemo(() => searchParams.get('debug') === '1', [searchParams])
 
   const [sellAmount, setSellAmount] = useState('')
   const [pricingMode, setPricingMode] = useState<'perUnit' | 'total'>('perUnit')
@@ -413,6 +418,45 @@ function DEX() {
         `tokenChangeAtoms=${tokenChangeAtoms.toString()}`
       ].join('\n')
       setMakerAdvanced(advancedDetails)
+      const priceCandidate = pricingMode === 'perUnit' ? xecPerRmz : totalXecWanted
+      const priceXecRaw = Number(priceCandidate)
+      const priceXec = Number.isFinite(priceXecRaw) ? priceXecRaw : 0
+      const sessionSummary = wcWallet.getOfferEventTargetsSummary()
+      console.info('[Tonalli][DEX][publish] sessions', {
+        total: sessionSummary.totalSessions,
+        eligibleTopics: sessionSummary.eligibleTopics,
+        eligibleChains: sessionSummary.eligibleChains
+      })
+      const offerPayload: OfferPublishedPayload = {
+        version: 1,
+        offerId,
+        txid: broadcast.txid,
+        tokenId: RMZ_ETOKEN_ID,
+        kind: 'rmz',
+        priceXec,
+        amount: actualOfferedAtoms.toString(),
+        seller: xecAddress,
+        timestamp: Math.floor(Date.now() / 1000),
+        source: 'tonalli'
+      }
+      if (!sessionSummary.totalSessions) {
+        console.info('[Tonalli][DEX][publish] no active sessions, queue emit')
+        wcWallet.queueOfferPublished(offerPayload, 'no-active-sessions')
+      } else {
+        void wcWallet.emitOfferPublished(offerPayload)
+      }
+      console.debug(
+        '[Tonalli][DEX][publish] kind=',
+        'rmz',
+        'offerId=',
+        offerId,
+        'txid=',
+        broadcast.txid,
+        'tokenId=',
+        RMZ_ETOKEN_ID,
+        'priceXec=',
+        priceXec
+      )
       await refreshBalances()
     } catch (err) {
       setMakerError((err as Error).message || 'No se pudo crear la oferta.')
@@ -469,52 +513,9 @@ function DEX() {
 
     setBuyBusy(true)
     try {
-      const walletKeyInfo = xolosWalletService.getKeyInfo()
-      const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-      if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
-        setOfferLookupError('No pudimos acceder a las llaves de tu billetera.')
-        return
-      }
-      const recipientScript = Script.fromAddress(xecAddress)
-
-      const offer = new AgoraOffer({
-        variant: { type: 'PARTIAL', params: offerDetails.agoraPartial },
-        outpoint: { txid: offerOutpoint.txid, outIdx: offerOutpoint.vout },
-        txBuilderInput: {
-          prevOut: { txid: offerOutpoint.txid, outIdx: offerOutpoint.vout },
-          signData: {
-            sats: offerDetails.offerOutput.sats,
-            redeemScript: offerDetails.agoraPartial.script()
-          }
-        },
-        token: offerDetails.token,
-        status: 'OPEN'
-      })
-
-      const acceptedAtoms = offerDetails.agoraPartial.prepareAcceptedAtoms(offerDetails.offeredAtoms)
-      const askedSats = offer.askedSats(acceptedAtoms)
-      const feeSats = offer.acceptFeeSats({ recipientScript, acceptedAtoms, feePerKb: FEE_PER_KB })
-      const totalNeeded = askedSats + feeSats
-
-      const addressUtxos = await getChronik().address(xecAddress).utxos()
-      const xecUtxos = addressUtxos.utxos.filter((utxo) => !utxo.token)
-      const funding = selectXecUtxosForTarget(xecUtxos, totalNeeded)
-
-      const signer = P2PKHSignatory(fromHex(walletKeyInfo.privateKeyHex), fromHex(walletKeyInfo.publicKeyHex), ALL_BIP143)
-      const fuelInputs = funding.map((utxo) => buildInput(utxo, recipientScript, signer))
-
-      const acceptTx = offer.acceptTx({
-        covenantSk: fromHex(walletKeyInfo.privateKeyHex),
-        covenantPk: fromHex(walletKeyInfo.publicKeyHex),
-        fuelInputs,
-        recipientScript,
-        acceptedAtoms,
-        dustSats: offerDetails.offerOutput.sats,
-        feePerKb: FEE_PER_KB
-      })
-
-      const broadcast = await getChronik().broadcastTx(acceptTx.ser())
-      setBuyTxid(broadcast.txid)
+      const offerId = `${offerOutpoint.txid}:${offerOutpoint.vout}`
+      const { txid } = await buyOfferById(offerId)
+      setBuyTxid(txid)
       await refreshBalances()
     } catch (err) {
       setOfferLookupError((err as Error).message || 'No se pudo completar la compra.')
@@ -605,6 +606,43 @@ function DEX() {
         createdAt: Date.now(),
         askXec: nftSellPrice
       })
+      const priceXecRaw = Number(nftSellPrice)
+      const priceXec = Number.isFinite(priceXecRaw) ? priceXecRaw : 0
+      const sessionSummary = wcWallet.getOfferEventTargetsSummary()
+      console.info('[Tonalli][DEX][publish] sessions', {
+        total: sessionSummary.totalSessions,
+        eligibleTopics: sessionSummary.eligibleTopics,
+        eligibleChains: sessionSummary.eligibleChains
+      })
+      const offerPayload: OfferPublishedPayload = {
+        version: 1,
+        offerId,
+        txid,
+        tokenId,
+        kind: 'nft',
+        priceXec,
+        seller: xecAddress,
+        timestamp: Math.floor(Date.now() / 1000),
+        source: 'tonalli'
+      }
+      if (!sessionSummary.totalSessions) {
+        console.info('[Tonalli][DEX][publish] no active sessions, queue emit')
+        wcWallet.queueOfferPublished(offerPayload, 'no-active-sessions')
+      } else {
+        void wcWallet.emitOfferPublished(offerPayload)
+      }
+      console.debug(
+        '[Tonalli][DEX][publish] kind=',
+        'nft',
+        'offerId=',
+        offerId,
+        'txid=',
+        txid,
+        'tokenId=',
+        tokenId,
+        'priceXec=',
+        priceXec
+      )
       await refreshBalances()
     } catch (err) {
       setNftOfferError((err as Error).message || 'No se pudo listar el NFT.')
@@ -681,6 +719,43 @@ function DEX() {
         createdAt: Date.now(),
         askXec: mintPassSellPrice
       })
+      const priceXecRaw = Number(mintPassSellPrice)
+      const priceXec = Number.isFinite(priceXecRaw) ? priceXecRaw : 0
+      const sessionSummary = wcWallet.getOfferEventTargetsSummary()
+      console.info('[Tonalli][DEX][publish] sessions', {
+        total: sessionSummary.totalSessions,
+        eligibleTopics: sessionSummary.eligibleTopics,
+        eligibleChains: sessionSummary.eligibleChains
+      })
+      const offerPayload: OfferPublishedPayload = {
+        version: 1,
+        offerId,
+        txid,
+        tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        kind: 'mintpass',
+        priceXec,
+        seller: xecAddress,
+        timestamp: Math.floor(Date.now() / 1000),
+        source: 'tonalli'
+      }
+      if (!sessionSummary.totalSessions) {
+        console.info('[Tonalli][DEX][publish] no active sessions, queue emit')
+        wcWallet.queueOfferPublished(offerPayload, 'no-active-sessions')
+      } else {
+        void wcWallet.emitOfferPublished(offerPayload)
+      }
+      console.debug(
+        '[Tonalli][DEX][publish] kind=',
+        'mintpass',
+        'offerId=',
+        offerId,
+        'txid=',
+        txid,
+        'tokenId=',
+        XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        'priceXec=',
+        priceXec
+      )
       await refreshBalances()
     } catch (err) {
       setMintPassError((err as Error).message || 'No se pudo listar el Mint Pass.')
@@ -1324,6 +1399,7 @@ function DEX() {
 
       {loading && <div className="muted">Actualizando saldos...</div>}
       {error && <div className="error">{error}</div>}
+      {debugEnabled && <WcDebugPanel />}
     </div>
   )
 }
@@ -1389,25 +1465,6 @@ function selectXecUtxos(params: {
   }
 
   throw new Error('No hay suficiente XEC para cubrir dust y comisiones.')
-}
-
-function selectXecUtxosForTarget(utxos: ScriptUtxo[], targetSats: bigint): ScriptUtxo[] {
-  const sorted = [...utxos].sort((a, b) => {
-    if (a.sats === b.sats) return 0
-    return a.sats > b.sats ? -1 : 1
-  })
-  const selected: ScriptUtxo[] = []
-  let total = 0n
-
-  for (const utxo of sorted) {
-    selected.push(utxo)
-    total += utxo.sats
-    if (total >= targetSats) {
-      return selected
-    }
-  }
-
-  throw new Error('No hay suficiente XEC para aceptar la oferta.')
 }
 
 function sumSats(utxos: ScriptUtxo[]): bigint {

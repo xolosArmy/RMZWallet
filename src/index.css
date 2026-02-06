@@ -471,6 +471,59 @@ a {
   margin-top: 16px;
 }
 
+.wc-tabs {
+  display: inline-flex;
+  gap: 8px;
+  padding: 6px;
+  border-radius: var(--radius-pill);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(15, 23, 42, 0.55);
+  margin-bottom: 16px;
+}
+
+.wc-tab {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 8px 14px;
+  border-radius: var(--radius-pill);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.wc-tab.active {
+  background: rgba(242, 154, 74, 0.18);
+  color: #ffd8b6;
+  border: 1px solid rgba(215, 104, 35, 0.5);
+}
+
+.wc-panel {
+  margin-top: 12px;
+}
+
+.wc-qr-shell {
+  margin-top: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(15, 23, 42, 0.6);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+}
+
+.wc-session {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.wc-session:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
 .reveal-card {
   background: linear-gradient(150deg, rgba(5, 7, 12, 0.92), rgba(255, 122, 26, 0.04));
   border-color: rgba(255, 122, 26, 0.28);

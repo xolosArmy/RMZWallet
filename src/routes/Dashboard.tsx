@@ -355,6 +355,9 @@ function Dashboard() {
           <Link className="cta outline" to="/receive">
             Recibir
           </Link>
+          <Link className="cta outline" to="/walletconnect">
+            Conectar dApp (WalletConnect)
+          </Link>
           <Link className="cta outline" to="/scan">
             Escanear QR para recibir RMZ
           </Link>

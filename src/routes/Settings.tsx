@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { EXTENDED_GAP_LIMIT } from '../services/XolosWalletService'
@@ -36,6 +37,9 @@ function Settings() {
           <button className="cta outline" type="button" onClick={handleRescan} disabled={!initialized || loading}>
             Re-escanear (extendido)
           </button>
+          <Link className="cta ghost" to="/walletconnect">
+            WalletConnect
+          </Link>
         </div>
         {rescanMessage && <div className="muted">{rescanMessage}</div>}
       </div>

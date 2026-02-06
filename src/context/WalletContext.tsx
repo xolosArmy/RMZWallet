@@ -1,11 +1,12 @@
 import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { xolosWalletService } from '../services/XolosWalletService'
+import { EXTENDED_GAP_LIMIT, xolosWalletService } from '../services/XolosWalletService'
 import type { WalletBalance, WalletRescanOptions } from '../services/XolosWalletService'
 import { getChronik } from '../services/ChronikClient'
 import { computeNetworkFeeSats, MIN_NETWORK_FEE_SATS, TONALLI_SERVICE_FEE_SATS, XEC_DUST_SATS } from '../config/xecFees'
 import { parseTokenAmount } from '../utils/tokenFormat'
 import { WalletContext } from './walletContext'
+import { WALLET_REFRESH_EVENT, type WalletRefreshDetail } from '../utils/walletRefresh'
 
 const BACKUP_KEY = 'xoloswallet_backup_verified'
 
@@ -195,6 +196,29 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     },
     [initialized]
   )
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const handler = (event: Event) => {
+      if (!initialized) return
+      const detail = (event as CustomEvent<WalletRefreshDetail>).detail ?? {}
+      void (async () => {
+        try {
+          if (detail.refreshUtxos) {
+            await rescanWallet({ gapLimit: EXTENDED_GAP_LIMIT })
+            return
+          }
+          if (detail.refreshBalances) {
+            await refreshBalances()
+          }
+        } catch (err) {
+          console.warn('[Wallet] refresh event failed', err)
+        }
+      })()
+    }
+    window.addEventListener(WALLET_REFRESH_EVENT, handler as EventListener)
+    return () => window.removeEventListener(WALLET_REFRESH_EVENT, handler as EventListener)
+  }, [initialized, refreshBalances, rescanWallet])
 
   const createNewWallet = useCallback(async (): Promise<string> => {
     setLoading(true)

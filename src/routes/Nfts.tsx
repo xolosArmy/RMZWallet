@@ -25,6 +25,7 @@ import {
   ipfsToGatewayUrl,
   resolveIpfsGatewayBase
 } from '../utils/ipfs'
+import { WALLET_REFRESH_EVENT, type WalletRefreshDetail } from '../utils/walletRefresh'
 
 const SLP_NFT1_GROUP = 129
 const FEE_PER_KB = 1200n
@@ -147,6 +148,17 @@ function Nfts() {
     localStorage.removeItem(NFT_RESCAN_STORAGE_KEY)
     void handleRescanNfts()
   }, [handleRescanNfts, initialized])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<WalletRefreshDetail>).detail ?? {}
+      if (!detail.refreshNfts) return
+      void handleRescanNfts()
+    }
+    window.addEventListener(WALLET_REFRESH_EVENT, handler as EventListener)
+    return () => window.removeEventListener(WALLET_REFRESH_EVENT, handler as EventListener)
+  }, [handleRescanNfts])
 
   const ipfsGatewayBase = useMemo(() => resolveIpfsGatewayBase(), [])
   const estimatedFeeSats = useMemo(() => estimateMintFeeSats(), [])
