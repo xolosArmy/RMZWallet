@@ -2,8 +2,10 @@ import { Core } from '@walletconnect/core'
 import { Web3Wallet } from '@walletconnect/web3wallet'
 import type { IWeb3Wallet, Web3WalletTypes } from '@walletconnect/web3wallet'
 import type { SessionTypes } from '@walletconnect/types'
+import { ALL_BIP143, Address, P2PKHSignatory, Script, Tx, TxBuilder, fromHex, toHexRev } from 'ecash-lib'
 import { getChronik } from '../../services/ChronikClient'
 import { xolosWalletService } from '../../services/XolosWalletService'
+import { XEC_DUST_SATS } from '../../config/xecFees'
 import { updateWcDebugState } from './wcDebug'
 import * as offerQueue from './offerQueue'
 import { appendWcRequestHistory } from './requestHistory'
@@ -30,6 +32,8 @@ const MIN_TTL_SECONDS = 30
 const MAX_TTL_SECONDS = 900
 const MAX_PENDING_AGE_SECONDS = 300
 const MAX_PENDING_QUEUE_SIZE = 20
+const MIN_WC_FEE_RATE = 5
+const MIN_MEMPOOL_POLICY_FEE_RATE = 3
 
 const WC_ALLOWED_DOMAINS = (
   ((import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_WC_ALLOWED_DOMAINS ??
@@ -66,6 +70,17 @@ function normalizeEpochSeconds(rawEpoch: unknown): number | null {
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000)
+}
+
+function resolveConfiguredWcFeeRate(): number | null {
+  const viteEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {}
+  const raw =
+    viteEnv.VITE_WC_FEE_RATE_SAT_PER_BYTE ??
+    (typeof process !== 'undefined' ? process.env?.VITE_WC_FEE_RATE_SAT_PER_BYTE : undefined)
+  if (!raw) return null
+  const numeric = Number(raw)
+  if (!Number.isFinite(numeric)) return null
+  return Math.floor(numeric)
 }
 
 function isHexString(value: string): boolean {
@@ -118,6 +133,7 @@ export type WcState = {
 export type SignAndBroadcastParams = {
   offerId: string
   rawHex?: string
+  outputs?: Array<{ address: string; valueSats: number }>
   userPrompt?: string
   [key: string]: unknown
 }
@@ -181,6 +197,11 @@ type SessionRequestPayload = {
     icons?: string[]
   }
   verifyContext?: PeerVerifyContext
+}
+
+type EcashProposalNamespace = {
+  chains?: string[]
+  methods?: string[]
 }
 
 const defaultState: WcState = {
@@ -272,6 +293,20 @@ export class WcWallet {
 
   private isSupportedChain(chainId: string): boolean {
     return chainId === WC_CHAIN_ID || chainId === WC_CHAIN_ID_LEGACY
+  }
+
+  private selectPreferredChain(chains: string[]): string | null {
+    if (chains.includes(WC_CHAIN_ID)) return WC_CHAIN_ID
+    if (chains.includes(WC_CHAIN_ID_LEGACY)) return WC_CHAIN_ID_LEGACY
+    return null
+  }
+
+  private getProposalEcashDetails(proposal: Web3WalletTypes.SessionProposal): { chains: string[]; methods: string[] } {
+    const requiredEcash = proposal.params.requiredNamespaces?.[WC_NAMESPACE] as EcashProposalNamespace | undefined
+    const optionalEcash = proposal.params.optionalNamespaces?.[WC_NAMESPACE] as EcashProposalNamespace | undefined
+    const chains = Array.from(new Set([...(requiredEcash?.chains ?? []), ...(optionalEcash?.chains ?? [])]))
+    const methods = Array.from(new Set([...(requiredEcash?.methods ?? []), ...(optionalEcash?.methods ?? [])]))
+    return { chains, methods }
   }
 
   private validatePeer(metadata: { url?: string } | undefined): PeerVerifyContext {
@@ -384,16 +419,302 @@ export class WcWallet {
         error: { code: -32602, message: 'Params inválidos: userPrompt debe ser string' }
       }
     }
+    if (requestParams.outputs !== undefined) {
+      if (!Array.isArray(requestParams.outputs)) {
+        return {
+          params: null,
+          error: { code: -32602, message: 'Params inválidos: outputs debe ser un arreglo' }
+        }
+      }
+      for (const output of requestParams.outputs) {
+        if (!output || typeof output !== 'object') {
+          return {
+            params: null,
+            error: { code: -32602, message: 'Params inválidos: cada output debe ser objeto' }
+          }
+        }
+        const candidate = output as { address?: unknown; valueSats?: unknown; sats?: unknown; value?: unknown }
+        if (typeof candidate.address !== 'string' || candidate.address.trim().length === 0) {
+          return {
+            params: null,
+            error: { code: -32602, message: 'Params inválidos: output.address debe ser string' }
+          }
+        }
+        const rawValueSats =
+          candidate.valueSats !== undefined ? candidate.valueSats : candidate.sats !== undefined ? candidate.sats : candidate.value
+        const parsedValueSats =
+          typeof rawValueSats === 'bigint'
+            ? Number(rawValueSats)
+            : typeof rawValueSats === 'string'
+              ? Number(rawValueSats)
+              : rawValueSats
+        if (
+          typeof parsedValueSats !== 'number' ||
+          !Number.isSafeInteger(parsedValueSats) ||
+          parsedValueSats <= 0
+        ) {
+          return {
+            params: null,
+            error: { code: -32602, message: 'Params inválidos: output.valueSats debe ser entero seguro > 0' }
+          }
+        }
+      }
+    }
 
     return {
       params: {
         ...requestParams,
         offerId,
         rawHex: requestParams.rawHex?.trim() || undefined,
+        outputs: requestParams.outputs?.map((output) => {
+          const candidate = output as { address: string; valueSats?: unknown; sats?: unknown; value?: unknown }
+          const rawValueSats =
+            candidate.valueSats !== undefined
+              ? candidate.valueSats
+              : candidate.sats !== undefined
+                ? candidate.sats
+                : candidate.value
+          return {
+            address: candidate.address.trim(),
+            valueSats: Number(rawValueSats)
+          }
+        }),
         userPrompt: requestParams.userPrompt?.trim() || undefined
       },
       error: null
     }
+  }
+
+  private isUnsignedRawHex(rawHex: string): boolean {
+    const normalizedRawHex = rawHex.trim()
+    if (!isHexString(normalizedRawHex)) return false
+    try {
+      const parsedTx = Tx.fromHex(normalizedRawHex)
+      return parsedTx.inputs.some((input) => (input.script?.bytecode.length ?? 0) === 0)
+    } catch {
+      return false
+    }
+  }
+
+  private deriveOutputsFromRawHex(rawHex: string): Array<{ address: string; valueSats: number }> {
+    const normalizedRawHex = rawHex.trim()
+    if (!isHexString(normalizedRawHex)) {
+      throw new Error('rawHex inválido')
+    }
+    const parsedTx = Tx.fromHex(normalizedRawHex)
+    const outputs = parsedTx.outputs.map((output, index) => {
+      const sats = typeof output.sats === 'bigint' ? Number(output.sats) : Number(output.sats)
+      if (!Number.isSafeInteger(sats) || sats <= 0) {
+        throw new Error(`No se pudo reconstruir output ${index}: sats inválidos`)
+      }
+      try {
+        const address = Address.fromScript(output.script).cash().toString()
+        return {
+          address: ensureEcashPrefixed(address),
+          valueSats: sats
+        }
+      } catch {
+        throw new Error(
+          `No se pudo reconstruir output ${index} desde rawHex. Incluye params.outputs para rawHex unsigned.`
+        )
+      }
+    })
+    if (!outputs.length) {
+      throw new Error('No se pudo reconstruir outputs desde rawHex unsigned')
+    }
+    return outputs
+  }
+
+  private outputAddressToScript(address: string): Script {
+    return Script.fromAddress(normalizeEcashAddressLikeYouAlreadyDid(ensureEcashPrefixed(address.trim())))
+  }
+
+  private getWalletConnectFeeRate(): number {
+    const feeRate = resolveConfiguredWcFeeRate()
+    return Math.max(feeRate ?? 0, MIN_WC_FEE_RATE)
+  }
+
+  private async inspectFeeStats(tx: Tx): Promise<{ txSize: number; fee: bigint; feeRate: number }> {
+    const txSize = tx.serSize()
+    const outputSats = tx.outputs.reduce((sum, output) => sum + BigInt(output.sats), 0n)
+    const prevTxCache = new Map<string, Awaited<ReturnType<ReturnType<typeof getChronik>['tx']>>>()
+    let inputSats = 0n
+    for (const input of tx.inputs) {
+      const prevTxid = typeof input.prevOut.txid === 'string' ? input.prevOut.txid : toHexRev(input.prevOut.txid)
+      let prevTx = prevTxCache.get(prevTxid)
+      if (!prevTx) {
+        prevTx = await getChronik().tx(prevTxid)
+        prevTxCache.set(prevTxid, prevTx)
+      }
+      const prevOutput = prevTx.outputs[input.prevOut.outIdx]
+      if (!prevOutput) {
+        throw new Error(`No se encontró el output previo ${prevTxid}:${input.prevOut.outIdx}`)
+      }
+      inputSats += BigInt(prevOutput.sats)
+    }
+    const fee = inputSats - outputSats
+    if (fee < 0n) {
+      throw new Error('Fee inválido: outputs exceden inputs')
+    }
+    const feeRate = txSize > 0 ? Number(fee) / txSize : 0
+    return { txSize, fee, feeRate }
+  }
+
+  private async assertBroadcastFeePolicy(tx: Tx) {
+    const { txSize, fee, feeRate } = await this.inspectFeeStats(tx)
+    console.debug('[WCv2][Fee]', {
+      size: txSize,
+      feeSats: Number(fee),
+      feeRate
+    })
+    if (fee < BigInt(txSize * MIN_MEMPOOL_POLICY_FEE_RATE)) {
+      throw new Error('Fee too low for mempool policy')
+    }
+    if (feeRate < this.getWalletConnectFeeRate()) {
+      throw new Error(`Fee rate too low for WalletConnect policy: ${feeRate.toFixed(2)} sat/byte`)
+    }
+  }
+
+  private async signAndBroadcastRawHex(rawHex: string): Promise<{ txid: string }> {
+    const normalizedRawHex = rawHex.trim()
+    if (!isHexString(normalizedRawHex)) {
+      throw new Error('rawHex inválido')
+    }
+
+    let parsedTx: Tx
+    try {
+      parsedTx = Tx.fromHex(normalizedRawHex)
+    } catch {
+      await getChronik().validateRawTx(normalizedRawHex)
+      return getChronik().broadcastTx(normalizedRawHex)
+    }
+    const unsignedInputs = parsedTx.inputs
+      .map((input, idx) => ({ input, idx }))
+      .filter(({ input }) => (input.script?.bytecode.length ?? 0) === 0)
+
+    // If all scriptSigs are already present, treat as signed tx and only validate+broadcast.
+    if (unsignedInputs.length === 0) {
+      await this.assertBroadcastFeePolicy(parsedTx)
+      await getChronik().validateRawTx(normalizedRawHex)
+      return getChronik().broadcastTx(normalizedRawHex)
+    }
+
+    const walletKeyInfo = xolosWalletService.getKeyInfo()
+    const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
+    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+      throw new Error('No pudimos acceder a las llaves de tu billetera.')
+    }
+
+    const signer = P2PKHSignatory(fromHex(walletKeyInfo.privateKeyHex), fromHex(walletKeyInfo.publicKeyHex), ALL_BIP143)
+    const walletUtxos = await getChronik().address(xecAddress).utxos()
+    const walletScript = new Script(fromHex(walletUtxos.outputScript))
+    const walletUtxoMap = new Map<string, bigint>()
+    for (const utxo of walletUtxos.utxos) {
+      if (utxo.token) continue
+      walletUtxoMap.set(`${utxo.outpoint.txid}:${utxo.outpoint.outIdx}`, utxo.sats)
+    }
+
+    const builder = TxBuilder.fromTx(parsedTx)
+    for (const { input, idx } of unsignedInputs) {
+      const prevTxid = typeof input.prevOut.txid === 'string' ? input.prevOut.txid : toHexRev(input.prevOut.txid)
+      const lookupKey = `${prevTxid}:${input.prevOut.outIdx}`
+      const inputSats = walletUtxoMap.get(lookupKey)
+      if (inputSats === undefined) {
+        throw new Error(`No pudimos firmar input ${idx}: UTXO no encontrado en la billetera activa.`)
+      }
+      builder.inputs[idx].input.signData = {
+        sats: inputSats,
+        outputScript: walletScript
+      }
+      builder.inputs[idx].signatory = signer
+    }
+
+    const signedTx = builder.sign()
+    const signedHex = signedTx.toHex()
+    await this.assertBroadcastFeePolicy(signedTx)
+    await getChronik().validateRawTx(signedHex)
+    return getChronik().broadcastTx(signedHex)
+  }
+
+  private async buildSignBroadcastFromOutputs(outputs: Array<{ address: string; valueSats: number }>): Promise<{ txid: string }> {
+    if (!outputs.length) {
+      throw new Error('outputs vacío')
+    }
+
+    const walletKeyInfo = xolosWalletService.getKeyInfo()
+    const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
+    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+      throw new Error('No pudimos acceder a las llaves de tu billetera.')
+    }
+
+    const recipientOutputs = outputs.map((output) => ({
+      sats: BigInt(output.valueSats),
+      script: this.outputAddressToScript(output.address)
+    }))
+    const addressUtxos = await getChronik().address(xecAddress).utxos()
+    const xecUtxos = addressUtxos.utxos
+      .filter((utxo) => !utxo.token)
+      .sort((a, b) => {
+        if (a.sats === b.sats) return 0
+        return a.sats > b.sats ? -1 : 1
+      })
+
+    if (!xecUtxos.length) {
+      throw new Error('No hay UTXOs XEC disponibles para construir la transacción.')
+    }
+
+    const signer = P2PKHSignatory(fromHex(walletKeyInfo.privateKeyHex), fromHex(walletKeyInfo.publicKeyHex), ALL_BIP143)
+    const walletScript = this.outputAddressToScript(xecAddress)
+    const feeRate = this.getWalletConnectFeeRate()
+    const feePerKb = BigInt(feeRate) * 1000n
+    let signedTxHex: string | null = null
+    let signedTx: Tx | null = null
+    let lastError: Error | null = null
+    const selectedUtxos: typeof xecUtxos = []
+
+    for (const utxo of xecUtxos) {
+      selectedUtxos.push(utxo)
+      const inputs = selectedUtxos.map((selected) => ({
+        input: {
+          prevOut: selected.outpoint,
+          signData: {
+            sats: selected.sats,
+            outputScript: walletScript
+          }
+        },
+        signatory: signer
+      }))
+      const builder = new TxBuilder({
+        inputs,
+        outputs: [...recipientOutputs, walletScript]
+      })
+
+      try {
+        signedTx = builder.sign({
+          feePerKb,
+          dustSats: BigInt(XEC_DUST_SATS)
+        })
+        signedTxHex = signedTx.toHex()
+        break
+      } catch (err) {
+        if (
+          err instanceof Error &&
+          (err.message.includes('Insufficient input sats') || err.message.includes('can only pay for'))
+        ) {
+          lastError = err
+          continue
+        }
+        throw err
+      }
+    }
+
+    if (!signedTxHex || !signedTx) {
+      throw lastError ?? new Error('No hay suficiente XEC para cubrir outputs + fees.')
+    }
+
+    await this.assertBroadcastFeePolicy(signedTx)
+    await getChronik().validateRawTx(signedTxHex)
+    return getChronik().broadcastTx(signedTxHex)
   }
 
   private cleanupQueuedRequests() {
@@ -533,7 +854,9 @@ export class WcWallet {
   async init(projectId: string) {
     if (this.state.initialized) return
     if (!projectId) {
-      this.setState({ lastError: 'Falta VITE_WALLETCONNECT_PROJECT_ID.' })
+      this.setState({
+        lastError: 'Falta WalletConnect Project ID (VITE_WALLETCONNECT_PROJECT_ID o VITE_WC_PROJECT_ID).'
+      })
       throw new Error('Missing WalletConnect project id')
     }
 
@@ -573,7 +896,7 @@ export class WcWallet {
     this.refreshSessions()
   }
 
-  async approveSession(id: number, namespaces: SessionTypes.Namespaces) {
+  async approveSession(id: number, namespaces: SessionTypes.Namespaces, proposalChains?: string[]) {
     if (!this.web3wallet) {
       throw new Error('WalletConnect no está listo.')
     }
@@ -587,12 +910,12 @@ export class WcWallet {
           WC_EVENT_OFFER_CONSUMED
         ])
       )
-      const chainsRequested = ecashNamespace?.chains ?? []
-      const chains = chainsRequested.includes(WC_CHAIN_ID)
-        ? [WC_CHAIN_ID]
-        : chainsRequested.includes(WC_CHAIN_ID_LEGACY)
-          ? [WC_CHAIN_ID_LEGACY]
-          : [WC_CHAIN_ID]
+      const chainsRequested = proposalChains && proposalChains.length > 0 ? proposalChains : ecashNamespace?.chains ?? []
+      const selectedChain = this.selectPreferredChain(chainsRequested)
+      if (chainsRequested.length > 0 && !selectedChain) {
+        throw new Error('Unsupported chain')
+      }
+      const chains = [selectedChain ?? WC_CHAIN_ID]
       const requestedMethods = ecashNamespace?.methods ?? []
       const baseMethods = requestedMethods.includes(WC_METHOD_GET_ADDRESSES)
         ? requestedMethods
@@ -626,7 +949,12 @@ export class WcWallet {
             }
         : namespaces
 
-      console.info('[WCv2] proposal approved', { id, chains, methods })
+      console.info('[WCv2] proposal approved', {
+        id,
+        proposalChains: chainsRequested,
+        selectedChain: chains[0],
+        approvedNamespaces: updatedNamespaces
+      })
       const approved = await this.web3wallet.approveSession({ id, namespaces: updatedNamespaces })
       this.refreshSessions()
       if (approved?.topic) {
@@ -787,11 +1115,10 @@ export class WcWallet {
   }
 
   private proposalSupportsEcashV2(proposal: Web3WalletTypes.SessionProposal): boolean {
-    const ecash = proposal.params.requiredNamespaces?.[WC_NAMESPACE]
-    if (!ecash) return false
-    const hasChain = (ecash.chains ?? []).includes(WC_CHAIN_ID)
-    const hasMethod = (ecash.methods ?? []).includes(WC_METHOD_SIGN_AND_BROADCAST)
-    return hasChain && hasMethod
+    const { chains, methods } = this.getProposalEcashDetails(proposal)
+    const selectedChain = this.selectPreferredChain(chains)
+    const hasMethod = methods.includes(WC_METHOD_SIGN_AND_BROADCAST)
+    return Boolean(selectedChain) && hasMethod
   }
 
   private registerHandlers() {
@@ -814,17 +1141,27 @@ export class WcWallet {
       }
 
       if (!this.proposalSupportsEcashV2(proposal)) {
+        const { chains, methods } = this.getProposalEcashDetails(proposal)
+        const selectedChain = this.selectPreferredChain(chains)
+        const errorMessage = selectedChain ? 'Unsupported method' : 'Unsupported chain'
         console.warn('[WCv2] proposal rejected by namespace/chains/methods', {
           id: proposal.id,
+          proposalChains: chains,
+          selectedChain,
+          proposalMethods: methods,
           requiredNamespaces: proposal.params.requiredNamespaces
         })
-        await this.rejectSession(proposal.id, { code: 5100, message: 'Unsupported chains or methods' })
+        await this.rejectSession(proposal.id, { code: 5100, message: errorMessage })
         return
       }
 
+      const { chains } = this.getProposalEcashDetails(proposal)
+      const selectedChain = this.selectPreferredChain(chains)
       console.info('[WCv2] proposal received', {
         id: proposal.id,
-        proposer: proposal.params.proposer.metadata
+        proposer: proposal.params.proposer.metadata,
+        proposalChains: chains,
+        selectedChain
       })
       for (const listener of this.proposalListeners) {
         listener(proposal)
@@ -867,8 +1204,12 @@ export class WcWallet {
       const session = this.getActiveSessions()[topic]
       const sessionChainId = session ? this.getChainForSession(session) : null
       const resolvedChainId = chainFromEvent ?? sessionChainId ?? WC_CHAIN_ID
-      if (chainFromEvent && chainFromEvent !== WC_CHAIN_ID) {
-        await this.respondError(topic, id, { code: -32000, message: `Unsupported chainId: ${chainFromEvent}` })
+      if (chainFromEvent && !this.isSupportedChain(chainFromEvent)) {
+        await this.respondError(topic, id, { code: -32000, message: 'Unsupported chain' })
+        return
+      }
+      if (chainFromEvent && sessionChainId && chainFromEvent !== sessionChainId) {
+        await this.respondError(topic, id, { code: -32000, message: 'Unsupported chain' })
         return
       }
       if (!this.isSupportedChain(resolvedChainId)) {
@@ -901,6 +1242,8 @@ export class WcWallet {
           paramsSummary: {
             offerId: parsed.params.offerId,
             hasRawHex: Boolean(parsed.params.rawHex),
+            hasOutputs: Boolean(parsed.params.outputs?.length),
+            outputsCount: parsed.params.outputs?.length ?? 0,
             userPrompt: parsed.params.userPrompt,
             chainId: resolvedChainId
           }
@@ -1060,11 +1403,21 @@ export class WcWallet {
     try {
       let txid = ''
       if (pending.params.rawHex) {
-        if (!isHexString(pending.params.rawHex)) {
-          throw new Error('rawHex inválido')
-        }
         this.setState({ pendingRequestStatus: 'broadcasting' })
-        const broadcast = await getChronik().broadcastTx(pending.params.rawHex)
+        if (this.isUnsignedRawHex(pending.params.rawHex)) {
+          const outputsForRebuild =
+            pending.params.outputs && pending.params.outputs.length > 0
+              ? pending.params.outputs
+              : this.deriveOutputsFromRawHex(pending.params.rawHex)
+          const broadcast = await this.buildSignBroadcastFromOutputs(outputsForRebuild)
+          txid = broadcast.txid
+        } else {
+          const broadcast = await this.signAndBroadcastRawHex(pending.params.rawHex)
+          txid = broadcast.txid
+        }
+      } else if (pending.params.outputs?.length) {
+        this.setState({ pendingRequestStatus: 'broadcasting' })
+        const broadcast = await this.buildSignBroadcastFromOutputs(pending.params.outputs)
         txid = broadcast.txid
       } else {
         const { acceptOfferById } = await import('../../services/agoraExchange')
