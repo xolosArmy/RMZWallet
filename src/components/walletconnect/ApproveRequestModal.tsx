@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import type { PendingRequest } from '../../lib/walletconnect/WcWallet'
+import type { PendingRequest, PendingRequestStatus } from '../../lib/walletconnect/WcWallet'
 
 type ApproveRequestModalProps = {
   open: boolean
@@ -7,6 +7,7 @@ type ApproveRequestModalProps = {
   busy?: boolean
   error?: string | null
   resolved?: boolean
+  status?: PendingRequestStatus
   successTxid?: string | null
   onApproved: () => void
   onRejected: () => void
@@ -20,18 +21,29 @@ const SectionRow = ({ label, children }: { label: string; children: ReactNode })
   </div>
 )
 
+const statusLabel: Record<PendingRequestStatus, string> = {
+  idle: 'Idle',
+  pending: 'Pendiente',
+  signing: 'Firmando',
+  broadcasting: 'Transmitiendo',
+  done: 'Completado',
+  error: 'Error'
+}
+
 export default function ApproveRequestModal({
   open,
   request,
   busy = false,
   error,
   resolved = false,
+  status = 'idle',
   successTxid,
   onApproved,
   onRejected,
   onRetry
 }: ApproveRequestModalProps) {
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000))
+  const [copyState, setCopyState] = useState<string | null>(null)
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -56,6 +68,20 @@ export default function ApproveRequestModal({
   const metadata = request.peer
   const icon = metadata?.icons?.[0]
   const params = request.params
+  const verifyWarning = request.verifyContext?.warning
+  const txPreview = request.rawTxPreview
+
+  const handleCopyTxid = async () => {
+    if (!successTxid || !navigator.clipboard?.writeText) return
+    try {
+      await navigator.clipboard.writeText(successTxid)
+      setCopyState('Txid copiado')
+      window.setTimeout(() => setCopyState(null), 1500)
+    } catch {
+      setCopyState('No se pudo copiar')
+      window.setTimeout(() => setCopyState(null), 1500)
+    }
+  }
 
   return (
     <div
@@ -84,7 +110,9 @@ export default function ApproveRequestModal({
           padding: 24,
           display: 'flex',
           flexDirection: 'column',
-          gap: 20
+          gap: 20,
+          maxHeight: '90vh',
+          overflowY: 'auto'
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
@@ -110,7 +138,7 @@ export default function ApproveRequestModal({
               Ritual de Compra
             </p>
             <h2 className="section-title" style={{ fontSize: 22, letterSpacing: '0.08em' }}>
-              Una dApp solicita firmar y transmitir una compra.
+              Solicitud WalletConnect para firmar y transmitir.
             </h2>
           </div>
         </div>
@@ -135,8 +163,14 @@ export default function ApproveRequestModal({
           </div>
         </div>
 
+        {verifyWarning && <div className="error">Warning: {verifyWarning}</div>}
+
         <div style={{ display: 'grid', gap: 16 }}>
+          <SectionRow label="Estado">
+            <span className="pill pill-ghost">{statusLabel[status]}</span>
+          </SectionRow>
           <SectionRow label="Accion">{request.method}</SectionRow>
+          <SectionRow label="Chain ID">{request.chainId}</SectionRow>
           <SectionRow label="Offer ID">
             <span className="pill pill-ghost" style={{ wordBreak: 'break-all' }}>
               {params.offerId}
@@ -166,6 +200,30 @@ export default function ApproveRequestModal({
               {expiresSoon && !isExpired && <span className="muted">Expira pronto.</span>}
             </div>
           </SectionRow>
+          {params.rawHex && (
+            <SectionRow label="rawHex">
+              <span className="muted">{params.rawHex.slice(0, 32)}...</span>
+            </SectionRow>
+          )}
+          {txPreview && (
+            <SectionRow label="Resumen tx">
+              <div style={{ display: 'grid', gap: 6 }}>
+                <span className="muted">
+                  {txPreview.inputs} inputs / {txPreview.outputs} outputs / {txPreview.bytes} bytes
+                </span>
+                <span className="muted">
+                  Total outputs: {txPreview.totalOutputXec} XEC ({txPreview.totalOutputSats} sats)
+                </span>
+                {txPreview.feeXec && <span className="muted">Fee aprox: {txPreview.feeXec} XEC</span>}
+                {txPreview.outputSummary.map((output, idx) => (
+                  <span key={`${output.script}-${idx}`} className="muted">
+                    Output {idx + 1}: {output.xec} XEC ({output.script}...)
+                  </span>
+                ))}
+                {txPreview.summaryError && <span className="error">{txPreview.summaryError}</span>}
+              </div>
+            </SectionRow>
+          )}
         </div>
 
         <div className="actions" style={{ justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
@@ -203,19 +261,24 @@ export default function ApproveRequestModal({
             </button>
           )}
         </div>
+
         {isExpired && !resolved && (
-          <div className="error">
-            Esta solicitud expiró antes de ser aprobada. Regresa a la dApp y vuelve a intentarlo.
-          </div>
+          <div className="error">Esta solicitud expiró antes de ser aprobada. Regresa a la dApp y vuelve a intentarlo.</div>
         )}
+
         {resolved && successTxid && !error && (
-          <div className="success" style={{ display: 'grid', gap: 6 }}>
+          <div className="success" style={{ display: 'grid', gap: 8 }}>
             <div>Compra transmitida.</div>
             <div className="address-box" style={{ wordBreak: 'break-all' }}>
               {successTxid}
             </div>
+            <button className="cta ghost" type="button" onClick={handleCopyTxid}>
+              Copiar txid
+            </button>
+            {copyState && <span className="muted">{copyState}</span>}
           </div>
         )}
+
         {error && <div className="error">{error}</div>}
       </div>
     </div>

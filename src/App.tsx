@@ -55,6 +55,7 @@ function App() {
         busy={wcState.pendingRequestBusy}
         error={wcState.pendingRequestError}
         resolved={wcState.pendingRequestResolved}
+        status={wcState.pendingRequestStatus}
         successTxid={wcState.pendingRequestTxid}
         onApproved={() => void wcWallet.approvePendingRequest()}
         onRejected={() => void wcWallet.rejectPendingRequest()}

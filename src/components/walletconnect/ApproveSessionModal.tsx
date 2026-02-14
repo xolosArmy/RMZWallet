@@ -60,7 +60,7 @@ export default function ApproveSessionModal({
       ? activeAddress.slice('ecash:'.length)
       : activeAddress
     : null
-  const addressLabel = normalizedAddress ? `ecash:mainnet:${normalizedAddress}` : 'Sin dirección activa'
+  const addressLabel = normalizedAddress ? `ecash:1:${normalizedAddress}` : 'Sin dirección activa'
 
   const handleApprove = async () => {
     setIsApproving(true)
@@ -78,9 +78,9 @@ export default function ApproveSessionModal({
     const namespaces = {
       ecash: {
         methods: ['ecash_getAddresses', 'ecash_signAndBroadcastTransaction'],
-        chains: ['ecash:mainnet'],
+        chains: ['ecash:1'],
         events: ['accountsChanged', 'xolos_offer_published', 'xolos_offer_consumed'],
-        accounts: normalizedAddress ? [`ecash:mainnet:${normalizedAddress}`] : []
+        accounts: normalizedAddress ? [`ecash:1:${normalizedAddress}`] : []
       }
     }
 
