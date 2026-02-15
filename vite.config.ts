@@ -6,6 +6,14 @@ import topLevelAwait from 'vite-plugin-top-level-await'
 
 // Configuración Vite + PWA + WASM + COOP/COEP para habilitar SharedArrayBuffer de forma segura.
 export default defineConfig({
+  define: {
+    global: 'globalThis'
+  },
+  resolve: {
+    alias: {
+      buffer: 'buffer'
+    }
+  },
   plugins: [
     react(),
     wasm(),
@@ -58,7 +66,8 @@ export default defineConfig({
   },
   optimizeDeps: {
     // Evitamos prebundling de WASM del core de la billetera.
-    exclude: ['minimal-xec-wallet']
+    exclude: ['minimal-xec-wallet'],
+    include: ['buffer']
   },
   build: {
     target: 'esnext'
