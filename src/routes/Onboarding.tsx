@@ -1,11 +1,13 @@
 import type { FormEvent } from 'react'
 import { useEffect, useRef, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
+import { EXTERNAL_SIGN_REQUEST_STORAGE_KEY, EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY } from '../utils/externalSign'
 
 function Onboarding() {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const { createNewWallet, loadExistingWallet, restoreWallet, backupVerified, initialized, getMnemonic, loading, error } =
     useWallet()
   const [passwordNew, setPasswordNew] = useState('')
@@ -18,12 +20,22 @@ function Onboarding() {
   useEffect(() => {
     if (resumeHandledRef.current) return
     if (!initialized || !backupVerified) return
+    const pendingExternalSign = sessionStorage.getItem(EXTERNAL_SIGN_REQUEST_STORAGE_KEY)
+    if (pendingExternalSign) {
+      resumeHandledRef.current = true
+      const requestedReturnTo = (searchParams.get('returnTo') ?? '').trim()
+      const storedReturnTo = sessionStorage.getItem(EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY) ?? ''
+      const returnTo = storedReturnTo || requestedReturnTo || '/external-sign'
+      sessionStorage.removeItem(EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY)
+      navigate(returnTo, { replace: true })
+      return
+    }
     const pendingSearch = localStorage.getItem('tonalli_pending_req_v1')
     if (!pendingSearch) return
     resumeHandledRef.current = true
     localStorage.removeItem('tonalli_pending_req_v1')
     navigate(`/connect${pendingSearch}`, { replace: true })
-  }, [backupVerified, initialized, navigate])
+  }, [backupVerified, initialized, navigate, searchParams])
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault()

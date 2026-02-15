@@ -14,6 +14,7 @@ import Nfts from './routes/Nfts'
 import SendNft from './routes/SendNft'
 import ConnectRequest from './routes/ConnectRequest'
 import WalletConnect from './routes/WalletConnect'
+import ExternalSign from './routes/ExternalSign'
 import ApproveRequestModal from './components/walletconnect/ApproveRequestModal'
 import { wcWallet } from './lib/walletconnect/WcWallet'
 
@@ -43,6 +44,7 @@ function App() {
           <Route path="/settings" element={<Settings />} />
           <Route path="/connect" element={<ConnectRequest />} />
           <Route path="/walletconnect" element={<WalletConnect />} />
+          <Route path="/external-sign" element={<ExternalSign />} />
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/backup" element={<BackupSeed />} />
           <Route path="/reveal-seed" element={<RevealSeed />} />
