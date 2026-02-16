@@ -50,9 +50,9 @@ function buildWalletHarness(sessionChainId = 'ecash:1') {
     }
   }
 
-  const wallet = new WcWallet()
+  const wallet = new (WcWallet as unknown as { new (): WcWallet })()
   ;(wallet as unknown as { web3wallet: unknown }).web3wallet = mockWeb3wallet
-  ;(wallet as unknown as { registerHandlers: () => void }).registerHandlers()
+  ;(wallet as unknown as { setupEventListeners: () => void }).setupEventListeners()
 
   const sessionRequest = handlers.get('session_request') as SessionRequestHandler
   assert.ok(sessionRequest, 'session_request handler should be registered')
@@ -375,4 +375,40 @@ test('si vienen rawHex firmado y outputs, rawHex mantiene prioridad', async () =
   assert.equal(responses.length, 1)
   assert.equal((responses[0].response.result as { txid: string }).txid, 'c'.repeat(64))
   xolosWalletService.getAddress = originalGetAddress
+})
+
+test('parser: intent-only (sin inputs) => mode intent', () => {
+  const wallet = new (WcWallet as unknown as { new (): WcWallet })() as unknown as {
+    parseSignAndBroadcastParams: (input: unknown) => { params: { requestMode?: string } | null; error: { code: number } | null }
+  }
+  const parsed = wallet.parseSignAndBroadcastParams({
+    outputs: [{ address: 'ecash:qrecipient', valueSats: 1500 }]
+  })
+  assert.equal(parsed.error, null)
+  assert.equal(parsed.params?.requestMode, 'intent')
+})
+
+test('parser: legacy inputsUsed => mode legacy', () => {
+  const wallet = new (WcWallet as unknown as { new (): WcWallet })() as unknown as {
+    parseSignAndBroadcastParams: (input: unknown) => { params: { requestMode?: string } | null; error: { code: number } | null }
+  }
+  const parsed = wallet.parseSignAndBroadcastParams({
+    inputsUsed: [`${'a'.repeat(64)}:0`],
+    outputs: [{ address: 'ecash:qrecipient', valueSats: 900 }]
+  })
+  assert.equal(parsed.error, null)
+  assert.equal(parsed.params?.requestMode, 'legacy')
+})
+
+test('parser: error por formato inválido en inputsUsed', () => {
+  const wallet = new (WcWallet as unknown as { new (): WcWallet })() as unknown as {
+    parseSignAndBroadcastParams: (input: unknown) => { params: unknown; error: { code: number; message: string } | null }
+  }
+  const parsed = wallet.parseSignAndBroadcastParams({
+    inputsUsed: ['no-es-outpoint'],
+    outputs: [{ address: 'ecash:qrecipient', valueSats: 900 }]
+  })
+  assert.equal(parsed.params, null)
+  assert.equal(parsed.error?.code, -32602)
+  assert.match(parsed.error?.message ?? '', /txid:vout/)
 })

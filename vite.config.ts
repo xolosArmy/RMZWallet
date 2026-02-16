@@ -67,7 +67,12 @@ export default defineConfig({
   optimizeDeps: {
     // Evitamos prebundling de WASM del core de la billetera.
     exclude: ['minimal-xec-wallet'],
-    include: ['buffer']
+    include: ['buffer'],
+    esbuildOptions: {
+      define: {
+        global: 'globalThis'
+      }
+    }
   },
   build: {
     target: 'esnext'

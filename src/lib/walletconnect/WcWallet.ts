@@ -23,9 +23,12 @@ const WC_CHAIN_ID = 'ecash:1'
 const WC_CHAIN_ID_LEGACY = 'ecash:mainnet'
 const WC_METHOD_GET_ADDRESSES = 'ecash_getAddresses'
 const WC_METHOD_SIGN_AND_BROADCAST = 'ecash_signAndBroadcastTransaction'
+const WC_METHOD_SIGN_AND_BROADCAST_ALIAS = 'ecash_signAndBroadcast'
 const WC_EVENT_OFFER_PUBLISHED = 'xolos_offer_published'
 const WC_EVENT_OFFER_CONSUMED = 'xolos_offer_consumed'
 const WC_EVENT_ACCOUNTS_CHANGED = 'accountsChanged'
+const WC_STORED_TOPIC_KEY = 'tonalli_wc_topic'
+const WC_PURGE_STORAGE_KEYS = ['tonalli_wc_topic', 'tonalli_wc_offer_queue', 'tonalli_wc_request_history']
 
 const DEFAULT_TTL_SECONDS = 300
 const MIN_TTL_SECONDS = 30
@@ -95,6 +98,42 @@ function formatXecFromSats(sats: bigint): string {
   return sats < 0n ? `-${formatted}` : formatted
 }
 
+function parseLegacyOutpointString(value: string): { txid: string; vout: number } | null {
+  const trimmed = value.trim()
+  const [txid, voutRaw] = trimmed.split(':')
+  if (!txid || !voutRaw) return null
+  if (!/^[0-9a-fA-F]{64}$/.test(txid)) return null
+  if (!/^\d+$/.test(voutRaw)) return null
+  const vout = Number(voutRaw)
+  if (!Number.isSafeInteger(vout) || vout < 0) return null
+  return { txid: txid.toLowerCase(), vout }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function unwrapWcParams(input: unknown): Record<string, unknown> {
+  if (Array.isArray(input)) {
+    const [first] = input
+    return isRecord(first) ? first : {}
+  }
+  if (!isRecord(input)) return {}
+  if (isRecord(input.request) && 'params' in input.request) {
+    return unwrapWcParams(input.request.params)
+  }
+  if ('params' in input) {
+    return unwrapWcParams(input.params)
+  }
+  return input
+}
+
+function detectWcParamsShape(input: unknown): 'array' | 'object' | 'unknown' {
+  if (Array.isArray(input)) return 'array'
+  if (isRecord(input)) return 'object'
+  return 'unknown'
+}
+
 export type PendingRequestStatus = 'idle' | 'pending' | 'signing' | 'broadcasting' | 'done' | 'error'
 
 export type RawTxPreview = {
@@ -131,10 +170,19 @@ export type WcState = {
 }
 
 export type SignAndBroadcastParams = {
-  offerId: string
+  offerId?: string
   rawHex?: string
-  outputs?: Array<{ address: string; valueSats: number }>
+  unsignedTxHex?: string
+  outputs?: Array<{ address: string; valueSats: string | number | bigint }>
+  inputsUsed?: string[]
+  outpoints?: string[]
+  valueSats?: number | string | bigint
+  sats?: number | string | bigint
+  value?: number | string | bigint
+  mode?: 'legacy' | 'intent' | 'tx'
+  message?: string
   userPrompt?: string
+  requestMode?: 'legacy' | 'intent' | 'tx'
   [key: string]: unknown
 }
 
@@ -204,6 +252,10 @@ type EcashProposalNamespace = {
   methods?: string[]
 }
 
+function isSignAndBroadcastMethod(method: unknown): boolean {
+  return method === WC_METHOD_SIGN_AND_BROADCAST || method === WC_METHOD_SIGN_AND_BROADCAST_ALIAS
+}
+
 const defaultState: WcState = {
   sessions: [],
   lastError: null,
@@ -220,14 +272,121 @@ const defaultState: WcState = {
 }
 
 export class WcWallet {
-  private core: Web3WalletTypes.Options['core'] | null = null
-  private web3wallet: IWeb3Wallet | null = null
+  private static instance: WcWallet | null = null
+  private initPromise: Promise<void> | null = null
+  public core: Web3WalletTypes.Options['core'] | null = null
+  public web3wallet: IWeb3Wallet | null = null
   private state: WcState = { ...defaultState }
   private listeners = new Set<(state: WcState) => void>()
   private proposalListeners = new Set<(proposal: Web3WalletTypes.SessionProposal) => void>()
   private successTimer: number | null = null
   private pendingExpiryTimer: number | null = null
   private pendingQueue: SessionRequestPayload[] = []
+  private handlersRegistered = false
+
+  private constructor() {}
+
+  public static getInstance(): WcWallet {
+    if (!WcWallet.instance) {
+      WcWallet.instance = new WcWallet()
+    }
+    return WcWallet.instance
+  }
+
+  private isStaleTopicError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? '')
+    const normalized = message.toLowerCase()
+    return normalized.includes('no matching key') || normalized.includes("session topic doesn't exist")
+  }
+
+  private resetPendingState() {
+    this.clearPendingExpiryTimer()
+    this.pendingQueue = []
+    this.setState({
+      sessions: [],
+      pendingRequest: null,
+      pendingRequestError: null,
+      pendingRequestBusy: false,
+      pendingRequestResolved: false,
+      pendingRequestTxid: null,
+      pendingRequestStatus: 'idle',
+      pendingQueueSize: 0
+    })
+  }
+
+  private clearStoredTopic() {
+    if (typeof window === 'undefined') return
+    try {
+      localStorage.removeItem(WC_STORED_TOPIC_KEY)
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  private readStoredTopic(): string | null {
+    if (typeof window === 'undefined') return null
+    try {
+      const raw = localStorage.getItem(WC_STORED_TOPIC_KEY)
+      const trimmed = raw?.trim() ?? ''
+      return trimmed || null
+    } catch {
+      return null
+    }
+  }
+
+  private writeStoredTopic(topic: string | null) {
+    if (typeof window === 'undefined') return
+    try {
+      if (!topic) {
+        localStorage.removeItem(WC_STORED_TOPIC_KEY)
+        return
+      }
+      localStorage.setItem(WC_STORED_TOPIC_KEY, topic)
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  private purgeWalletConnectStorage() {
+    if (typeof window === 'undefined') return
+    try {
+      const keys = new Set(WC_PURGE_STORAGE_KEYS)
+      for (let i = 0; i < localStorage.length; i += 1) {
+        const key = localStorage.key(i)
+        if (!key) continue
+        const lower = key.toLowerCase()
+        if (lower.includes('walletconnect') || lower.startsWith('wc@2:') || lower.startsWith('wc:')) {
+          keys.add(key)
+        }
+      }
+      for (const key of keys) {
+        localStorage.removeItem(key)
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  private purgeStaleTopic(reason: string) {
+    console.warn('[WC] stale topic detected → purging', { reason })
+    this.purgeWalletConnectStorage()
+    this.clearStoredTopic()
+    this.resetPendingState()
+  }
+
+  private syncStoredTopic(sessions: SessionTypes.Struct[]) {
+    const firstTopic = sessions[0]?.topic ?? null
+    this.writeStoredTopic(firstTopic)
+  }
+
+  private validateStoredTopicOnRestore() {
+    const storedTopic = this.readStoredTopic()
+    if (!storedTopic) return
+    const sessions = this.getActiveSessions()
+    if (!sessions[storedTopic]) {
+      this.purgeStaleTopic(`missing stored topic ${storedTopic}`)
+    }
+  }
 
   getState() {
     return this.state
@@ -341,7 +500,7 @@ export class WcWallet {
 
   private normalizeJsonRpcError(kind: 'user' | 'params' | 'method' | 'internal' | 'expired' | 'busy'): JsonRpcError {
     if (kind === 'user') return { code: 4001, message: 'Rechazado por el usuario.' }
-    if (kind === 'params') return { code: -32602, message: 'Params inválidos: offerId requerido' }
+    if (kind === 'params') return { code: -32602, message: 'Params inválidos: offerId o outputs requeridos' }
     if (kind === 'method') return { code: -32601, message: 'Método no soportado' }
     if (kind === 'expired') return { code: -32000, message: 'Request expired' }
     if (kind === 'busy') return { code: -32000, message: 'Request busy' }
@@ -350,26 +509,42 @@ export class WcWallet {
 
   private async respondError(topic: string, id: number, error: JsonRpcError) {
     if (!this.web3wallet) return
-    await this.web3wallet.respondSessionRequest({
-      topic,
-      response: {
-        id,
-        jsonrpc: '2.0',
-        error
+    try {
+      await this.web3wallet.respondSessionRequest({
+        topic,
+        response: {
+          id,
+          jsonrpc: '2.0',
+          error
+        }
+      })
+    } catch (err) {
+      if (this.isStaleTopicError(err)) {
+        this.purgeStaleTopic(err instanceof Error ? err.message : String(err))
+        return
       }
-    })
+      throw err
+    }
   }
 
   private async respondSuccess(topic: string, id: number, result: unknown) {
     if (!this.web3wallet) return
-    await this.web3wallet.respondSessionRequest({
-      topic,
-      response: {
-        id,
-        jsonrpc: '2.0',
-        result
+    try {
+      await this.web3wallet.respondSessionRequest({
+        topic,
+        response: {
+          id,
+          jsonrpc: '2.0',
+          result
+        }
+      })
+    } catch (err) {
+      if (this.isStaleTopicError(err)) {
+        this.purgeStaleTopic(err instanceof Error ? err.message : String(err))
+        return
       }
-    })
+      throw err
+    }
   }
 
   private resolveRequestExpiry(event: Web3WalletTypes.SessionRequest): number {
@@ -395,22 +570,17 @@ export class WcWallet {
   }
 
   private parseSignAndBroadcastParams(input: unknown): { params: SignAndBroadcastParams | null; error: JsonRpcError | null } {
-    if (!input || typeof input !== 'object') {
-      return { params: null, error: this.normalizeJsonRpcError('params') }
-    }
-    const requestParams = input as Partial<SignAndBroadcastParams>
+    const requestParams = unwrapWcParams(input) as Partial<SignAndBroadcastParams>
     const offerId =
       typeof requestParams.offerId === 'string' && requestParams.offerId.trim().length > 0
         ? requestParams.offerId.trim()
         : ''
 
-    if (!offerId) {
-      return { params: null, error: this.normalizeJsonRpcError('params') }
-    }
-    if (requestParams.rawHex !== undefined && typeof requestParams.rawHex !== 'string') {
+    const rawHexInput = requestParams.rawHex ?? requestParams.unsignedTxHex
+    if (rawHexInput !== undefined && typeof rawHexInput !== 'string') {
       return {
         params: null,
-        error: { code: -32602, message: 'Params inválidos: rawHex debe ser string' }
+        error: { code: -32602, message: 'Params inválidos: rawHex/unsignedTxHex debe ser string' }
       }
     }
     if (requestParams.userPrompt !== undefined && typeof requestParams.userPrompt !== 'string') {
@@ -419,6 +589,57 @@ export class WcWallet {
         error: { code: -32602, message: 'Params inválidos: userPrompt debe ser string' }
       }
     }
+    const normalizedMessage =
+      requestParams.message === undefined
+        ? undefined
+        : typeof requestParams.message === 'string'
+          ? requestParams.message.trim()
+          : null
+    if (normalizedMessage === null) {
+      return {
+        params: null,
+        error: { code: -32602, message: 'Params inválidos: message debe ser string' }
+      }
+    }
+
+    const normalizePositiveIntString = (value: unknown): string | null => {
+      if (typeof value === 'bigint') {
+        if (value <= 0n) return null
+        return value.toString()
+      }
+      if (typeof value === 'number') {
+        if (!Number.isSafeInteger(value) || value <= 0) return null
+        return value.toString()
+      }
+      if (typeof value === 'string') {
+        const trimmed = value.trim()
+        if (!/^\d+$/.test(trimmed)) return null
+        try {
+          const normalized = BigInt(trimmed)
+          if (normalized <= 0n) return null
+          return normalized.toString()
+        } catch {
+          return null
+        }
+      }
+      return null
+    }
+
+    const topLevelOutputValueRaw =
+      requestParams.valueSats !== undefined
+        ? requestParams.valueSats
+        : requestParams.sats !== undefined
+          ? requestParams.sats
+          : requestParams.value
+    const normalizedTopLevelValue = topLevelOutputValueRaw === undefined ? undefined : normalizePositiveIntString(topLevelOutputValueRaw)
+    if (topLevelOutputValueRaw !== undefined && !normalizedTopLevelValue) {
+      return {
+        params: null,
+        error: { code: -32602, message: 'Params inválidos: valueSats/sats/value debe ser entero > 0' }
+      }
+    }
+
+    const normalizedOutputs: Array<{ address: string; valueSats: string }> = []
     if (requestParams.outputs !== undefined) {
       if (!Array.isArray(requestParams.outputs)) {
         return {
@@ -442,44 +663,109 @@ export class WcWallet {
         }
         const rawValueSats =
           candidate.valueSats !== undefined ? candidate.valueSats : candidate.sats !== undefined ? candidate.sats : candidate.value
-        const parsedValueSats =
-          typeof rawValueSats === 'bigint'
-            ? Number(rawValueSats)
-            : typeof rawValueSats === 'string'
-              ? Number(rawValueSats)
-              : rawValueSats
-        if (
-          typeof parsedValueSats !== 'number' ||
-          !Number.isSafeInteger(parsedValueSats) ||
-          parsedValueSats <= 0
-        ) {
+        const normalizedValueSats =
+          rawValueSats === undefined && normalizedTopLevelValue !== undefined
+            ? normalizedTopLevelValue
+            : normalizePositiveIntString(rawValueSats)
+        if (!normalizedValueSats) {
           return {
             params: null,
-            error: { code: -32602, message: 'Params inválidos: output.valueSats debe ser entero seguro > 0' }
+            error: { code: -32602, message: 'Params inválidos: output.valueSats/sats/value debe ser entero > 0' }
           }
         }
+        normalizedOutputs.push({
+          address: candidate.address.trim(),
+          valueSats: normalizedValueSats
+        })
       }
+    }
+
+    const hasOutputs = normalizedOutputs.length > 0
+    const normalizedRawHex = (rawHexInput as string | undefined)?.trim() || undefined
+    const hasRawHex = Boolean(normalizedRawHex)
+    const modeCandidate = requestParams.mode ?? requestParams.requestMode
+    const explicitMode =
+      modeCandidate === 'intent' || modeCandidate === 'legacy' || modeCandidate === 'tx' ? modeCandidate : undefined
+    const requestMode: 'legacy' | 'intent' | 'tx' = explicitMode ?? (hasOutputs ? 'intent' : hasRawHex ? 'tx' : 'legacy')
+
+    const normalizeOutpointValue = (item: unknown): string | null => {
+      if (typeof item === 'string') return item.trim()
+      if (!item || typeof item !== 'object') return null
+      const candidate = item as { txid?: unknown; hash?: unknown; vout?: unknown; outIdx?: unknown; index?: unknown }
+      const txid = typeof candidate.txid === 'string' ? candidate.txid.trim() : ''
+      const hash = typeof candidate.hash === 'string' ? candidate.hash.trim() : ''
+      const txidLike = txid || hash
+      const outpointIdx =
+        candidate.vout !== undefined
+          ? candidate.vout
+          : candidate.outIdx !== undefined
+            ? candidate.outIdx
+            : candidate.index
+      const parsedOutpointIdx = typeof outpointIdx === 'string' ? Number(outpointIdx) : outpointIdx
+      if (!txidLike || typeof parsedOutpointIdx !== 'number' || !Number.isSafeInteger(parsedOutpointIdx) || parsedOutpointIdx < 0) {
+        return null
+      }
+      return `${txidLike}:${parsedOutpointIdx}`
+    }
+
+    const parseLegacyOutpoints = (key: 'inputsUsed' | 'outpoints'): { outpoints: string[] | null; error: JsonRpcError | null } => {
+      const value = requestParams[key]
+      if (value === undefined) return { outpoints: null, error: null }
+      if (!Array.isArray(value)) {
+        return {
+          outpoints: null,
+          error: { code: -32602, message: `Params inválidos: ${key} debe ser un arreglo` }
+        }
+      }
+      const normalized: string[] = []
+      for (const item of value) {
+        const normalizedOutpoint = normalizeOutpointValue(item)
+        if (!normalizedOutpoint || !parseLegacyOutpointString(normalizedOutpoint)) {
+          const itemLabel =
+            typeof item === 'string'
+              ? item
+              : (() => {
+                  try {
+                    return JSON.stringify(item)
+                  } catch {
+                    return String(item)
+                  }
+                })()
+          return {
+            outpoints: null,
+            error: {
+              code: -32602,
+              message: `Params inválidos: ${key} contiene outpoint inválido "${itemLabel}". Usa formato txid:vout.`
+            }
+          }
+        }
+        normalized.push(normalizedOutpoint.toLowerCase())
+      }
+      return { outpoints: normalized, error: null }
+    }
+
+    const shouldParseLegacyOutpoints = requestMode === 'legacy' && !hasRawHex
+    const parsedInputsUsed = shouldParseLegacyOutpoints ? parseLegacyOutpoints('inputsUsed') : { outpoints: null, error: null }
+    if (parsedInputsUsed.error) return { params: null, error: parsedInputsUsed.error }
+
+    const parsedOutpoints = shouldParseLegacyOutpoints ? parseLegacyOutpoints('outpoints') : { outpoints: null, error: null }
+    if (parsedOutpoints.error) return { params: null, error: parsedOutpoints.error }
+    if (!offerId && !hasOutputs && !hasRawHex) {
+      return { params: null, error: this.normalizeJsonRpcError('params') }
     }
 
     return {
       params: {
         ...requestParams,
-        offerId,
-        rawHex: requestParams.rawHex?.trim() || undefined,
-        outputs: requestParams.outputs?.map((output) => {
-          const candidate = output as { address: string; valueSats?: unknown; sats?: unknown; value?: unknown }
-          const rawValueSats =
-            candidate.valueSats !== undefined
-              ? candidate.valueSats
-              : candidate.sats !== undefined
-                ? candidate.sats
-                : candidate.value
-          return {
-            address: candidate.address.trim(),
-            valueSats: Number(rawValueSats)
-          }
-        }),
-        userPrompt: requestParams.userPrompt?.trim() || undefined
+        mode: requestMode,
+        offerId: offerId || undefined,
+        rawHex: normalizedRawHex,
+        outputs: normalizedOutputs.length > 0 ? normalizedOutputs : undefined,
+        inputsUsed: parsedInputsUsed.outpoints ?? undefined,
+        outpoints: parsedOutpoints.outpoints ?? undefined,
+        message: normalizedMessage || undefined,
+        userPrompt: requestParams.userPrompt?.trim() || undefined,
+        requestMode
       },
       error: null
     }
@@ -636,7 +922,38 @@ export class WcWallet {
     return getChronik().broadcastTx(signedHex)
   }
 
-  private async buildSignBroadcastFromOutputs(outputs: Array<{ address: string; valueSats: number }>): Promise<{ txid: string }> {
+  private buildOpReturnScript(message: string): Script | null {
+    const trimmed = message.trim()
+    if (!trimmed) return null
+
+    const payloadBytes = new TextEncoder().encode(trimmed)
+    if (payloadBytes.length > 220) {
+      throw new Error('message OP_RETURN excede 220 bytes')
+    }
+
+    const payloadHex =
+      '6d02' +
+      Array.from(payloadBytes)
+        .map((byte) => byte.toString(16).padStart(2, '0'))
+        .join('')
+    const payloadLength = payloadHex.length / 2
+
+    let pushOpHex = ''
+    if (payloadLength <= 75) {
+      pushOpHex = payloadLength.toString(16).padStart(2, '0')
+    } else if (payloadLength <= 0xff) {
+      pushOpHex = `4c${payloadLength.toString(16).padStart(2, '0')}`
+    } else {
+      throw new Error('message OP_RETURN demasiado grande')
+    }
+
+    return new Script(fromHex(`6a${pushOpHex}${payloadHex}`))
+  }
+
+  private async buildSignBroadcastFromOutputs(
+    outputs: Array<{ address: string; valueSats: string | number | bigint }>,
+    message?: string
+  ): Promise<{ txid: string }> {
     if (!outputs.length) {
       throw new Error('outputs vacío')
     }
@@ -651,6 +968,8 @@ export class WcWallet {
       sats: BigInt(output.valueSats),
       script: this.outputAddressToScript(output.address)
     }))
+    const opReturnScript = message ? this.buildOpReturnScript(message) : null
+    const outputsWithMessage = opReturnScript ? [...recipientOutputs, { sats: 0n, script: opReturnScript }] : recipientOutputs
     const addressUtxos = await getChronik().address(xecAddress).utxos()
     const xecUtxos = addressUtxos.utxos
       .filter((utxo) => !utxo.token)
@@ -686,7 +1005,7 @@ export class WcWallet {
       }))
       const builder = new TxBuilder({
         inputs,
-        outputs: [...recipientOutputs, walletScript]
+        outputs: [...outputsWithMessage, walletScript]
       })
 
       try {
@@ -750,7 +1069,7 @@ export class WcWallet {
       if (next.expiresAt <= nowSeconds()) {
         await this.respondError(next.topic, next.id, this.normalizeJsonRpcError('expired'))
         appendWcRequestHistory({
-          offerId: next.params.offerId,
+          offerId: next.params.offerId ?? '',
           peer: next.peer?.name ?? next.peer?.url ?? 'unknown',
           topic: next.topic,
           status: 'error',
@@ -851,35 +1170,55 @@ export class WcWallet {
     }
   }
 
-  async init(projectId: string) {
-    if (this.state.initialized) return
-    if (!projectId) {
-      this.setState({
-        lastError: 'Falta WalletConnect Project ID (VITE_WALLETCONNECT_PROJECT_ID o VITE_WC_PROJECT_ID).'
-      })
-      throw new Error('Missing WalletConnect project id')
-    }
+  public async initialize(projectId?: string): Promise<void> {
+    if (this.initPromise) return this.initPromise
 
-    this.core = new Core({ projectId }) as unknown as Web3WalletTypes.Options['core']
-    this.web3wallet = await Web3Wallet.init({
-      core: this.core,
-      metadata: {
-        name: 'RMZWallet',
-        description: 'XolosArmy RMZWallet (eCash)',
-        url:
-          typeof window !== 'undefined' && import.meta.env.DEV
-            ? window.location.origin
-            : 'https://app.tonalli.cash',
-        icons: ['https://xolosarmy.xyz/icon.png']
+    this.initPromise = (async () => {
+      if (this.web3wallet) return
+
+      const resolvedProjectId =
+        projectId?.trim() ||
+        (import.meta.env.VITE_WALLETCONNECT_PROJECT_ID as string | undefined) ||
+        (import.meta.env.VITE_WC_PROJECT_ID as string | undefined)
+      if (!resolvedProjectId) {
+        this.setState({
+          lastError: 'Falta WalletConnect Project ID (VITE_WALLETCONNECT_PROJECT_ID o VITE_WC_PROJECT_ID).'
+        })
+        throw new Error('Missing WalletConnect project id')
       }
+
+      console.log('[WC] Initializing Web3Wallet Singleton...')
+      this.core = new Core({ projectId: resolvedProjectId }) as unknown as Web3WalletTypes.Options['core']
+      this.web3wallet = await Web3Wallet.init({
+        core: this.core,
+        metadata: {
+          name: 'RMZ Wallet',
+          description: 'eCash Wallet for Xolos Army',
+          url: typeof window !== 'undefined' ? window.location.origin : 'https://app.tonalli.cash',
+          icons: ['https://avatars.githubusercontent.com/u/37784886']
+        }
+      })
+      this.setupEventListeners()
+      this.setState({ initialized: true })
+      this.validateStoredTopicOnRestore()
+      this.refreshSessions()
+      console.log('[WC] Web3Wallet initialized successfully.')
+    })().catch((error) => {
+      this.initPromise = null
+      throw error
     })
 
-    this.registerHandlers()
-    this.setState({ initialized: true })
-    this.refreshSessions()
+    return this.initPromise
+  }
+
+  async init(projectId: string) {
+    await this.initialize(projectId)
   }
 
   async pair(uri: string) {
+    if (!this.core) {
+      await this.initialize()
+    }
     if (!this.core) {
       throw new Error('WalletConnect no está listo.')
     }
@@ -889,10 +1228,18 @@ export class WcWallet {
 
   async disconnectSession(topic: string) {
     if (!this.web3wallet) return
-    await this.web3wallet.disconnectSession({
-      topic,
-      reason: { code: 6000, message: 'Sesión terminada por el usuario.' }
-    })
+    try {
+      await this.web3wallet.disconnectSession({
+        topic,
+        reason: { code: 6000, message: 'Sesión terminada por el usuario.' }
+      })
+    } catch (err) {
+      if (this.isStaleTopicError(err)) {
+        this.purgeStaleTopic(err instanceof Error ? err.message : String(err))
+        return
+      }
+      throw err
+    }
     this.refreshSessions()
   }
 
@@ -983,13 +1330,23 @@ export class WcWallet {
   }
 
   getActiveSessions() {
-    return this.web3wallet?.getActiveSessions?.() ?? {}
+    if (!this.web3wallet) return {}
+    try {
+      return this.web3wallet.getActiveSessions?.() ?? {}
+    } catch (err) {
+      if (this.isStaleTopicError(err)) {
+        this.purgeStaleTopic(err instanceof Error ? err.message : String(err))
+        return {}
+      }
+      throw err
+    }
   }
 
   refreshSessions() {
     if (!this.web3wallet) return
     const sessions = Object.values(this.getActiveSessions())
     this.setState({ sessions })
+    this.syncStoredTopic(sessions)
   }
 
   getOfferEventTargetsSummary() {
@@ -1121,8 +1478,9 @@ export class WcWallet {
     return Boolean(selectedChain) && hasMethod
   }
 
-  private registerHandlers() {
-    if (!this.web3wallet) return
+  private setupEventListeners() {
+    if (!this.web3wallet || this.handlersRegistered) return
+    this.handlersRegistered = true
     const web3wallet = this.web3wallet
 
     web3wallet.on('session_proposal', async (proposal: Web3WalletTypes.SessionProposal) => {
@@ -1196,7 +1554,7 @@ export class WcWallet {
         return
       }
 
-      if (request.method !== WC_METHOD_SIGN_AND_BROADCAST) {
+      if (!isSignAndBroadcastMethod(request.method)) {
         await this.respondError(topic, id, this.normalizeJsonRpcError('method'))
         return
       }
@@ -1217,17 +1575,29 @@ export class WcWallet {
         return
       }
 
+      const paramsShape = detectWcParamsShape(request.params)
       const parsed = this.parseSignAndBroadcastParams(request.params)
       if (!parsed.params || parsed.error) {
         await this.respondError(topic, id, parsed.error ?? this.normalizeJsonRpcError('params'))
         return
       }
 
+      if ((import.meta as unknown as { env?: Record<string, unknown> }).env?.DEV) {
+        console.info('[WCv2] paramsShape', { shape: paramsShape })
+      }
+      console.info('[WCv2] normalized request', {
+        method: request.method,
+        mode: parsed.params.requestMode,
+        outputsCount: parsed.params.outputs?.length ?? 0,
+        hasRawHex: Boolean(parsed.params.rawHex),
+        hasOutpoints: Boolean((parsed.params.inputsUsed?.length ?? 0) > 0 || (parsed.params.outpoints?.length ?? 0) > 0)
+      })
+
       const verifyContext = this.validatePeer(session?.peer?.metadata)
       const payload: SessionRequestPayload = {
         id,
         topic,
-        method: request.method,
+        method: WC_METHOD_SIGN_AND_BROADCAST,
         chainId: resolvedChainId,
         params: parsed.params,
         expiresAt: expiryTimestamp,
@@ -1396,45 +1766,75 @@ export class WcWallet {
       return
     }
 
-    const offerId = pending.params.offerId
+    const offerId = pending.params.offerId ?? ''
     this.setState({ pendingRequestBusy: true, pendingRequestError: null, pendingRequestStatus: 'signing' })
     console.info('[WCv2] signAndBroadcast approve', { offerId, topic: pending.topic })
 
     try {
       let txid = ''
-      if (pending.params.rawHex) {
+      const mode = pending.params.requestMode ?? (pending.params.outputs?.length ? 'intent' : pending.params.rawHex ? 'tx' : 'legacy')
+      const outputsCount = pending.params.outputs?.length ?? 0
+      const totalSats = (pending.params.outputs ?? []).reduce((sum, output) => sum + BigInt(output.valueSats), 0n)
+      console.info('[WCv2] signAndBroadcast summary', {
+        mode,
+        outputsCount,
+        totalSats: totalSats.toString()
+      })
+      if (mode === 'intent' && pending.params.outputs?.length) {
+        console.info('[WC] intent-only flow')
+        this.setState({ pendingRequestStatus: 'broadcasting' })
+        const broadcast = await this.buildSignBroadcastFromOutputs(pending.params.outputs, pending.params.message)
+        txid = broadcast.txid
+      } else if (mode === 'tx' && pending.params.rawHex) {
+        console.info('[WC] tx rawHex flow')
         this.setState({ pendingRequestStatus: 'broadcasting' })
         if (this.isUnsignedRawHex(pending.params.rawHex)) {
           const outputsForRebuild =
             pending.params.outputs && pending.params.outputs.length > 0
               ? pending.params.outputs
               : this.deriveOutputsFromRawHex(pending.params.rawHex)
-          const broadcast = await this.buildSignBroadcastFromOutputs(outputsForRebuild)
+          const broadcast = await this.buildSignBroadcastFromOutputs(outputsForRebuild, pending.params.message)
           txid = broadcast.txid
         } else {
           const broadcast = await this.signAndBroadcastRawHex(pending.params.rawHex)
           txid = broadcast.txid
         }
-      } else if (pending.params.outputs?.length) {
-        this.setState({ pendingRequestStatus: 'broadcasting' })
-        const broadcast = await this.buildSignBroadcastFromOutputs(pending.params.outputs)
-        txid = broadcast.txid
       } else {
-        const { acceptOfferById } = await import('../../services/agoraExchange')
-        const { buyOfferById } = await import('../../services/buyOfferById')
-
-        try {
-          this.setState({ pendingRequestStatus: 'signing' })
-          const result = await acceptOfferById({ offerId, wallet: xolosWalletService })
-          txid = result.txid
-        } catch (err) {
-          const message = err instanceof Error ? err.message : ''
-          const canFallback = /oneshot/i.test(message)
-          if (!canFallback) {
-            throw err
+        if (pending.params.rawHex) {
+          console.info('[WC] legacy rawHex flow')
+          this.setState({ pendingRequestStatus: 'broadcasting' })
+          if (this.isUnsignedRawHex(pending.params.rawHex)) {
+            const outputsForRebuild =
+              pending.params.outputs && pending.params.outputs.length > 0
+                ? pending.params.outputs
+                : this.deriveOutputsFromRawHex(pending.params.rawHex)
+            const broadcast = await this.buildSignBroadcastFromOutputs(outputsForRebuild, pending.params.message)
+            txid = broadcast.txid
+          } else {
+            const broadcast = await this.signAndBroadcastRawHex(pending.params.rawHex)
+            txid = broadcast.txid
           }
-          const fallback = await buyOfferById(offerId)
-          txid = fallback.txid
+        } else if (pending.params.outputs?.length) {
+          this.setState({ pendingRequestStatus: 'broadcasting' })
+          const broadcast = await this.buildSignBroadcastFromOutputs(pending.params.outputs, pending.params.message)
+          txid = broadcast.txid
+        } else {
+          const { acceptOfferById } = await import('../../services/agoraExchange')
+          const { buyOfferById } = await import('../../services/buyOfferById')
+
+          try {
+            this.setState({ pendingRequestStatus: 'signing' })
+            const result = await acceptOfferById({ offerId, wallet: xolosWalletService })
+            txid = result.txid
+          } catch (err) {
+            const message = err instanceof Error ? err.message : ''
+            const canFallback = /oneshot/i.test(message)
+            if (!canFallback) {
+              throw err
+            }
+            const fallback = await buyOfferById(offerId)
+            txid = fallback.txid
+          }
         }
       }
 
@@ -1443,6 +1843,7 @@ export class WcWallet {
       }
 
       await this.respondSuccess(pending.topic, pending.id, { txid })
+      console.info(`[WC] broadcast success txid=${txid}`)
       const buyer = xolosWalletService.getAddress() ?? undefined
       const rawKind = pending.params?.kind
       const kind = typeof rawKind === 'string' && rawKind.trim().length > 0 ? rawKind.trim() : 'rmz'
@@ -1477,7 +1878,13 @@ export class WcWallet {
         createdAt: pending.createdAt,
         method: pending.method
       })
-      console.info('[WCv2] sign success / broadcast success', { offerId, txid })
+      console.info('[WCv2] sign success / broadcast success', {
+        offerId,
+        mode,
+        outputsCount,
+        totalSats: totalSats.toString(),
+        txid
+      })
     } catch (err) {
       const message = err instanceof Error ? err.message : this.normalizeJsonRpcError('internal').message
       await this.respondError(pending.topic, pending.id, {
@@ -1540,7 +1947,7 @@ export class WcWallet {
     })
     this.clearPendingExpiryTimer()
     appendWcRequestHistory({
-      offerId: pending.params.offerId,
+      offerId: pending.params.offerId ?? '',
       peer: pending.peer?.name ?? pending.peer?.url ?? 'unknown',
       topic: pending.topic,
       status: 'rejected',
@@ -1568,7 +1975,7 @@ export class WcWallet {
     })
     this.clearPendingExpiryTimer()
     appendWcRequestHistory({
-      offerId: pending.params.offerId,
+      offerId: pending.params.offerId ?? '',
       peer: pending.peer?.name ?? pending.peer?.url ?? 'unknown',
       topic: pending.topic,
       status: 'error',
@@ -1579,4 +1986,4 @@ export class WcWallet {
   }
 }
 
-export const wcWallet = new WcWallet()
+export const wcWallet = WcWallet.getInstance()

@@ -11,14 +11,8 @@ export type ProposalLike = {
         icons?: string[]
       }
     }
-    requiredNamespaces: Record<
-      string,
-      {
-        chains?: string[]
-        methods?: string[]
-        events?: string[]
-      }
-    >
+    requiredNamespaces: Record<string, { chains?: string[]; methods?: string[]; events?: string[] }>
+    optionalNamespaces?: Record<string, { chains?: string[]; methods?: string[]; events?: string[] }>
   }
 }
 
@@ -29,6 +23,31 @@ type ApproveSessionModalProps = {
   onApproved: () => void
   onRejected?: () => void
   onClose?: () => void
+}
+
+type WalletConnectSignClient = {
+  approve?: (args: { id: number; namespaces: Record<string, unknown> }) => Promise<unknown>
+}
+
+function getSignClient(): WalletConnectSignClient | null {
+  const wallet = wcWallet as unknown as {
+    web3wallet?: {
+      approveSession?: (args: { id: number; namespaces: Record<string, unknown> }) => Promise<unknown>
+      approve?: WalletConnectSignClient['approve']
+    }
+  }
+  if (!wallet.web3wallet) return null
+  return {
+    approve: async (args) => {
+      if (wallet.web3wallet?.approve) {
+        return wallet.web3wallet.approve(args)
+      }
+      if (wallet.web3wallet?.approveSession) {
+        return wallet.web3wallet.approveSession(args)
+      }
+      throw new Error('WalletConnect client no soporta approve().')
+    }
+  }
 }
 
 const SectionRow = ({ label, children }: { label: string; children: ReactNode }) => (
@@ -55,12 +74,21 @@ export default function ApproveSessionModal({
   const metadata = proposal.params.proposer.metadata
   const icon = metadata.icons?.[0]
   const requiredNamespaces = proposal.params.requiredNamespaces
+  const optionalNamespaces = proposal.params.optionalNamespaces ?? {}
+  const proposalChains = Array.from(
+    new Set([...(requiredNamespaces.ecash?.chains ?? []), ...(optionalNamespaces.ecash?.chains ?? [])])
+  )
+  const selectedChain = proposalChains.includes('ecash:1')
+    ? 'ecash:1'
+    : proposalChains.includes('ecash:mainnet')
+      ? 'ecash:mainnet'
+      : null
   const normalizedAddress = activeAddress
     ? activeAddress.startsWith('ecash:')
       ? activeAddress.slice('ecash:'.length)
       : activeAddress
     : null
-  const addressLabel = normalizedAddress ? `ecash:1:${normalizedAddress}` : 'Sin dirección activa'
+  const addressLabel = normalizedAddress ? `${selectedChain ?? 'ecash:1'}:${normalizedAddress}` : 'Sin dirección activa'
 
   const handleApprove = async () => {
     setIsApproving(true)
@@ -74,20 +102,37 @@ export default function ApproveSessionModal({
       setIsApproving(false)
       return
     }
+    if (!selectedChain) {
+      const reason = 'Unsupported chain'
+      console.warn('[WC] rejecting proposal due to unsupported chain', { id: proposal.id, proposalChains })
+      await wcWallet.rejectSession(proposal.id, { code: 5100, message: reason })
+      setErrorMsg(reason)
+      setIsApproving(false)
+      return
+    }
 
-    const namespaces = {
+    const approvedNamespaces = {
       ecash: {
         methods: ['ecash_getAddresses', 'ecash_signAndBroadcastTransaction'],
-        chains: ['ecash:1'],
+        chains: [selectedChain],
         events: ['accountsChanged', 'xolos_offer_published', 'xolos_offer_consumed'],
-        accounts: normalizedAddress ? [`ecash:1:${normalizedAddress}`] : []
+        accounts: normalizedAddress ? [`${selectedChain}:${normalizedAddress}`] : []
       }
     }
 
-    console.log('[WC] approving namespaces', namespaces)
+    console.log('[wc] approving proposal', {
+      proposalChains,
+      selectedChain,
+      approvedNamespaces
+    })
 
     try {
-      await wcWallet.approveSession(proposal.id, namespaces)
+      const signClient = getSignClient()
+      if (!signClient?.approve) {
+        throw new Error('WalletConnect client aún no está inicializado.')
+      }
+      await signClient.approve({ id: proposal.id, namespaces: approvedNamespaces })
+      wcWallet.refreshSessions()
       setSuccessMsg('Vínculo sellado ✓')
       onApproved()
       if (onClose) {
