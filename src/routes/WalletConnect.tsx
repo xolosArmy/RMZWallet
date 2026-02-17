@@ -38,10 +38,7 @@ function WalletConnect() {
   )
   const effectiveUri = useMemo(() => (pendingPairUri ?? uri).trim(), [pendingPairUri, uri])
   const isValidUri = useMemo(() => canPairWalletConnectUri(effectiveUri), [effectiveUri])
-  const canConnect = useMemo(
-    () => !isPairing && isValidUri && wcReady,
-    [isPairing, isValidUri, wcReady]
-  )
+  const canConnect = useMemo(() => !isPairing && isValidUri, [isPairing, isValidUri])
   const visibleError = useMemo(() => (error && !isChronikWsError(error) ? error : null), [error])
   const visibleWalletConnectError = useMemo(
     () => (wcState.lastError && !isChronikWsError(wcState.lastError) ? wcState.lastError : null),
@@ -377,7 +374,7 @@ function WalletConnect() {
                 onClick={handlePair}
                 disabled={!canConnect}
               >
-                {isPairing ? 'Conectando…' : 'Conectar'}
+                {isPairing ? 'Conectando…' : !wcReady && isValidUri ? 'Conectar (inicializando...)' : 'Conectar'}
               </button>
             </div>
             <p className="muted">{connectionStatusLabel}</p>
@@ -405,7 +402,7 @@ function WalletConnect() {
               onClick={handlePair}
               disabled={!canConnect}
             >
-              {isPairing ? 'Conectando…' : 'Conectar'}
+              {isPairing ? 'Conectando…' : !wcReady && isValidUri ? 'Conectar (inicializando...)' : 'Conectar'}
             </button>
             <span className="pill pill-ghost">{address ? `Activo: ${address}` : 'Sin dirección activa'}</span>
           </div>

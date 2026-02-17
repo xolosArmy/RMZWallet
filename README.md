@@ -12,7 +12,7 @@ Configura estas variables en Vercel o tu entorno local:
 - `VITE_NFT_MINT_FEE_RECEIVER_ADDRESS` (tesorería para el fee de minteo)
 - `VITE_WALLETCONNECT_PROJECT_ID` (principal, requerido para WalletConnect v2)
 - `VITE_WC_PROJECT_ID` (legacy compatible; fallback si falta la principal)
-- `VITE_WC_ALLOWED_DOMAINS` (opcional, lista CSV para warning anti-phishing en UI)
+- `VITE_WC_ALLOWED_DOMAINS` (opcional, lista CSV para warning anti-phishing en UI; sugerido: `teyolia.cash,www.teyolia.cash`)
 
 ## WalletConnect v2 (CAIP-25)
 
