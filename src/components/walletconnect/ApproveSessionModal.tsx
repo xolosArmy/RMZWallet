@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from 'react'
+import type { SessionTypes } from '@walletconnect/types'
 import { wcWallet } from '../../lib/walletconnect/WcWallet'
 
 export type ProposalLike = {
@@ -23,31 +24,6 @@ type ApproveSessionModalProps = {
   onApproved: () => void
   onRejected?: () => void
   onClose?: () => void
-}
-
-type WalletConnectSignClient = {
-  approve?: (args: { id: number; namespaces: Record<string, unknown> }) => Promise<unknown>
-}
-
-function getSignClient(): WalletConnectSignClient | null {
-  const wallet = wcWallet as unknown as {
-    web3wallet?: {
-      approveSession?: (args: { id: number; namespaces: Record<string, unknown> }) => Promise<unknown>
-      approve?: WalletConnectSignClient['approve']
-    }
-  }
-  if (!wallet.web3wallet) return null
-  return {
-    approve: async (args) => {
-      if (wallet.web3wallet?.approve) {
-        return wallet.web3wallet.approve(args)
-      }
-      if (wallet.web3wallet?.approveSession) {
-        return wallet.web3wallet.approveSession(args)
-      }
-      throw new Error('WalletConnect client no soporta approve().')
-    }
-  }
 }
 
 const SectionRow = ({ label, children }: { label: string; children: ReactNode }) => (
@@ -83,12 +59,13 @@ export default function ApproveSessionModal({
     : proposalChains.includes('ecash:mainnet')
       ? 'ecash:mainnet'
       : null
+  const fallbackChain = selectedChain ?? 'ecash:1'
   const normalizedAddress = activeAddress
     ? activeAddress.startsWith('ecash:')
       ? activeAddress.slice('ecash:'.length)
       : activeAddress
     : null
-  const addressLabel = normalizedAddress ? `${selectedChain ?? 'ecash:1'}:${normalizedAddress}` : 'Sin dirección activa'
+  const addressLabel = normalizedAddress ? `${fallbackChain}:${normalizedAddress}` : 'Sin dirección activa'
 
   const handleApprove = async () => {
     setIsApproving(true)
@@ -102,37 +79,27 @@ export default function ApproveSessionModal({
       setIsApproving(false)
       return
     }
-    if (!selectedChain) {
-      const reason = 'Unsupported chain'
-      console.warn('[WC] rejecting proposal due to unsupported chain', { id: proposal.id, proposalChains })
-      await wcWallet.rejectSession(proposal.id, { code: 5100, message: reason })
-      setErrorMsg(reason)
-      setIsApproving(false)
-      return
-    }
-
     const approvedNamespaces = {
       ecash: {
         methods: ['ecash_getAddresses', 'ecash_signAndBroadcastTransaction'],
-        chains: [selectedChain],
+        chains: proposalChains.length > 0 ? proposalChains : [fallbackChain],
         events: ['accountsChanged', 'xolos_offer_published', 'xolos_offer_consumed'],
-        accounts: normalizedAddress ? [`${selectedChain}:${normalizedAddress}`] : []
+        accounts: normalizedAddress ? [`${fallbackChain}:${normalizedAddress}`] : []
       }
     }
 
     console.log('[wc] approving proposal', {
       proposalChains,
-      selectedChain,
+      selectedChain: fallbackChain,
       approvedNamespaces
     })
 
     try {
-      const signClient = getSignClient()
-      if (!signClient?.approve) {
-        throw new Error('WalletConnect client aún no está inicializado.')
-      }
-      await signClient.approve({ id: proposal.id, namespaces: approvedNamespaces })
-      wcWallet.refreshSessions()
+      await wcWallet.approveSession(
+        proposal.id,
+        approvedNamespaces as unknown as SessionTypes.Namespaces,
+        proposalChains
+      )
       setSuccessMsg('Vínculo sellado ✓')
       onApproved()
       if (onClose) {

@@ -1249,57 +1249,38 @@ export class WcWallet {
     }
     try {
       const ecashNamespace = namespaces.ecash
-      const events = Array.from(
-        new Set([
-          ...(ecashNamespace?.events ?? []),
-          WC_EVENT_ACCOUNTS_CHANGED,
-          WC_EVENT_OFFER_PUBLISHED,
-          WC_EVENT_OFFER_CONSUMED
-        ])
-      )
-      const chainsRequested = proposalChains && proposalChains.length > 0 ? proposalChains : ecashNamespace?.chains ?? []
-      const selectedChain = this.selectPreferredChain(chainsRequested)
-      if (chainsRequested.length > 0 && !selectedChain) {
-        throw new Error('Unsupported chain')
+      const activeAddress = xolosWalletService.getAddress()
+      const fallbackAccount = ecashNamespace?.accounts?.[0]
+      const fallbackAddressPart = fallbackAccount ? fallbackAccount.split(':').slice(2).join(':') : null
+      const addressSource = activeAddress ?? fallbackAddressPart
+      if (!addressSource) {
+        throw new Error('Wallet not ready')
       }
-      const chains = [selectedChain ?? WC_CHAIN_ID]
-      const requestedMethods = ecashNamespace?.methods ?? []
-      const baseMethods = requestedMethods.includes(WC_METHOD_GET_ADDRESSES)
-        ? requestedMethods
-        : [...requestedMethods, WC_METHOD_GET_ADDRESSES]
-      const methods = baseMethods.includes(WC_METHOD_SIGN_AND_BROADCAST)
-        ? baseMethods
-        : [...baseMethods, WC_METHOD_SIGN_AND_BROADCAST]
+      const normalizedAddress = normalizeEcashAddressLikeYouAlreadyDid(addressSource)
+      if (normalizedAddress !== addressSource) {
+        console.log('[wc] sanitized session account address', {
+          from: addressSource,
+          to: normalizedAddress
+        })
+      }
 
-      const updatedNamespaces = ecashNamespace
-        ? ecashNamespace.accounts && ecashNamespace.accounts.length > 0
-          ? {
-              ...namespaces,
-              ecash: {
-                ...ecashNamespace,
-                events,
-                methods,
-                chains,
-                accounts: ecashNamespace.accounts.map((account) => {
-                  const parts = account.split(':')
-                  if (parts.length < 3) return account
-                  const addressPart = parts.slice(2).join(':')
-                  if (!addressPart) return account
-                  const caipAddress = normalizeEcashAddressLikeYouAlreadyDid(addressPart)
-                  return `${chains[0]}:${caipAddress}`
-                })
-              }
-            }
-          : {
-              ...namespaces,
-              ecash: { ...ecashNamespace, events, methods, chains }
-            }
-        : namespaces
+      const updatedNamespaces: SessionTypes.Namespaces = {
+        ...namespaces,
+        ecash: {
+          ...ecashNamespace,
+          chains: [WC_CHAIN_ID, WC_CHAIN_ID_LEGACY],
+          methods: [WC_METHOD_SIGN_AND_BROADCAST, WC_METHOD_SIGN_AND_BROADCAST_ALIAS, WC_METHOD_GET_ADDRESSES],
+          events: [WC_EVENT_ACCOUNTS_CHANGED],
+          accounts: [`${WC_CHAIN_ID}:${normalizedAddress}`, `${WC_CHAIN_ID_LEGACY}:${normalizedAddress}`]
+        }
+      }
+
+      console.log('[wc] approving session namespaces', updatedNamespaces)
 
       console.info('[WCv2] proposal approved', {
         id,
-        proposalChains: chainsRequested,
-        selectedChain: chains[0],
+        proposalChains: proposalChains ?? ecashNamespace?.chains ?? [],
+        selectedChain: WC_CHAIN_ID,
         approvedNamespaces: updatedNamespaces
       })
       const approved = await this.web3wallet.approveSession({ id, namespaces: updatedNamespaces })

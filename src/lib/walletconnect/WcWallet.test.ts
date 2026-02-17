@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import type { SessionTypes } from '@walletconnect/types'
 import { getChronik } from '../../services/ChronikClient.ts'
 import { xolosWalletService } from '../../services/XolosWalletService.ts'
 import { WcWallet } from './WcWallet.ts'
@@ -80,6 +81,55 @@ test('session_request con offerId faltante responde -32602', async () => {
 
   assert.equal(responses.length, 1)
   assert.equal(responses[0].response.error?.code, -32602)
+
+  xolosWalletService.getAddress = originalGetAddress
+})
+
+test('approveSession fuerza namespace ecash con ecash:1 y signAndBroadcastTransaction', async () => {
+  const originalGetAddress = xolosWalletService.getAddress
+  xolosWalletService.getAddress = () => 'ecash:qqtestaddress'
+
+  let approvedPayload:
+    | {
+        id: number
+        namespaces: Record<string, unknown>
+      }
+    | undefined
+
+  const wallet = new (WcWallet as unknown as { new (): WcWallet })()
+  ;(wallet as unknown as { web3wallet: unknown }).web3wallet = {
+    async approveSession(payload: { id: number; namespaces: Record<string, unknown> }) {
+      approvedPayload = payload
+      return { topic: 'topic-1' }
+    },
+    getActiveSessions() {
+      return {}
+    }
+  }
+
+  await wallet.approveSession(
+    777,
+    {
+      ecash: {
+        chains: ['ecash:999'],
+        methods: ['ecash_unknown'],
+        events: ['unknownEvent'],
+        accounts: ['ecash:1:ecash:qqlegacy']
+      }
+    } as unknown as SessionTypes.Namespaces,
+    ['ecash:999']
+  )
+
+  assert.ok(approvedPayload)
+  assert.equal(approvedPayload.id, 777)
+  assert.deepEqual(approvedPayload.namespaces, {
+    ecash: {
+      chains: ['ecash:1', 'ecash:mainnet'],
+      methods: ['ecash_signAndBroadcastTransaction', 'ecash_signAndBroadcast', 'ecash_getAddresses'],
+      events: ['accountsChanged'],
+      accounts: ['ecash:1:qqtestaddress', 'ecash:mainnet:qqtestaddress']
+    }
+  })
 
   xolosWalletService.getAddress = originalGetAddress
 })
