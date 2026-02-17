@@ -47,14 +47,20 @@ function WalletConnect() {
   const connectionStatusLabel = useMemo(() => {
     if (visibleError || visibleWalletConnectError) return 'Error'
     if (wcState.sessions.length > 0 || status === 'session_active') return 'Sesión activa'
+    if (status === 'paired') return 'Sesión creada'
     if (status === 'proposal_received') return 'Proposal recibido'
     if (status === 'paired_waiting_proposal') return 'Pair ok, esperando proposal...'
+    if (status === 'initializing') return 'Inicializando WalletConnect...'
     if (status === 'pairing' || isPairing) return 'Pairing...'
     return 'Listo para conectar'
   }, [isPairing, status, visibleError, visibleWalletConnectError, wcState.sessions.length])
   const statusDetail = useMemo(() => {
     if (!status) return null
-    if (['idle', 'pairing', 'paired_waiting_proposal', 'proposal_received', 'session_active'].includes(status)) {
+    if (
+      ['idle', 'initializing', 'pairing', 'paired', 'paired_waiting_proposal', 'proposal_received', 'session_active'].includes(
+        status
+      )
+    ) {
       return null
     }
     return status
@@ -184,18 +190,27 @@ function WalletConnect() {
 
     ;(async () => {
       try {
+        const cleaned = sanitizeWcUri(pendingPairUri)
+        if (!canPairWalletConnectUri(cleaned)) {
+          setUriError(INVALID_WC_URI_ERROR)
+          setPendingPairUri(null)
+          setStatus('idle')
+          return
+        }
+
         console.log('[wc] auto-pair queued URI', pendingPairUri)
         setIsPairing(true)
         setStatus('pairing')
-        await wcWallet.pair(pendingPairUri)
-        console.log('[wc] pair() ok, waiting for session_proposal...')
-        setStatus('paired_waiting_proposal')
-        setSuccess('Pairing iniciado ✓')
-        setError(null)
+        setUriError(null)
+        await wcWallet.pair(cleaned)
+        console.log('[wc] pair() ok')
         setPendingPairUri(null)
+        setStatus('paired')
+        setSuccess('Sesión WalletConnect creada.')
+        setError(null)
       } catch (err) {
         const message = (err as Error).message || 'No se pudo emparejar el URI en cola.'
-        setError(`Auto-pair falló: ${message}. Reintenta con Conectar.`)
+        setError(`Auto-pair falló: ${message}`)
         setStatus('idle')
       } finally {
         setIsPairing(false)
@@ -235,7 +250,7 @@ function WalletConnect() {
     if (!wcReady) {
       setPendingPairUri(cleaned)
       setUriError(null)
-      setStatus('pairing')
+      setStatus('initializing')
       return
     }
 
