@@ -114,7 +114,18 @@ function SendNft() {
         {(localError || error) && <div className="error">{localError || error}</div>}
         {txid && (
           <div className="success">
-            Transacción enviada: <span className="address-box">{txid}</span>
+            <p className="success-title">Transaction successful!</p>
+            <p className="success-hash">
+              Hash:
+              <a
+                href={`https://explorer.xolosarmy.xyz/tx/${txid}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="success-link"
+              >
+                {txid}
+              </a>
+            </p>
           </div>
         )}
       </form>

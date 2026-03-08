@@ -611,6 +611,29 @@ textarea:focus {
   margin-top: 10px;
 }
 
+.success-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.success-hash {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.success-link {
+  margin-left: 6px;
+  color: #00eaff;
+  text-decoration: none;
+}
+
+.success-link:hover {
+  text-decoration: underline;
+}
+
 .fee-breakdown {
   margin-top: 16px;
   padding: 14px;
