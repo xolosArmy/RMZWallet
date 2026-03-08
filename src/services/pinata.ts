@@ -62,14 +62,14 @@ export const uploadFileToPinata = async (file: File): Promise<{ cid: string }> =
   return { cid: data.IpfsHash }
 }
 
-export const uploadJsonToPinata = async (json: unknown): Promise<{ cid: string }> => {
+export const uploadJsonToPinata = async (json: unknown | string): Promise<{ cid: string }> => {
   const response = await fetchWithTimeout(`${PINATA_BASE_URL}/pinJSONToIPFS`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...resolveAuthHeaders()
     },
-    body: JSON.stringify(json)
+    body: typeof json === 'string' ? json : JSON.stringify(json)
   })
 
   const data = await parsePinataResponse(response)

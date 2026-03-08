@@ -2,6 +2,7 @@ import type { GenesisInfo, ScriptUtxo } from 'chronik-client'
 import { getChronik } from './ChronikClient'
 import { uploadFileToPinata, uploadJsonToPinata } from './pinata'
 import { buildXolosarmyNftMetadata } from './nftMetadata'
+import type { XolosLineage } from './nftMetadata'
 import { mintNftChildGenesis, sendNftChild } from './slpNftTxBuilder'
 import { XOLOSARMY_NFT_PARENT_TOKEN_ID } from '../config/nfts'
 import { xolosWalletService } from './XolosWalletService'
@@ -101,8 +102,24 @@ const cacheParent = (tokenId: string, parentId: string) => {
 
 const getCachedMetadata = (tokenId: string) => readCache().metadataByTokenId[tokenId]
 
-const hashJsonToSha256Hex = async (json: unknown): Promise<string> => {
-  const data = new TextEncoder().encode(JSON.stringify(json))
+const stableStringifyJson = (value: unknown): string => {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableStringifyJson(entry)).join(',')}]`
+  }
+  const objectEntries = Object.entries(value as Record<string, unknown>)
+    .filter(([, entry]) => typeof entry !== 'undefined')
+    .sort(([left], [right]) => left.localeCompare(right))
+  const serializedEntries = objectEntries.map(
+    ([key, entry]) => `${JSON.stringify(key)}:${stableStringifyJson(entry)}`
+  )
+  return `{${serializedEntries.join(',')}}`
+}
+
+const hashJsonToSha256Hex = async (json: string): Promise<string> => {
+  const data = new TextEncoder().encode(json)
   const digest = await crypto.subtle.digest('SHA-256', data)
   return Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, '0'))
@@ -126,6 +143,7 @@ export const mintXolosarmyNftChild = async (params: {
   description: string
   imageFile: File
   externalUrl?: string
+  lineage?: XolosLineage
 }): Promise<{ childTokenId: string; txid: string; metadataCid: string }> => {
   const walletKeyInfo = xolosWalletService.getKeyInfo()
   const address = walletKeyInfo.xecAddress ?? walletKeyInfo.address
@@ -141,12 +159,14 @@ export const mintXolosarmyNftChild = async (params: {
     name: params.name,
     description: params.description,
     imageCid: imageResult.cid,
-    externalUrl: params.externalUrl
+    externalUrl: params.externalUrl,
+    lineage: params.lineage
   })
+  const metadataJson = stableStringifyJson(metadata)
 
-  const metadataResult = await uploadJsonToPinata(metadata)
+  const metadataResult = await uploadJsonToPinata(metadataJson)
   const documentUrl = `ipfs://${metadataResult.cid}`
-  const documentHash = await hashJsonToSha256Hex(metadata)
+  const documentHash = await hashJsonToSha256Hex(metadataJson)
 
   const genesisInfo: GenesisInfo = {
     tokenTicker: 'XOLOSNFT',

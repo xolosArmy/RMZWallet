@@ -26,6 +26,7 @@ import {
   resolveIpfsGatewayBase
 } from '../utils/ipfs'
 import { WALLET_REFRESH_EVENT, type WalletRefreshDetail } from '../utils/walletRefresh'
+import type { XolosLineage } from '../services/nftMetadata'
 
 const SLP_NFT1_GROUP = 129
 const FEE_PER_KB = 1200n
@@ -52,6 +53,18 @@ function Nfts() {
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [externalUrl, setExternalUrl] = useState('')
+  const [lineageEtapa, setLineageEtapa] = useState<'' | NonNullable<XolosLineage['etapa']>>('')
+  const [lineageSexo, setLineageSexo] = useState('')
+  const [lineageColor, setLineageColor] = useState('')
+  const [lineageVariedad, setLineageVariedad] = useState('')
+  const [lineageFechaNacimiento, setLineageFechaNacimiento] = useState('')
+  const [lineageLugarNacimiento, setLineageLugarNacimiento] = useState('')
+  const [lineageCriador, setLineageCriador] = useState('')
+  const [lineagePadre, setLineagePadre] = useState('')
+  const [lineageMadre, setLineageMadre] = useState('')
+  const [lineageCamada, setLineageCamada] = useState('')
+  const [lineageMicrochip, setLineageMicrochip] = useState('')
+  const [lineageRegistroFcm, setLineageRegistroFcm] = useState('')
   const [imageFile, setImageFile] = useState<File | null>(null)
   const [imagePreview, setImagePreview] = useState<string | null>(null)
   const [mintBusy, setMintBusy] = useState(false)
@@ -258,11 +271,28 @@ function Nfts() {
 
     setMintBusy(true)
     try {
+      const lineagePayload: XolosLineage = {
+        etapa: lineageEtapa || undefined,
+        sexo: lineageSexo.trim() || undefined,
+        color: lineageColor.trim() || undefined,
+        variedad: lineageVariedad.trim() || undefined,
+        fechaNacimiento: lineageFechaNacimiento || undefined,
+        lugarNacimiento: lineageLugarNacimiento.trim() || undefined,
+        criador: lineageCriador.trim() || undefined,
+        padre: lineagePadre.trim() || undefined,
+        madre: lineageMadre.trim() || undefined,
+        camada: lineageCamada.trim() || undefined,
+        microchip: lineageMicrochip.trim() || undefined,
+        registroFCM: lineageRegistroFcm.trim() || undefined
+      }
+      const hasLineageData = Object.values(lineagePayload).some((value) => typeof value !== 'undefined')
+
       const result = await mintXolosarmyNftChild({
         name: name.trim(),
         description: description.trim(),
         imageFile,
-        externalUrl: externalUrl.trim() || undefined
+        externalUrl: externalUrl.trim() || undefined,
+        lineage: hasLineageData ? lineagePayload : undefined
       })
       setMintTxid(result.txid)
       setMintTokenId(result.childTokenId)
@@ -272,6 +302,18 @@ function Nfts() {
       setName('')
       setDescription('')
       setExternalUrl('')
+      setLineageEtapa('')
+      setLineageSexo('')
+      setLineageColor('')
+      setLineageVariedad('')
+      setLineageFechaNacimiento('')
+      setLineageLugarNacimiento('')
+      setLineageCriador('')
+      setLineagePadre('')
+      setLineageMadre('')
+      setLineageCamada('')
+      setLineageMicrochip('')
+      setLineageRegistroFcm('')
       setImageFile(null)
     } catch (err) {
       setMintError((err as Error).message || 'No pudimos mintear el NFT.')
@@ -481,6 +523,133 @@ function Nfts() {
               onChange={(e) => setExternalUrl(e.target.value)}
               placeholder="https://..."
             />
+
+            <div className="card" style={{ marginTop: 12 }}>
+              <p className="card-kicker">Lineage (opcional)</p>
+              <label htmlFor="nftEtapa">Etapa</label>
+              <select
+                id="nftEtapa"
+                value={lineageEtapa}
+                onChange={(e) =>
+                  setLineageEtapa(e.target.value as '' | NonNullable<XolosLineage['etapa']>)
+                }
+              >
+                <option value="">Seleccionar etapa</option>
+                <option value="adulto">Adulto</option>
+                <option value="joven">Joven</option>
+                <option value="recien-nacido">Recién nacido</option>
+              </select>
+
+              <label htmlFor="nftSexo" style={{ marginTop: 12 }}>
+                Sexo
+              </label>
+              <input
+                id="nftSexo"
+                value={lineageSexo}
+                onChange={(e) => setLineageSexo(e.target.value)}
+                placeholder="Ej. Hembra"
+              />
+
+              <label htmlFor="nftColor" style={{ marginTop: 12 }}>
+                Color
+              </label>
+              <input
+                id="nftColor"
+                value={lineageColor}
+                onChange={(e) => setLineageColor(e.target.value)}
+                placeholder="Ej. Negro"
+              />
+
+              <label htmlFor="nftVariedad" style={{ marginTop: 12 }}>
+                Variedad
+              </label>
+              <input
+                id="nftVariedad"
+                value={lineageVariedad}
+                onChange={(e) => setLineageVariedad(e.target.value)}
+                placeholder="Ej. Sin pelo"
+              />
+
+              <label htmlFor="nftFechaNacimiento" style={{ marginTop: 12 }}>
+                Fecha de nacimiento
+              </label>
+              <input
+                id="nftFechaNacimiento"
+                type="date"
+                value={lineageFechaNacimiento}
+                onChange={(e) => setLineageFechaNacimiento(e.target.value)}
+              />
+
+              <label htmlFor="nftLugarNacimiento" style={{ marginTop: 12 }}>
+                Lugar de nacimiento
+              </label>
+              <input
+                id="nftLugarNacimiento"
+                value={lineageLugarNacimiento}
+                onChange={(e) => setLineageLugarNacimiento(e.target.value)}
+                placeholder="Ciudad / Estado"
+              />
+
+              <label htmlFor="nftCriador" style={{ marginTop: 12 }}>
+                Criador
+              </label>
+              <input
+                id="nftCriador"
+                value={lineageCriador}
+                onChange={(e) => setLineageCriador(e.target.value)}
+                placeholder="Nombre del criador"
+              />
+
+              <label htmlFor="nftPadre" style={{ marginTop: 12 }}>
+                Padre
+              </label>
+              <input
+                id="nftPadre"
+                value={lineagePadre}
+                onChange={(e) => setLineagePadre(e.target.value)}
+                placeholder="Nombre del padre"
+              />
+
+              <label htmlFor="nftMadre" style={{ marginTop: 12 }}>
+                Madre
+              </label>
+              <input
+                id="nftMadre"
+                value={lineageMadre}
+                onChange={(e) => setLineageMadre(e.target.value)}
+                placeholder="Nombre de la madre"
+              />
+
+              <label htmlFor="nftCamada" style={{ marginTop: 12 }}>
+                Camada
+              </label>
+              <input
+                id="nftCamada"
+                value={lineageCamada}
+                onChange={(e) => setLineageCamada(e.target.value)}
+                placeholder="Ej. Camada B"
+              />
+
+              <label htmlFor="nftMicrochip" style={{ marginTop: 12 }}>
+                Microchip
+              </label>
+              <input
+                id="nftMicrochip"
+                value={lineageMicrochip}
+                onChange={(e) => setLineageMicrochip(e.target.value)}
+                placeholder="ID de microchip"
+              />
+
+              <label htmlFor="nftRegistroFcm" style={{ marginTop: 12 }}>
+                Registro FCM
+              </label>
+              <input
+                id="nftRegistroFcm"
+                value={lineageRegistroFcm}
+                onChange={(e) => setLineageRegistroFcm(e.target.value)}
+                placeholder="Número de registro"
+              />
+            </div>
 
             <label htmlFor="nftImage" style={{ marginTop: 12 }}>
               Imagen
