@@ -439,7 +439,6 @@ export class XolosWalletService {
   }
 
   async sendRMZ(destination: string, amountAtoms: bigint): Promise<string> {
-    const wallet = this.getWallet()
     if (amountAtoms <= 0n) {
       throw new Error('El monto debe ser mayor a cero.')
     }
@@ -452,9 +451,51 @@ export class XolosWalletService {
       throw new Error(`No hay suficientes RMZ. Need: ${needStr} RMZ, Available: ${availStr} RMZ`)
     }
 
-    const amount = this.atomsToDisplayNumber(amountAtoms, rmzDecimals)
-    const outputs: SendETokenOutput[] = [{ address: destination, amount }]
-    return wallet.sendETokens(RMZ_ETOKEN_ID, outputs)
+    return this.sendToken(
+      RMZ_ETOKEN_ID,
+      [{ address: destination, amountAtoms }],
+      { expectedProtocol: 'ALP', tokenLabel: 'RMZ' }
+    )
+  }
+
+  async sendToken(
+    tokenId: string,
+    outputs: Array<{ address: string; amountAtoms: bigint }>,
+    options: { expectedProtocol?: string; tokenLabel?: string } = {}
+  ): Promise<string> {
+    const wallet = this.getWallet()
+    const normalizedTokenId = tokenId.trim().toLowerCase()
+    if (!/^[0-9a-f]{64}$/.test(normalizedTokenId)) {
+      throw new Error('El tokenId es inválido.')
+    }
+    if (!outputs.length) {
+      throw new Error('Debes indicar al menos un destino para el token.')
+    }
+
+    const tokenInfo = await getChronik().token(normalizedTokenId)
+    const protocol = tokenInfo?.tokenType?.protocol
+    const expectedProtocol = options.expectedProtocol?.trim().toUpperCase()
+    if (expectedProtocol && protocol !== expectedProtocol) {
+      const label = options.tokenLabel?.trim() || 'El token'
+      throw new Error(`${label} no usa protocolo ${expectedProtocol}.`)
+    }
+
+    const decimals = tokenInfo?.genesisInfo?.decimals
+    if (!Number.isInteger(decimals) || decimals < 0) {
+      throw new Error('No pudimos cargar los decimales del token.')
+    }
+
+    const normalizedOutputs: SendETokenOutput[] = outputs.map(({ address, amountAtoms }) => {
+      if (amountAtoms <= 0n) {
+        throw new Error('El monto del token debe ser mayor a cero.')
+      }
+      return {
+        address,
+        amount: this.atomsToDisplayNumber(amountAtoms, decimals)
+      }
+    })
+
+    return wallet.sendETokens(normalizedTokenId, normalizedOutputs)
   }
 
   async sendXEC(destination: string, amountInSats: number, message = ''): Promise<string> {

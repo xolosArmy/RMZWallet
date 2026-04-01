@@ -313,6 +313,67 @@ test('request con outputs usa ruta build+sign+broadcast desde outputs', async ()
   xolosWalletService.getAddress = originalGetAddress
 })
 
+test('intent con output token ALP usa el sender de tokens y preserva token', async () => {
+  const originalGetAddress = xolosWalletService.getAddress
+  const originalSendToken = xolosWalletService.sendToken
+  xolosWalletService.getAddress = () => 'ecash:qtestaddress'
+
+  const { wallet, responses, sessionRequest } = buildWalletHarness()
+  let sendTokenCalled = false
+
+  xolosWalletService.sendToken = async (tokenId, outputs, options) => {
+    sendTokenCalled = true
+    assert.equal(tokenId, 'c923bd0f09c630c5e9980cf518c8d34b6353802a3cb7c3f34fa7cc85c9305908')
+    assert.deepEqual(outputs, [{ address: 'ecash:qrecipient', amountAtoms: 160000n }])
+    assert.deepEqual(options, { expectedProtocol: 'ALP' })
+    return 'e'.repeat(64)
+  }
+
+  await sessionRequest({
+    topic: 't1',
+    id: 1071,
+    params: {
+      chainId: 'ecash:1',
+      request: {
+        method: 'ecash_signAndBroadcastTransaction',
+        params: {
+          offerId: 'offer-token-output',
+          mode: 'intent',
+          outputs: [
+            {
+              address: 'ecash:qrecipient',
+              valueSats: '546',
+              token: {
+                protocol: 'ALP',
+                tokenId: 'c923bd0f09c630c5e9980cf518c8d34b6353802a3cb7c3f34fa7cc85c9305908',
+                amount: '160000'
+              }
+            }
+          ]
+        }
+      }
+    }
+  })
+
+  assert.equal(
+    (
+      wallet.getState().pendingRequest?.params.outputs?.[0] as
+        | { token?: { protocol: string; tokenId: string; amount: string } }
+        | undefined
+    )?.token?.amount,
+    '160000'
+  )
+
+  await wallet.approvePendingRequest()
+
+  assert.equal(sendTokenCalled, true)
+  assert.equal(responses.length, 1)
+  assert.equal((responses[0].response.result as { txid: string }).txid, 'e'.repeat(64))
+
+  xolosWalletService.sendToken = originalSendToken
+  xolosWalletService.getAddress = originalGetAddress
+})
+
 test('si vienen rawHex unsigned y outputs, se reconstruye desde outputs', async () => {
   const originalGetAddress = xolosWalletService.getAddress
   xolosWalletService.getAddress = () => 'ecash:qtestaddress'
@@ -436,6 +497,43 @@ test('parser: intent-only (sin inputs) => mode intent', () => {
   })
   assert.equal(parsed.error, null)
   assert.equal(parsed.params?.requestMode, 'intent')
+})
+
+test('parser: preserva output.token ALP en intents', () => {
+  const wallet = new (WcWallet as unknown as { new (): WcWallet })() as unknown as {
+    parseSignAndBroadcastParams: (input: unknown) => {
+      params:
+        | {
+            outputs?: Array<{
+              token?: { protocol: 'ALP'; tokenId: string; amount: string }
+            }>
+            requestMode?: string
+          }
+        | null
+      error: { code: number } | null
+    }
+  }
+  const parsed = wallet.parseSignAndBroadcastParams({
+    mode: 'intent',
+    outputs: [
+      {
+        address: 'ecash:qrecipient',
+        valueSats: '546',
+        token: {
+          protocol: 'ALP',
+          tokenId: 'c923bd0f09c630c5e9980cf518c8d34b6353802a3cb7c3f34fa7cc85c9305908',
+          amount: '160000'
+        }
+      }
+    ]
+  })
+  assert.equal(parsed.error, null)
+  assert.equal(parsed.params?.requestMode, 'intent')
+  assert.deepEqual(parsed.params?.outputs?.[0]?.token, {
+    protocol: 'ALP',
+    tokenId: 'c923bd0f09c630c5e9980cf518c8d34b6353802a3cb7c3f34fa7cc85c9305908',
+    amount: '160000'
+  })
 })
 
 test('parser: legacy inputsUsed => mode legacy', () => {

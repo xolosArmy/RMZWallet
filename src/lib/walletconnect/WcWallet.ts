@@ -173,7 +173,15 @@ export type SignAndBroadcastParams = {
   offerId?: string
   rawHex?: string
   unsignedTxHex?: string
-  outputs?: Array<{ address: string; valueSats: string | number | bigint }>
+  outputs?: Array<{
+    address: string
+    valueSats: string | number | bigint
+    token?: {
+      protocol: 'ALP'
+      tokenId: string
+      amount: string | number | bigint
+    }
+  }>
   inputsUsed?: string[]
   outpoints?: string[]
   valueSats?: number | string | bigint
@@ -639,7 +647,11 @@ export class WcWallet {
       }
     }
 
-    const normalizedOutputs: Array<{ address: string; valueSats: string }> = []
+    const normalizedOutputs: Array<{
+      address: string
+      valueSats: string
+      token?: { protocol: 'ALP'; tokenId: string; amount: string }
+    }> = []
     if (requestParams.outputs !== undefined) {
       if (!Array.isArray(requestParams.outputs)) {
         return {
@@ -673,9 +685,48 @@ export class WcWallet {
             error: { code: -32602, message: 'Params inválidos: output.valueSats/sats/value debe ser entero > 0' }
           }
         }
+
+        let normalizedToken: { protocol: 'ALP'; tokenId: string; amount: string } | undefined
+        if ('token' in output && (output as { token?: unknown }).token !== undefined) {
+          const token = (output as { token?: unknown }).token
+          if (!isRecord(token)) {
+            return {
+              params: null,
+              error: { code: -32602, message: 'Params inválidos: output.token debe ser objeto' }
+            }
+          }
+          const protocol = typeof token.protocol === 'string' ? token.protocol.trim().toUpperCase() : ''
+          if (protocol !== 'ALP') {
+            return {
+              params: null,
+              error: { code: -32602, message: 'Params inválidos: output.token.protocol debe ser ALP' }
+            }
+          }
+          const tokenId = typeof token.tokenId === 'string' ? token.tokenId.trim().toLowerCase() : ''
+          if (!/^[0-9a-f]{64}$/.test(tokenId)) {
+            return {
+              params: null,
+              error: { code: -32602, message: 'Params inválidos: output.token.tokenId debe ser hex de 64 chars' }
+            }
+          }
+          const amount = normalizePositiveIntString(token.amount)
+          if (!amount) {
+            return {
+              params: null,
+              error: { code: -32602, message: 'Params inválidos: output.token.amount debe ser entero > 0' }
+            }
+          }
+          normalizedToken = {
+            protocol: 'ALP',
+            tokenId,
+            amount
+          }
+        }
+
         normalizedOutputs.push({
           address: candidate.address.trim(),
-          valueSats: normalizedValueSats
+          valueSats: normalizedValueSats,
+          token: normalizedToken
         })
       }
     }
@@ -951,11 +1002,23 @@ export class WcWallet {
   }
 
   private async buildSignBroadcastFromOutputs(
-    outputs: Array<{ address: string; valueSats: string | number | bigint }>,
+    outputs: Array<{
+      address: string
+      valueSats: string | number | bigint
+      token?: {
+        protocol: 'ALP'
+        tokenId: string
+        amount: string | number | bigint
+      }
+    }>,
     message?: string
   ): Promise<{ txid: string }> {
     if (!outputs.length) {
       throw new Error('outputs vacío')
+    }
+
+    if (outputs.some((output) => output.token)) {
+      return this.buildSignBroadcastFromTokenOutputs(outputs, message)
     }
 
     const walletKeyInfo = xolosWalletService.getKeyInfo()
@@ -1034,6 +1097,67 @@ export class WcWallet {
     await this.assertBroadcastFeePolicy(signedTx)
     await getChronik().validateRawTx(signedTxHex)
     return getChronik().broadcastTx(signedTxHex)
+  }
+
+  private async buildSignBroadcastFromTokenOutputs(
+    outputs: Array<{
+      address: string
+      valueSats: string | number | bigint
+      token?: {
+        protocol: 'ALP'
+        tokenId: string
+        amount: string | number | bigint
+      }
+    }>,
+    message?: string
+  ): Promise<{ txid: string }> {
+    if (message?.trim()) {
+      throw new Error('WalletConnect token intents no soportan message OP_RETURN adicional.')
+    }
+
+    const tokenOutputs = outputs.filter(
+      (
+        output
+      ): output is {
+        address: string
+        valueSats: string | number | bigint
+        token: {
+          protocol: 'ALP'
+          tokenId: string
+          amount: string | number | bigint
+        }
+      } => Boolean(output.token)
+    )
+
+    const xecOnlyOutputs = outputs.filter((output) => !output.token)
+    if (xecOnlyOutputs.length > 0) {
+      throw new Error('WalletConnect token intents no soportan mezclar outputs de XEC y token.')
+    }
+
+    const tokenId = tokenOutputs[0]?.token.tokenId
+    if (!tokenId) {
+      throw new Error('Intent tokenizado inválido: falta tokenId.')
+    }
+
+    for (const output of tokenOutputs) {
+      if (output.token.protocol !== 'ALP') {
+        throw new Error(`WalletConnect token protocol no soportado: ${output.token.protocol}`)
+      }
+      if (output.token.tokenId !== tokenId) {
+        throw new Error('WalletConnect token intents solo soportan un tokenId por transacción.')
+      }
+    }
+
+    const txid = await xolosWalletService.sendToken(
+      tokenId,
+      tokenOutputs.map((output) => ({
+        address: output.address,
+        amountAtoms: BigInt(output.token.amount)
+      })),
+      { expectedProtocol: 'ALP' }
+    )
+
+    return { txid }
   }
 
   private cleanupQueuedRequests() {
