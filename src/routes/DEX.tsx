@@ -909,20 +909,22 @@ function DEX() {
             Mint Pass
           </button>
 
-          {/* Botón Marketplace Externo */}
+          {/* Botón Marketplace Externo Actualizado */}
           <a
-            href="https://xololegend.xyz"
+            href="https://marketplace.xolosarmy.xyz/"
             target="_blank"
             rel="noopener noreferrer"
-            className="cta outline"
+            className="cta primary"
             style={{
               marginLeft: 'auto',
-              borderColor: 'var(--teal)',
-              color: 'var(--teal)',
-              borderStyle: 'dashed',
+              border: '2px solid var(--teal)',
+              background: 'linear-gradient(135deg, #00c6ff 0%, #0072ff 100%)',
+              color: '#fff',
+              boxShadow: '0 0 15px rgba(0, 198, 255, 0.4)',
+              animation: 'pulse 2s infinite',
             }}
           >
-            🛒 Adquirir RMZ en XoloLegend
+            🛒 ¡Comprar eToken $RMZ aquí!
           </a>
         </div>
 
