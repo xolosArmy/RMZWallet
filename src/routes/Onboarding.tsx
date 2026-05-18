@@ -4,6 +4,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
 import { EXTERNAL_SIGN_REQUEST_STORAGE_KEY, EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY } from '../utils/externalSign'
+import { resolvePendingConnectTarget, TONALLI_PENDING_REQUEST_KEY } from '../utils/tonalliConnect'
 
 function Onboarding() {
   const navigate = useNavigate()
@@ -30,11 +31,11 @@ function Onboarding() {
       navigate(returnTo, { replace: true })
       return
     }
-    const pendingSearch = localStorage.getItem('tonalli_pending_req_v1')
-    if (!pendingSearch) return
+    const pendingConnect = localStorage.getItem(TONALLI_PENDING_REQUEST_KEY)
+    if (!pendingConnect) return
     resumeHandledRef.current = true
-    localStorage.removeItem('tonalli_pending_req_v1')
-    navigate(`/connect${pendingSearch}`, { replace: true })
+    localStorage.removeItem(TONALLI_PENDING_REQUEST_KEY)
+    navigate(resolvePendingConnectTarget(pendingConnect), { replace: true })
   }, [backupVerified, initialized, navigate, searchParams])
 
   const handleCreate = async (e: FormEvent) => {

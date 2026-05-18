@@ -43,6 +43,7 @@ function App() {
           <Route path="/send-nft" element={<SendNft />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/connect" element={<ConnectRequest />} />
+          <Route path="/connect/sign-message" element={<ConnectRequest />} />
           <Route path="/walletconnect" element={<WalletConnect />} />
           <Route path="/external-sign" element={<ExternalSign />} />
           <Route path="/onboarding" element={<Onboarding />} />

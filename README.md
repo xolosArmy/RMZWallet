@@ -37,3 +37,9 @@ Configura estas variables en Vercel o tu entorno local:
 ## NFTs
 
 Ver pruebas manuales sugeridas en `docs/nfts.md`.
+
+## Tonalli Connect sign-message
+
+Tonalli Wallet expone la ruta `/connect/sign-message` para que apps externas, como eCash México Mining Gateway, soliciten una firma de challenge sin exponer llaves privadas. El callback vuelve por hash params con `status`, `address`, `pubkey`, `signature` y `challengeId`.
+
+Detalles y ejemplos: `docs/tonalli-connect-sign-message.md`.
