@@ -1,21 +1,5 @@
-const PINATA_BASE_URL = 'https://api.pinata.cloud/pinning'
+const PINATA_UPLOAD_URL = '/api/pinata/upload'
 const PINATA_TIMEOUT_MS = 20000
-
-const resolveAuthHeaders = (): Record<string, string> => {
-  const jwt = import.meta.env.VITE_PINATA_JWT
-  if (jwt) {
-    return { Authorization: `Bearer ${jwt}` }
-  }
-  const apiKey = import.meta.env.VITE_PINATA_API_KEY
-  const apiSecret = import.meta.env.VITE_PINATA_SECRET
-  if (apiKey && apiSecret) {
-    return {
-      pinata_api_key: apiKey,
-      pinata_secret_api_key: apiSecret
-    }
-  }
-  throw new Error('Pinata no está configurado. Agrega VITE_PINATA_JWT o VITE_PINATA_API_KEY/VITE_PINATA_SECRET.')
-}
 
 const fetchWithTimeout = async (input: RequestInfo, init?: RequestInit) => {
   const controller = new AbortController()
@@ -29,16 +13,30 @@ const fetchWithTimeout = async (input: RequestInfo, init?: RequestInit) => {
 }
 
 const parsePinataResponse = async (response: Response) => {
+  const contentType = response.headers.get('content-type') || ''
+  const payload = contentType.includes('application/json')
+    ? await response.json().catch(() => null)
+    : await response.text().catch(() => '')
+
   if (response.ok) {
-    return response.json()
+    return payload
   }
-  if (response.status === 401) {
-    throw new Error('Pinata rechazó la autenticación. Revisa tu JWT o API keys.')
+  if (response.status === 401 || response.status === 403) {
+    throw new Error('El backend rechazó la subida a IPFS. Revisa la configuración del servidor.')
   }
   if (response.status === 413) {
     throw new Error('El archivo es demasiado grande para Pinata.')
   }
-  const message = await response.text()
+  const message =
+    typeof payload === 'string'
+      ? payload
+      : payload && typeof payload === 'object'
+      ? String(
+          (payload as { error?: unknown; message?: unknown }).error ??
+            (payload as { error?: unknown; message?: unknown }).message ??
+            ''
+        )
+      : ''
   throw new Error(message || 'No pudimos subir el archivo a Pinata.')
 }
 
@@ -49,9 +47,8 @@ export const uploadFileToPinata = async (file: File): Promise<{ cid: string }> =
   const formData = new FormData()
   formData.append('file', file)
 
-  const response = await fetchWithTimeout(`${PINATA_BASE_URL}/pinFileToIPFS`, {
+  const response = await fetchWithTimeout(PINATA_UPLOAD_URL, {
     method: 'POST',
-    headers: resolveAuthHeaders(),
     body: formData
   })
 
@@ -63,11 +60,10 @@ export const uploadFileToPinata = async (file: File): Promise<{ cid: string }> =
 }
 
 export const uploadJsonToPinata = async (json: unknown | string): Promise<{ cid: string }> => {
-  const response = await fetchWithTimeout(`${PINATA_BASE_URL}/pinJSONToIPFS`, {
+  const response = await fetchWithTimeout(PINATA_UPLOAD_URL, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
-      ...resolveAuthHeaders()
+      'Content-Type': 'application/json'
     },
     body: typeof json === 'string' ? json : JSON.stringify(json)
   })

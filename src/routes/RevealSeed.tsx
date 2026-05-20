@@ -1,7 +1,11 @@
 import type { FormEvent } from 'react'
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import SensitiveSeedPhrase from '../components/SensitiveSeedPhrase'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
+
+const MAX_FAILED_ATTEMPTS = 3
+const LOCKOUT_DURATION_MS = 30_000
 
 function RevealSeed() {
   const { unlockEncryptedWallet, getMnemonic } = useWallet()
@@ -10,9 +14,44 @@ function RevealSeed() {
   const [error, setError] = useState<string | null>(null)
   const [copyStatus, setCopyStatus] = useState<string | null>(null)
   const [unlocking, setUnlocking] = useState(false)
+  const [failedAttempts, setFailedAttempts] = useState(0)
+  const [lockoutUntil, setLockoutUntil] = useState<number | null>(null)
+  const [lockoutRemainingSeconds, setLockoutRemainingSeconds] = useState(0)
+
+  useEffect(() => {
+    if (!lockoutUntil) {
+      setLockoutRemainingSeconds(0)
+      return
+    }
+
+    const syncCountdown = () => {
+      const remainingMs = lockoutUntil - Date.now()
+      if (remainingMs <= 0) {
+        setLockoutUntil(null)
+        setFailedAttempts(0)
+        setLockoutRemainingSeconds(0)
+        return
+      }
+
+      setLockoutRemainingSeconds(Math.ceil(remainingMs / 1000))
+    }
+
+    syncCountdown()
+    const intervalId = window.setInterval(syncCountdown, 250)
+
+    return () => window.clearInterval(intervalId)
+  }, [lockoutUntil])
+
+  const isLockedOut = useMemo(() => Boolean(lockoutUntil && lockoutRemainingSeconds > 0), [lockoutRemainingSeconds, lockoutUntil])
 
   const handleReveal = async (event: FormEvent) => {
     event.preventDefault()
+
+    if (isLockedOut) {
+      setError(`Demasiados intentos. Intenta de nuevo en ${lockoutRemainingSeconds} segundos.`)
+      return
+    }
+
     setError(null)
     setCopyStatus(null)
     setMnemonic(null)
@@ -27,11 +66,23 @@ function RevealSeed() {
       await unlockEncryptedWallet(pin)
       const phrase = getMnemonic()
       if (!phrase) {
-        throw new Error('No pudimos recuperar la seed. Intenta reimportar tu cartera.')
+        setError('No pudimos recuperar la seed. Intenta reimportar tu cartera.')
+        return
       }
+      setFailedAttempts(0)
+      setLockoutUntil(null)
       setMnemonic(phrase)
     } catch (err) {
-      setError((err as Error).message)
+      const message = (err as Error).message
+      const nextFailedAttempts = failedAttempts + 1
+      setFailedAttempts(nextFailedAttempts)
+
+      if (nextFailedAttempts >= MAX_FAILED_ATTEMPTS) {
+        setLockoutUntil(Date.now() + LOCKOUT_DURATION_MS)
+        setError(`Demasiados intentos. Intenta de nuevo en ${Math.ceil(LOCKOUT_DURATION_MS / 1000)} segundos.`)
+      } else {
+        setError(message)
+      }
     } finally {
       setUnlocking(false)
     }
@@ -75,16 +126,19 @@ function RevealSeed() {
             onChange={(e) => setPin(e.target.value)}
             placeholder="PIN local"
           />
+          {isLockedOut && (
+            <div className="error">Demasiados intentos. Intenta de nuevo en {lockoutRemainingSeconds} segundos.</div>
+          )}
           <div className="actions">
-            <button className="cta primary" type="submit" disabled={unlocking}>
-              {unlocking ? 'Desbloqueando...' : 'Revelar frase'}
+            <button className="cta primary" type="submit" disabled={unlocking || isLockedOut}>
+              {unlocking ? 'Desbloqueando...' : isLockedOut ? `Bloqueado (${lockoutRemainingSeconds}s)` : 'Revelar frase'}
             </button>
           </div>
         </form>
 
         {mnemonic && (
           <>
-            <div className="seed-box">{mnemonic}</div>
+            <SensitiveSeedPhrase mnemonic={mnemonic} />
             <p className="muted">Guarda esta frase en un lugar seguro. Es la clave de tu templo.</p>
             <div className="actions">
               <button className="cta outline" type="button" onClick={handleCopy}>

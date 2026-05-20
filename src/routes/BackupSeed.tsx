@@ -1,6 +1,7 @@
 import type { FormEvent } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
+import SensitiveSeedPhrase from '../components/SensitiveSeedPhrase'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
 
@@ -26,7 +27,7 @@ function BackupSeed() {
     }
   }, [backupState, navigate])
 
-  const checkAnswers = (e: FormEvent) => {
+  const checkAnswers = async (e: FormEvent) => {
     e.preventDefault()
     setError(null)
     setSuccess(null)
@@ -47,10 +48,14 @@ function BackupSeed() {
       return
     }
 
-    encryptAndStore(backupState.password)
-    setBackupVerified?.(true)
-    setSuccess('Seed respaldada. Puedes usar la billetera.')
-    navigate('/')
+    try {
+      await encryptAndStore(backupState.password)
+      setBackupVerified?.(true)
+      setSuccess('Seed respaldada. Puedes usar la billetera.')
+      navigate('/')
+    } catch {
+      setError('No se pudo cifrar y guardar la seed. Inténtalo de nuevo.')
+    }
   }
 
   if (!backupState?.mnemonic || !backupState?.password) {
@@ -69,11 +74,15 @@ function BackupSeed() {
       </header>
 
       <div className="card">
+        <div className="warning">
+          ATENCIÓN: Nunca tomes captura de pantalla de esta frase. Asegúrate de que no haya cámaras ni nadie
+          mirándote.
+        </div>
         <p className="muted">
           Escribe estas 12 palabras en orden. La seed solo vive en tu memoria y se cifra con tu password local.
-          En producción se debe usar PBKDF2/scrypt con salt e iteraciones altas para derivar claves.
+          La persistencia cifrada permanece en este dispositivo.
         </p>
-        <div className="address-box">{backupState.mnemonic}</div>
+        <SensitiveSeedPhrase mnemonic={backupState.mnemonic} className="address-box" />
       </div>
 
       <form className="card" onSubmit={checkAnswers}>

@@ -1,10 +1,13 @@
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
-import { fromHex, signMsg } from 'ecash-lib'
+import { ALL_BIP143, P2PKHSignatory, fromHex, signMsg } from 'ecash-lib'
+import { AgoraOneshotAdSignatory } from 'ecash-agora'
+import type { AgoraOffer } from 'ecash-agora'
+import type { TxBuilder } from 'ecash-lib'
 import type { ScriptUtxo } from 'chronik-client'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { FEE_RATE_SATS_PER_BYTE, TONALLI_SERVICE_FEE_SATS, XEC_TONALLI_TREASURY_ADDRESS } from '../config/xecFees'
 import { getChronik } from './ChronikClient'
-import { decryptWithPassword, encryptWithPassword } from './crypto'
+import { decryptWithPassword, encryptWithPassword, isEncryptedPayloadV2 } from './crypto'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
 import type {
   MinimalXecWallet,
@@ -128,7 +131,6 @@ export interface WalletKeyInfo {
   xecAddress: string | null
   address: string | null
   publicKeyHex: string | null
-  privateKeyHex: string | null
 }
 
 export class XolosWalletService {
@@ -192,8 +194,8 @@ export class XolosWalletService {
   }
 
   async restoreFromMnemonic(mnemonic: string): Promise<void> {
-    if (!mnemonic || mnemonic.trim().split(' ').length < 12) {
-      throw new Error('La frase semilla es inválida.')
+    if (!mnemonic || mnemonic.trim().split(" ").length < 12) {
+      throw new Error("La frase semilla es inválida.")
     }
     this.buildWallet(mnemonic.trim())
     const wallet = this.wallet as MinimalXecWallet
@@ -210,23 +212,33 @@ export class XolosWalletService {
     if (!this.encryptedMnemonic) {
       throw new Error('No existe una semilla cifrada en este dispositivo.')
     }
-    const mnemonic = decryptWithPassword(this.encryptedMnemonic, password)
+    const wasLegacy = !isEncryptedPayloadV2(this.encryptedMnemonic)
+    const mnemonic = await decryptWithPassword(this.encryptedMnemonic, password)
     await this.restoreFromMnemonic(mnemonic)
     this.decryptedMnemonic = mnemonic
     this.scanCache = null
     this.scanPromise = null
     this.scanPromiseGapLimit = null
+
+    if (wasLegacy) {
+      await this.encryptAndStoreMnemonic(password)
+    }
   }
 
   async unlockEncryptedWallet(password: string): Promise<void> {
     if (!this.encryptedMnemonic) {
       throw new Error('No existe una semilla cifrada en este dispositivo.')
     }
-    const mnemonic = decryptWithPassword(this.encryptedMnemonic, password)
+    const wasLegacy = !isEncryptedPayloadV2(this.encryptedMnemonic)
+    const mnemonic = await decryptWithPassword(this.encryptedMnemonic, password)
     this.decryptedMnemonic = mnemonic
+
+    if (wasLegacy) {
+      await this.encryptAndStoreMnemonic(password)
+    }
   }
 
-  encryptAndStoreMnemonic(password: string): void {
+  async encryptAndStoreMnemonic(password: string): Promise<void> {
     let mnemonic = this.decryptedMnemonic
 
     const walletMnemonic = this.wallet?.mnemonic || this.wallet?.walletInfo?.mnemonic
@@ -239,7 +251,7 @@ export class XolosWalletService {
       throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
     }
 
-    const cipherText = encryptWithPassword(mnemonic, password)
+    const cipherText = await encryptWithPassword(mnemonic, password)
     localStorage.setItem(STORAGE_KEY_MNEMONIC, cipherText)
     this.encryptedMnemonic = cipherText
   }
@@ -525,8 +537,7 @@ export class XolosWalletService {
       mnemonic: this.getMnemonic(),
       xecAddress,
       address: xecAddress,
-      publicKeyHex: this.getPublicKeyHex(),
-      privateKeyHex: this.getPrivateKeyHex()
+      publicKeyHex: this.getPublicKeyHex()
     }
   }
 
@@ -534,8 +545,47 @@ export class XolosWalletService {
     return this.wallet?.walletInfo?.publicKey || null
   }
 
-  getPrivateKeyHex(): string | null {
-    return this.wallet?.walletInfo?.privateKey || null
+  canSign(): boolean {
+    return Boolean(this.wallet?.walletInfo?.privateKey && this.wallet?.walletInfo?.publicKey)
+  }
+
+  getSignatory(): ReturnType<typeof P2PKHSignatory> {
+    return P2PKHSignatory(fromHex(this.getPrivateKeyHex()), fromHex(this.getPublicKeyHexOrThrow()), ALL_BIP143)
+  }
+
+  getAgoraAdSignatory(): ReturnType<typeof AgoraOneshotAdSignatory> {
+    return AgoraOneshotAdSignatory(fromHex(this.getPrivateKeyHex()))
+  }
+
+  signTxBuilder(builder: TxBuilder, options?: Parameters<TxBuilder['sign']>[0]) {
+    return builder.sign(options)
+  }
+
+  acceptAgoraOfferTx(params: {
+    offer: AgoraOffer
+    txParams: Omit<Parameters<AgoraOffer['acceptTx']>[0], 'covenantSk' | 'covenantPk'>
+  }) {
+    return params.offer.acceptTx({
+      ...params.txParams,
+      covenantSk: fromHex(this.getPrivateKeyHex()),
+      covenantPk: fromHex(this.getPublicKeyHexOrThrow())
+    })
+  }
+
+  private getPrivateKeyHex(): string {
+    const privateKeyHex = this.wallet?.walletInfo?.privateKey || null
+    if (!privateKeyHex) {
+      throw new Error('WALLET_LOCKED')
+    }
+    return privateKeyHex
+  }
+
+  private getPublicKeyHexOrThrow(): string {
+    const publicKeyHex = this.getPublicKeyHex()
+    if (!publicKeyHex) {
+      throw new Error('WALLET_LOCKED')
+    }
+    return publicKeyHex
   }
 
   getAddress(): string | null {
@@ -543,11 +593,7 @@ export class XolosWalletService {
   }
 
   async signMessage(message: string): Promise<string> {
-    const privKeyHex = this.getPrivateKeyHex()
-    if (!privKeyHex) {
-      throw new Error('WALLET_LOCKED')
-    }
-    return signMsg(message, fromHex(privKeyHex))
+    return signMsg(message, fromHex(this.getPrivateKeyHex()))
   }
 
   async getRmzDecimals(): Promise<number> {

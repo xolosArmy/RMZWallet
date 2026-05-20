@@ -3,3 +3,8 @@
   [headers.values]
     Cross-Origin-Embedder-Policy = "require-corp"
     Cross-Origin-Opener-Policy = "same-origin"
+
+[[redirects]]
+  from = "/api/pinata/upload"
+  to = "/.netlify/functions/pinata-upload"
+  status = 200

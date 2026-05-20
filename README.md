@@ -6,13 +6,15 @@ Tonalli RMZWallet (Vite + React + TypeScript) para eCash (XEC).
 
 Configura estas variables en Vercel o tu entorno local:
 
-- `VITE_PINATA_JWT` (recomendado) o `VITE_PINATA_API_KEY` + `VITE_PINATA_SECRET`
-- `VITE_PINATA_GATEWAY` (opcional) para render de imágenes IPFS
+- `PINATA_JWT` en el entorno del servidor, sin prefijo `VITE_`
+- `VITE_IPFS_GATEWAY` (opcional) para render de imágenes IPFS
 - `VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID` (token padre NFT1 Group)
 - `VITE_NFT_MINT_FEE_RECEIVER_ADDRESS` (tesorería para el fee de minteo)
 - `VITE_WALLETCONNECT_PROJECT_ID` (principal, requerido para WalletConnect v2)
 - `VITE_WC_PROJECT_ID` (legacy compatible; fallback si falta la principal)
 - `VITE_WC_ALLOWED_DOMAINS` (opcional, lista CSV para warning anti-phishing en UI; sugerido: `teyolia.cash,www.teyolia.cash`)
+
+Las subidas a Pinata ya no salen desde `src/`: el frontend envía `POST /api/pinata/upload` y la función serverless inyecta `PINATA_JWT` en Vercel o Netlify. La guía rápida está en `docs/pinata-backend.md`.
 
 ## WalletConnect v2 (CAIP-25)
 

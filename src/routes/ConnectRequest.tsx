@@ -7,6 +7,17 @@ import { storePendingConnectRequest } from '../utils/tonalliConnect'
 
 const MAX_TS_SKEW_SEC = 300
 
+const CONNECT_ALLOWED_DOMAINS = (
+  ((import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_CONNECT_ALLOWED_DOMAINS ??
+    (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_WC_ALLOWED_DOMAINS ??
+    (typeof process !== 'undefined'
+      ? process.env?.VITE_CONNECT_ALLOWED_DOMAINS ?? process.env?.VITE_WC_ALLOWED_DOMAINS
+      : undefined)) as string | undefined
+)
+  ?.split(',')
+  .map((host) => host.trim().toLowerCase())
+  .filter(Boolean)
+
 const CONNECT_REQUEST_NOW_SEC = Math.floor(Date.now() / 1000)
 
 const redirectHash = (returnUrl: string, params: Record<string, string>) => {
@@ -39,15 +50,24 @@ function ConnectRequest() {
   const walletAddress = xolosWalletService.getAddress()
   const walletPubkey = xolosWalletService.getPublicKeyHex()
 
+  const parsedReturnUrl = useMemo(() => {
+    if (!returnUrl) return null
+    try {
+      return new URL(returnUrl)
+    } catch {
+      return null
+    }
+  }, [returnUrl])
+
+  const requestOriginHost = parsedReturnUrl?.hostname.toLowerCase() ?? null
+  const isAllowedRequester = requestOriginHost ? Boolean(CONNECT_ALLOWED_DOMAINS?.includes(requestOriginHost)) : false
+
   const signMessageValidation = useMemo(() => {
     if (!returnUrl) {
       return 'Missing return URL.'
     }
 
-    try {
-      // Production should validate allowed origins more strictly before redirecting.
-      new URL(returnUrl)
-    } catch {
+    if (!parsedReturnUrl) {
       return 'Missing return URL.'
     }
 
@@ -56,7 +76,7 @@ function ConnectRequest() {
     }
 
     return null
-  }, [challengeId, message, returnUrl])
+  }, [challengeId, message, parsedReturnUrl, returnUrl])
 
   const connectValidation = (() => {
     if (!returnUrl || !origin || !requestId || !nonce || !ts) {
@@ -69,18 +89,18 @@ function ConnectRequest() {
     if (Math.abs(CONNECT_REQUEST_NOW_SEC - tsNumber) > MAX_TS_SKEW_SEC) {
       return 'Solicitud inválida: timestamp fuera de tiempo.'
     }
-    try {
-      const parsedUrl = new URL(returnUrl)
-      if (parsedUrl.origin !== origin) {
-        return 'Solicitud inválida: origin no coincide con returnUrl.'
-      }
-    } catch {
+    if (!parsedReturnUrl) {
       return 'Solicitud inválida: returnUrl no válido.'
+    }
+    if (parsedReturnUrl.origin !== origin) {
+      return 'Bloqueada por seguridad: el origin no coincide exactamente con returnUrl.'
     }
     return null
   })()
 
   const validationError = isSignMessageRoute ? signMessageValidation : connectValidation
+  const unknownOriginWarning = !validationError && requestOriginHost && !isAllowedRequester
+  const connectSecurityTone = unknownOriginWarning ? 'roja' : 'verde'
 
   useEffect(() => {
     if (validationError) return
@@ -216,6 +236,27 @@ function ConnectRequest() {
         {validationError && <div className="error">{validationError}</div>}
         {actionError && <div className="error">{actionError}</div>}
 
+        {!validationError && unknownOriginWarning && (
+          <div
+            style={{
+              borderRadius: 18,
+              border: '2px solid rgba(251, 191, 36, 0.8)',
+              background: 'linear-gradient(180deg, rgba(120, 53, 15, 0.3), rgba(68, 30, 5, 0.45))',
+              color: '#fde68a',
+              padding: 18,
+              marginBottom: 16,
+              display: 'grid',
+              gap: 8
+            }}
+          >
+            <strong>Origen desconocido - Posible phishing</strong>
+            <span>
+              El callback apunta a <code>{requestOriginHost}</code>, que no está en <code>VITE_CONNECT_ALLOWED_DOMAINS</code>.
+            </span>
+            <span>Firma bajo tu propio riesgo.</span>
+          </div>
+        )}
+
         {!validationError && (
           <div className="card">
             <p className="muted">
@@ -286,6 +327,39 @@ function ConnectRequest() {
 
       {validationError && <div className="error">{validationError}</div>}
       {actionError && <div className="error">{actionError}</div>}
+
+      {!validationError && requestOriginHost && (
+        <div
+          style={{
+            borderRadius: 18,
+            border: unknownOriginWarning
+              ? '2px solid rgba(251, 191, 36, 0.8)'
+              : '1px solid rgba(34, 197, 94, 0.55)',
+            background: unknownOriginWarning
+              ? 'linear-gradient(180deg, rgba(120, 53, 15, 0.3), rgba(68, 30, 5, 0.45))'
+              : 'rgba(20, 83, 45, 0.28)',
+            color: unknownOriginWarning ? '#fde68a' : '#bbf7d0',
+            padding: 18,
+            marginBottom: 16,
+            display: 'grid',
+            gap: 8
+          }}
+        >
+          <strong>
+            {unknownOriginWarning ? 'Origen Desconocido - Posible Phishing' : 'Origen permitido por RMZWallet'}
+          </strong>
+          <span>
+            Host solicitante: <code>{requestOriginHost}</code>
+          </span>
+          <span>
+            Origen declarado: <code>{origin}</code>
+          </span>
+          <span>
+            Estado: {connectSecurityTone === 'roja' ? 'no verificado en allowlist' : 'verificado en allowlist'}
+          </span>
+          {unknownOriginWarning && <span>Autoriza solo si reconoces esta app y esperabas este callback.</span>}
+        </div>
+      )}
 
       {!validationError && (
         <div className="card">

@@ -1,8 +1,8 @@
 import { Core } from '@walletconnect/core'
 import { Web3Wallet } from '@walletconnect/web3wallet'
 import type { IWeb3Wallet, Web3WalletTypes } from '@walletconnect/web3wallet'
-import type { SessionTypes } from '@walletconnect/types'
-import { ALL_BIP143, Address, P2PKHSignatory, Script, Tx, TxBuilder, fromHex, toHexRev } from 'ecash-lib'
+import type { SessionTypes, Verify } from '@walletconnect/types'
+import { Address, Script, Tx, TxBuilder, fromHex, toHexRev } from 'ecash-lib'
 import { getChronik } from '../../services/ChronikClient'
 import { xolosWalletService } from '../../services/XolosWalletService'
 import { XEC_DUST_SATS } from '../../config/xecFees'
@@ -152,6 +152,13 @@ export type PeerVerifyContext = {
   warning: string | null
   host: string | null
   allowlisted: boolean
+  validation: 'VALID' | 'INVALID' | 'UNKNOWN' | 'SCAM'
+  verifiedOrigin: string | null
+  verifyUrl: string | null
+}
+
+export type SessionProposalPayload = Omit<Web3WalletTypes.SessionProposal, 'verifyContext'> & {
+  verifyContext: PeerVerifyContext
 }
 
 export type WcState = {
@@ -286,7 +293,7 @@ export class WcWallet {
   public web3wallet: IWeb3Wallet | null = null
   private state: WcState = { ...defaultState }
   private listeners = new Set<(state: WcState) => void>()
-  private proposalListeners = new Set<(proposal: Web3WalletTypes.SessionProposal) => void>()
+  private proposalListeners = new Set<(proposal: SessionProposalPayload) => void>()
   private successTimer: number | null = null
   private pendingExpiryTimer: number | null = null
   private pendingQueue: SessionRequestPayload[] = []
@@ -408,7 +415,7 @@ export class WcWallet {
     }
   }
 
-  onSessionProposal(listener: (proposal: Web3WalletTypes.SessionProposal) => void) {
+  onSessionProposal(listener: (proposal: SessionProposalPayload) => void) {
     this.proposalListeners.add(listener)
     return () => {
       this.proposalListeners.delete(listener)
@@ -476,32 +483,64 @@ export class WcWallet {
     return { chains, methods }
   }
 
-  private validatePeer(metadata: { url?: string } | undefined): PeerVerifyContext {
+  private getVerifyValidation(verifyContext?: Verify.Context): PeerVerifyContext['validation'] {
+    if (verifyContext?.verified?.isScam) return 'SCAM'
+    return verifyContext?.verified?.validation ?? 'UNKNOWN'
+  }
+
+  private validatePeer(metadata: { url?: string } | undefined, verifyContext?: Verify.Context): PeerVerifyContext {
+    const validation = this.getVerifyValidation(verifyContext)
+    const verifiedOrigin = verifyContext?.verified?.origin ?? null
+    const verifyUrl = verifyContext?.verified?.verifyUrl ?? null
     const rawUrl = metadata?.url?.trim()
     if (!rawUrl) {
       return {
-        warning: 'La dApp no proporcionó URL. Verifica manualmente el origen antes de aprobar.',
+        warning:
+          validation === 'SCAM'
+            ? 'WalletConnect Verify marcó esta dApp como SCAM. Posible ataque de phishing.'
+            : validation === 'INVALID'
+              ? 'WalletConnect Verify no pudo validar esta dApp. Posible phishing.'
+              : 'La dApp no proporcionó URL. Verifica manualmente el origen antes de aprobar.',
         host: null,
-        allowlisted: false
+        allowlisted: false,
+        validation,
+        verifiedOrigin,
+        verifyUrl
       }
     }
 
     try {
       const host = new URL(rawUrl).hostname.toLowerCase()
-      if (!WC_ALLOWED_DOMAINS || WC_ALLOWED_DOMAINS.length === 0) {
-        return { warning: null, host, allowlisted: false }
+      const allowlisted = Boolean(WC_ALLOWED_DOMAINS?.includes(host))
+      let warning: string | null = null
+
+      if (validation === 'SCAM') {
+        warning = `WalletConnect Verify marcó ${host} como SCAM. Bloqueado por seguridad.`
+      } else if (validation === 'INVALID') {
+        warning = `WalletConnect Verify marcó ${host} como INVALID. Posible phishing.`
+      } else if (validation === 'UNKNOWN' && !allowlisted) {
+        warning = `Origen no verificado: ${host}. No está en la allowlist de RMZWallet.`
       }
-      const allowlisted = WC_ALLOWED_DOMAINS.includes(host)
+
       return {
-        warning: allowlisted ? null : `Dominio fuera de allowlist: ${host}`,
+        warning,
         host,
-        allowlisted
+        allowlisted,
+        validation,
+        verifiedOrigin,
+        verifyUrl
       }
     } catch {
       return {
-        warning: 'La URL de la dApp es inválida. Verifica el origen antes de aprobar.',
+        warning:
+          validation === 'SCAM'
+            ? 'WalletConnect Verify marcó esta dApp como SCAM y además su URL es inválida.'
+            : 'La URL de la dApp es inválida. Verifica el origen antes de aprobar.',
         host: null,
-        allowlisted: false
+        allowlisted: false,
+        validation,
+        verifiedOrigin,
+        verifyUrl
       }
     }
   }
@@ -938,11 +977,11 @@ export class WcWallet {
 
     const walletKeyInfo = xolosWalletService.getKeyInfo()
     const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+    if (!xecAddress || !xolosWalletService.canSign()) {
       throw new Error('No pudimos acceder a las llaves de tu billetera.')
     }
 
-    const signer = P2PKHSignatory(fromHex(walletKeyInfo.privateKeyHex), fromHex(walletKeyInfo.publicKeyHex), ALL_BIP143)
+    const signer = xolosWalletService.getSignatory()
     const walletUtxos = await getChronik().address(xecAddress).utxos()
     const walletScript = new Script(fromHex(walletUtxos.outputScript))
     const walletUtxoMap = new Map<string, bigint>()
@@ -966,7 +1005,7 @@ export class WcWallet {
       builder.inputs[idx].signatory = signer
     }
 
-    const signedTx = builder.sign()
+    const signedTx = xolosWalletService.signTxBuilder(builder)
     const signedHex = signedTx.toHex()
     await this.assertBroadcastFeePolicy(signedTx)
     await getChronik().validateRawTx(signedHex)
@@ -1023,7 +1062,7 @@ export class WcWallet {
 
     const walletKeyInfo = xolosWalletService.getKeyInfo()
     const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+    if (!xecAddress || !xolosWalletService.canSign()) {
       throw new Error('No pudimos acceder a las llaves de tu billetera.')
     }
 
@@ -1045,7 +1084,7 @@ export class WcWallet {
       throw new Error('No hay UTXOs XEC disponibles para construir la transacción.')
     }
 
-    const signer = P2PKHSignatory(fromHex(walletKeyInfo.privateKeyHex), fromHex(walletKeyInfo.publicKeyHex), ALL_BIP143)
+    const signer = xolosWalletService.getSignatory()
     const walletScript = this.outputAddressToScript(xecAddress)
     const feeRate = this.getWalletConnectFeeRate()
     const feePerKb = BigInt(feeRate) * 1000n
@@ -1072,7 +1111,7 @@ export class WcWallet {
       })
 
       try {
-        signedTx = builder.sign({
+        signedTx = xolosWalletService.signTxBuilder(builder, {
           feePerKb,
           dustSats: BigInt(XEC_DUST_SATS)
         })
@@ -1618,16 +1657,23 @@ export class WcWallet {
         return
       }
 
+      const verifyContext = this.validatePeer(proposal.params.proposer.metadata, proposal.verifyContext)
       const { chains } = this.getProposalEcashDetails(proposal)
       const selectedChain = this.selectPreferredChain(chains)
       console.info('[WCv2] proposal received', {
         id: proposal.id,
         proposer: proposal.params.proposer.metadata,
+        verifyValidation: verifyContext.validation,
+        allowlisted: verifyContext.allowlisted,
         proposalChains: chains,
         selectedChain
       })
+      const proposalPayload: SessionProposalPayload = {
+        ...proposal,
+        verifyContext
+      }
       for (const listener of this.proposalListeners) {
-        listener(proposal)
+        listener(proposalPayload)
       }
     })
 
@@ -1698,7 +1744,7 @@ export class WcWallet {
         hasOutpoints: Boolean((parsed.params.inputsUsed?.length ?? 0) > 0 || (parsed.params.outpoints?.length ?? 0) > 0)
       })
 
-      const verifyContext = this.validatePeer(session?.peer?.metadata)
+      const verifyContext = this.validatePeer(session?.peer?.metadata, event.verifyContext)
       const payload: SessionRequestPayload = {
         id,
         topic,

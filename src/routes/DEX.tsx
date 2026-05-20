@@ -3,7 +3,6 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { AgoraPartial } from 'ecash-agora'
 import {
   ALP_STANDARD,
-  ALL_BIP143,
   Address,
   P2PKHSignatory,
   Script,
@@ -28,12 +27,12 @@ import { buyOfferById } from '../services/buyOfferById'
 import { wcWallet } from '../lib/walletconnect/WcWallet'
 import type { OfferPublishedPayload } from '../lib/walletconnect/WcWallet'
 import WcDebugPanel from '../components/WcDebugPanel'
+import DexTakerRmz from '../features/dex/components/DexTakerRmz'
 import {
   TOKEN_DUST_SATS,
   buildAlpAgoraListOutputs,
   calcPriceNanoSatsFromTotal,
   calcPriceNanoSatsPerAtom,
-  formatOfferSummary,
   formatSatsToXec,
   parseAgoraOfferFromTx,
   parseDecimalToAtoms,
@@ -294,7 +293,7 @@ function DEX() {
     }
 
     const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+    if (!walletKeyInfo.publicKeyHex || !xecAddress || !xolosWalletService.canSign()) {
       setMakerError('No pudimos acceder a las llaves de tu billetera.')
       return
     }
@@ -395,7 +394,7 @@ function DEX() {
         tokenInputsCount: tokenSelection.selected.length
       })
 
-      const signer = P2PKHSignatory(fromHex(walletKeyInfo.privateKeyHex), fromHex(walletKeyInfo.publicKeyHex), ALL_BIP143)
+      const signer = xolosWalletService.getSignatory()
       const inputs = [
         ...tokenSelection.selected.map((utxo) => buildInput(utxo, p2pkhScript, signer)),
         ...funding.selected.map((utxo) => buildInput(utxo, p2pkhScript, signer))
@@ -403,7 +402,7 @@ function DEX() {
 
       const outputs = funding.includeChange ? [...listOutputs, p2pkhScript] : listOutputs
       const txBuilder = new TxBuilder({ inputs, outputs })
-      const signedTx = txBuilder.sign({ feePerKb: FEE_PER_KB, dustSats: TOKEN_DUST_SATS })
+      const signedTx = xolosWalletService.signTxBuilder(txBuilder, { feePerKb: FEE_PER_KB, dustSats: TOKEN_DUST_SATS })
 
       const broadcast = await chronik.broadcastTx(signedTx.ser())
 
@@ -469,15 +468,17 @@ function DEX() {
     }
   }
 
-  const handleLookupOffer = async () => {
+  const handleLookupOffer = async (overrideOfferId?: string) => {
     setOfferLookupError(null)
     setOfferDetails(null)
     setOfferOutpoint(null)
     setBuyTxid(null)
 
+    const nextOfferId = (overrideOfferId ?? offerIdInput).trim()
+
     let outpoint
     try {
-      outpoint = parseOfferId(offerIdInput)
+      outpoint = parseOfferId(nextOfferId)
     } catch (err) {
       setOfferLookupError((err as Error).message)
       return
@@ -581,7 +582,7 @@ function DEX() {
     try {
       const walletKeyInfo = xolosWalletService.getKeyInfo()
       const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-      if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+      if (!xecAddress || !xolosWalletService.canSign()) {
         setNftOfferError('No pudimos acceder a las llaves de tu billetera.')
         return
       }
@@ -685,7 +686,7 @@ function DEX() {
 
     const walletKeyInfo = xolosWalletService.getKeyInfo()
     const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+    if (!xecAddress || !xolosWalletService.canSign()) {
       setMintPassError('No pudimos acceder a las llaves de tu billetera.')
       return
     }
@@ -856,15 +857,6 @@ function DEX() {
       </div>
     )
   }
-
-  const offerSummary =
-    offerDetails && rmzDecimals !== null
-      ? formatOfferSummary({
-          offeredAtoms: offerDetails.offeredAtoms,
-          tokenDecimals: rmzDecimals,
-          askedSats: offerDetails.askedSats
-        })
-      : null
 
   return (
     <div className="page">
@@ -1046,55 +1038,18 @@ function DEX() {
         )}
 
         {dexTab === 'taker' && (
-          <div style={{ marginTop: 16 }}>
-            <label htmlFor="offerId">Offer ID (txid:vout o JSON)</label>
-            <textarea
-              id="offerId"
-              value={offerIdInput}
-              onChange={(event) => setOfferIdInput(event.target.value)}
-              placeholder="txid:vout"
-              rows={3}
-            />
-            <div className="actions" style={{ marginTop: 12 }}>
-              <button className="cta" type="button" onClick={handleLookupOffer} disabled={offerBusy}>
-                {offerBusy ? 'Verificando...' : 'Cargar oferta'}
-              </button>
-            </div>
-
-            {offerLookupError && <div className="error">{offerLookupError}</div>}
-
-            {offerDetails && offerSummary && (
-              <div style={{ marginTop: 16 }}>
-                <div className="success">
-                  Oferta lista: {offerSummary.offeredDisplay} RMZ por {offerSummary.askedDisplay} XEC
-                </div>
-                <p className="muted" style={{ marginTop: 8 }}>
-                  Pago a: {offerDetails.payoutAddress}
-                </p>
-                <div className="actions" style={{ marginTop: 12 }}>
-                  <button className="cta primary" type="button" onClick={handleBuyOffer} disabled={buyBusy}>
-                    {buyBusy ? 'Comprando...' : 'Comprar RMZ'}
-                  </button>
-                </div>
-                {buyTxid && (
-                  <div className="success" style={{ marginTop: 12 }}>
-                    Compra completada: <span className="address-box">{buyTxid}</span>
-                  </div>
-                )}
-                <details style={{ marginTop: 12 }}>
-                  <summary>Avanzado</summary>
-                  <div className="address-box" style={{ marginTop: 8, whiteSpace: 'pre-line' }}>
-                    {[
-                      `sellAtoms=${offerDetails.offeredAtoms.toString()}`,
-                      `askedSats=${offerDetails.askedSats.toString()}`,
-                      `priceNanoSatsPerAtom=${offerDetails.priceNanoSatsPerAtom.toString()}`,
-                      `payoutAddress=${offerDetails.payoutAddress}`
-                    ].join('\n')}
-                  </div>
-                </details>
-              </div>
-            )}
-          </div>
+          <DexTakerRmz
+            rmzDecimals={rmzDecimals}
+            offerIdInput={offerIdInput}
+            onOfferIdInputChange={setOfferIdInput}
+            onLookupOffer={handleLookupOffer}
+            offerBusy={offerBusy}
+            offerLookupError={offerLookupError}
+            offerDetails={offerDetails}
+            onBuyOffer={handleBuyOffer}
+            buyBusy={buyBusy}
+            buyTxid={buyTxid}
+          />
         )}
 
         {dexTab === 'nft' && (

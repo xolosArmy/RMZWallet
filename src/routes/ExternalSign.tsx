@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { ALL_BIP143, P2PKHSignatory, Script, Tx, TxBuilder, fromHex, toHex } from 'ecash-lib'
+import { Script, Tx, TxBuilder, fromHex, toHex } from 'ecash-lib'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { getChronik } from '../services/ChronikClient'
@@ -24,7 +24,7 @@ type ExternalSignResult = {
 function isWalletReady() {
   const keyInfo = xolosWalletService.getKeyInfo()
   return {
-    ready: Boolean(keyInfo.address && keyInfo.privateKeyHex && keyInfo.publicKeyHex),
+    ready: Boolean(keyInfo.address && keyInfo.publicKeyHex && xolosWalletService.canSign()),
     keyInfo
   }
 }
@@ -52,18 +52,14 @@ async function signExternalRequest(request: ExternalSignRequest): Promise<Extern
   console.info(`[external-sign] derived inputs=${outpoints.length}`)
 
   const wallet = isWalletReady()
-  if (!wallet.ready || !wallet.keyInfo.privateKeyHex || !wallet.keyInfo.publicKeyHex || !wallet.keyInfo.address) {
+  if (!wallet.ready || !wallet.keyInfo.address) {
     throw new Error('No pudimos acceder a la cuenta activa para firmar.')
   }
 
   const unsignedTx = Tx.fromHex(request.unsignedTxHex)
   const chronik = getChronik()
 
-  const signer = P2PKHSignatory(
-    fromHex(wallet.keyInfo.privateKeyHex),
-    fromHex(wallet.keyInfo.publicKeyHex),
-    ALL_BIP143
-  )
+  const signer = xolosWalletService.getSignatory()
   const walletScript = Script.fromAddress(wallet.keyInfo.address.replace(/^ecash:/, ''))
   const walletScriptHex = toHex(walletScript.bytecode).toLowerCase()
 
@@ -108,7 +104,7 @@ async function signExternalRequest(request: ExternalSignRequest): Promise<Extern
     builder.inputs[index].signatory = signer
   }
 
-  const signedTx = builder.sign()
+  const signedTx = xolosWalletService.signTxBuilder(builder)
   const signedTxHex = signedTx.toHex()
 
   if (request.broadcast !== true) {

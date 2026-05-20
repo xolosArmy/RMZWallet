@@ -1,14 +1,4 @@
-import {
-  ALL_BIP143,
-  Address,
-  P2PKHSignatory,
-  Script,
-  TxBuilder,
-  calcTxFee,
-  fromHex,
-  slpGenesis,
-  slpSend
-} from 'ecash-lib'
+import { Address, P2PKHSignatory, Script, TxBuilder, calcTxFee, slpGenesis, slpSend } from 'ecash-lib'
 import type { GenesisInfo, ScriptUtxo } from 'chronik-client'
 import { XEC_DUST_SATS } from '../config/xecFees'
 import {
@@ -17,6 +7,7 @@ import {
   XOLOSARMY_NFT_PARENT_TOKEN_ID
 } from '../config/nfts'
 import { getChronik } from './ChronikClient'
+import type { XolosWalletService } from './XolosWalletService'
 
 const SLP_NFT1_CHILD = 65
 const SLP_NFT1_GROUP = 129
@@ -104,12 +95,12 @@ const selectParentFanoutInput = (utxos: ScriptUtxo[], parentTokenId: string) => 
 
 const createParentFanoutTx = async (params: {
   address: string
-  keyInfo: { privateKeyHex: string; publicKeyHex: string }
+  wallet: XolosWalletService
   parentTokenId: string
   parentUtxo: ScriptUtxo
 }): Promise<string> => {
   const addressScript = resolveAddressScript(params.address)
-  const signer = P2PKHSignatory(fromHex(params.keyInfo.privateKeyHex), fromHex(params.keyInfo.publicKeyHex), ALL_BIP143)
+  const signer = params.wallet.getSignatory()
 
   const parentAtoms = params.parentUtxo.token?.atoms ?? 0n
   if (parentAtoms <= 1n) {
@@ -153,7 +144,7 @@ const createParentFanoutTx = async (params: {
 // Basado en Cashtab: getNftChildGenesisTargetOutputs (SLP NFT1 child GENESIS).
 export const mintNftChildGenesis = async (params: {
   address: string
-  keyInfo: { privateKeyHex: string; publicKeyHex: string }
+  wallet: XolosWalletService
   genesisInfo: GenesisInfo
 }): Promise<{ txid: string }> => {
   if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) {
@@ -165,7 +156,7 @@ export const mintNftChildGenesis = async (params: {
 
   const chronik = getChronik()
   const addressScript = resolveAddressScript(params.address)
-  const signer = P2PKHSignatory(fromHex(params.keyInfo.privateKeyHex), fromHex(params.keyInfo.publicKeyHex), ALL_BIP143)
+  const signer = params.wallet.getSignatory()
 
   const utxoResponse = await chronik.address(params.address).utxos()
   let allUtxos = utxoResponse.utxos
@@ -178,7 +169,7 @@ export const mintNftChildGenesis = async (params: {
     }
     await createParentFanoutTx({
       address: params.address,
-      keyInfo: params.keyInfo,
+      wallet: params.wallet,
       parentTokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
       parentUtxo: fanoutCandidate
     })
@@ -226,19 +217,11 @@ export const mintNftChildGenesis = async (params: {
 export const mintSlpNft1GroupParentGenesis = async (params: {
   address: string
   genesisInfo: GenesisInfo
-  keyInfo?: { privateKeyHex: string; publicKeyHex: string }
+  wallet: XolosWalletService
 }): Promise<{ txid: string; tokenId: string; batonVout: number }> => {
-  if (!params.keyInfo?.privateKeyHex || !params.keyInfo?.publicKeyHex) {
-    throw new Error('Falta la llave privada/pública para firmar el genesis del parent.')
-  }
-
   const chronik = getChronik()
   const addressScript = resolveAddressScript(params.address)
-  const signer = P2PKHSignatory(
-    fromHex(params.keyInfo.privateKeyHex),
-    fromHex(params.keyInfo.publicKeyHex),
-    ALL_BIP143
-  )
+  const signer = params.wallet.getSignatory()
 
   const utxoResponse = await chronik.address(params.address).utxos()
   const xecUtxos = utxoResponse.utxos.filter((utxo) => !utxo.token)
@@ -271,14 +254,14 @@ export const mintSlpNft1GroupParentGenesis = async (params: {
 
 export const sendNftChild = async (params: {
   address: string
-  keyInfo: { privateKeyHex: string; publicKeyHex: string }
+  wallet: XolosWalletService
   tokenId: string
   destinationAddress: string
 }): Promise<{ txid: string }> => {
   const chronik = getChronik()
   const addressScript = resolveAddressScript(params.address)
   const destinationScript = resolveAddressScript(params.destinationAddress)
-  const signer = P2PKHSignatory(fromHex(params.keyInfo.privateKeyHex), fromHex(params.keyInfo.publicKeyHex), ALL_BIP143)
+  const signer = params.wallet.getSignatory()
 
   const utxoResponse = await chronik.address(params.address).utxos()
   const allUtxos = utxoResponse.utxos

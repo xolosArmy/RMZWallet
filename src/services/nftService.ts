@@ -147,7 +147,7 @@ export const mintXolosarmyNftChild = async (params: {
 }): Promise<{ childTokenId: string; txid: string; metadataCid: string }> => {
   const walletKeyInfo = xolosWalletService.getKeyInfo()
   const address = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-  if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !address) {
+  if (!address || !xolosWalletService.canSign()) {
     throw new Error('No pudimos acceder a las llaves de tu billetera.')
   }
   if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) {
@@ -178,10 +178,7 @@ export const mintXolosarmyNftChild = async (params: {
 
   const { txid } = await mintNftChildGenesis({
     address,
-    keyInfo: {
-      privateKeyHex: walletKeyInfo.privateKeyHex,
-      publicKeyHex: walletKeyInfo.publicKeyHex
-    },
+    wallet: xolosWalletService,
     genesisInfo
   })
 
@@ -337,16 +334,13 @@ export const sendNft = async (params: {
 }): Promise<{ txid: string }> => {
   const walletKeyInfo = xolosWalletService.getKeyInfo()
   const address = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-  if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !address) {
+  if (!address || !xolosWalletService.canSign()) {
     throw new Error('No pudimos acceder a las llaves de tu billetera.')
   }
 
   return sendNftChild({
     address,
-    keyInfo: {
-      privateKeyHex: walletKeyInfo.privateKeyHex,
-      publicKeyHex: walletKeyInfo.publicKeyHex
-    },
+    wallet: xolosWalletService,
     tokenId: params.tokenId,
     destinationAddress: params.destinationAddress
   })

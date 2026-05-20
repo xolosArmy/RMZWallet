@@ -68,7 +68,10 @@ export default function ApproveRequestModal({
   const metadata = request.peer
   const icon = metadata?.icons?.[0]
   const params = request.params
-  const verifyWarning = request.verifyContext?.warning
+  const verifyContext = request.verifyContext
+  const verifyWarning = verifyContext?.warning
+  const isBlockedByScam = verifyContext?.validation === 'SCAM'
+  const isHighRisk = verifyContext?.validation === 'SCAM' || verifyContext?.validation === 'INVALID'
   const txPreview = request.rawTxPreview
 
   const handleCopyTxid = async () => {
@@ -163,7 +166,60 @@ export default function ApproveRequestModal({
           </div>
         </div>
 
-        {verifyWarning && <div className="error">Warning: {verifyWarning}</div>}
+        {isHighRisk && (
+          <div
+            role="alert"
+            style={{
+              borderRadius: 18,
+              border: '2px solid rgba(239, 68, 68, 0.9)',
+              background: 'linear-gradient(180deg, rgba(127, 29, 29, 0.95), rgba(69, 10, 10, 0.95))',
+              padding: 18,
+              boxShadow: '0 0 24px rgba(239, 68, 68, 0.28)',
+              display: 'grid',
+              gap: 8
+            }}
+          >
+            <strong style={{ fontSize: 18, letterSpacing: '0.04em', color: '#fee2e2' }}>
+              {isBlockedByScam ? 'ALERTA CRITICA: solicitud marcada como SCAM' : 'ALERTA DE PHISHING: solicitud INVALIDA'}
+            </strong>
+            <span style={{ color: '#fecaca', lineHeight: 1.5 }}>
+              {verifyWarning || 'WalletConnect Verify detectó señales de phishing en esta solicitud.'}
+            </span>
+            {verifyContext?.verifiedOrigin && <span style={{ color: '#fca5a5' }}>Origen verificado: {verifyContext.verifiedOrigin}</span>}
+            {isBlockedByScam && <span style={{ color: '#fda4af' }}>RMZWallet bloqueó la aprobación de esta solicitud.</span>}
+          </div>
+        )}
+
+        {verifyContext?.allowlisted && (
+          <div
+            style={{
+              borderRadius: 14,
+              border: '1px solid rgba(34, 197, 94, 0.55)',
+              background: 'rgba(20, 83, 45, 0.35)',
+              color: '#bbf7d0',
+              padding: '12px 14px',
+              fontWeight: 600
+            }}
+          >
+            Verificado por RMZWallet
+            {verifyContext.host ? `: ${verifyContext.host}` : ''}
+          </div>
+        )}
+
+        {!isHighRisk && !verifyContext?.allowlisted && verifyWarning && (
+          <div
+            style={{
+              borderRadius: 14,
+              border: '1px solid rgba(251, 191, 36, 0.55)',
+              background: 'rgba(120, 53, 15, 0.28)',
+              color: '#fde68a',
+              padding: '12px 14px',
+              lineHeight: 1.5
+            }}
+          >
+            {verifyWarning}
+          </div>
+        )}
 
         <div style={{ display: 'grid', gap: 16 }}>
           <SectionRow label="Estado">
@@ -250,14 +306,20 @@ export default function ApproveRequestModal({
               className="cta"
               type="button"
               onClick={onApproved}
-              disabled={busy || isExpired}
+              disabled={busy || isExpired || isBlockedByScam}
               style={{
                 background: 'linear-gradient(120deg, rgba(249, 115, 22, 0.95), rgba(245, 158, 11, 0.95))',
                 boxShadow: '0 0 14px rgba(249, 115, 22, 0.4)',
                 color: '#050505'
               }}
             >
-              {busy ? 'Procesando...' : isExpired ? 'Solicitud expirada' : 'Aprobar compra'}
+              {isBlockedByScam
+                ? 'Bloqueado por seguridad'
+                : busy
+                  ? 'Procesando...'
+                  : isExpired
+                    ? 'Solicitud expirada'
+                    : 'Aprobar compra'}
             </button>
           )}
         </div>

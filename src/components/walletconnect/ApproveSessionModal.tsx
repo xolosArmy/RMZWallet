@@ -1,21 +1,9 @@
 import { useState, type ReactNode } from 'react'
 import type { SessionTypes } from '@walletconnect/types'
 import { wcWallet } from '../../lib/walletconnect/WcWallet'
+import type { SessionProposalPayload } from '../../lib/walletconnect/WcWallet'
 
-export type ProposalLike = {
-  id: number
-  params: {
-    proposer: {
-      metadata: {
-        name?: string
-        url?: string
-        icons?: string[]
-      }
-    }
-    requiredNamespaces: Record<string, { chains?: string[]; methods?: string[]; events?: string[] }>
-    optionalNamespaces?: Record<string, { chains?: string[]; methods?: string[]; events?: string[] }>
-  }
-}
+export type ProposalLike = SessionProposalPayload
 
 type ApproveSessionModalProps = {
   open: boolean
@@ -51,6 +39,9 @@ export default function ApproveSessionModal({
   const icon = metadata.icons?.[0]
   const requiredNamespaces = proposal.params.requiredNamespaces
   const optionalNamespaces = proposal.params.optionalNamespaces ?? {}
+  const verifyContext = proposal.verifyContext
+  const isBlockedByScam = verifyContext.validation === 'SCAM'
+  const isHighRisk = verifyContext.validation === 'SCAM' || verifyContext.validation === 'INVALID'
   const proposalChains = Array.from(
     new Set([...(requiredNamespaces.ecash?.chains ?? []), ...(optionalNamespaces.ecash?.chains ?? [])])
   )
@@ -76,6 +67,11 @@ export default function ApproveSessionModal({
 
     if (!activeAddress) {
       setErrorMsg('No hay dirección activa para aprobar el vínculo.')
+      setIsApproving(false)
+      return
+    }
+    if (isBlockedByScam) {
+      setErrorMsg('Aprobación bloqueada: WalletConnect Verify marcó esta dApp como SCAM.')
       setIsApproving(false)
       return
     }
@@ -193,6 +189,61 @@ export default function ApproveSessionModal({
           </div>
         </div>
 
+        {isHighRisk && (
+          <div
+            role="alert"
+            style={{
+              borderRadius: 18,
+              border: '2px solid rgba(239, 68, 68, 0.9)',
+              background: 'linear-gradient(180deg, rgba(127, 29, 29, 0.95), rgba(69, 10, 10, 0.95))',
+              padding: 18,
+              boxShadow: '0 0 24px rgba(239, 68, 68, 0.28)',
+              display: 'grid',
+              gap: 8
+            }}
+          >
+            <strong style={{ fontSize: 18, letterSpacing: '0.04em', color: '#fee2e2' }}>
+              {isBlockedByScam ? 'ALERTA CRITICA: dApp marcada como SCAM' : 'ALERTA DE PHISHING: identidad INVALIDA'}
+            </strong>
+            <span style={{ color: '#fecaca', lineHeight: 1.5 }}>
+              {verifyContext.warning || 'WalletConnect Verify detectó señales de phishing en esta conexión.'}
+            </span>
+            {verifyContext.verifiedOrigin && <span style={{ color: '#fca5a5' }}>Origen verificado: {verifyContext.verifiedOrigin}</span>}
+            {isBlockedByScam && <span style={{ color: '#fda4af' }}>RMZWallet bloqueó la aprobación de esta sesión.</span>}
+          </div>
+        )}
+
+        {verifyContext.allowlisted && (
+          <div
+            style={{
+              borderRadius: 14,
+              border: '1px solid rgba(34, 197, 94, 0.55)',
+              background: 'rgba(20, 83, 45, 0.35)',
+              color: '#bbf7d0',
+              padding: '12px 14px',
+              fontWeight: 600
+            }}
+          >
+            Verificado por RMZWallet
+            {verifyContext.host ? `: ${verifyContext.host}` : ''}
+          </div>
+        )}
+
+        {!isHighRisk && !verifyContext.allowlisted && verifyContext.warning && (
+          <div
+            style={{
+              borderRadius: 14,
+              border: '1px solid rgba(251, 191, 36, 0.55)',
+              background: 'rgba(120, 53, 15, 0.28)',
+              color: '#fde68a',
+              padding: '12px 14px',
+              lineHeight: 1.5
+            }}
+          >
+            {verifyContext.warning}
+          </div>
+        )}
+
         <div style={{ display: 'grid', gap: 16 }}>
           {Object.entries(requiredNamespaces).map(([namespace, config]) => (
             <div
@@ -261,14 +312,14 @@ export default function ApproveSessionModal({
             className="cta"
             type="button"
             onClick={handleApprove}
-            disabled={!activeAddress || isApproving}
+            disabled={!activeAddress || isApproving || isBlockedByScam}
             style={{
               background: 'linear-gradient(120deg, rgba(249, 115, 22, 0.95), rgba(245, 158, 11, 0.95))',
               boxShadow: '0 0 14px rgba(249, 115, 22, 0.4)',
               color: '#050505'
             }}
           >
-            {isApproving ? 'Sellando vínculo...' : 'Aprobar vínculo'}
+            {isBlockedByScam ? 'Bloqueado por seguridad' : isApproving ? 'Sellando vínculo...' : 'Aprobar vínculo'}
           </button>
         </div>
       </div>

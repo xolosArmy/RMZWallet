@@ -42,4 +42,4 @@ export const NFT_MINT_FEE_RECEIVER_ADDRESS =
 export const NFT_RESCAN_STORAGE_KEY = 'tonalli_nft_rescan_pending'
 
 export const DEFAULT_PINATA_GATEWAY =
-  getEnv('VITE_PINATA_GATEWAY') || getEnv('PINATA_GATEWAY') || ''
+  getEnv('VITE_IPFS_GATEWAY') || getEnv('IPFS_GATEWAY') || ''
