@@ -5,13 +5,13 @@ import { useActiveOffers } from '../hooks/useActiveOffers'
 const FEATURED_OFFERS = [
   {
     id: '22b2856ea7913071216be589c0eb7b1ed5334810a5041cca2fdb0143761c07f1:1',
-    title: 'Pack Basico',
-    description: '100 RMZ por ~1000 XEC'
+    title: 'Pack Básico',
+    description: '100 RMZ por 50,000 XEC'
   },
   {
     id: '67e456dab49064ee289455f16e36db97eaa681a8c5d15ff3f57b072bb73ef49e:1',
     title: 'Pack Inversor',
-    description: '500 RMZ por ~4800 XEC'
+    description: '500 RMZ por 250,000 XEC'
   }
 ] as const
 
