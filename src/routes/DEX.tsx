@@ -916,7 +916,7 @@ function DEX() {
               animation: 'pulse 2s infinite',
             }}
           >
-            🛒 ¡Comprar eToken $RMZ aquí!
+            🛒 Mercado Xolos NFTs
           </a>
         </div>
 
