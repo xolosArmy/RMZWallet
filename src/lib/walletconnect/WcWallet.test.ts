@@ -125,13 +125,35 @@ test('approveSession fuerza namespace ecash con ecash:1 y signAndBroadcastTransa
   assert.deepEqual(approvedPayload.namespaces, {
     ecash: {
       chains: ['ecash:1', 'ecash:mainnet'],
-      methods: ['ecash_signAndBroadcastTransaction', 'ecash_signAndBroadcast', 'ecash_getAddresses'],
+      methods: ['ecash_signAndBroadcastTransaction', 'ecash_signAndBroadcast', 'ecash_getAddresses', 'ecash_signMessage'],
       events: ['accountsChanged'],
       accounts: ['ecash:1:qqtestaddress', 'ecash:mainnet:qqtestaddress']
     }
   })
 
   xolosWalletService.getAddress = originalGetAddress
+})
+
+test('proposal acepta ecash_signMessage junto con ecash_getAddresses', () => {
+  const wallet = new (WcWallet as unknown as { new (): WcWallet })() as unknown as {
+    proposalSupportsEcashV2: (proposal: unknown) => boolean
+  }
+
+  const accepted = wallet.proposalSupportsEcashV2({
+    id: 500,
+    params: {
+      requiredNamespaces: {
+        ecash: {
+          chains: ['ecash:1'],
+          methods: ['ecash_getAddresses', 'ecash_signMessage']
+        }
+      },
+      optionalNamespaces: {},
+      proposer: { metadata: { name: 'Mining Gateway' } }
+    }
+  })
+
+  assert.equal(accepted, true)
 })
 
 test('método desconocido responde -32601', async () => {
@@ -175,6 +197,41 @@ test('rechazo usuario responde 4001', async () => {
 
   assert.equal(responses.length, 1)
   assert.equal(responses[0].response.error?.code, 4001)
+
+  xolosWalletService.getAddress = originalGetAddress
+})
+
+test('session_request ecash_signMessage no llama parseSignAndBroadcastParams y queda pendiente', async () => {
+  const originalGetAddress = xolosWalletService.getAddress
+  xolosWalletService.getAddress = () => 'ecash:qtestaddress'
+
+  const { wallet, responses, sessionRequest } = buildWalletHarness()
+  ;(wallet as unknown as {
+    parseSignAndBroadcastParams: (input: unknown) => { params: unknown; error: { code: number; message: string } | null }
+  }).parseSignAndBroadcastParams = () => {
+    throw new Error('parseSignAndBroadcastParams should not be called for ecash_signMessage')
+  }
+
+  await sessionRequest({
+    topic: 't1',
+    id: 104,
+    params: {
+      chainId: 'ecash:1',
+      request: {
+        method: 'ecash_signMessage',
+        params: {
+          message: 'exact challenge message',
+          domain: 'ecash.mx',
+          purpose: 'mining-gateway-session',
+          challengeId: 'challenge-1'
+        }
+      }
+    }
+  })
+
+  assert.equal(responses.length, 0)
+  assert.equal(wallet.getState().pendingRequest?.method, 'ecash_signMessage')
+  assert.equal(wallet.getState().pendingRequest?.params.message, 'exact challenge message')
 
   xolosWalletService.getAddress = originalGetAddress
 })
@@ -229,6 +286,61 @@ test('request válido responde { txid }', async () => {
   chronik.broadcastTx = originalBroadcastTx
   chronik.validateRawTx = originalValidateRawTx
   xolosWalletService.getAddress = originalGetAddress
+})
+
+test('approvePendingRequest ecash_signMessage responde signature publicKey y address', async () => {
+  const originalGetAddress = xolosWalletService.getAddress
+  const originalGetKeyInfo = xolosWalletService.getKeyInfo
+  const originalSignMessage = xolosWalletService.signMessage
+
+  xolosWalletService.getAddress = () => 'ecash:qsigner'
+  xolosWalletService.getKeyInfo = () => ({
+    mnemonic: null,
+    xecAddress: 'ecash:qsigner',
+    address: 'ecash:qsigner',
+    publicKeyHex: '02' + '11'.repeat(32),
+    privateKeyHex: null
+  })
+  xolosWalletService.signMessage = async (message: string) => {
+    assert.equal(message, 'exact challenge message')
+    return 'signed-message'
+  }
+
+  const { wallet, responses, sessionRequest } = buildWalletHarness()
+
+  await sessionRequest({
+    topic: 't1',
+    id: 1045,
+    params: {
+      chainId: 'ecash:1',
+      request: {
+        method: 'ecash_signMessage',
+        params: {
+          message: 'exact challenge message',
+          address: 'ecash:qsigner',
+          domain: 'ecash.mx',
+          purpose: 'mining-gateway-session',
+          challengeId: 'challenge-2'
+        }
+      }
+    }
+  })
+
+  await wallet.approvePendingRequest()
+
+  assert.equal(responses.length, 1)
+  assert.deepEqual(responses[0].response.result, {
+    signature: 'signed-message',
+    publicKey: '02' + '11'.repeat(32),
+    pubkey: '02' + '11'.repeat(32),
+    address: 'ecash:qsigner',
+    challengeId: 'challenge-2'
+  })
+  assert.equal(wallet.getState().pendingRequest, null)
+
+  xolosWalletService.getAddress = originalGetAddress
+  xolosWalletService.getKeyInfo = originalGetKeyInfo
+  xolosWalletService.signMessage = originalSignMessage
 })
 
 test('session_request legacy ecash:mainnet se acepta si la sesión usa legacy chain', async () => {
@@ -287,7 +399,7 @@ test('request con outputs usa ruta build+sign+broadcast desde outputs', async ()
   }).buildSignBroadcastFromOutputs = async (outputs) => {
     assert.equal(outputs.length, 1)
     assert.equal(outputs[0].address, 'ecash:qrecipient')
-    assert.equal(outputs[0].valueSats, 1200)
+    assert.equal(outputs[0].valueSats, '1200')
     return { txid: 'b'.repeat(64) }
   }
 
@@ -404,7 +516,7 @@ test('si vienen rawHex unsigned y outputs, se reconstruye desde outputs', async 
     outputsRouteCalled = true
     assert.equal(outputs.length, 1)
     assert.equal(outputs[0].address, 'ecash:qrecipient')
-    assert.equal(outputs[0].valueSats, 1200)
+    assert.equal(outputs[0].valueSats, '1200')
     return { txid: 'd'.repeat(64) }
   }
 
@@ -417,6 +529,7 @@ test('si vienen rawHex unsigned y outputs, se reconstruye desde outputs', async 
         method: 'ecash_signAndBroadcastTransaction',
         params: {
           offerId: 'offer-priority',
+          mode: 'tx',
           rawHex: unsignedRawHex,
           outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }]
         }
@@ -433,7 +546,7 @@ test('si vienen rawHex unsigned y outputs, se reconstruye desde outputs', async 
   xolosWalletService.getAddress = originalGetAddress
 })
 
-test('si vienen rawHex firmado y outputs, rawHex mantiene prioridad', async () => {
+test('si vienen rawHex firmado y outputs con mode tx, rawHex mantiene prioridad', async () => {
   const originalGetAddress = xolosWalletService.getAddress
   xolosWalletService.getAddress = () => 'ecash:qtestaddress'
 
@@ -473,6 +586,7 @@ test('si vienen rawHex firmado y outputs, rawHex mantiene prioridad', async () =
         method: 'ecash_signAndBroadcastTransaction',
         params: {
           offerId: 'offer-signed-priority',
+          mode: 'tx',
           rawHex: signedLikeRawHex,
           outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }]
         }
@@ -541,6 +655,7 @@ test('parser: legacy inputsUsed => mode legacy', () => {
     parseSignAndBroadcastParams: (input: unknown) => { params: { requestMode?: string } | null; error: { code: number } | null }
   }
   const parsed = wallet.parseSignAndBroadcastParams({
+    mode: 'legacy',
     inputsUsed: [`${'a'.repeat(64)}:0`],
     outputs: [{ address: 'ecash:qrecipient', valueSats: 900 }]
   })
@@ -553,6 +668,7 @@ test('parser: error por formato inválido en inputsUsed', () => {
     parseSignAndBroadcastParams: (input: unknown) => { params: unknown; error: { code: number; message: string } | null }
   }
   const parsed = wallet.parseSignAndBroadcastParams({
+    mode: 'legacy',
     inputsUsed: ['no-es-outpoint'],
     outputs: [{ address: 'ecash:qrecipient', valueSats: 900 }]
   })

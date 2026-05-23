@@ -22,8 +22,15 @@ const WC_NAMESPACE = 'ecash'
 const WC_CHAIN_ID = 'ecash:1'
 const WC_CHAIN_ID_LEGACY = 'ecash:mainnet'
 const WC_METHOD_GET_ADDRESSES = 'ecash_getAddresses'
+const WC_METHOD_SIGN_MESSAGE = 'ecash_signMessage'
 const WC_METHOD_SIGN_AND_BROADCAST = 'ecash_signAndBroadcastTransaction'
 const WC_METHOD_SIGN_AND_BROADCAST_ALIAS = 'ecash_signAndBroadcast'
+const WC_SUPPORTED_METHODS = [
+  WC_METHOD_GET_ADDRESSES,
+  WC_METHOD_SIGN_AND_BROADCAST,
+  WC_METHOD_SIGN_AND_BROADCAST_ALIAS,
+  WC_METHOD_SIGN_MESSAGE
+] as const
 const WC_EVENT_OFFER_PUBLISHED = 'xolos_offer_published'
 const WC_EVENT_OFFER_CONSUMED = 'xolos_offer_consumed'
 const WC_EVENT_ACCOUNTS_CHANGED = 'accountsChanged'
@@ -194,12 +201,22 @@ export type SignAndBroadcastParams = {
   [key: string]: unknown
 }
 
+export type SignMessageParams = {
+  message: string
+  address?: string
+  domain?: string
+  purpose?: string
+  challengeId?: string
+}
+
+type PendingRequestParams = SignAndBroadcastParams & Partial<SignMessageParams>
+
 export type PendingRequest = {
   id: number
   topic: string
   method: string
   chainId: string
-  params: SignAndBroadcastParams
+  params: PendingRequestParams
   expiresAt: number
   createdAt: number
   peer?: {
@@ -244,7 +261,7 @@ type SessionRequestPayload = {
   topic: string
   method: string
   chainId: string
-  params: SignAndBroadcastParams
+  params: PendingRequestParams
   expiresAt: number
   createdAt: number
   peer?: {
@@ -262,6 +279,10 @@ type EcashProposalNamespace = {
 
 function isSignAndBroadcastMethod(method: unknown): boolean {
   return method === WC_METHOD_SIGN_AND_BROADCAST || method === WC_METHOD_SIGN_AND_BROADCAST_ALIAS
+}
+
+function isSignMessageMethod(method: unknown): boolean {
+  return method === WC_METHOD_SIGN_MESSAGE
 }
 
 const defaultState: WcState = {
@@ -817,6 +838,36 @@ export class WcWallet {
         message: normalizedMessage || undefined,
         userPrompt: requestParams.userPrompt?.trim() || undefined,
         requestMode
+      },
+      error: null
+    }
+  }
+
+  private parseSignMessageParams(input: unknown): {
+    params: SignMessageParams | null
+    error: JsonRpcError | null
+  } {
+    const requestParams = unwrapWcParams(input)
+
+    const message =
+      typeof requestParams.message === 'string'
+        ? requestParams.message
+        : ''
+
+    if (!message) {
+      return {
+        params: null,
+        error: { code: -32602, message: 'Params inválidos: message requerido' }
+      }
+    }
+
+    return {
+      params: {
+        message,
+        address: typeof requestParams.address === 'string' ? requestParams.address : undefined,
+        domain: typeof requestParams.domain === 'string' ? requestParams.domain : undefined,
+        purpose: typeof requestParams.purpose === 'string' ? requestParams.purpose : undefined,
+        challengeId: typeof requestParams.challengeId === 'string' ? requestParams.challengeId : undefined
       },
       error: null
     }
@@ -1393,7 +1444,12 @@ export class WcWallet {
         ecash: {
           ...ecashNamespace,
           chains: [WC_CHAIN_ID, WC_CHAIN_ID_LEGACY],
-          methods: [WC_METHOD_SIGN_AND_BROADCAST, WC_METHOD_SIGN_AND_BROADCAST_ALIAS, WC_METHOD_GET_ADDRESSES],
+          methods: [
+            WC_METHOD_SIGN_AND_BROADCAST,
+            WC_METHOD_SIGN_AND_BROADCAST_ALIAS,
+            WC_METHOD_GET_ADDRESSES,
+            WC_METHOD_SIGN_MESSAGE
+          ],
           events: [WC_EVENT_ACCOUNTS_CHANGED],
           accounts: [`${WC_CHAIN_ID}:${normalizedAddress}`, `${WC_CHAIN_ID_LEGACY}:${normalizedAddress}`]
         }
@@ -1579,7 +1635,7 @@ export class WcWallet {
   private proposalSupportsEcashV2(proposal: Web3WalletTypes.SessionProposal): boolean {
     const { chains, methods } = this.getProposalEcashDetails(proposal)
     const selectedChain = this.selectPreferredChain(chains)
-    const hasMethod = methods.includes(WC_METHOD_SIGN_AND_BROADCAST)
+    const hasMethod = methods.some((method) => WC_SUPPORTED_METHODS.includes(method as (typeof WC_SUPPORTED_METHODS)[number]))
     return Boolean(selectedChain) && hasMethod
   }
 
@@ -1659,11 +1715,6 @@ export class WcWallet {
         return
       }
 
-      if (!isSignAndBroadcastMethod(request.method)) {
-        await this.respondError(topic, id, this.normalizeJsonRpcError('method'))
-        return
-      }
-
       const session = this.getActiveSessions()[topic]
       const sessionChainId = session ? this.getChainForSession(session) : null
       const resolvedChainId = chainFromEvent ?? sessionChainId ?? WC_CHAIN_ID
@@ -1677,6 +1728,45 @@ export class WcWallet {
       }
       if (!this.isSupportedChain(resolvedChainId)) {
         await this.respondError(topic, id, { code: -32000, message: 'Unsupported chain' })
+        return
+      }
+
+      const isSignMessage = isSignMessageMethod(request.method)
+
+      if (isSignMessage) {
+        const parsed = this.parseSignMessageParams(request.params)
+        if (!parsed.params || parsed.error) {
+          await this.respondError(topic, id, parsed.error ?? this.normalizeJsonRpcError('params'))
+          return
+        }
+
+        const verifyContext = this.validatePeer(session?.peer?.metadata)
+        const payload: SessionRequestPayload = {
+          id,
+          topic,
+          method: WC_METHOD_SIGN_MESSAGE,
+          chainId: resolvedChainId,
+          params: parsed.params,
+          expiresAt: expiryTimestamp,
+          createdAt: nowSeconds(),
+          peer: session?.peer?.metadata,
+          verifyContext
+        }
+
+        if (this.state.pendingRequest && !this.state.pendingRequestResolved) {
+          const enqueued = await this.enqueuePendingRequest(payload)
+          if (!enqueued) {
+            await this.respondError(topic, id, this.normalizeJsonRpcError('busy'))
+          }
+          return
+        }
+
+        await this.activatePendingRequest(payload)
+        return
+      }
+
+      if (!isSignAndBroadcastMethod(request.method)) {
+        await this.respondError(topic, id, this.normalizeJsonRpcError('method'))
         return
       }
 
@@ -1871,8 +1961,96 @@ export class WcWallet {
       return
     }
 
-    const offerId = pending.params.offerId ?? ''
     this.setState({ pendingRequestBusy: true, pendingRequestError: null, pendingRequestStatus: 'signing' })
+
+    if (pending.method === WC_METHOD_SIGN_MESSAGE) {
+      try {
+        const message = typeof pending.params.message === 'string' ? pending.params.message : ''
+        if (!message) {
+          throw new Error('Message requerido para firmar.')
+        }
+
+        const keyInfo = xolosWalletService.getKeyInfo()
+        const address = keyInfo.xecAddress ?? keyInfo.address
+        const publicKey = keyInfo.publicKeyHex
+
+        if (!address) {
+          throw new Error('No pudimos obtener la dirección activa de la billetera.')
+        }
+        if (!publicKey) {
+          throw new Error('No pudimos obtener la llave pública de la billetera.')
+        }
+        if (pending.params.address && pending.params.address !== address) {
+          throw new Error('La dirección solicitada no coincide con la dirección activa de la billetera.')
+        }
+
+        const signature = await xolosWalletService.signMessage(message)
+
+        await this.respondSuccess(pending.topic, pending.id, {
+          signature,
+          publicKey,
+          pubkey: publicKey,
+          address,
+          challengeId:
+            typeof pending.params.challengeId === 'string'
+              ? pending.params.challengeId
+              : undefined
+        })
+
+        this.setState({
+          pendingRequestBusy: false,
+          pendingRequestError: null,
+          pendingRequestResolved: true,
+          pendingRequestTxid: null,
+          pendingRequestStatus: 'done'
+        })
+        this.clearPendingExpiryTimer()
+        appendWcRequestHistory({
+          offerId: '',
+          peer: pending.peer?.name ?? pending.peer?.url ?? 'unknown',
+          topic: pending.topic,
+          status: 'success',
+          createdAt: pending.createdAt,
+          method: pending.method
+        })
+        this.setState({
+          pendingRequest: null,
+          pendingRequestError: null,
+          pendingRequestBusy: false,
+          pendingRequestResolved: false,
+          pendingRequestTxid: null,
+          pendingRequestStatus: 'idle'
+        })
+        await this.flushNextPendingRequest()
+        return
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'Error al firmar mensaje'
+        await this.respondError(pending.topic, pending.id, {
+          code: -32000,
+          message: errorMessage
+        })
+        this.setState({
+          pendingRequestError: errorMessage,
+          pendingRequestBusy: false,
+          pendingRequestResolved: true,
+          pendingRequestTxid: null,
+          pendingRequestStatus: 'error'
+        })
+        this.clearPendingExpiryTimer()
+        appendWcRequestHistory({
+          offerId: '',
+          peer: pending.peer?.name ?? pending.peer?.url ?? 'unknown',
+          topic: pending.topic,
+          status: 'error',
+          error: errorMessage,
+          createdAt: pending.createdAt,
+          method: pending.method
+        })
+        return
+      }
+    }
+
+    const offerId = pending.params.offerId ?? ''
     console.info('[WCv2] signAndBroadcast approve', { offerId, topic: pending.topic })
 
     try {

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { PendingRequest, PendingRequestStatus } from '../../lib/walletconnect/WcWallet'
+import { xolosWalletService } from '../../services/XolosWalletService'
 
 type ApproveRequestModalProps = {
   open: boolean
@@ -68,8 +69,13 @@ export default function ApproveRequestModal({
   const metadata = request.peer
   const icon = metadata?.icons?.[0]
   const params = request.params
+  const isSignMessage = request.method === 'ecash_signMessage'
   const verifyWarning = request.verifyContext?.warning
   const txPreview = request.rawTxPreview
+  const keyInfo = xolosWalletService.getKeyInfo()
+  const walletAddress = keyInfo.xecAddress ?? keyInfo.address ?? params.address
+  const dialogLabel = isSignMessage ? 'Firmar mensaje' : 'Ritual de Compra'
+  const title = isSignMessage ? 'Firmar mensaje' : 'Solicitud WalletConnect para firmar y transmitir.'
 
   const handleCopyTxid = async () => {
     if (!successTxid || !navigator.clipboard?.writeText) return
@@ -87,7 +93,7 @@ export default function ApproveRequestModal({
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Ritual de Compra"
+      aria-label={dialogLabel}
       style={{
         position: 'fixed',
         inset: 0,
@@ -135,10 +141,10 @@ export default function ApproveRequestModal({
           </div>
           <div>
             <p className="eyebrow" style={{ marginBottom: 6, letterSpacing: '0.16em' }}>
-              Ritual de Compra
+              {isSignMessage ? 'Firmar mensaje' : 'Ritual de Compra'}
             </p>
             <h2 className="section-title" style={{ fontSize: 22, letterSpacing: '0.08em' }}>
-              Solicitud WalletConnect para firmar y transmitir.
+              {title}
             </h2>
           </div>
         </div>
@@ -171,12 +177,40 @@ export default function ApproveRequestModal({
           </SectionRow>
           <SectionRow label="Accion">{request.method}</SectionRow>
           <SectionRow label="Chain ID">{request.chainId}</SectionRow>
-          <SectionRow label="Offer ID">
-            <span className="pill pill-ghost" style={{ wordBreak: 'break-all' }}>
-              {params.offerId}
-            </span>
-          </SectionRow>
-          {params.userPrompt && <SectionRow label="Mensaje">{params.userPrompt}</SectionRow>}
+          {isSignMessage ? (
+            <>
+              {params.domain && <SectionRow label="Domain">{params.domain}</SectionRow>}
+              {params.purpose && <SectionRow label="Purpose">{params.purpose}</SectionRow>}
+              {params.challengeId && <SectionRow label="Challenge ID">{params.challengeId}</SectionRow>}
+              {walletAddress && <SectionRow label="Wallet address">{walletAddress}</SectionRow>}
+              <SectionRow label="Mensaje exacto">
+                <pre
+                  style={{
+                    margin: 0,
+                    padding: 12,
+                    borderRadius: 12,
+                    background: 'rgba(255,255,255,0.04)',
+                    border: '1px solid rgba(255,255,255,0.08)',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    fontSize: 13,
+                    lineHeight: 1.5
+                  }}
+                >
+                  {params.message}
+                </pre>
+              </SectionRow>
+            </>
+          ) : (
+            <>
+              <SectionRow label="Offer ID">
+                <span className="pill pill-ghost" style={{ wordBreak: 'break-all' }}>
+                  {params.offerId}
+                </span>
+              </SectionRow>
+              {params.userPrompt && <SectionRow label="Mensaje">{params.userPrompt}</SectionRow>}
+            </>
+          )}
           <SectionRow label="Expira en">
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
               <span
@@ -200,12 +234,12 @@ export default function ApproveRequestModal({
               {expiresSoon && !isExpired && <span className="muted">Expira pronto.</span>}
             </div>
           </SectionRow>
-          {params.rawHex && (
+          {!isSignMessage && params.rawHex && (
             <SectionRow label="rawHex">
               <span className="muted">{params.rawHex.slice(0, 32)}...</span>
             </SectionRow>
           )}
-          {txPreview && (
+          {!isSignMessage && txPreview && (
             <SectionRow label="Resumen tx">
               <div style={{ display: 'grid', gap: 6 }}>
                 <span className="muted">
@@ -257,7 +291,7 @@ export default function ApproveRequestModal({
                 color: '#050505'
               }}
             >
-              {busy ? 'Procesando...' : isExpired ? 'Solicitud expirada' : 'Aprobar compra'}
+              {busy ? 'Procesando...' : isExpired ? 'Solicitud expirada' : isSignMessage ? 'Firmar mensaje' : 'Aprobar compra'}
             </button>
           )}
         </div>

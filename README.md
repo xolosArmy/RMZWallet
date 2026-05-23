@@ -19,8 +19,11 @@ Configura estas variables en Vercel o tu entorno local:
 - Namespace soportado: `ecash`
 - Chain estándar soportada: `ecash:1`
 - Compat legacy: también se acepta `ecash:mainnet` si la dApp lo propone
-- Método principal: `ecash_signAndBroadcastTransaction`
-- Método auxiliar: `ecash_getAddresses`
+- Métodos soportados:
+  - `ecash_getAddresses`
+  - `ecash_signMessage`
+  - `ecash_signAndBroadcastTransaction`
+  - `ecash_signAndBroadcast`
 - Accounts CAIP-10: `<chain>:<address>` (preferido `ecash:1:<address>`)
 
 ### Errores JSON-RPC expuestos a la dApp
@@ -33,6 +36,17 @@ Configura estas variables en Vercel o tu entorno local:
 ### Validación manual (dev)
 
 - Flujo intent-only: conectar Flipstarter -> Donar -> debe abrir modal de RMZWallet y firmar sin mostrar `Usa el formato txid:vout.` cuando la request solo trae `outputs`.
+
+### Mining Gateway WalletConnect flow
+
+1. `mining.ecash.mx` genera un URI `wc:`.
+2. El usuario pega el URI `wc:` en RMZWallet -> Conectar dApps.
+3. El usuario aprueba la sesión de WalletConnect.
+4. Mining Gateway envía `ecash_signMessage` con el challenge exacto.
+5. RMZWallet muestra una pantalla de aprobación `Firmar mensaje`.
+6. RMZWallet firma con `xolosWalletService.signMessage(message)`.
+7. RMZWallet devuelve `address`, `publicKey`/`pubkey`, `signature` y `challengeId`.
+8. Mining Gateway verifica la firma y emite el token de sesión de minería.
 
 ## NFTs
 
