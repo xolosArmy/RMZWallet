@@ -32,6 +32,16 @@ const FEATURED_OFFERS: FeaturedOffer[] = [
     id: '67e456dab49064ee289455f16e36db97eaa681a8c5d15ff3f57b072bb73ef49e:1',
     label: 'Pack Inversor',
     summary: '500 RMZ por 250,000 XEC'
+  },
+  {
+    id: '9932a3ca8285d76db96a9e646a09a4d9c7eaa1a5eb7ddeba8d16538e45e0724c:1',
+    label: 'Paquete Básico para Workers',
+    summary: 'Oferta para agregar workers en mining.ecash.mx'
+  },
+  {
+    id: 'b000e816b45aa2b835d74b275d5882651bb6c57d249700712c308068b3fbcb72:1',
+    label: 'Paquete para Crear Teyolias',
+    summary: 'Consigue los recursos necesarios para crear Teyolias'
   }
 ]
 
