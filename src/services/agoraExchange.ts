@@ -1,19 +1,8 @@
-import {
-  ALL_BIP143,
-  Address,
-  EccDummy,
-  P2PKHSignatory,
-  Script,
-  TxBuilder,
-  calcTxFee,
-  fromHex,
-  shaRmd160,
-  slpSend
-} from 'ecash-lib'
-import { AgoraOffer, AgoraOneshot, AgoraOneshotAdSignatory, parseAgoraTx } from 'ecash-agora'
+import { Address, EccDummy, Script, TxBuilder, calcTxFee, shaRmd160, slpSend } from 'ecash-lib'
+import { AgoraOffer, AgoraOneshot, parseAgoraTx } from 'ecash-agora'
 import type { ScriptUtxo, Tx } from 'chronik-client'
 import { getChronik } from './ChronikClient'
-import type { XolosWalletService } from './XolosWalletService'
+import type { WalletSignatory, XolosWalletService } from './XolosWalletService'
 import { XEC_DUST_SATS } from '../config/xecFees'
 
 const SLP_NFT1_CHILD = 65
@@ -94,7 +83,7 @@ const selectXecUtxosForTarget = (utxos: ScriptUtxo[], targetSats: bigint): Scrip
   throw new Error('No hay suficiente XEC para cubrir la compra.')
 }
 
-const buildInput = (utxo: ScriptUtxo, outputScript: Script, signatory: ReturnType<typeof P2PKHSignatory>) => {
+const buildInput = (utxo: ScriptUtxo, outputScript: Script, signatory: WalletSignatory['signatory']) => {
   return {
     input: {
       prevOut: utxo.outpoint,
@@ -185,10 +174,11 @@ const createSellOfferInternal = async (params: {
   tokenAtoms: bigint
   askXecSats: bigint
   payoutAddress: string
-  keyInfo: { privateKeyHex: string; publicKeyHex: string }
+  publicKey: Uint8Array
+  adSignatory: unknown
+  signatory: WalletSignatory['signatory']
 }): Promise<{ offerTxid: string; adTxid: string; offerId: string }> => {
   const makerScript = Script.fromAddress(Address.parse(params.payoutAddress).cash().toString())
-  const signer = P2PKHSignatory(fromHex(params.keyInfo.privateKeyHex), fromHex(params.keyInfo.publicKeyHex), ALL_BIP143)
 
   const chronik = getChronik()
   const utxos = await chronik.address(params.payoutAddress).utxos()
@@ -222,7 +212,7 @@ const createSellOfferInternal = async (params: {
 
   const agoraOneshot = new AgoraOneshot({
     enforcedOutputs,
-    cancelPk: fromHex(params.keyInfo.publicKeyHex)
+    cancelPk: params.publicKey
   })
   const agoraAdScript = new Script(agoraOneshot.adScript().bytecode)
   const agoraAdP2sh = Script.p2sh(shaRmd160(agoraAdScript.bytecode))
@@ -237,7 +227,7 @@ const createSellOfferInternal = async (params: {
 
   const offerTxFuelSats = getAgoraAdFuelSats(
     agoraAdScript,
-    AgoraOneshotAdSignatory(fromHex(params.keyInfo.privateKeyHex)),
+    params.adSignatory,
     offerOutputs
   )
 
@@ -261,8 +251,8 @@ const createSellOfferInternal = async (params: {
   })
 
   const adSetupInputs = [
-    buildInput(tokenUtxo, makerScript, signer),
-    ...funding.selected.map((utxo) => buildInput(utxo, makerScript, signer))
+    buildInput(tokenUtxo, makerScript, params.signatory),
+    ...funding.selected.map((utxo) => buildInput(utxo, makerScript, params.signatory))
   ]
   const adSetupFinalOutputs = funding.includeChange ? [...adSetupOutputs, makerScript] : adSetupOutputs
 
@@ -285,7 +275,7 @@ const createSellOfferInternal = async (params: {
           redeemScript: agoraAdScript
         }
       },
-      signatory: AgoraOneshotAdSignatory(fromHex(params.keyInfo.privateKeyHex)) as never
+      signatory: params.adSignatory as never
     }
   ]
 
@@ -337,19 +327,15 @@ export const createSellOfferToken = async (params: {
   payoutAddress: string
   wallet: XolosWalletService
 }): Promise<{ txid: string; offerId: string }> => {
-  const walletKeyInfo = params.wallet.getKeyInfo()
-  if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex) {
-    throw new Error('No pudimos acceder a las llaves de tu billetera.')
-  }
+  const signer = params.wallet.getSignatory()
   const result = await createSellOfferInternal({
     tokenId: params.tokenId,
     tokenAtoms: params.tokenAtoms,
     askXecSats: params.askXecSats,
     payoutAddress: params.payoutAddress,
-    keyInfo: {
-      privateKeyHex: walletKeyInfo.privateKeyHex,
-      publicKeyHex: walletKeyInfo.publicKeyHex
-    }
+    publicKey: signer.publicKey,
+    adSignatory: params.wallet.getAgoraOneshotAdSignatory(),
+    signatory: signer.signatory
   })
   return { txid: result.offerTxid, offerId: result.offerId }
 }
@@ -391,33 +377,30 @@ export const acceptOfferById = async (params: {
   wallet: XolosWalletService
 }): Promise<{ txid: string }> => {
   const { offer } = await loadOfferById({ offerId: params.offerId })
-  const walletKeyInfo = params.wallet.getKeyInfo()
-  const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-  if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
-    throw new Error('No pudimos acceder a las llaves de tu billetera.')
-  }
-  const recipientScript = Script.fromAddress(Address.parse(xecAddress).cash().toString())
+  const signer = params.wallet.getSignatory()
+  const recipientScript = Script.fromAddress(Address.parse(signer.address).cash().toString())
 
   const askedSats = offer.askedSats()
   const feeSats = offer.acceptFeeSats({ recipientScript, feePerKb: FEE_PER_KB, acceptedAtoms: offer.token.atoms })
   const totalNeeded = askedSats + feeSats
 
   const chronik = getChronik()
-  const addressUtxos = await chronik.address(xecAddress).utxos()
+  const addressUtxos = await chronik.address(signer.address).utxos()
   const xecUtxos = addressUtxos.utxos.filter((utxo) => !utxo.token)
   const funding = selectXecUtxosForTarget(xecUtxos, totalNeeded)
 
-  const signer = P2PKHSignatory(fromHex(walletKeyInfo.privateKeyHex), fromHex(walletKeyInfo.publicKeyHex), ALL_BIP143)
-  const fuelInputs = funding.map((utxo) => buildInput(utxo, recipientScript, signer))
+  const fuelInputs = funding.map((utxo) => buildInput(utxo, recipientScript, signer.signatory))
 
-  const acceptTx = offer.acceptTx({
-    covenantSk: fromHex(walletKeyInfo.privateKeyHex),
-    covenantPk: fromHex(walletKeyInfo.publicKeyHex),
-    fuelInputs,
-    recipientScript,
-    dustSats: BigInt(XEC_DUST_SATS),
-    feePerKb: FEE_PER_KB
-  })
+  const acceptTx = params.wallet.withPrivateKey((privateKey) =>
+    offer.acceptTx({
+      covenantSk: privateKey,
+      covenantPk: signer.publicKey,
+      fuelInputs,
+      recipientScript,
+      dustSats: BigInt(XEC_DUST_SATS),
+      feePerKb: FEE_PER_KB
+    })
+  )
 
   const broadcast = await chronik.broadcastTx(acceptTx.ser())
   return { txid: broadcast.txid }

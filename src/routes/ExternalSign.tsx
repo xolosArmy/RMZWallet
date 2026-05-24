@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { ALL_BIP143, P2PKHSignatory, Script, Tx, TxBuilder, fromHex, toHex } from 'ecash-lib'
+import { Script, Tx, TxBuilder, fromHex, toHex } from 'ecash-lib'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { getChronik } from '../services/ChronikClient'
@@ -22,10 +22,17 @@ type ExternalSignResult = {
 }
 
 function isWalletReady() {
-  const keyInfo = xolosWalletService.getKeyInfo()
-  return {
-    ready: Boolean(keyInfo.address && keyInfo.privateKeyHex && keyInfo.publicKeyHex),
-    keyInfo
+  try {
+    const signer = xolosWalletService.getSignatory()
+    return {
+      ready: Boolean(signer.address && signer.publicKeyHex),
+      signer
+    }
+  } catch {
+    return {
+      ready: false,
+      signer: null
+    }
   }
 }
 
@@ -52,19 +59,14 @@ async function signExternalRequest(request: ExternalSignRequest): Promise<Extern
   console.info(`[external-sign] derived inputs=${outpoints.length}`)
 
   const wallet = isWalletReady()
-  if (!wallet.ready || !wallet.keyInfo.privateKeyHex || !wallet.keyInfo.publicKeyHex || !wallet.keyInfo.address) {
+  if (!wallet.ready || !wallet.signer) {
     throw new Error('No pudimos acceder a la cuenta activa para firmar.')
   }
 
   const unsignedTx = Tx.fromHex(request.unsignedTxHex)
   const chronik = getChronik()
 
-  const signer = P2PKHSignatory(
-    fromHex(wallet.keyInfo.privateKeyHex),
-    fromHex(wallet.keyInfo.publicKeyHex),
-    ALL_BIP143
-  )
-  const walletScript = Script.fromAddress(wallet.keyInfo.address.replace(/^ecash:/, ''))
+  const walletScript = Script.fromAddress(wallet.signer.address.replace(/^ecash:/, ''))
   const walletScriptHex = toHex(walletScript.bytecode).toLowerCase()
 
   const prevTxCache = new Map<string, Awaited<ReturnType<ReturnType<typeof getChronik>['tx']>>>()
@@ -105,7 +107,7 @@ async function signExternalRequest(request: ExternalSignRequest): Promise<Extern
       sats: BigInt(prevOutput.sats),
       outputScript: parsedPrevScript
     }
-    builder.inputs[index].signatory = signer
+    builder.inputs[index].signatory = wallet.signer.signatory
   }
 
   const signedTx = builder.sign()

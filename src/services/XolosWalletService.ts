@@ -1,5 +1,6 @@
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
-import { fromHex, signMsg } from 'ecash-lib'
+import { ALL_BIP143, P2PKHSignatory, type TxBuilder, fromHex, signMsg } from 'ecash-lib'
+import { AgoraOneshotAdSignatory } from 'ecash-agora'
 import type { ScriptUtxo } from 'chronik-client'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { FEE_RATE_SATS_PER_BYTE, TONALLI_SERVICE_FEE_SATS, XEC_TONALLI_TREASURY_ADDRESS } from '../config/xecFees'
@@ -128,7 +129,13 @@ export interface WalletKeyInfo {
   xecAddress: string | null
   address: string | null
   publicKeyHex: string | null
-  privateKeyHex: string | null
+}
+
+export interface WalletSignatory {
+  address: string
+  publicKeyHex: string
+  publicKey: Uint8Array
+  signatory: ReturnType<typeof P2PKHSignatory>
 }
 
 export class XolosWalletService {
@@ -210,9 +217,13 @@ export class XolosWalletService {
     if (!this.encryptedMnemonic) {
       throw new Error('No existe una semilla cifrada en este dispositivo.')
     }
-    const mnemonic = decryptWithPassword(this.encryptedMnemonic, password)
-    await this.restoreFromMnemonic(mnemonic)
-    this.decryptedMnemonic = mnemonic
+    const { plainText, migratedCipherText } = await decryptWithPassword(this.encryptedMnemonic, password)
+    if (migratedCipherText) {
+      localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
+      this.encryptedMnemonic = migratedCipherText
+    }
+    await this.restoreFromMnemonic(plainText)
+    this.decryptedMnemonic = plainText
     this.scanCache = null
     this.scanPromise = null
     this.scanPromiseGapLimit = null
@@ -222,11 +233,15 @@ export class XolosWalletService {
     if (!this.encryptedMnemonic) {
       throw new Error('No existe una semilla cifrada en este dispositivo.')
     }
-    const mnemonic = decryptWithPassword(this.encryptedMnemonic, password)
-    this.decryptedMnemonic = mnemonic
+    const { plainText, migratedCipherText } = await decryptWithPassword(this.encryptedMnemonic, password)
+    if (migratedCipherText) {
+      localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
+      this.encryptedMnemonic = migratedCipherText
+    }
+    this.decryptedMnemonic = plainText
   }
 
-  encryptAndStoreMnemonic(password: string): void {
+  async encryptAndStoreMnemonic(password: string): Promise<void> {
     let mnemonic = this.decryptedMnemonic
 
     const walletMnemonic = this.wallet?.mnemonic || this.wallet?.walletInfo?.mnemonic
@@ -239,7 +254,7 @@ export class XolosWalletService {
       throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
     }
 
-    const cipherText = encryptWithPassword(mnemonic, password)
+    const cipherText = await encryptWithPassword(mnemonic, password)
     localStorage.setItem(STORAGE_KEY_MNEMONIC, cipherText)
     this.encryptedMnemonic = cipherText
   }
@@ -525,8 +540,7 @@ export class XolosWalletService {
       mnemonic: this.getMnemonic(),
       xecAddress,
       address: xecAddress,
-      publicKeyHex: this.getPublicKeyHex(),
-      privateKeyHex: this.getPrivateKeyHex()
+      publicKeyHex: this.getPublicKeyHex()
     }
   }
 
@@ -534,20 +548,52 @@ export class XolosWalletService {
     return this.wallet?.walletInfo?.publicKey || null
   }
 
-  getPrivateKeyHex(): string | null {
-    return this.wallet?.walletInfo?.privateKey || null
-  }
-
   getAddress(): string | null {
     return this.wallet?.walletInfo?.xecAddress || null
   }
 
-  async signMessage(message: string): Promise<string> {
-    const privKeyHex = this.getPrivateKeyHex()
-    if (!privKeyHex) {
+  getSignatory(): WalletSignatory {
+    const privateKeyHex = this.wallet?.walletInfo?.privateKey || null
+    const publicKeyHex = this.wallet?.walletInfo?.publicKey || null
+    const address = this.wallet?.walletInfo?.xecAddress || null
+
+    if (!privateKeyHex || !publicKeyHex || !address) {
       throw new Error('WALLET_LOCKED')
     }
-    return signMsg(message, fromHex(privKeyHex))
+
+    const privateKey = fromHex(privateKeyHex)
+    const publicKey = fromHex(publicKeyHex)
+
+    return {
+      address,
+      publicKeyHex,
+      publicKey,
+      signatory: P2PKHSignatory(privateKey, publicKey, ALL_BIP143)
+    }
+  }
+
+  getAgoraOneshotAdSignatory(): unknown {
+    const privateKeyHex = this.wallet?.walletInfo?.privateKey || null
+    if (!privateKeyHex) {
+      throw new Error('WALLET_LOCKED')
+    }
+    return AgoraOneshotAdSignatory(fromHex(privateKeyHex))
+  }
+
+  withPrivateKey<T>(handler: (privateKey: Uint8Array) => T): T {
+    const privateKeyHex = this.wallet?.walletInfo?.privateKey || null
+    if (!privateKeyHex) {
+      throw new Error('WALLET_LOCKED')
+    }
+    return handler(fromHex(privateKeyHex))
+  }
+
+  signTxBuilder(builder: TxBuilder, options?: { feePerKb?: bigint; dustSats?: bigint }) {
+    return builder.sign(options)
+  }
+
+  async signMessage(message: string): Promise<string> {
+    return this.withPrivateKey((privateKey) => signMsg(message, privateKey))
   }
 
   async getRmzDecimals(): Promise<number> {

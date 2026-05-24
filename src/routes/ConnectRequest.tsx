@@ -40,13 +40,15 @@ function ConnectRequest() {
   const walletPubkey = xolosWalletService.getPublicKeyHex()
 
   const signMessageValidation = useMemo(() => {
-    if (!returnUrl) {
+    if (!returnUrl || !origin) {
       return 'Missing return URL.'
     }
 
     try {
-      // Production should validate allowed origins more strictly before redirecting.
-      new URL(returnUrl)
+      const parsedReturnUrl = new URL(returnUrl)
+      if (parsedReturnUrl.origin !== origin) {
+        return 'Invalid Tonalli Connect signing request.'
+      }
     } catch {
       return 'Missing return URL.'
     }
@@ -56,7 +58,7 @@ function ConnectRequest() {
     }
 
     return null
-  }, [challengeId, message, returnUrl])
+  }, [challengeId, message, origin, returnUrl])
 
   const connectValidation = (() => {
     if (!returnUrl || !origin || !requestId || !nonce || !ts) {

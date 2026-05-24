@@ -1,8 +1,8 @@
 import { Core } from '@walletconnect/core'
 import { Web3Wallet } from '@walletconnect/web3wallet'
 import type { IWeb3Wallet, Web3WalletTypes } from '@walletconnect/web3wallet'
-import type { SessionTypes } from '@walletconnect/types'
-import { ALL_BIP143, Address, P2PKHSignatory, Script, Tx, TxBuilder, fromHex, toHexRev } from 'ecash-lib'
+import type { SessionTypes, Verify } from '@walletconnect/types'
+import { Address, Script, Tx, TxBuilder, fromHex, toHexRev } from 'ecash-lib'
 import { getChronik } from '../../services/ChronikClient'
 import { xolosWalletService } from '../../services/XolosWalletService'
 import { XEC_DUST_SATS } from '../../config/xecFees'
@@ -159,6 +159,8 @@ export type PeerVerifyContext = {
   warning: string | null
   host: string | null
   allowlisted: boolean
+  validation: 'UNKNOWN' | 'VALID' | 'INVALID'
+  isScam: boolean
 }
 
 export type WcState = {
@@ -497,32 +499,75 @@ export class WcWallet {
     return { chains, methods }
   }
 
-  private validatePeer(metadata: { url?: string } | undefined): PeerVerifyContext {
+  private validatePeer(metadata: { url?: string } | undefined, verifyContext?: Verify.Context): PeerVerifyContext {
     const rawUrl = metadata?.url?.trim()
+    const verifiedOrigin = verifyContext?.verified.origin?.trim() || ''
+    const validation = verifyContext?.verified.validation ?? 'UNKNOWN'
+    const isScam = verifyContext?.verified.isScam === true
+
     if (!rawUrl) {
       return {
         warning: 'La dApp no proporcionó URL. Verifica manualmente el origen antes de aprobar.',
         host: null,
-        allowlisted: false
+        allowlisted: false,
+        validation,
+        isScam
       }
     }
 
     try {
-      const host = new URL(rawUrl).hostname.toLowerCase()
-      if (!WC_ALLOWED_DOMAINS || WC_ALLOWED_DOMAINS.length === 0) {
-        return { warning: null, host, allowlisted: false }
+      const url = new URL(rawUrl)
+      const host = url.hostname.toLowerCase()
+      const allowlisted = Boolean(WC_ALLOWED_DOMAINS && WC_ALLOWED_DOMAINS.includes(host))
+
+      if (isScam) {
+        return {
+          warning: 'WalletConnect Verify marcó esta solicitud como SCAM.',
+          host,
+          allowlisted,
+          validation,
+          isScam
+        }
       }
-      const allowlisted = WC_ALLOWED_DOMAINS.includes(host)
+
+      if (validation === 'INVALID') {
+        return {
+          warning: 'WalletConnect Verify detectó una discrepancia de origen para esta dApp.',
+          host,
+          allowlisted,
+          validation,
+          isScam
+        }
+      }
+
+      if (verifiedOrigin && validation === 'VALID' && new URL(verifiedOrigin).hostname.toLowerCase() !== host) {
+        return {
+          warning: 'WalletConnect Verify devolvió un origen distinto al metadata de la dApp.',
+          host,
+          allowlisted,
+          validation: 'INVALID',
+          isScam
+        }
+      }
+
+      if (!WC_ALLOWED_DOMAINS || WC_ALLOWED_DOMAINS.length === 0) {
+        return { warning: null, host, allowlisted: false, validation, isScam }
+      }
+
       return {
         warning: allowlisted ? null : `Dominio fuera de allowlist: ${host}`,
         host,
-        allowlisted
+        allowlisted,
+        validation,
+        isScam
       }
     } catch {
       return {
         warning: 'La URL de la dApp es inválida. Verifica el origen antes de aprobar.',
         host: null,
-        allowlisted: false
+        allowlisted: false,
+        validation: validation === 'VALID' ? 'INVALID' : validation,
+        isScam
       }
     }
   }
@@ -987,14 +1032,8 @@ export class WcWallet {
       return getChronik().broadcastTx(normalizedRawHex)
     }
 
-    const walletKeyInfo = xolosWalletService.getKeyInfo()
-    const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
-      throw new Error('No pudimos acceder a las llaves de tu billetera.')
-    }
-
-    const signer = P2PKHSignatory(fromHex(walletKeyInfo.privateKeyHex), fromHex(walletKeyInfo.publicKeyHex), ALL_BIP143)
-    const walletUtxos = await getChronik().address(xecAddress).utxos()
+    const signer = xolosWalletService.getSignatory()
+    const walletUtxos = await getChronik().address(signer.address).utxos()
     const walletScript = new Script(fromHex(walletUtxos.outputScript))
     const walletUtxoMap = new Map<string, bigint>()
     for (const utxo of walletUtxos.utxos) {
@@ -1014,7 +1053,7 @@ export class WcWallet {
         sats: inputSats,
         outputScript: walletScript
       }
-      builder.inputs[idx].signatory = signer
+      builder.inputs[idx].signatory = signer.signatory
     }
 
     const signedTx = builder.sign()
@@ -1072,11 +1111,8 @@ export class WcWallet {
       return this.buildSignBroadcastFromTokenOutputs(outputs, message)
     }
 
-    const walletKeyInfo = xolosWalletService.getKeyInfo()
-    const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
-      throw new Error('No pudimos acceder a las llaves de tu billetera.')
-    }
+    const signer = xolosWalletService.getSignatory()
+    const xecAddress = signer.address
 
     const recipientOutputs = outputs.map((output) => ({
       sats: BigInt(output.valueSats),
@@ -1096,7 +1132,6 @@ export class WcWallet {
       throw new Error('No hay UTXOs XEC disponibles para construir la transacción.')
     }
 
-    const signer = P2PKHSignatory(fromHex(walletKeyInfo.privateKeyHex), fromHex(walletKeyInfo.publicKeyHex), ALL_BIP143)
     const walletScript = this.outputAddressToScript(xecAddress)
     const feeRate = this.getWalletConnectFeeRate()
     const feePerKb = BigInt(feeRate) * 1000n
@@ -1115,7 +1150,7 @@ export class WcWallet {
             outputScript: walletScript
           }
         },
-        signatory: signer
+        signatory: signer.signatory
       }))
       const builder = new TxBuilder({
         inputs,
@@ -1740,7 +1775,7 @@ export class WcWallet {
           return
         }
 
-        const verifyContext = this.validatePeer(session?.peer?.metadata)
+        const verifyContext = this.validatePeer(session?.peer?.metadata, event.verifyContext)
         const payload: SessionRequestPayload = {
           id,
           topic,
@@ -1788,7 +1823,7 @@ export class WcWallet {
         hasOutpoints: Boolean((parsed.params.inputsUsed?.length ?? 0) > 0 || (parsed.params.outpoints?.length ?? 0) > 0)
       })
 
-      const verifyContext = this.validatePeer(session?.peer?.metadata)
+      const verifyContext = this.validatePeer(session?.peer?.metadata, event.verifyContext)
       const payload: SessionRequestPayload = {
         id,
         topic,
@@ -1963,6 +1998,21 @@ export class WcWallet {
 
     this.setState({ pendingRequestBusy: true, pendingRequestError: null, pendingRequestStatus: 'signing' })
 
+    if (pending.verifyContext && (pending.verifyContext.isScam || pending.verifyContext.validation === 'INVALID')) {
+      const message = pending.verifyContext.isScam
+        ? 'WalletConnect Verify bloqueó esta solicitud como SCAM.'
+        : 'WalletConnect Verify bloqueó esta solicitud por origen inválido.'
+      this.setState({
+        pendingRequestBusy: false,
+        pendingRequestError: message,
+        pendingRequestResolved: true,
+        pendingRequestTxid: null,
+        pendingRequestStatus: 'error'
+      })
+      await this.respondError(pending.topic, pending.id, { code: 4001, message })
+      return
+    }
+
     if (pending.method === WC_METHOD_SIGN_MESSAGE) {
       try {
         const message = typeof pending.params.message === 'string' ? pending.params.message : ''
@@ -1970,9 +2020,9 @@ export class WcWallet {
           throw new Error('Message requerido para firmar.')
         }
 
-        const keyInfo = xolosWalletService.getKeyInfo()
-        const address = keyInfo.xecAddress ?? keyInfo.address
-        const publicKey = keyInfo.publicKeyHex
+        const signer = xolosWalletService.getSignatory()
+        const address = signer.address
+        const publicKey = signer.publicKeyHex
 
         if (!address) {
           throw new Error('No pudimos obtener la dirección activa de la billetera.')

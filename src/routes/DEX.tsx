@@ -1,16 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { AgoraPartial } from 'ecash-agora'
-import {
-  ALP_STANDARD,
-  ALL_BIP143,
-  Address,
-  P2PKHSignatory,
-  Script,
-  TxBuilder,
-  calcTxFee,
-  fromHex
-} from 'ecash-lib'
+import { ALP_STANDARD, Address, Script, TxBuilder, calcTxFee } from 'ecash-lib'
 import type { ScriptUtxo } from 'chronik-client'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
@@ -21,13 +12,14 @@ import {
   XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR
 } from '../config/nfts'
 import { getChronik } from '../services/ChronikClient'
-import { EXTENDED_GAP_LIMIT, xolosWalletService } from '../services/XolosWalletService'
+import { EXTENDED_GAP_LIMIT, type WalletSignatory, xolosWalletService } from '../services/XolosWalletService'
 import { fetchNftDetails, fetchOwnedNfts, type NftAsset } from '../services/nftService'
 import { acceptOfferById, createSellOfferToken, loadOfferById, type OneshotOfferSummary } from '../services/agoraExchange'
 import { buyOfferById } from '../services/buyOfferById'
 import { wcWallet } from '../lib/walletconnect/WcWallet'
 import type { OfferPublishedPayload } from '../lib/walletconnect/WcWallet'
 import WcDebugPanel from '../components/WcDebugPanel'
+import DexTakerRmz from '../features/dex/components/DexTakerRmz'
 import {
   TOKEN_DUST_SATS,
   buildAlpAgoraListOutputs,
@@ -285,19 +277,15 @@ function DEX() {
       return
     }
 
-    let walletKeyInfo
+    let signer
     try {
-      walletKeyInfo = xolosWalletService.getKeyInfo()
+      signer = xolosWalletService.getSignatory()
     } catch (err) {
       setMakerError((err as Error).message)
       return
     }
 
-    const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
-      setMakerError('No pudimos acceder a las llaves de tu billetera.')
-      return
-    }
+    const xecAddress = signer.address
 
     if (Address.parse(xecAddress).cash().toString() !== payout) {
       setMakerError('La dirección de pago debe coincidir con la dirección actual de tu billetera.')
@@ -343,7 +331,7 @@ function DEX() {
       agoraPartial = AgoraPartial.approximateParams({
         offeredAtoms,
         priceNanoSatsPerAtom,
-        makerPk: fromHex(walletKeyInfo.publicKeyHex),
+        makerPk: signer.publicKey,
         minAcceptedAtoms,
         tokenId: RMZ_ETOKEN_ID,
         tokenType: ALP_STANDARD,
@@ -394,16 +382,14 @@ function DEX() {
         fixedOutputs: listOutputs,
         tokenInputsCount: tokenSelection.selected.length
       })
-
-      const signer = P2PKHSignatory(fromHex(walletKeyInfo.privateKeyHex), fromHex(walletKeyInfo.publicKeyHex), ALL_BIP143)
       const inputs = [
-        ...tokenSelection.selected.map((utxo) => buildInput(utxo, p2pkhScript, signer)),
-        ...funding.selected.map((utxo) => buildInput(utxo, p2pkhScript, signer))
+        ...tokenSelection.selected.map((utxo) => buildInput(utxo, p2pkhScript, signer.signatory)),
+        ...funding.selected.map((utxo) => buildInput(utxo, p2pkhScript, signer.signatory))
       ]
 
       const outputs = funding.includeChange ? [...listOutputs, p2pkhScript] : listOutputs
       const txBuilder = new TxBuilder({ inputs, outputs })
-      const signedTx = txBuilder.sign({ feePerKb: FEE_PER_KB, dustSats: TOKEN_DUST_SATS })
+      const signedTx = xolosWalletService.signTxBuilder(txBuilder, { feePerKb: FEE_PER_KB, dustSats: TOKEN_DUST_SATS })
 
       const broadcast = await chronik.broadcastTx(signedTx.ser())
 
@@ -579,9 +565,10 @@ function DEX() {
 
     setNftSellBusy(true)
     try {
-      const walletKeyInfo = xolosWalletService.getKeyInfo()
-      const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-      if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+      let xecAddress: string
+      try {
+        xecAddress = xolosWalletService.getSignatory().address
+      } catch {
         setNftOfferError('No pudimos acceder a las llaves de tu billetera.')
         return
       }
@@ -682,10 +669,10 @@ function DEX() {
       setMintPassError('El precio por unidad debe ser mayor a cero.')
       return
     }
-
-    const walletKeyInfo = xolosWalletService.getKeyInfo()
-    const xecAddress = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-    if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !xecAddress) {
+    let xecAddress: string
+    try {
+      xecAddress = xolosWalletService.getSignatory().address
+    } catch {
       setMintPassError('No pudimos acceder a las llaves de tu billetera.')
       return
     }
@@ -1046,55 +1033,18 @@ function DEX() {
         )}
 
         {dexTab === 'taker' && (
-          <div style={{ marginTop: 16 }}>
-            <label htmlFor="offerId">Offer ID (txid:vout o JSON)</label>
-            <textarea
-              id="offerId"
-              value={offerIdInput}
-              onChange={(event) => setOfferIdInput(event.target.value)}
-              placeholder="txid:vout"
-              rows={3}
-            />
-            <div className="actions" style={{ marginTop: 12 }}>
-              <button className="cta" type="button" onClick={handleLookupOffer} disabled={offerBusy}>
-                {offerBusy ? 'Verificando...' : 'Cargar oferta'}
-              </button>
-            </div>
-
-            {offerLookupError && <div className="error">{offerLookupError}</div>}
-
-            {offerDetails && offerSummary && (
-              <div style={{ marginTop: 16 }}>
-                <div className="success">
-                  Oferta lista: {offerSummary.offeredDisplay} RMZ por {offerSummary.askedDisplay} XEC
-                </div>
-                <p className="muted" style={{ marginTop: 8 }}>
-                  Pago a: {offerDetails.payoutAddress}
-                </p>
-                <div className="actions" style={{ marginTop: 12 }}>
-                  <button className="cta primary" type="button" onClick={handleBuyOffer} disabled={buyBusy}>
-                    {buyBusy ? 'Comprando...' : 'Comprar RMZ'}
-                  </button>
-                </div>
-                {buyTxid && (
-                  <div className="success" style={{ marginTop: 12 }}>
-                    Compra completada: <span className="address-box">{buyTxid}</span>
-                  </div>
-                )}
-                <details style={{ marginTop: 12 }}>
-                  <summary>Avanzado</summary>
-                  <div className="address-box" style={{ marginTop: 8, whiteSpace: 'pre-line' }}>
-                    {[
-                      `sellAtoms=${offerDetails.offeredAtoms.toString()}`,
-                      `askedSats=${offerDetails.askedSats.toString()}`,
-                      `priceNanoSatsPerAtom=${offerDetails.priceNanoSatsPerAtom.toString()}`,
-                      `payoutAddress=${offerDetails.payoutAddress}`
-                    ].join('\n')}
-                  </div>
-                </details>
-              </div>
-            )}
-          </div>
+          <DexTakerRmz
+            offerIdInput={offerIdInput}
+            setOfferIdInput={setOfferIdInput}
+            offerLookupError={offerLookupError}
+            offerBusy={offerBusy}
+            onLookupOffer={handleLookupOffer}
+            buyBusy={buyBusy}
+            onBuyOffer={handleBuyOffer}
+            buyTxid={buyTxid}
+            offerSummary={offerSummary}
+            payoutAddress={offerDetails?.payoutAddress ?? null}
+          />
         )}
 
         {dexTab === 'nft' && (
@@ -1458,7 +1408,7 @@ function sumSats(utxos: ScriptUtxo[]): bigint {
   return utxos.reduce((sum, utxo) => sum + utxo.sats, 0n)
 }
 
-function buildInput(utxo: ScriptUtxo, outputScript: Script, signatory: ReturnType<typeof P2PKHSignatory>) {
+function buildInput(utxo: ScriptUtxo, outputScript: Script, signatory: WalletSignatory['signatory']) {
   return {
     input: {
       prevOut: utxo.outpoint,

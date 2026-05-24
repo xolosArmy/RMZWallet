@@ -118,6 +118,8 @@ const stableStringifyJson = (value: unknown): string => {
   return `{${serializedEntries.join(',')}}`
 }
 
+const bytesToHex = (bytes: Uint8Array) => Array.from(bytes).map((byte) => byte.toString(16).padStart(2, '0')).join('')
+
 const hashJsonToSha256Hex = async (json: string): Promise<string> => {
   const data = new TextEncoder().encode(json)
   const digest = await crypto.subtle.digest('SHA-256', data)
@@ -145,11 +147,8 @@ export const mintXolosarmyNftChild = async (params: {
   externalUrl?: string
   lineage?: XolosLineage
 }): Promise<{ childTokenId: string; txid: string; metadataCid: string }> => {
-  const walletKeyInfo = xolosWalletService.getKeyInfo()
-  const address = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-  if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !address) {
-    throw new Error('No pudimos acceder a las llaves de tu billetera.')
-  }
+  const signer = xolosWalletService.getSignatory()
+  const address = signer.address
   if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) {
     throw new Error('Falta configurar el token padre de la colección.')
   }
@@ -176,14 +175,16 @@ export const mintXolosarmyNftChild = async (params: {
     decimals: 0
   }
 
-  const { txid } = await mintNftChildGenesis({
-    address,
-    keyInfo: {
-      privateKeyHex: walletKeyInfo.privateKeyHex,
-      publicKeyHex: walletKeyInfo.publicKeyHex
-    },
-    genesisInfo
-  })
+  const { txid } = await xolosWalletService.withPrivateKey((privateKey) =>
+    mintNftChildGenesis({
+      address,
+      keyInfo: {
+        privateKeyHex: bytesToHex(privateKey),
+        publicKeyHex: signer.publicKeyHex
+      },
+      genesisInfo
+    })
+  )
 
   cacheTokenId(txid)
   cacheMetadata(txid, metadata, metadataResult.cid)
@@ -335,19 +336,17 @@ export const sendNft = async (params: {
   tokenId: string
   destinationAddress: string
 }): Promise<{ txid: string }> => {
-  const walletKeyInfo = xolosWalletService.getKeyInfo()
-  const address = walletKeyInfo.xecAddress ?? walletKeyInfo.address
-  if (!walletKeyInfo.privateKeyHex || !walletKeyInfo.publicKeyHex || !address) {
-    throw new Error('No pudimos acceder a las llaves de tu billetera.')
-  }
+  const signer = xolosWalletService.getSignatory()
 
-  return sendNftChild({
-    address,
-    keyInfo: {
-      privateKeyHex: walletKeyInfo.privateKeyHex,
-      publicKeyHex: walletKeyInfo.publicKeyHex
-    },
-    tokenId: params.tokenId,
-    destinationAddress: params.destinationAddress
-  })
+  return xolosWalletService.withPrivateKey((privateKey) =>
+    sendNftChild({
+      address: signer.address,
+      keyInfo: {
+        privateKeyHex: bytesToHex(privateKey),
+        publicKeyHex: signer.publicKeyHex
+      },
+      tokenId: params.tokenId,
+      destinationAddress: params.destinationAddress
+    })
+  )
 }

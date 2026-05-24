@@ -11,7 +11,7 @@ export interface WalletContextValue {
   createNewWallet: () => Promise<string>
   restoreWallet: (mnemonic: string) => Promise<void>
   loadExistingWallet: (password: string) => Promise<void>
-  encryptAndStore: (password: string) => void
+  encryptAndStore: (password: string) => Promise<void>
   refreshBalances: () => Promise<void>
   rescanWallet: (options?: WalletRescanOptions) => Promise<void>
   sendRMZ: (to: string, amount: string) => Promise<string>

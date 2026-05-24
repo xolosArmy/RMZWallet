@@ -71,6 +71,7 @@ export default function ApproveRequestModal({
   const params = request.params
   const isSignMessage = request.method === 'ecash_signMessage'
   const verifyWarning = request.verifyContext?.warning
+  const verifyBlocked = Boolean(request.verifyContext?.isScam || request.verifyContext?.validation === 'INVALID')
   const txPreview = request.rawTxPreview
   const keyInfo = xolosWalletService.getKeyInfo()
   const walletAddress = keyInfo.xecAddress ?? keyInfo.address ?? params.address
@@ -170,6 +171,7 @@ export default function ApproveRequestModal({
         </div>
 
         {verifyWarning && <div className="error">Warning: {verifyWarning}</div>}
+        {verifyBlocked && <div className="error">Aprobación bloqueada por WalletConnect Verify.</div>}
 
         <div style={{ display: 'grid', gap: 16 }}>
           <SectionRow label="Estado">
@@ -284,14 +286,14 @@ export default function ApproveRequestModal({
               className="cta"
               type="button"
               onClick={onApproved}
-              disabled={busy || isExpired}
+              disabled={busy || isExpired || verifyBlocked}
               style={{
                 background: 'linear-gradient(120deg, rgba(249, 115, 22, 0.95), rgba(245, 158, 11, 0.95))',
                 boxShadow: '0 0 14px rgba(249, 115, 22, 0.4)',
                 color: '#050505'
               }}
             >
-              {busy ? 'Procesando...' : isExpired ? 'Solicitud expirada' : isSignMessage ? 'Firmar mensaje' : 'Aprobar compra'}
+              {busy ? 'Procesando...' : isExpired ? 'Solicitud expirada' : verifyBlocked ? 'Bloqueado' : isSignMessage ? 'Firmar mensaje' : 'Aprobar compra'}
             </button>
           )}
         </div>

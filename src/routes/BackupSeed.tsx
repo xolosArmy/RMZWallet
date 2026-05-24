@@ -1,6 +1,7 @@
 import type { FormEvent } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
+import SensitiveSeedPhrase from '../components/SensitiveSeedPhrase'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
 
@@ -16,6 +17,7 @@ function BackupSeed() {
   const [answers, setAnswers] = useState({ w3: '', w7: '', w11: '' })
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
 
   const backupState = state
   const words = useMemo(() => (backupState?.mnemonic ? backupState.mnemonic.split(' ') : []), [backupState])
@@ -26,7 +28,7 @@ function BackupSeed() {
     }
   }, [backupState, navigate])
 
-  const checkAnswers = (e: FormEvent) => {
+  const checkAnswers = async (e: FormEvent) => {
     e.preventDefault()
     setError(null)
     setSuccess(null)
@@ -41,16 +43,22 @@ function BackupSeed() {
       return
     }
 
-    // Guardamos la seed cifrada en localStorage; solo vive en texto plano en memoria durante este flujo.
     if (!backupState?.password) {
       setError('Falta el password de cifrado. Regresa al onboarding.')
       return
     }
 
-    encryptAndStore(backupState.password)
-    setBackupVerified?.(true)
-    setSuccess('Seed respaldada. Puedes usar la billetera.')
-    navigate('/')
+    try {
+      setSaving(true)
+      await encryptAndStore(backupState.password)
+      setBackupVerified?.(true)
+      setSuccess('Seed respaldada. Puedes usar la billetera.')
+      navigate('/')
+    } catch {
+      setError('No pudimos cifrar la seed para guardarla en este dispositivo.')
+    } finally {
+      setSaving(false)
+    }
   }
 
   if (!backupState?.mnemonic || !backupState?.password) {
@@ -71,9 +79,8 @@ function BackupSeed() {
       <div className="card">
         <p className="muted">
           Escribe estas 12 palabras en orden. La seed solo vive en tu memoria y se cifra con tu password local.
-          En producción se debe usar PBKDF2/scrypt con salt e iteraciones altas para derivar claves.
         </p>
-        <div className="address-box">{backupState.mnemonic}</div>
+        <SensitiveSeedPhrase key={backupState.mnemonic} mnemonic={backupState.mnemonic} />
       </div>
 
       <form className="card" onSubmit={checkAnswers}>
@@ -98,8 +105,8 @@ function BackupSeed() {
           onChange={(e) => setAnswers((prev) => ({ ...prev, w11: e.target.value }))}
         />
         <div className="actions">
-          <button className="cta" type="submit">
-            Marcar respaldo como listo
+          <button className="cta" type="submit" disabled={saving}>
+            {saving ? 'Cifrando...' : 'Marcar respaldo como listo'}
           </button>
         </div>
         {error && <div className="error">{error}</div>}
