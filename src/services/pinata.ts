@@ -4,6 +4,7 @@ const PINATA_TIMEOUT_MS = 20_000
 type PinataProxyPayload = {
   cid?: string
   error?: string
+  code?: string
 }
 
 const fetchWithTimeout = async (input: RequestInfo, init?: RequestInit) => {
@@ -11,6 +12,11 @@ const fetchWithTimeout = async (input: RequestInfo, init?: RequestInit) => {
   const timeout = window.setTimeout(() => controller.abort(), PINATA_TIMEOUT_MS)
   try {
     return await fetch(input, { ...init, signal: controller.signal })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('La subida a Pinata tardó demasiado. Intenta de nuevo.')
+    }
+    throw error
   } finally {
     window.clearTimeout(timeout)
   }
@@ -22,7 +28,7 @@ const parseProxyResponse = async (response: Response): Promise<{ cid: string }> 
     throw new Error(payload?.error || 'No pudimos subir el contenido a Pinata.')
   }
   if (!payload?.cid) {
-    throw new Error('El endpoint interno no devolvió un CID válido.')
+    throw new Error(payload?.error || 'El endpoint interno no devolvió un CID válido.')
   }
   return { cid: payload.cid }
 }
