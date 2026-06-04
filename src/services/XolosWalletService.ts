@@ -161,17 +161,37 @@ export type AliasRegistrationBroadcastResult = {
   status: 'broadcast_pending_index' | 'confirmed_by_chronik'
   message?: string
   rawTx: string
+  debug: AliasRegistrationDebugInfo
+}
+
+export type AliasUtxoDebugInfo = {
+  txid: string
+  outIdx: number
+  sats: string
+}
+
+export type AliasRegistrationUtxoSource = 'current_wallet_utxos' | 'reserved_pre_rmz_utxos'
+
+export type AliasRegistrationDebugInfo = {
+  reservedAliasUtxosBeforeRmzTx: AliasUtxoDebugInfo[]
+  rmzTxid: string | null
+  aliasSelectedUtxos: AliasUtxoDebugInfo[]
+  excludedTxids: string[]
+  usesRmzChangeOutput: boolean
+  utxoSelectionSource: AliasRegistrationUtxoSource
 }
 
 export type AliasRegistrationRawTxDebug = {
   rawTxHex: string
   computedTxid: string
   containsAliasLokadPrefix: boolean
-  selectedUtxos: Array<{
-    txid: string
-    outIdx: number
-    sats: string
-  }>
+  selectedUtxos: AliasUtxoDebugInfo[]
+  aliasSelectedUtxos: AliasUtxoDebugInfo[]
+  reservedAliasUtxosBeforeRmzTx: AliasUtxoDebugInfo[]
+  rmzTxid: string | null
+  excludedTxids: string[]
+  usesRmzChangeOutput: boolean
+  utxoSelectionSource: AliasRegistrationUtxoSource
   outputs: Array<{
     index: number
     sats: string
@@ -186,7 +206,17 @@ type AliasTxPlan = {
   inputSats: bigint
   fixedOutputSats: bigint
   selectedUtxos: ScriptUtxo[]
+  reservedAliasUtxosBeforeRmzTx: ScriptUtxo[]
+  excludedTxids: string[]
+  usesRmzChangeOutput: boolean
+  utxoSelectionSource: AliasRegistrationUtxoSource
 }
+
+export type AliasReservedUtxo = ScriptUtxo
+
+const INDEPENDENT_ALIAS_UTXO_ERROR =
+  'Not enough independent XEC UTXOs. Send a small amount of XEC to yourself, wait for it to appear, and try again.'
+const RMZ_CHANGE_ALIAS_ABORT_ERROR = 'Alias transaction attempted to spend RMZ fee change output. Aborting.'
 
 export class XolosWalletService {
   private static instance: XolosWalletService
@@ -199,6 +229,7 @@ export class XolosWalletService {
   private scanPromiseGapLimit: number | null = null
   private rmzDecimals: number | null = null
   private rmzDecimalsPromise: Promise<number> | null = null
+  private pendingAliasReservationExcludedTxids: string[] = []
 
   private constructor() {
     this.encryptedMnemonic = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_MNEMONIC) : null
@@ -232,6 +263,156 @@ export class XolosWalletService {
   private getWallet(): MinimalXecWallet {
     this.ensureReady()
     return this.wallet as MinimalXecWallet
+  }
+
+  private getUtxoKey(utxo: ScriptUtxo) {
+    return `${utxo.outpoint.txid}:${utxo.outpoint.outIdx}`
+  }
+
+  private utxosToDebug(utxos: ScriptUtxo[]): AliasUtxoDebugInfo[] {
+    return utxos.map((utxo) => ({
+      txid: utxo.outpoint.txid,
+      outIdx: utxo.outpoint.outIdx,
+      sats: utxo.sats.toString()
+    }))
+  }
+
+  private getWalletUtxoStore(wallet: MinimalXecWallet): { xecUtxos?: ScriptUtxo[] } | null {
+    const walletWithStore = wallet as MinimalXecWallet & {
+      utxos?: {
+        utxoStore?: {
+          xecUtxos?: ScriptUtxo[]
+        }
+      }
+    }
+    return walletWithStore.utxos?.utxoStore ?? null
+  }
+
+  private async withTemporarilyExcludedWalletUtxos<T>(excludedUtxos: ScriptUtxo[], handler: () => Promise<T>): Promise<T> {
+    if (excludedUtxos.length === 0) {
+      return handler()
+    }
+
+    const wallet = this.getWallet()
+    const utxoStore = this.getWalletUtxoStore(wallet)
+    const originalUtxos = utxoStore?.xecUtxos
+    if (!originalUtxos) {
+      return handler()
+    }
+
+    const excludedKeys = new Set(excludedUtxos.map((utxo) => this.getUtxoKey(utxo)))
+    utxoStore.xecUtxos = originalUtxos.filter((utxo) => !excludedKeys.has(this.getUtxoKey(utxo)))
+
+    try {
+      return await handler()
+    } finally {
+      utxoStore.xecUtxos = originalUtxos
+    }
+  }
+
+  private getUtxoSatsNumber(utxo: ScriptUtxo) {
+    return Number(utxo.sats)
+  }
+
+  private estimateTokenSendFeeSats(inputsCount: number, outputsCount: number) {
+    const estimatedSizeBytes = inputsCount * 148 + outputsCount * 34 + 50
+    return Math.ceil(estimatedSizeBytes * FEE_RATE_SATS_PER_BYTE)
+  }
+
+  private selectPureXecUtxosForSats(utxos: ScriptUtxo[], requiredSats: number, xecFromTokenUtxos: number) {
+    if (xecFromTokenUtxos >= requiredSats) {
+      return []
+    }
+
+    const additionalNeeded = requiredSats - xecFromTokenUtxos
+    const sortedUtxos = utxos
+      .slice()
+      .sort((a, b) => this.getUtxoSatsNumber(b) - this.getUtxoSatsNumber(a))
+
+    const selected: ScriptUtxo[] = []
+    let selectedSats = 0
+
+    for (const utxo of sortedUtxos) {
+      selected.push(utxo)
+      selectedSats += this.getUtxoSatsNumber(utxo)
+      if (selectedSats >= additionalNeeded) {
+        break
+      }
+    }
+
+    if (selectedSats < additionalNeeded) {
+      throw new Error(`Insufficient XEC for transaction fees. Need ${requiredSats} sats, have ${xecFromTokenUtxos} from tokens + ${selectedSats} from UTXOs`)
+    }
+
+    return selected
+  }
+
+  private async selectRmzServiceTransactionUtxos(amountAtoms: bigint): Promise<ScriptUtxo[]> {
+    const address = this.getAddress()
+    if (!address) {
+      throw new Error('No se encontro la direccion de la billetera.')
+    }
+
+    const tokenInfo = await getChronik().token(RMZ_ETOKEN_ID)
+    const utxoResponse = await getChronik().address(address).utxos()
+    const rmzUtxos = utxoResponse.utxos
+      .filter((utxo) =>
+        utxo.token?.tokenId === RMZ_ETOKEN_ID &&
+        utxo.token.tokenType?.protocol === 'ALP' &&
+        !utxo.token.isMintBaton
+      )
+      .sort((a, b) => {
+        const aAtoms = BigInt(a.token?.atoms ?? 0)
+        const bAtoms = BigInt(b.token?.atoms ?? 0)
+        return aAtoms > bAtoms ? -1 : aAtoms < bAtoms ? 1 : 0
+      })
+
+    const selectedTokenUtxos: ScriptUtxo[] = []
+    let selectedAtoms = 0n
+    for (const utxo of rmzUtxos) {
+      selectedTokenUtxos.push(utxo)
+      selectedAtoms += BigInt(utxo.token?.atoms ?? 0)
+      if (selectedAtoms >= amountAtoms) {
+        break
+      }
+    }
+
+    if (selectedAtoms < amountAtoms) {
+      const decimals = tokenInfo?.genesisInfo?.decimals ?? 0
+      throw new Error(
+        `No hay suficientes RMZ. Need: ${formatTokenAmount(amountAtoms, decimals)} RMZ, Available: ${formatTokenAmount(selectedAtoms, decimals)} RMZ`
+      )
+    }
+
+    const pureXecUtxos = utxoResponse.utxos.filter((utxo) => !utxo.token)
+    const tokenChangeAmount = selectedAtoms - amountAtoms
+    const dustOutputsNeeded = 1 + (tokenChangeAmount > 0n ? 1 : 0)
+    const dustRequirement = dustOutputsNeeded * XEC_DUST_SATS
+    const baseInputs = selectedTokenUtxos.length
+    const baseOutputs = 1 + 1 + (tokenChangeAmount > 0n ? 1 : 0)
+
+    let estimatedFee = this.estimateTokenSendFeeSats(baseInputs, baseOutputs)
+    let totalXecRequired = dustRequirement + estimatedFee
+    let selectedFeeUtxos = this.selectPureXecUtxosForSats(
+      pureXecUtxos,
+      totalXecRequired,
+      selectedTokenUtxos.reduce((sum, utxo) => sum + this.getUtxoSatsNumber(utxo), 0)
+    )
+
+    if (selectedFeeUtxos.length > 0) {
+      estimatedFee = this.estimateTokenSendFeeSats(baseInputs + selectedFeeUtxos.length, baseOutputs)
+      const nextTotalXecRequired = dustRequirement + estimatedFee
+      if (nextTotalXecRequired > totalXecRequired) {
+        totalXecRequired = nextTotalXecRequired
+        selectedFeeUtxos = this.selectPureXecUtxosForSats(
+          pureXecUtxos,
+          totalXecRequired,
+          selectedTokenUtxos.reduce((sum, utxo) => sum + this.getUtxoSatsNumber(utxo), 0)
+        )
+      }
+    }
+
+    return [...selectedTokenUtxos, ...selectedFeeUtxos]
   }
 
   async createNewWallet(): Promise<string> {
@@ -503,7 +684,7 @@ export class XolosWalletService {
     return cache.balances
   }
 
-  async sendRMZ(destination: string, amountAtoms: bigint): Promise<string> {
+  async sendRMZ(destination: string, amountAtoms: bigint, excludedUtxos: ScriptUtxo[] = []): Promise<string> {
     if (amountAtoms <= 0n) {
       throw new Error('El monto debe ser mayor a cero.')
     }
@@ -519,14 +700,14 @@ export class XolosWalletService {
     return this.sendToken(
       RMZ_ETOKEN_ID,
       [{ address: destination, amountAtoms }],
-      { expectedProtocol: 'ALP', tokenLabel: 'RMZ' }
+      { expectedProtocol: 'ALP', tokenLabel: 'RMZ', excludedUtxos }
     )
   }
 
   async sendToken(
     tokenId: string,
     outputs: Array<{ address: string; amountAtoms: bigint }>,
-    options: { expectedProtocol?: string; tokenLabel?: string } = {}
+    options: { expectedProtocol?: string; tokenLabel?: string; excludedUtxos?: ScriptUtxo[] } = {}
   ): Promise<string> {
     const wallet = this.getWallet()
     const normalizedTokenId = tokenId.trim().toLowerCase()
@@ -560,7 +741,9 @@ export class XolosWalletService {
       }
     })
 
-    return wallet.sendETokens(normalizedTokenId, normalizedOutputs)
+    return this.withTemporarilyExcludedWalletUtxos(options.excludedUtxos ?? [], () =>
+      wallet.sendETokens(normalizedTokenId, normalizedOutputs)
+    )
   }
 
   async sendXEC(destination: string, amountInSats: number, message = ''): Promise<string> {
@@ -581,6 +764,17 @@ export class XolosWalletService {
   }
 
 
+  async reserveAliasRegistrationUtxos(registration: AliasRegistrationData): Promise<AliasReservedUtxo[]> {
+    const rmzAmountAtoms = parseTokenAmount(String(registration.serviceFee.amount), await this.getRmzDecimals())
+    const rmzServiceUtxos = await this.selectRmzServiceTransactionUtxos(rmzAmountAtoms)
+    const excludedTxids = Array.from(new Set(rmzServiceUtxos.map((utxo) => utxo.outpoint.txid)))
+    this.pendingAliasReservationExcludedTxids = excludedTxids
+    const plan = await this.buildAliasRegistrationTxPlan(registration, { excludedTxids })
+    console.debug('[AliasRegistration] reservedAliasUtxosBeforeRmzTx', this.utxosToDebug(plan.selectedUtxos))
+    console.debug('[AliasRegistration] excludedTxids', plan.excludedTxids)
+    return plan.selectedUtxos
+  }
+
   async estimateAliasRegistration(registration: AliasRegistrationData): Promise<AliasRegistrationEstimate> {
     const plan = await this.buildAliasRegistrationTxPlan(registration)
     const outputSats = plan.signedTx.outputs.reduce((sum, output) => sum + output.sats, 0n)
@@ -593,16 +787,18 @@ export class XolosWalletService {
     }
   }
 
-  async buildAliasRegistrationRawTx(registration: AliasRegistrationData): Promise<AliasRegistrationRawTxDebug> {
-    const plan = await this.buildAliasRegistrationTxPlan(registration)
+  async buildAliasRegistrationRawTx(
+    registration: AliasRegistrationData,
+    reservedUtxos?: AliasReservedUtxo[]
+  ): Promise<AliasRegistrationRawTxDebug> {
+    const plan = await this.buildAliasRegistrationTxPlan(registration, {
+      reservedUtxos,
+      excludedTxids: reservedUtxos?.length ? this.pendingAliasReservationExcludedTxids : []
+    })
     const rawTxHex = plan.signedTx.toHex()
     const computedTxid = plan.signedTx.txid()
     const containsAliasLokadPrefix = rawTxHex.includes('6a042e78656300')
-    const selectedUtxos = plan.selectedUtxos.map((utxo) => ({
-      txid: utxo.outpoint.txid,
-      outIdx: utxo.outpoint.outIdx,
-      sats: utxo.sats.toString()
-    }))
+    const selectedUtxos = this.utxosToDebug(plan.selectedUtxos)
     const outputs = plan.signedTx.outputs.map((output, index) => ({
       index,
       sats: output.sats.toString(),
@@ -614,16 +810,43 @@ export class XolosWalletService {
       computedTxid,
       containsAliasLokadPrefix,
       selectedUtxos,
+      aliasSelectedUtxos: selectedUtxos,
+      reservedAliasUtxosBeforeRmzTx: this.utxosToDebug(plan.reservedAliasUtxosBeforeRmzTx),
+      rmzTxid: null,
+      excludedTxids: plan.excludedTxids,
+      usesRmzChangeOutput: plan.usesRmzChangeOutput,
+      utxoSelectionSource: plan.utxoSelectionSource,
       outputs,
       protocolFeeAddress: registration.protocolFee.address,
       protocolFeeSats: registration.protocolFee.sats
     }
   }
 
-  async registerAliasTransaction(registration: AliasRegistrationData): Promise<AliasRegistrationBroadcastResult> {
+  async registerAliasTransaction(
+    registration: AliasRegistrationData,
+    reservedUtxos: AliasReservedUtxo[] = [],
+    rmzTxid: string | null = null
+  ): Promise<AliasRegistrationBroadcastResult> {
     console.debug('[AliasRegistration] intent', registration)
-    const plan = await this.buildAliasRegistrationTxPlan(registration)
+    const excludedTxids = Array.from(new Set([
+      ...(reservedUtxos.length > 0 ? this.pendingAliasReservationExcludedTxids : []),
+      ...(rmzTxid ? [rmzTxid] : [])
+    ]))
+    const plan = await this.buildAliasRegistrationTxPlan(registration, {
+      reservedUtxos,
+      excludedTxids,
+      rmzTxid
+    })
     const rawTx = toHex(plan.signedTx.ser())
+    const debug: AliasRegistrationDebugInfo = {
+      reservedAliasUtxosBeforeRmzTx: this.utxosToDebug(plan.reservedAliasUtxosBeforeRmzTx),
+      rmzTxid,
+      aliasSelectedUtxos: this.utxosToDebug(plan.selectedUtxos),
+      excludedTxids: plan.excludedTxids,
+      usesRmzChangeOutput: plan.usesRmzChangeOutput,
+      utxoSelectionSource: plan.utxoSelectionSource
+    }
+    console.debug('[AliasRegistration] debug', debug)
     console.debug('[AliasRegistration] raw alias tx hex', rawTx)
 
     let txid: string | undefined
@@ -647,7 +870,7 @@ export class XolosWalletService {
     this.scanCache = null
 
     if (verified) {
-      return { txid, status: 'confirmed_by_chronik', rawTx }
+      return { txid, status: 'confirmed_by_chronik', rawTx, debug }
     }
 
     console.warn('[AliasRegistration] tx broadcast but Chronik not indexed yet', txid)
@@ -655,12 +878,17 @@ export class XolosWalletService {
       txid,
       status: 'broadcast_pending_index',
       message: 'Alias transaction was broadcast but is not indexed by Chronik yet.',
-      rawTx
+      rawTx,
+      debug
     }
   }
 
-  async registerAliasOnChain(registration: AliasRegistrationData): Promise<AliasRegistrationBroadcastResult> {
-    return this.registerAliasTransaction(registration)
+  async registerAliasOnChain(
+    registration: AliasRegistrationData,
+    reservedUtxos: AliasReservedUtxo[] = [],
+    rmzTxid: string | null = null
+  ): Promise<AliasRegistrationBroadcastResult> {
+    return this.registerAliasTransaction(registration, reservedUtxos, rmzTxid)
   }
 
   getMnemonic(): string | null {
@@ -744,7 +972,14 @@ export class XolosWalletService {
     return false
   }
 
-  private async buildAliasRegistrationTxPlan(registration: AliasRegistrationData): Promise<AliasTxPlan> {
+  private async buildAliasRegistrationTxPlan(
+    registration: AliasRegistrationData,
+    options: {
+      reservedUtxos?: AliasReservedUtxo[]
+      excludedTxids?: string[]
+      rmzTxid?: string | null
+    } = {}
+  ): Promise<AliasTxPlan> {
     this.ensureReady()
     const address = this.getAddress()
     if (!address) {
@@ -753,13 +988,26 @@ export class XolosWalletService {
 
     const signatory = this.getSignatory()
     const addressScript = Script.fromAddress(address)
-    const utxoResponse = await getChronik().address(address).utxos()
-    const spendableUtxos = utxoResponse.utxos
+    const excludedTxids = Array.from(new Set(options.excludedTxids ?? []))
+    const excludedTxidSet = new Set(excludedTxids)
+    const reservedUtxos = options.reservedUtxos ?? []
+    const utxoSelectionSource: AliasRegistrationUtxoSource = reservedUtxos.length > 0
+      ? 'reserved_pre_rmz_utxos'
+      : 'current_wallet_utxos'
+
+    const candidateUtxos = reservedUtxos.length > 0
+      ? reservedUtxos
+      : (await getChronik().address(address).utxos()).utxos
+
+    const spendableUtxos = candidateUtxos
       .filter((utxo) => !utxo.token)
+      .filter((utxo) => !excludedTxidSet.has(utxo.outpoint.txid))
       .sort((a, b) => (a.sats > b.sats ? -1 : 1))
 
     if (spendableUtxos.length === 0) {
-      throw new Error('No hay suficiente XEC para cubrir el fee oficial del alias y la tarifa de red.')
+      throw new Error(reservedUtxos.length > 0 || excludedTxids.length > 0
+        ? INDEPENDENT_ALIAS_UTXO_ERROR
+        : 'No hay suficiente XEC para cubrir el fee oficial del alias y la tarifa de red.')
     }
 
     if (!registration.opReturnHex.startsWith('6a042e78656300')) {
@@ -778,6 +1026,11 @@ export class XolosWalletService {
 
     for (let count = 1; count <= spendableUtxos.length; count += 1) {
       const selectedUtxos = spendableUtxos.slice(0, count)
+      const usesRmzChangeOutput = Boolean(options.rmzTxid && selectedUtxos.some((utxo) => utxo.outpoint.txid === options.rmzTxid))
+      if (usesRmzChangeOutput) {
+        throw new Error(RMZ_CHANGE_ALIAS_ABORT_ERROR)
+      }
+
       const inputs = selectedUtxos.map((utxo) => ({
         input: {
           prevOut: utxo.outpoint,
@@ -804,21 +1057,30 @@ export class XolosWalletService {
           signedTx,
           inputSats,
           fixedOutputSats: protocolFeeSats,
-          selectedUtxos
+          selectedUtxos,
+          reservedAliasUtxosBeforeRmzTx: reservedUtxos,
+          excludedTxids,
+          usesRmzChangeOutput,
+          utxoSelectionSource
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         if (!/insufficient/i.test(message) || count === spendableUtxos.length) {
           if (/insufficient/i.test(message)) {
-            throw new Error('No hay suficiente XEC para cubrir el fee oficial del alias y la tarifa de red.')
+            throw new Error(reservedUtxos.length > 0 || excludedTxids.length > 0
+              ? INDEPENDENT_ALIAS_UTXO_ERROR
+              : 'No hay suficiente XEC para cubrir el fee oficial del alias y la tarifa de red.')
           }
           throw err
         }
       }
     }
 
-    throw new Error('No hay suficiente XEC para cubrir el fee oficial del alias y la tarifa de red.')
+    throw new Error(reservedUtxos.length > 0 || excludedTxids.length > 0
+      ? INDEPENDENT_ALIAS_UTXO_ERROR
+      : 'No hay suficiente XEC para cubrir el fee oficial del alias y la tarifa de red.')
   }
+
 
   async signMessage(message: string): Promise<string> {
     return this.withPrivateKey((privateKey) => signMsg(message, privateKey))

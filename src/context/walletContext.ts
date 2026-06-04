@@ -3,6 +3,7 @@ import type {
   AliasRegistrationBroadcastResult,
   AliasRegistrationEstimate,
   AliasRegistrationRawTxDebug,
+  AliasReservedUtxo,
   WalletBalance,
   WalletRescanOptions
 } from '../services/XolosWalletService'
@@ -21,11 +22,12 @@ export interface WalletContextValue {
   encryptAndStore: (password: string) => Promise<void>
   refreshBalances: () => Promise<void>
   rescanWallet: (options?: WalletRescanOptions) => Promise<void>
-  sendRMZ: (to: string, amount: string) => Promise<string>
+  sendRMZ: (to: string, amount: string, excludedUtxos?: AliasReservedUtxo[]) => Promise<string>
   sendXEC: (to: string, amountInSats: number, message?: string) => Promise<string>
   estimateAliasRegistration: (registration: AliasRegistrationData) => Promise<AliasRegistrationEstimate>
-  buildAliasRegistrationRawTx: (registration: AliasRegistrationData) => Promise<AliasRegistrationRawTxDebug>
-  registerAliasOnChain: (registration: AliasRegistrationData) => Promise<AliasRegistrationBroadcastResult>
+  reserveAliasRegistrationUtxos: (registration: AliasRegistrationData) => Promise<AliasReservedUtxo[]>
+  buildAliasRegistrationRawTx: (registration: AliasRegistrationData, reservedUtxos?: AliasReservedUtxo[]) => Promise<AliasRegistrationRawTxDebug>
+  registerAliasOnChain: (registration: AliasRegistrationData, reservedUtxos?: AliasReservedUtxo[], rmzTxid?: string | null) => Promise<AliasRegistrationBroadcastResult>
   estimateXecSend: (amountInSats: number, message?: string) => Promise<{ networkFeeSats: number; totalCostSats: number }>
   getMnemonic: () => string | null
   unlockEncryptedWallet: (password: string) => Promise<void>

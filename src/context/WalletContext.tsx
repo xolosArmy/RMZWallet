@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { EXTENDED_GAP_LIMIT, xolosWalletService } from '../services/XolosWalletService'
-import type { WalletBalance, WalletRescanOptions } from '../services/XolosWalletService'
+import type { AliasReservedUtxo, WalletBalance, WalletRescanOptions } from '../services/XolosWalletService'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import { getChronik } from '../services/ChronikClient'
 import { computeNetworkFeeSats, MIN_NETWORK_FEE_SATS, TONALLI_SERVICE_FEE_SATS, XEC_DUST_SATS } from '../config/xecFees'
@@ -308,7 +308,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   )
 
   const sendRMZ = useCallback(
-    async (to: string, amount: string) => {
+    async (to: string, amount: string, excludedUtxos: AliasReservedUtxo[] = []) => {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no está lista: termina el onboarding y el respaldo de la seed.')
       }
@@ -317,7 +317,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       try {
         const decimals = balance?.rmzDecimals ?? (await xolosWalletService.getRmzDecimals())
         const atoms = parseTokenAmount(amount, decimals)
-        const txid = await xolosWalletService.sendRMZ(to, atoms)
+        const txid = await xolosWalletService.sendRMZ(to, atoms, excludedUtxos)
         await syncAddressAndBalance()
         return txid
       } catch (err) {
@@ -398,15 +398,25 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     [initialized]
   )
 
-  const buildAliasRegistrationRawTx = useCallback(
+  const reserveAliasRegistrationUtxos = useCallback(
     async (registration: AliasRegistrationData) => {
+      if (!initialized || !backupVerified) {
+        throw new Error('La billetera no esta lista: termina el onboarding y el respaldo de la seed.')
+      }
+      return xolosWalletService.reserveAliasRegistrationUtxos(registration)
+    },
+    [backupVerified, initialized]
+  )
+
+  const buildAliasRegistrationRawTx = useCallback(
+    async (registration: AliasRegistrationData, reservedUtxos: AliasReservedUtxo[] = []) => {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no esta lista: termina el onboarding y el respaldo de la seed.')
       }
       setLoading(true)
       setError(null)
       try {
-        return await xolosWalletService.buildAliasRegistrationRawTx(registration)
+        return await xolosWalletService.buildAliasRegistrationRawTx(registration, reservedUtxos)
       } catch (err) {
         const message = (err as Error).message || 'No se pudo construir el debug tx del alias.'
         setError(message)
@@ -419,14 +429,14 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   )
 
   const registerAliasOnChain = useCallback(
-    async (registration: AliasRegistrationData) => {
+    async (registration: AliasRegistrationData, reservedUtxos: AliasReservedUtxo[] = [], rmzFeeTxid: string | null = null) => {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no esta lista: termina el onboarding y el respaldo de la seed.')
       }
       setLoading(true)
       setError(null)
       try {
-        const txid = await xolosWalletService.registerAliasOnChain(registration)
+        const txid = await xolosWalletService.registerAliasOnChain(registration, reservedUtxos, rmzFeeTxid)
         await syncAddressAndBalance()
         return txid
       } catch (err) {
@@ -459,6 +469,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       sendRMZ,
       sendXEC,
       estimateAliasRegistration,
+      reserveAliasRegistrationUtxos,
       buildAliasRegistrationRawTx,
       registerAliasOnChain,
       estimateXecSend,
@@ -482,6 +493,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       sendRMZ,
       sendXEC,
       estimateAliasRegistration,
+      reserveAliasRegistrationUtxos,
       buildAliasRegistrationRawTx,
       registerAliasOnChain,
       estimateXecSend,

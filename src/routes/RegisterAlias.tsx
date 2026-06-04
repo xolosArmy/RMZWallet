@@ -1,7 +1,7 @@
 import type { FormEvent } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import { buildAliasRegistration, type AliasRegistrationData } from '@xolosarmy/tonalli-core'
-import type { AliasRegistrationRawTxDebug } from '../services/XolosWalletService'
+import type { AliasRegistrationDebugInfo, AliasRegistrationRawTxDebug } from '../services/XolosWalletService'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { XEC_SATS_PER_XEC } from '../config/xecFees'
@@ -12,6 +12,7 @@ type AliasTxResult = {
   aliasTxid: string
   status: 'broadcast_pending_index' | 'confirmed_by_chronik'
   message?: string
+  debug?: AliasRegistrationDebugInfo
 }
 
 type AliasBroadcastFailure = {
@@ -38,6 +39,7 @@ function RegisterAlias() {
     error,
     sendRMZ,
     estimateAliasRegistration,
+    reserveAliasRegistrationUtxos,
     buildAliasRegistrationRawTx,
     registerAliasOnChain
   } = useWallet()
@@ -128,6 +130,12 @@ function RegisterAlias() {
       console.debug('[AliasRegistration Debug] computedTxid', debug.computedTxid)
       console.debug('[AliasRegistration Debug] containsAliasLokadPrefix', debug.containsAliasLokadPrefix)
       console.debug('[AliasRegistration Debug] selectedUtxos', debug.selectedUtxos)
+      console.debug('[AliasRegistration Debug] reservedAliasUtxosBeforeRmzTx', debug.reservedAliasUtxosBeforeRmzTx)
+      console.debug('[AliasRegistration Debug] rmzTxid', debug.rmzTxid)
+      console.debug('[AliasRegistration Debug] aliasSelectedUtxos', debug.aliasSelectedUtxos)
+      console.debug('[AliasRegistration Debug] excludedTxids', debug.excludedTxids)
+      console.debug('[AliasRegistration Debug] usesRmzChangeOutput', debug.usesRmzChangeOutput)
+      console.debug('[AliasRegistration Debug] utxoSelectionSource', debug.utxoSelectionSource)
       console.debug('[AliasRegistration Debug] outputs', debug.outputs)
       setAliasDebug(debug)
     } catch (err) {
@@ -188,19 +196,34 @@ function RegisterAlias() {
     let paidRmzTxid: string | null = null
 
     try {
+      const reservedAliasUtxosBeforeRmzTx = await reserveAliasRegistrationUtxos(registration)
+      console.debug('[AliasRegistration] reservedAliasUtxosBeforeRmzTx', reservedAliasUtxosBeforeRmzTx.map((utxo) => ({
+        txid: utxo.outpoint.txid,
+        outIdx: utxo.outpoint.outIdx,
+        sats: utxo.sats.toString()
+      })))
+
       setStep('rmz')
-      paidRmzTxid = await sendRMZ(registration.serviceFee.receiverAddress, String(registration.serviceFee.amount))
+      paidRmzTxid = await sendRMZ(
+        registration.serviceFee.receiverAddress,
+        String(registration.serviceFee.amount),
+        reservedAliasUtxosBeforeRmzTx
+      )
       console.debug('[AliasRegistration] rmzTxid', paidRmzTxid)
       setRmzTxid(paidRmzTxid)
 
       setStep('alias')
-      const aliasBroadcast = await registerAliasOnChain(registration)
+      const aliasBroadcast = await registerAliasOnChain(registration, reservedAliasUtxosBeforeRmzTx, paidRmzTxid)
+      console.debug('[AliasRegistration] aliasSelectedUtxos', aliasBroadcast.debug.aliasSelectedUtxos)
+      console.debug('[AliasRegistration] excludedTxids', aliasBroadcast.debug.excludedTxids)
+      console.debug('[AliasRegistration] usesRmzChangeOutput', aliasBroadcast.debug.usesRmzChangeOutput)
       setAliasTxid(aliasBroadcast.txid)
       const txResult = {
         rmzTxid: paidRmzTxid,
         aliasTxid: aliasBroadcast.txid,
         status: aliasBroadcast.status,
-        message: aliasBroadcast.message
+        message: aliasBroadcast.message,
+        debug: aliasBroadcast.debug
       }
       setResult(txResult)
       setStep('done')
