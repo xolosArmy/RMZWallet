@@ -1,9 +1,15 @@
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
-import { ALL_BIP143, P2PKHSignatory, type TxBuilder, fromHex, signMsg } from 'ecash-lib'
+import { ALL_BIP143, P2PKHSignatory, Script, TxBuilder, fromHex, signMsg } from 'ecash-lib'
 import { AgoraOneshotAdSignatory } from 'ecash-agora'
 import type { ScriptUtxo } from 'chronik-client'
+import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
-import { FEE_RATE_SATS_PER_BYTE, TONALLI_SERVICE_FEE_SATS, XEC_TONALLI_TREASURY_ADDRESS } from '../config/xecFees'
+import {
+  FEE_RATE_SATS_PER_BYTE,
+  TONALLI_SERVICE_FEE_SATS,
+  XEC_DUST_SATS,
+  XEC_TONALLI_TREASURY_ADDRESS
+} from '../config/xecFees'
 import { getChronik } from './ChronikClient'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
@@ -136,6 +142,18 @@ export interface WalletSignatory {
   publicKeyHex: string
   publicKey: Uint8Array
   signatory: ReturnType<typeof P2PKHSignatory>
+}
+
+export type AliasRegistrationEstimate = {
+  protocolFeeSats: number
+  networkFeeSats: number
+  totalCostSats: number
+}
+
+type AliasTxPlan = {
+  signedTx: ReturnType<TxBuilder['sign']>
+  inputSats: bigint
+  fixedOutputSats: bigint
 }
 
 export class XolosWalletService {
@@ -530,6 +548,29 @@ export class XolosWalletService {
     return wallet.sendXec(outputs)
   }
 
+
+  async estimateAliasRegistration(registration: AliasRegistrationData): Promise<AliasRegistrationEstimate> {
+    const plan = await this.buildAliasRegistrationTxPlan(registration)
+    const outputSats = plan.signedTx.outputs.reduce((sum, output) => sum + output.sats, 0n)
+    const networkFeeSats = plan.inputSats - outputSats
+
+    return {
+      protocolFeeSats: registration.protocolFee.sats,
+      networkFeeSats: Number(networkFeeSats),
+      totalCostSats: Number(plan.fixedOutputSats + networkFeeSats)
+    }
+  }
+
+  async registerAliasOnChain(registration: AliasRegistrationData): Promise<string> {
+    const plan = await this.buildAliasRegistrationTxPlan(registration)
+    const broadcast = await getChronik().broadcastTx(plan.signedTx.ser())
+    if (!broadcast.txid) {
+      throw new Error('La red no devolvio txid al registrar el alias.')
+    }
+    this.scanCache = null
+    return broadcast.txid
+  }
+
   getMnemonic(): string | null {
     return this.decryptedMnemonic
   }
@@ -590,6 +631,74 @@ export class XolosWalletService {
 
   signTxBuilder(builder: TxBuilder, options?: { feePerKb?: bigint; dustSats?: bigint }) {
     return builder.sign(options)
+  }
+
+
+  private async buildAliasRegistrationTxPlan(registration: AliasRegistrationData): Promise<AliasTxPlan> {
+    this.ensureReady()
+    const address = this.getAddress()
+    if (!address) {
+      throw new Error('No se encontro la direccion de la billetera.')
+    }
+
+    const signatory = this.getSignatory()
+    const addressScript = Script.fromAddress(address)
+    const utxoResponse = await getChronik().address(address).utxos()
+    const spendableUtxos = utxoResponse.utxos
+      .filter((utxo) => !utxo.token)
+      .sort((a, b) => (a.sats > b.sats ? -1 : 1))
+
+    if (spendableUtxos.length === 0) {
+      throw new Error('No hay suficiente XEC para cubrir el fee oficial del alias y la tarifa de red.')
+    }
+
+    const protocolFeeSats = BigInt(registration.protocolFee.sats)
+    const fixedOutputs = [
+      { sats: 0n, script: new Script(fromHex(registration.opReturnHex)) },
+      { sats: protocolFeeSats, script: Script.fromAddress(registration.protocolFee.address) }
+    ]
+
+    for (let count = 1; count <= spendableUtxos.length; count += 1) {
+      const selectedUtxos = spendableUtxos.slice(0, count)
+      const inputs = selectedUtxos.map((utxo) => ({
+        input: {
+          prevOut: utxo.outpoint,
+          signData: {
+            sats: utxo.sats,
+            outputScript: addressScript
+          }
+        },
+        signatory: signatory.signatory
+      }))
+
+      const txBuilder = new TxBuilder({
+        inputs,
+        outputs: [...fixedOutputs, addressScript]
+      })
+
+      try {
+        const signedTx = txBuilder.sign({
+          feePerKb: BigInt(Math.ceil(FEE_RATE_SATS_PER_BYTE * 1000)),
+          dustSats: BigInt(XEC_DUST_SATS)
+        })
+        const inputSats = selectedUtxos.reduce((sum, utxo) => sum + utxo.sats, 0n)
+        return {
+          signedTx,
+          inputSats,
+          fixedOutputSats: protocolFeeSats
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (!/insufficient/i.test(message) || count === spendableUtxos.length) {
+          if (/insufficient/i.test(message)) {
+            throw new Error('No hay suficiente XEC para cubrir el fee oficial del alias y la tarifa de red.')
+          }
+          throw err
+        }
+      }
+    }
+
+    throw new Error('No hay suficiente XEC para cubrir el fee oficial del alias y la tarifa de red.')
   }
 
   async signMessage(message: string): Promise<string> {

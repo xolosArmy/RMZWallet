@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { EXTENDED_GAP_LIMIT, xolosWalletService } from '../services/XolosWalletService'
 import type { WalletBalance, WalletRescanOptions } from '../services/XolosWalletService'
+import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import { getChronik } from '../services/ChronikClient'
 import { computeNetworkFeeSats, MIN_NETWORK_FEE_SATS, TONALLI_SERVICE_FEE_SATS, XEC_DUST_SATS } from '../config/xecFees'
 import { parseTokenAmount } from '../utils/tokenFormat'
@@ -386,6 +387,39 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     [backupVerified, initialized, syncAddressAndBalance]
   )
 
+
+  const estimateAliasRegistration = useCallback(
+    async (registration: AliasRegistrationData) => {
+      if (!initialized) {
+        throw new Error('La billetera no esta lista.')
+      }
+      return xolosWalletService.estimateAliasRegistration(registration)
+    },
+    [initialized]
+  )
+
+  const registerAliasOnChain = useCallback(
+    async (registration: AliasRegistrationData) => {
+      if (!initialized || !backupVerified) {
+        throw new Error('La billetera no esta lista: termina el onboarding y el respaldo de la seed.')
+      }
+      setLoading(true)
+      setError(null)
+      try {
+        const txid = await xolosWalletService.registerAliasOnChain(registration)
+        await syncAddressAndBalance()
+        return txid
+      } catch (err) {
+        const message = (err as Error).message || 'No se pudo registrar el alias.'
+        setError(message)
+        throw new Error(message)
+      } finally {
+        setLoading(false)
+      }
+    },
+    [backupVerified, initialized, syncAddressAndBalance]
+  )
+
   const getMnemonic = useCallback(() => xolosWalletService.getMnemonic(), [])
 
   const value = useMemo(
@@ -404,6 +438,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       rescanWallet,
       sendRMZ,
       sendXEC,
+      estimateAliasRegistration,
+      registerAliasOnChain,
       estimateXecSend,
       getMnemonic,
       unlockEncryptedWallet,
@@ -424,6 +460,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       rescanWallet,
       sendRMZ,
       sendXEC,
+      estimateAliasRegistration,
+      registerAliasOnChain,
       estimateXecSend,
       getMnemonic,
       unlockEncryptedWallet

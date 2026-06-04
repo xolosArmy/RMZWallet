@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import Dashboard from './routes/Dashboard'
 import SendRMZ from './routes/SendRMZ'
 import SendXEC from './routes/SendXEC'
+import RegisterAlias from './routes/RegisterAlias'
 import Receive from './routes/Receive'
 import Settings from './routes/Settings'
 import Onboarding from './routes/Onboarding'
@@ -36,6 +37,7 @@ function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/send" element={<SendRMZ />} />
           <Route path="/send-xec" element={<SendXEC />} />
+          <Route path="/register-alias" element={<RegisterAlias />} />
           <Route path="/receive" element={<Receive />} />
           <Route path="/scan" element={<ScanQR />} />
           <Route path="/dex" element={<DEX />} />

@@ -1,5 +1,6 @@
 import { createContext } from 'react'
-import type { WalletBalance, WalletRescanOptions } from '../services/XolosWalletService'
+import type { AliasRegistrationEstimate, WalletBalance, WalletRescanOptions } from '../services/XolosWalletService'
+import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 
 export interface WalletContextValue {
   address: string | null
@@ -16,6 +17,8 @@ export interface WalletContextValue {
   rescanWallet: (options?: WalletRescanOptions) => Promise<void>
   sendRMZ: (to: string, amount: string) => Promise<string>
   sendXEC: (to: string, amountInSats: number, message?: string) => Promise<string>
+  estimateAliasRegistration: (registration: AliasRegistrationData) => Promise<AliasRegistrationEstimate>
+  registerAliasOnChain: (registration: AliasRegistrationData) => Promise<string>
   estimateXecSend: (amountInSats: number, message?: string) => Promise<{ networkFeeSats: number; totalCostSats: number }>
   getMnemonic: () => string | null
   unlockEncryptedWallet: (password: string) => Promise<void>

@@ -346,6 +346,9 @@ function Dashboard() {
           <Link className="cta outline" to="/send-xec">
             Enviar XEC
           </Link>
+          <Link className="cta outline" to="/register-alias">
+            Register Alias / Identidad
+          </Link>
           <Link className="cta outline" to="/dex">
             DEX (Phase 1)
           </Link>
