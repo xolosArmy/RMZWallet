@@ -51,8 +51,8 @@ const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
 const STORAGE_KEY_GAP_LIMIT = 'xoloswallet_gap_limit'
 const SCAN_CACHE_TTL_MS = 30000
 const CHRONIK_CONCURRENCY_LIMIT = 4
-const ALIAS_CHRONIK_VERIFY_ATTEMPTS = 5
-const ALIAS_CHRONIK_VERIFY_DELAY_MS = 1000
+const ALIAS_CHRONIK_VERIFY_ATTEMPTS = 20
+const ALIAS_CHRONIK_VERIFY_DELAY_MS = 3000
 
 export const DEFAULT_GAP_LIMIT = 20
 export const EXTENDED_GAP_LIMIT = 100
@@ -83,16 +83,6 @@ const clampGapLimit = (value: number) => Math.min(Math.max(value, 1), EXTENDED_G
 const delay = (ms: number) => new Promise((resolve) => {
   globalThis.setTimeout(resolve, ms)
 })
-
-const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
-
-const stringifyDebugValue = (value: unknown) => {
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
-}
 
 const resolveBasePath = (path: string) => {
   const segments = path.split('/')
@@ -168,6 +158,8 @@ export type AliasRegistrationEstimate = {
 
 export type AliasRegistrationBroadcastResult = {
   txid: string
+  status: 'broadcast_pending_index' | 'confirmed_by_chronik'
+  message?: string
   rawTx: string
 }
 
@@ -588,26 +580,41 @@ export class XolosWalletService {
     const rawTx = toHex(plan.signedTx.ser())
     console.debug('[AliasRegistration] raw alias tx hex', rawTx)
 
+    let txid: string | undefined
     try {
       const result = await getChronik().broadcastTx(rawTx)
       console.debug('[AliasRegistration] broadcast response', result)
-      if (!result.txid) {
-        throw new Error('La red no devolvio txid al registrar el alias.')
-      }
-      const txid = result.txid
-      console.debug('[AliasRegistration] candidate alias txid', txid)
-      await this.verifyAliasTxInChronik(txid, result)
-      this.scanCache = null
-      return { txid, rawTx }
+      txid = result.txid
     } catch (error) {
       console.error('[AliasRegistration] alias broadcast failed', error)
-      throw error
+      throw new Error('Alias transaction broadcast failed.')
+    }
+
+    if (!txid) {
+      console.error('[AliasRegistration] alias broadcast returned no txid')
+      throw new Error('Alias transaction broadcast failed.')
+    }
+
+    console.debug('[AliasRegistration] broadcast accepted txid', txid)
+
+    const verified = await this.verifyAliasTxInChronik(txid)
+    this.scanCache = null
+
+    if (verified) {
+      return { txid, status: 'confirmed_by_chronik', rawTx }
+    }
+
+    console.warn('[AliasRegistration] tx broadcast but Chronik not indexed yet', txid)
+    return {
+      txid,
+      status: 'broadcast_pending_index',
+      message: 'Alias transaction was broadcast but is not indexed by Chronik yet.',
+      rawTx
     }
   }
 
-  async registerAliasOnChain(registration: AliasRegistrationData): Promise<string> {
-    const result = await this.registerAliasTransaction(registration)
-    return result.txid
+  async registerAliasOnChain(registration: AliasRegistrationData): Promise<AliasRegistrationBroadcastResult> {
+    return this.registerAliasTransaction(registration)
   }
 
   getMnemonic(): string | null {
@@ -673,32 +680,22 @@ export class XolosWalletService {
   }
 
 
-  private async verifyAliasTxInChronik(txid: string, broadcastResponse: unknown): Promise<void> {
-    let lastError: unknown = null
-
+  private async verifyAliasTxInChronik(txid: string): Promise<boolean> {
     for (let attempt = 1; attempt <= ALIAS_CHRONIK_VERIFY_ATTEMPTS; attempt += 1) {
-      console.debug('[AliasRegistration] chronik verification attempt', attempt)
+      console.debug('[AliasRegistration] chronik pending attempt', attempt)
       try {
         await getChronik().tx(txid)
-        return
+        console.debug('[AliasRegistration] chronik confirmed tx', txid)
+        return true
       } catch (error) {
-        lastError = error
-        console.error('[AliasRegistration] chronik verification failed', error)
+        console.debug('[AliasRegistration] chronik verification pending', error)
         if (attempt < ALIAS_CHRONIK_VERIFY_ATTEMPTS) {
           await delay(ALIAS_CHRONIK_VERIFY_DELAY_MS)
         }
       }
     }
 
-    const error = new Error(
-      [
-        'Alias transaction broadcast was not confirmed by Chronik.',
-        `candidate txid: ${txid}`,
-        `raw broadcast response: ${stringifyDebugValue(broadcastResponse)}`,
-        `last Chronik error: ${getErrorMessage(lastError)}`
-      ].join(' ')
-    )
-    throw error
+    return false
   }
 
   private async buildAliasRegistrationTxPlan(registration: AliasRegistrationData): Promise<AliasTxPlan> {

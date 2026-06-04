@@ -9,6 +9,8 @@ import { parseTokenAmount } from '../utils/tokenFormat'
 type AliasTxResult = {
   rmzTxid: string
   aliasTxid: string
+  status: 'broadcast_pending_index' | 'confirmed_by_chronik'
+  message?: string
 }
 
 type AliasBroadcastFailure = {
@@ -94,6 +96,11 @@ function RegisterAlias() {
   const registration = preview.registration
   const serviceFeeAmount = registration?.serviceFee.amount ?? 1600
   const protocolFeeSats = registration?.protocolFee.sats ?? null
+  const resultTitle = result?.status === 'confirmed_by_chronik'
+    ? 'Alias registration confirmed.'
+    : result?.status === 'broadcast_pending_index'
+      ? 'Alias transaction broadcast. Waiting for Chronik indexing.'
+      : 'Transacciones'
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault()
@@ -152,9 +159,14 @@ function RegisterAlias() {
       setRmzTxid(paidRmzTxid)
 
       setStep('alias')
-      const registeredAliasTxid = await registerAliasOnChain(registration)
-      setAliasTxid(registeredAliasTxid)
-      const txResult = { rmzTxid: paidRmzTxid, aliasTxid: registeredAliasTxid }
+      const aliasBroadcast = await registerAliasOnChain(registration)
+      setAliasTxid(aliasBroadcast.txid)
+      const txResult = {
+        rmzTxid: paidRmzTxid,
+        aliasTxid: aliasBroadcast.txid,
+        status: aliasBroadcast.status,
+        message: aliasBroadcast.message
+      }
       setResult(txResult)
       setStep('done')
     } catch (err) {
@@ -263,7 +275,7 @@ function RegisterAlias() {
 
         {(rmzTxid || aliasTxid) && (
           <div className="success">
-            <p className="success-title">Transacciones</p>
+            <p className="success-title">{resultTitle}</p>
             {rmzTxid && (
               <p className="success-hash">
                 RMZ fee tx:
@@ -281,7 +293,9 @@ function RegisterAlias() {
               </p>
             )}
             {result && <pre className="address-box">{JSON.stringify(result, null, 2)}</pre>}
-            {aliasTxid && <p className="muted">El alias puede aparecer despues de confirmacion y refresh de alias.ecash.mx.</p>}
+            {result?.status === 'broadcast_pending_index' && (
+              <p className="muted">Alias txid {result.aliasTxid} is broadcast. Refresh alias.ecash.mx after a few minutes.</p>
+            )}
           </div>
         )}
       </form>
