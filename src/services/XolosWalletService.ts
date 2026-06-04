@@ -163,10 +163,29 @@ export type AliasRegistrationBroadcastResult = {
   rawTx: string
 }
 
+export type AliasRegistrationRawTxDebug = {
+  rawTxHex: string
+  computedTxid: string
+  containsAliasLokadPrefix: boolean
+  selectedUtxos: Array<{
+    txid: string
+    outIdx: number
+    sats: string
+  }>
+  outputs: Array<{
+    index: number
+    sats: string
+    scriptHex: string
+  }>
+  protocolFeeAddress: string
+  protocolFeeSats: number
+}
+
 type AliasTxPlan = {
   signedTx: ReturnType<TxBuilder['sign']>
   inputSats: bigint
   fixedOutputSats: bigint
+  selectedUtxos: ScriptUtxo[]
 }
 
 export class XolosWalletService {
@@ -574,6 +593,33 @@ export class XolosWalletService {
     }
   }
 
+  async buildAliasRegistrationRawTx(registration: AliasRegistrationData): Promise<AliasRegistrationRawTxDebug> {
+    const plan = await this.buildAliasRegistrationTxPlan(registration)
+    const rawTxHex = plan.signedTx.toHex()
+    const computedTxid = plan.signedTx.txid()
+    const containsAliasLokadPrefix = rawTxHex.includes('6a042e78656300')
+    const selectedUtxos = plan.selectedUtxos.map((utxo) => ({
+      txid: utxo.outpoint.txid,
+      outIdx: utxo.outpoint.outIdx,
+      sats: utxo.sats.toString()
+    }))
+    const outputs = plan.signedTx.outputs.map((output, index) => ({
+      index,
+      sats: output.sats.toString(),
+      scriptHex: toHex(output.script.bytecode)
+    }))
+
+    return {
+      rawTxHex,
+      computedTxid,
+      containsAliasLokadPrefix,
+      selectedUtxos,
+      outputs,
+      protocolFeeAddress: registration.protocolFee.address,
+      protocolFeeSats: registration.protocolFee.sats
+    }
+  }
+
   async registerAliasTransaction(registration: AliasRegistrationData): Promise<AliasRegistrationBroadcastResult> {
     console.debug('[AliasRegistration] intent', registration)
     const plan = await this.buildAliasRegistrationTxPlan(registration)
@@ -757,7 +803,8 @@ export class XolosWalletService {
         return {
           signedTx,
           inputSats,
-          fixedOutputSats: protocolFeeSats
+          fixedOutputSats: protocolFeeSats,
+          selectedUtxos
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)

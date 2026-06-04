@@ -398,6 +398,26 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     [initialized]
   )
 
+  const buildAliasRegistrationRawTx = useCallback(
+    async (registration: AliasRegistrationData) => {
+      if (!initialized || !backupVerified) {
+        throw new Error('La billetera no esta lista: termina el onboarding y el respaldo de la seed.')
+      }
+      setLoading(true)
+      setError(null)
+      try {
+        return await xolosWalletService.buildAliasRegistrationRawTx(registration)
+      } catch (err) {
+        const message = (err as Error).message || 'No se pudo construir el debug tx del alias.'
+        setError(message)
+        throw new Error(message)
+      } finally {
+        setLoading(false)
+      }
+    },
+    [backupVerified, initialized]
+  )
+
   const registerAliasOnChain = useCallback(
     async (registration: AliasRegistrationData) => {
       if (!initialized || !backupVerified) {
@@ -439,6 +459,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       sendRMZ,
       sendXEC,
       estimateAliasRegistration,
+      buildAliasRegistrationRawTx,
       registerAliasOnChain,
       estimateXecSend,
       getMnemonic,
@@ -461,6 +482,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       sendRMZ,
       sendXEC,
       estimateAliasRegistration,
+      buildAliasRegistrationRawTx,
       registerAliasOnChain,
       estimateXecSend,
       getMnemonic,

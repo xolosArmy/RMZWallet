@@ -1,6 +1,7 @@
 import type { FormEvent } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import { buildAliasRegistration, type AliasRegistrationData } from '@xolosarmy/tonalli-core'
+import type { AliasRegistrationRawTxDebug } from '../services/XolosWalletService'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { XEC_SATS_PER_XEC } from '../config/xecFees'
@@ -37,6 +38,7 @@ function RegisterAlias() {
     error,
     sendRMZ,
     estimateAliasRegistration,
+    buildAliasRegistrationRawTx,
     registerAliasOnChain
   } = useWallet()
   const [aliasInput, setAliasInput] = useState('')
@@ -49,6 +51,8 @@ function RegisterAlias() {
   const [aliasBroadcastFailure, setAliasBroadcastFailure] = useState<AliasBroadcastFailure | null>(null)
   const [result, setResult] = useState<AliasTxResult | null>(null)
   const [step, setStep] = useState<'idle' | 'rmz' | 'alias' | 'done'>('idle')
+  const [aliasDebug, setAliasDebug] = useState<AliasRegistrationRawTxDebug | null>(null)
+  const [aliasDebugError, setAliasDebugError] = useState<string | null>(null)
 
   const preview = useMemo<{ registration: AliasRegistrationData | null; error: string | null }>(() => {
     if (!aliasInput.trim()) return { registration: null, error: null }
@@ -102,6 +106,35 @@ function RegisterAlias() {
       ? 'Alias transaction broadcast. Waiting for Chronik indexing.'
       : 'Transacciones'
 
+  const handleBuildAliasDebugTx = async () => {
+    setAliasDebug(null)
+    setAliasDebugError(null)
+
+    if (!initialized || !backupVerified) {
+      setAliasDebugError('Debes completar el onboarding y el respaldo de tu frase semilla antes de construir el debug tx.')
+      return
+    }
+
+    if (!address) {
+      setAliasDebugError('La billetera no tiene direccion eCash cargada.')
+      return
+    }
+
+    try {
+      const intent = buildAliasRegistration(aliasInput, address)
+      console.debug('[AliasRegistration Debug] intent', intent)
+      const debug = await buildAliasRegistrationRawTx(intent)
+      console.debug('[AliasRegistration Debug] rawTxHex', debug.rawTxHex)
+      console.debug('[AliasRegistration Debug] computedTxid', debug.computedTxid)
+      console.debug('[AliasRegistration Debug] containsAliasLokadPrefix', debug.containsAliasLokadPrefix)
+      console.debug('[AliasRegistration Debug] selectedUtxos', debug.selectedUtxos)
+      console.debug('[AliasRegistration Debug] outputs', debug.outputs)
+      setAliasDebug(debug)
+    } catch (err) {
+      setAliasDebugError(getErrorMessage(err))
+    }
+  }
+
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault()
     setLocalError(null)
@@ -110,6 +143,8 @@ function RegisterAlias() {
     setAliasBroadcastFailure(null)
     setResult(null)
     setStep('idle')
+    setAliasDebug(null)
+    setAliasDebugError(null)
 
     if (!initialized || !backupVerified) {
       setLocalError('Debes completar el onboarding y el respaldo de tu frase semilla antes de registrar un alias.')
@@ -249,6 +284,7 @@ function RegisterAlias() {
         </div>
 
         {estimateError && <div className="error">{estimateError}</div>}
+        {import.meta.env.DEV && aliasDebugError && <div className="error">{aliasDebugError}</div>}
         {(localError || error) && <div className="error">{localError || error}</div>}
         {aliasBroadcastFailure && (
           <div className="error">
@@ -271,7 +307,30 @@ function RegisterAlias() {
           >
             {step === 'rmz' ? 'Enviando RMZ...' : step === 'alias' ? 'Registrando alias...' : 'Registrar alias'}
           </button>
+          {import.meta.env.DEV && (
+            <button
+              className="cta outline"
+              type="button"
+              onClick={handleBuildAliasDebugTx}
+              disabled={!initialized || !backupVerified || loading || !aliasInput.trim()}
+            >
+              Dev-Only: Build Alias Tx Hex
+            </button>
+          )}
         </div>
+
+        {import.meta.env.DEV && aliasDebug && (
+          <div className="success">
+            <p className="success-title">Alias tx debug</p>
+            <p className="success-hash">computedTxid: {aliasDebug.computedTxid}</p>
+            <p className="success-hash">containsAliasLokadPrefix: {String(aliasDebug.containsAliasLokadPrefix)}</p>
+            <p className="success-hash">protocolFeeSats: {aliasDebug.protocolFeeSats}</p>
+            <p className="success-hash">protocolFeeAddress: {aliasDebug.protocolFeeAddress}</p>
+            <p className="success-hash">selectedUtxos: {aliasDebug.selectedUtxos.length}</p>
+            <p className="success-hash">outputs: {aliasDebug.outputs.length}</p>
+            <pre className="address-box">{JSON.stringify(aliasDebug, null, 2)}</pre>
+          </div>
+        )}
 
         {(rmzTxid || aliasTxid) && (
           <div className="success">
