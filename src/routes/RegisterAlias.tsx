@@ -160,6 +160,8 @@ function RegisterAlias() {
     } catch (err) {
       const aliasError = getErrorMessage(err)
       if (paidRmzTxid) {
+        setAliasTxid(null)
+        setResult(null)
         setLocalError('RMZ service fee paid, but alias registration failed.')
         setAliasBroadcastFailure({ rmzTxid: paidRmzTxid, error: aliasError })
       } else {
@@ -238,6 +240,7 @@ function RegisterAlias() {
         {(localError || error) && <div className="error">{localError || error}</div>}
         {aliasBroadcastFailure && (
           <div className="error">
+            <p>RMZ service fee paid, but alias registration failed.</p>
             <p className="success-hash">
               rmzTxid:
               <a href={explorerUrl(aliasBroadcastFailure.rmzTxid)} target="_blank" rel="noopener noreferrer" className="success-link">
