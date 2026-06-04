@@ -1,5 +1,5 @@
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
-import { ALL_BIP143, P2PKHSignatory, Script, TxBuilder, fromHex, signMsg } from 'ecash-lib'
+import { ALL_BIP143, P2PKHSignatory, Script, TxBuilder, fromHex, signMsg, toHex } from 'ecash-lib'
 import { AgoraOneshotAdSignatory } from 'ecash-agora'
 import type { ScriptUtxo } from 'chronik-client'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
@@ -148,6 +148,11 @@ export type AliasRegistrationEstimate = {
   protocolFeeSats: number
   networkFeeSats: number
   totalCostSats: number
+}
+
+export type AliasRegistrationBroadcastResult = {
+  txid: string
+  rawTx: string
 }
 
 type AliasTxPlan = {
@@ -561,14 +566,29 @@ export class XolosWalletService {
     }
   }
 
-  async registerAliasOnChain(registration: AliasRegistrationData): Promise<string> {
+  async registerAliasTransaction(registration: AliasRegistrationData): Promise<AliasRegistrationBroadcastResult> {
+    console.debug('[AliasRegistration] intent', registration)
     const plan = await this.buildAliasRegistrationTxPlan(registration)
-    const broadcast = await getChronik().broadcastTx(plan.signedTx.ser())
-    if (!broadcast.txid) {
-      throw new Error('La red no devolvio txid al registrar el alias.')
+    const rawTx = toHex(plan.signedTx.ser())
+    console.debug('[AliasRegistration] alias raw tx', rawTx)
+
+    try {
+      const result = await getChronik().broadcastTx(rawTx)
+      console.debug('[AliasRegistration] alias broadcast result', result)
+      if (!result.txid) {
+        throw new Error('La red no devolvio txid al registrar el alias.')
+      }
+      this.scanCache = null
+      return { txid: result.txid, rawTx }
+    } catch (error) {
+      console.error('[AliasRegistration] alias broadcast failed', error)
+      throw error
     }
-    this.scanCache = null
-    return broadcast.txid
+  }
+
+  async registerAliasOnChain(registration: AliasRegistrationData): Promise<string> {
+    const result = await this.registerAliasTransaction(registration)
+    return result.txid
   }
 
   getMnemonic(): string | null {
@@ -652,7 +672,15 @@ export class XolosWalletService {
       throw new Error('No hay suficiente XEC para cubrir el fee oficial del alias y la tarifa de red.')
     }
 
+    if (!registration.opReturnHex.startsWith('6a042e78656300')) {
+      throw new Error('Alias OP_RETURN invalido: se esperaba prefijo 6a042e78656300.')
+    }
+
     const protocolFeeSats = BigInt(registration.protocolFee.sats)
+    if (protocolFeeSats <= 0n || !registration.protocolFee.address) {
+      throw new Error('Fee oficial del alias invalido.')
+    }
+
     const fixedOutputs = [
       { sats: 0n, script: new Script(fromHex(registration.opReturnHex)) },
       { sats: protocolFeeSats, script: Script.fromAddress(registration.protocolFee.address) }

@@ -11,6 +11,13 @@ type AliasTxResult = {
   aliasTxid: string
 }
 
+type AliasBroadcastFailure = {
+  rmzTxid: string
+  error: string
+}
+
+const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
+
 const formatXecFromSats = (sats: number) => (sats / XEC_SATS_PER_XEC).toLocaleString(undefined, {
   minimumFractionDigits: 2,
   maximumFractionDigits: 2
@@ -37,6 +44,7 @@ function RegisterAlias() {
   const [totalXecCostSats, setTotalXecCostSats] = useState<number | null>(null)
   const [rmzTxid, setRmzTxid] = useState<string | null>(null)
   const [aliasTxid, setAliasTxid] = useState<string | null>(null)
+  const [aliasBroadcastFailure, setAliasBroadcastFailure] = useState<AliasBroadcastFailure | null>(null)
   const [result, setResult] = useState<AliasTxResult | null>(null)
   const [step, setStep] = useState<'idle' | 'rmz' | 'alias' | 'done'>('idle')
 
@@ -92,6 +100,7 @@ function RegisterAlias() {
     setLocalError(null)
     setRmzTxid(null)
     setAliasTxid(null)
+    setAliasBroadcastFailure(null)
     setResult(null)
     setStep('idle')
 
@@ -134,9 +143,12 @@ function RegisterAlias() {
       return
     }
 
+    let paidRmzTxid: string | null = null
+
     try {
       setStep('rmz')
-      const paidRmzTxid = await sendRMZ(registration.serviceFee.receiverAddress, String(registration.serviceFee.amount))
+      paidRmzTxid = await sendRMZ(registration.serviceFee.receiverAddress, String(registration.serviceFee.amount))
+      console.debug('[AliasRegistration] rmzTxid', paidRmzTxid)
       setRmzTxid(paidRmzTxid)
 
       setStep('alias')
@@ -146,7 +158,13 @@ function RegisterAlias() {
       setResult(txResult)
       setStep('done')
     } catch (err) {
-      setLocalError((err as Error).message)
+      const aliasError = getErrorMessage(err)
+      if (paidRmzTxid) {
+        setLocalError('RMZ service fee paid, but alias registration failed.')
+        setAliasBroadcastFailure({ rmzTxid: paidRmzTxid, error: aliasError })
+      } else {
+        setLocalError(aliasError)
+      }
       setStep('idle')
     }
   }
@@ -218,6 +236,17 @@ function RegisterAlias() {
 
         {estimateError && <div className="error">{estimateError}</div>}
         {(localError || error) && <div className="error">{localError || error}</div>}
+        {aliasBroadcastFailure && (
+          <div className="error">
+            <p className="success-hash">
+              rmzTxid:
+              <a href={explorerUrl(aliasBroadcastFailure.rmzTxid)} target="_blank" rel="noopener noreferrer" className="success-link">
+                {aliasBroadcastFailure.rmzTxid}
+              </a>
+            </p>
+            <p className="success-hash">alias broadcast error: {aliasBroadcastFailure.error}</p>
+          </div>
+        )}
 
         <div className="actions">
           <button
