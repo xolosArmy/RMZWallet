@@ -1,15 +1,85 @@
 import { Script } from 'ecash-lib'
-import { AgoraOffer } from 'ecash-agora'
-import type { ScriptUtxo } from 'chronik-client'
+import { Agora, AgoraOffer } from 'ecash-agora'
+import type { ScriptUtxo, Tx } from 'chronik-client'
 import { getChronik } from './ChronikClient'
 import { xolosWalletService } from './XolosWalletService'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { parseAgoraOfferFromTx, parseOfferId } from '../dex/agoraPhase1'
 
 const FEE_PER_KB = 1200n
+const REMAINING_OFFER_INDEX_WAIT_MS = 600
+const OFFER_ALREADY_CHANGED_MESSAGE = 'Esta oferta ya fue comprada o modificada. Recarga la oferta restante.'
+export const MISSING_OR_SPENT_MESSAGE =
+  'La oferta o alguno de tus UTXOs ya fue gastado. Recarga la wallet y vuelve a cargar la oferta.'
 
 type AcceptedAtomsPreparer = {
   prepareAcceptedAtoms(atoms: bigint): bigint
+}
+
+type ActiveOfferCandidate = {
+  outpoint?: { txid?: string; outIdx?: number; vout?: number }
+}
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+export const isMissingOrSpentError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error)
+  return /missingorspent|bad-txns-inputs-missingorspent|Missing inputs/i.test(message)
+}
+
+export const toFriendlyBroadcastError = (error: unknown): Error => {
+  if (isMissingOrSpentError(error)) {
+    return new Error(MISSING_OR_SPENT_MESSAGE)
+  }
+  return error instanceof Error ? error : new Error(String(error))
+}
+
+export const isPartialAccept = (params: { acceptedAtoms: bigint; offeredAtoms: bigint }): boolean =>
+  params.acceptedAtoms < params.offeredAtoms
+
+export const findRemainingOfferId = (offers: ActiveOfferCandidate[], txid: string): string | undefined => {
+  const normalizedTxid = txid.toLowerCase()
+  for (const offer of offers) {
+    const outpoint = offer.outpoint
+    const outpointTxid = outpoint?.txid?.toLowerCase()
+    const outIdx = outpoint?.outIdx ?? outpoint?.vout
+    if (outpointTxid === normalizedTxid && typeof outIdx === 'number' && Number.isInteger(outIdx) && outIdx >= 0) {
+      return `${outpointTxid}:${outIdx}`
+    }
+  }
+  return undefined
+}
+
+export const assertOfferOutputUnspent = (tx: Tx, vout: number) => {
+  const output = tx.outputs[vout]
+  if (!output || output.spentBy) {
+    throw new Error(OFFER_ALREADY_CHANGED_MESSAGE)
+  }
+}
+
+const fetchLiveOfferTx = async (txid: string, vout: number): Promise<Tx> => {
+  let tx: Tx
+  try {
+    tx = await getChronik().tx(txid)
+  } catch {
+    throw new Error(OFFER_ALREADY_CHANGED_MESSAGE)
+  }
+  assertOfferOutputUnspent(tx, vout)
+  return tx
+}
+
+const resolveRemainingOfferId = async (txid: string): Promise<string | undefined> => {
+  const load = async () => {
+    const agora = new Agora(getChronik() as never)
+    const activeOffers = await agora.activeOffersByTokenId(RMZ_ETOKEN_ID)
+    return findRemainingOfferId(activeOffers as ActiveOfferCandidate[], txid)
+  }
+
+  try {
+    return (await load()) ?? (await delay(REMAINING_OFFER_INDEX_WAIT_MS).then(load))
+  } catch {
+    return undefined
+  }
 }
 
 const selectXecUtxosForTarget = (utxos: ScriptUtxo[], targetSats: bigint): ScriptUtxo[] => {
@@ -78,10 +148,11 @@ export const resolveAcceptedAtoms = (params: {
 export const buyOfferById = async (offerId: string, desiredAtoms?: bigint): Promise<{
   txid: string
   acceptedAtoms: bigint
+  isPartial: boolean
   remainingOfferId?: string
 }> => {
   const outpoint = parseOfferId(offerId)
-  const tx = await getChronik().tx(outpoint.txid)
+  const tx = await fetchLiveOfferTx(outpoint.txid, outpoint.vout)
   const offerDetails = parseAgoraOfferFromTx(tx, outpoint.vout, RMZ_ETOKEN_ID)
 
   const signer = xolosWalletService.getSignatory()
@@ -106,10 +177,12 @@ export const buyOfferById = async (offerId: string, desiredAtoms?: bigint): Prom
     offeredAtoms: offerDetails.offeredAtoms,
     desiredAtoms
   })
+  const isPartial = isPartialAccept({ acceptedAtoms, offeredAtoms: offerDetails.offeredAtoms })
   const askedSats = offer.askedSats(acceptedAtoms)
   const feeSats = offer.acceptFeeSats({ recipientScript, acceptedAtoms, feePerKb: FEE_PER_KB })
   const totalNeeded = askedSats + feeSats
 
+  await xolosWalletService.getBalances()
   const addressUtxos = await getChronik().address(signer.address).utxos()
   const xecUtxos = addressUtxos.utxos.filter((utxo) => !utxo.token)
   const funding = selectXecUtxosForTarget(xecUtxos, totalNeeded)
@@ -128,7 +201,12 @@ export const buyOfferById = async (offerId: string, desiredAtoms?: bigint): Prom
     })
   )
 
-  const broadcast = await getChronik().broadcastTx(acceptTx.ser())
-  const remainingOfferId = acceptedAtoms < offerDetails.offeredAtoms ? `${broadcast.txid}:2` : undefined
-  return { txid: broadcast.txid, acceptedAtoms, remainingOfferId }
+  try {
+    const broadcast = await getChronik().broadcastTx(acceptTx.ser())
+    await xolosWalletService.getBalances()
+    const remainingOfferId = isPartial ? await resolveRemainingOfferId(broadcast.txid) : undefined
+    return { txid: broadcast.txid, acceptedAtoms, isPartial, remainingOfferId }
+  } catch (error) {
+    throw toFriendlyBroadcastError(error)
+  }
 }

@@ -15,7 +15,7 @@ import { getChronik } from '../services/ChronikClient'
 import { EXTENDED_GAP_LIMIT, type WalletSignatory, xolosWalletService } from '../services/XolosWalletService'
 import { fetchNftDetails, fetchOwnedNfts, type NftAsset } from '../services/nftService'
 import { acceptOfferById, createSellOfferToken, loadOfferById, type OneshotOfferSummary } from '../services/agoraExchange'
-import { buyOfferById } from '../services/buyOfferById'
+import { MISSING_OR_SPENT_MESSAGE, buyOfferById } from '../services/buyOfferById'
 import { wcWallet } from '../lib/walletconnect/WcWallet'
 import type { OfferPublishedPayload } from '../lib/walletconnect/WcWallet'
 import WcDebugPanel from '../components/WcDebugPanel'
@@ -528,8 +528,9 @@ function DEX() {
 
     setBuyBusy(true)
     try {
+      await refreshBalances()
       const offerId = `${offerOutpoint.txid}:${offerOutpoint.vout}`
-      const { txid, remainingOfferId } = await buyOfferById(offerId, desiredAtoms)
+      const { txid, isPartial, remainingOfferId } = await buyOfferById(offerId, desiredAtoms)
       if (desiredAtoms !== undefined && acceptedAtoms !== desiredAtoms) {
         setBuyAdjustmentNotice(
           `La cantidad fue ajustada a ${formatAtomsToDecimal(acceptedAtoms, rmzDecimals)} RMZ por la granularidad de esta oferta.`
@@ -555,9 +556,23 @@ function DEX() {
       } else {
         setOfferDetails(null)
         setOfferOutpoint(null)
+        if (isPartial) {
+          setBuyAdjustmentNotice('Compra parcial realizada. La oferta restante se está indexando; recarga en unos segundos.')
+        }
       }
     } catch (err) {
-      setOfferLookupError((err as Error).message || 'No se pudo completar la compra.')
+      const message = (err as Error).message || 'No se pudo completar la compra.'
+      if (message === MISSING_OR_SPENT_MESSAGE) {
+        try {
+          await refreshBalances()
+        } catch {
+          // Keep the original purchase error visible.
+        }
+        setOfferDetails(null)
+        setOfferOutpoint(null)
+        setOfferIdInput('')
+      }
+      setOfferLookupError(message)
     } finally {
       setBuyBusy(false)
     }

@@ -4,6 +4,50 @@ import { RMZ_ETOKEN_ID } from '../../../config/rmzToken'
 import { formatAtomsToDecimal, formatSatsToXec, parseDecimalToAtoms } from '../../../dex/agoraPhase1'
 import { useActiveOffers } from '../hooks/useActiveOffers'
 
+export type RmzOfferSummary = {
+  offeredDisplay: string
+  askedDisplay: string
+  offeredAtoms: bigint
+  askedSats: bigint
+  tokenDecimals: number
+}
+
+export type RmzBuyPreview =
+  | { valid: false; error: string }
+  | {
+      valid: true
+      desiredDisplay: string
+      estimatedXec: string
+      remainingDisplay: string
+    }
+
+export const buildRmzBuyPreview = (offerSummary: RmzOfferSummary | null, buyAmountInput: string): RmzBuyPreview => {
+  if (!offerSummary || !buyAmountInput.trim()) {
+    return { valid: false, error: 'Ingresa una cantidad de RMZ.' }
+  }
+
+  try {
+    const desiredAtoms = parseDecimalToAtoms(buyAmountInput, offerSummary.tokenDecimals)
+    if (desiredAtoms <= 0n) {
+      return { valid: false, error: 'La cantidad debe ser mayor a cero.' }
+    }
+    if (desiredAtoms > offerSummary.offeredAtoms) {
+      return { valid: false, error: 'La cantidad supera los RMZ disponibles.' }
+    }
+
+    const estimatedSats = (offerSummary.askedSats * desiredAtoms) / offerSummary.offeredAtoms
+    const remainingAtoms = offerSummary.offeredAtoms - desiredAtoms
+    return {
+      valid: true,
+      desiredDisplay: formatAtomsToDecimal(desiredAtoms, offerSummary.tokenDecimals),
+      estimatedXec: formatSatsToXec(estimatedSats),
+      remainingDisplay: formatAtomsToDecimal(remainingAtoms, offerSummary.tokenDecimals)
+    }
+  } catch (err) {
+    return { valid: false, error: (err as Error).message }
+  }
+}
+
 type DexTakerRmzProps = {
   offerIdInput: string
   setOfferIdInput: Dispatch<SetStateAction<string>>
@@ -13,13 +57,7 @@ type DexTakerRmzProps = {
   buyBusy: boolean
   onBuyOffer: (buyAmountInput?: string) => void
   buyTxid: string | null
-  offerSummary: {
-    offeredDisplay: string
-    askedDisplay: string
-    offeredAtoms: bigint
-    askedSats: bigint
-    tokenDecimals: number
-  } | null
+  offerSummary: RmzOfferSummary | null
   payoutAddress: string | null
   adjustmentNotice: string | null
 }
@@ -76,32 +114,7 @@ export default function DexTakerRmz({
     setBuyAmountInput('')
   }, [offerSummary?.offeredAtoms, offerSummary?.askedSats])
 
-  const buyPreview = useMemo(() => {
-    if (!offerSummary || !buyAmountInput.trim()) {
-      return { valid: false, error: 'Ingresa una cantidad de RMZ.' }
-    }
-
-    try {
-      const desiredAtoms = parseDecimalToAtoms(buyAmountInput, offerSummary.tokenDecimals)
-      if (desiredAtoms <= 0n) {
-        return { valid: false, error: 'La cantidad debe ser mayor a cero.' }
-      }
-      if (desiredAtoms > offerSummary.offeredAtoms) {
-        return { valid: false, error: 'La cantidad supera los RMZ disponibles.' }
-      }
-
-      const estimatedSats = (offerSummary.askedSats * desiredAtoms) / offerSummary.offeredAtoms
-      const remainingAtoms = offerSummary.offeredAtoms - desiredAtoms
-      return {
-        valid: true,
-        desiredDisplay: formatAtomsToDecimal(desiredAtoms, offerSummary.tokenDecimals),
-        estimatedXec: formatSatsToXec(estimatedSats),
-        remainingDisplay: formatAtomsToDecimal(remainingAtoms, offerSummary.tokenDecimals)
-      }
-    } catch (err) {
-      return { valid: false, error: (err as Error).message }
-    }
-  }, [buyAmountInput, offerSummary])
+  const buyPreview = useMemo(() => buildRmzBuyPreview(offerSummary, buyAmountInput), [buyAmountInput, offerSummary])
 
   const buyDisabled = buyBusy || !buyPreview.valid
 
@@ -179,9 +192,9 @@ export default function DexTakerRmz({
 
         {offerSummary && (
           <div style={{ marginTop: 16 }}>
-            <div className="success">Oferta lista: {offerSummary.offeredDisplay} RMZ por {offerSummary.askedDisplay} XEC</div>
+            <div className="success">Oferta cargada.</div>
             <div className="muted" style={{ marginTop: 8 }}>
-              RMZ disponibles: {offerSummary.offeredDisplay}
+              Total disponible en la oferta: {offerSummary.offeredDisplay} RMZ
             </div>
             <div className="muted" style={{ marginTop: 6 }}>
               Precio total de la oferta: {offerSummary.askedDisplay} XEC
@@ -205,7 +218,7 @@ export default function DexTakerRmz({
 
             {buyPreview.valid ? (
               <div className="muted" style={{ marginTop: 8 }}>
-                Estimado a pagar: {buyPreview.estimatedXec} XEC · Restante: {buyPreview.remainingDisplay} RMZ
+                Cantidad a comprar: {buyPreview.desiredDisplay} RMZ · Estimado a pagar: {buyPreview.estimatedXec} XEC · Restante después de compra: {buyPreview.remainingDisplay} RMZ
               </div>
             ) : (
               <div className="muted" style={{ marginTop: 8 }}>

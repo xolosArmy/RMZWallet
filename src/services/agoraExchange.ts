@@ -372,20 +372,24 @@ export const loadOfferById = async (params: {
   return { offer, summary }
 }
 
+export const assertOneshotDesiredAtoms = (desiredAtoms: bigint | undefined, offerAtoms: bigint) => {
+  if (desiredAtoms !== undefined) {
+    if (desiredAtoms <= 0n) {
+      throw new Error('La cantidad a comprar debe ser mayor a cero.')
+    }
+    if (desiredAtoms !== offerAtoms) {
+      throw new Error('Esta oferta oneshot solo se puede comprar completa.')
+    }
+  }
+}
+
 export const acceptOfferById = async (params: {
   offerId: string
   wallet: XolosWalletService
   desiredAtoms?: bigint
 }): Promise<{ txid: string }> => {
   const { offer } = await loadOfferById({ offerId: params.offerId })
-  if (params.desiredAtoms !== undefined) {
-    if (params.desiredAtoms <= 0n) {
-      throw new Error('La cantidad a comprar debe ser mayor a cero.')
-    }
-    if (params.desiredAtoms !== offer.token.atoms) {
-      throw new Error('Esta oferta oneshot solo se puede comprar completa.')
-    }
-  }
+  assertOneshotDesiredAtoms(params.desiredAtoms, offer.token.atoms)
   const signer = params.wallet.getSignatory()
   const recipientScript = Script.fromAddress(Address.parse(signer.address).cash().toString())
 
