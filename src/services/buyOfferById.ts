@@ -8,6 +8,10 @@ import { parseAgoraOfferFromTx, parseOfferId } from '../dex/agoraPhase1'
 
 const FEE_PER_KB = 1200n
 
+type AcceptedAtomsPreparer = {
+  prepareAcceptedAtoms(atoms: bigint): bigint
+}
+
 const selectXecUtxosForTarget = (utxos: ScriptUtxo[], targetSats: bigint): ScriptUtxo[] => {
   const sorted = [...utxos].sort((a, b) => {
     if (a.sats === b.sats) return 0
@@ -40,7 +44,42 @@ const buildInput = (utxo: ScriptUtxo, outputScript: Script, signatory: unknown) 
   }
 }
 
-export const buyOfferById = async (offerId: string): Promise<{ txid: string }> => {
+export const resolveAcceptedAtoms = (params: {
+  agoraPartial: AcceptedAtomsPreparer
+  offeredAtoms: bigint
+  desiredAtoms?: bigint
+}): bigint => {
+  if (params.offeredAtoms <= 0n) {
+    throw new Error('La oferta no contiene RMZ disponibles.')
+  }
+
+  if (params.desiredAtoms !== undefined) {
+    if (params.desiredAtoms <= 0n) {
+      throw new Error('La cantidad a comprar debe ser mayor a cero.')
+    }
+    if (params.desiredAtoms > params.offeredAtoms) {
+      throw new Error('La cantidad a comprar supera los RMZ disponibles en la oferta.')
+    }
+  }
+
+  const targetAtoms = params.desiredAtoms ?? params.offeredAtoms
+  const acceptedAtoms = params.agoraPartial.prepareAcceptedAtoms(targetAtoms)
+
+  if (acceptedAtoms <= 0n) {
+    throw new Error('La cantidad aceptada por Agora debe ser mayor a cero.')
+  }
+  if (acceptedAtoms > params.offeredAtoms) {
+    throw new Error('La cantidad aceptada por Agora supera los RMZ disponibles en la oferta.')
+  }
+
+  return acceptedAtoms
+}
+
+export const buyOfferById = async (offerId: string, desiredAtoms?: bigint): Promise<{
+  txid: string
+  acceptedAtoms: bigint
+  remainingOfferId?: string
+}> => {
   const outpoint = parseOfferId(offerId)
   const tx = await getChronik().tx(outpoint.txid)
   const offerDetails = parseAgoraOfferFromTx(tx, outpoint.vout, RMZ_ETOKEN_ID)
@@ -62,7 +101,11 @@ export const buyOfferById = async (offerId: string): Promise<{ txid: string }> =
     status: 'OPEN'
   })
 
-  const acceptedAtoms = offerDetails.agoraPartial.prepareAcceptedAtoms(offerDetails.offeredAtoms)
+  const acceptedAtoms = resolveAcceptedAtoms({
+    agoraPartial: offerDetails.agoraPartial,
+    offeredAtoms: offerDetails.offeredAtoms,
+    desiredAtoms
+  })
   const askedSats = offer.askedSats(acceptedAtoms)
   const feeSats = offer.acceptFeeSats({ recipientScript, acceptedAtoms, feePerKb: FEE_PER_KB })
   const totalNeeded = askedSats + feeSats
@@ -86,5 +129,6 @@ export const buyOfferById = async (offerId: string): Promise<{ txid: string }> =
   )
 
   const broadcast = await getChronik().broadcastTx(acceptTx.ser())
-  return { txid: broadcast.txid }
+  const remainingOfferId = acceptedAtoms < offerDetails.offeredAtoms ? `${broadcast.txid}:2` : undefined
+  return { txid: broadcast.txid, acceptedAtoms, remainingOfferId }
 }

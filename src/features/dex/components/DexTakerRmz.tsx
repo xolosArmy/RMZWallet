@@ -1,6 +1,7 @@
 import type { Dispatch, SetStateAction } from 'react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { RMZ_ETOKEN_ID } from '../../../config/rmzToken'
+import { formatAtomsToDecimal, formatSatsToXec, parseDecimalToAtoms } from '../../../dex/agoraPhase1'
 import { useActiveOffers } from '../hooks/useActiveOffers'
 
 type DexTakerRmzProps = {
@@ -10,10 +11,17 @@ type DexTakerRmzProps = {
   offerBusy: boolean
   onLookupOffer: () => void
   buyBusy: boolean
-  onBuyOffer: () => void
+  onBuyOffer: (buyAmountInput?: string) => void
   buyTxid: string | null
-  offerSummary: { offeredDisplay: string; askedDisplay: string } | null
+  offerSummary: {
+    offeredDisplay: string
+    askedDisplay: string
+    offeredAtoms: bigint
+    askedSats: bigint
+    tokenDecimals: number
+  } | null
   payoutAddress: string | null
+  adjustmentNotice: string | null
 }
 
 type FeaturedOffer = {
@@ -55,12 +63,47 @@ export default function DexTakerRmz({
   onBuyOffer,
   buyTxid,
   offerSummary,
-  payoutAddress
+  payoutAddress,
+  adjustmentNotice
 }: DexTakerRmzProps) {
   const { offers, pluginUnavailable, loading } = useActiveOffers(RMZ_ETOKEN_ID)
   const [copyStatus, setCopyStatus] = useState<string | null>(null)
+  const [buyAmountInput, setBuyAmountInput] = useState('')
 
   const activeOfferCount = useMemo(() => offers.length, [offers])
+
+  useEffect(() => {
+    setBuyAmountInput('')
+  }, [offerSummary?.offeredAtoms, offerSummary?.askedSats])
+
+  const buyPreview = useMemo(() => {
+    if (!offerSummary || !buyAmountInput.trim()) {
+      return { valid: false, error: 'Ingresa una cantidad de RMZ.' }
+    }
+
+    try {
+      const desiredAtoms = parseDecimalToAtoms(buyAmountInput, offerSummary.tokenDecimals)
+      if (desiredAtoms <= 0n) {
+        return { valid: false, error: 'La cantidad debe ser mayor a cero.' }
+      }
+      if (desiredAtoms > offerSummary.offeredAtoms) {
+        return { valid: false, error: 'La cantidad supera los RMZ disponibles.' }
+      }
+
+      const estimatedSats = (offerSummary.askedSats * desiredAtoms) / offerSummary.offeredAtoms
+      const remainingAtoms = offerSummary.offeredAtoms - desiredAtoms
+      return {
+        valid: true,
+        desiredDisplay: formatAtomsToDecimal(desiredAtoms, offerSummary.tokenDecimals),
+        estimatedXec: formatSatsToXec(estimatedSats),
+        remainingDisplay: formatAtomsToDecimal(remainingAtoms, offerSummary.tokenDecimals)
+      }
+    } catch (err) {
+      return { valid: false, error: (err as Error).message }
+    }
+  }, [buyAmountInput, offerSummary])
+
+  const buyDisabled = buyBusy || !buyPreview.valid
 
   const handleCopyId = async (offerId: string) => {
     try {
@@ -137,14 +180,57 @@ export default function DexTakerRmz({
         {offerSummary && (
           <div style={{ marginTop: 16 }}>
             <div className="success">Oferta lista: {offerSummary.offeredDisplay} RMZ por {offerSummary.askedDisplay} XEC</div>
+            <div className="muted" style={{ marginTop: 8 }}>
+              RMZ disponibles: {offerSummary.offeredDisplay}
+            </div>
+            <div className="muted" style={{ marginTop: 6 }}>
+              Precio total de la oferta: {offerSummary.askedDisplay} XEC
+            </div>
             {payoutAddress && (
               <p className="muted" style={{ marginTop: 8 }}>
                 Pago a: {payoutAddress}
               </p>
             )}
+
+            <label htmlFor="buyAmountRmz" style={{ marginTop: 12 }}>
+              Cantidad a comprar (RMZ)
+            </label>
+            <input
+              id="buyAmountRmz"
+              inputMode="decimal"
+              value={buyAmountInput}
+              onChange={(event) => setBuyAmountInput(event.target.value)}
+              placeholder="Ej. 1"
+            />
+
+            {buyPreview.valid ? (
+              <div className="muted" style={{ marginTop: 8 }}>
+                Estimado a pagar: {buyPreview.estimatedXec} XEC · Restante: {buyPreview.remainingDisplay} RMZ
+              </div>
+            ) : (
+              <div className="muted" style={{ marginTop: 8 }}>
+                {buyPreview.error}
+              </div>
+            )}
+
+            {adjustmentNotice && (
+              <div className="success" style={{ marginTop: 12 }}>
+                {adjustmentNotice}
+              </div>
+            )}
+
             <div className="actions" style={{ marginTop: 12 }}>
-              <button className="cta primary" type="button" onClick={onBuyOffer} disabled={buyBusy}>
-                {buyBusy ? 'Comprando...' : 'Comprar RMZ'}
+              <button
+                className="cta primary"
+                type="button"
+                onClick={() => onBuyOffer(buyAmountInput)}
+                disabled={buyDisabled}
+              >
+                {buyBusy
+                  ? 'Comprando...'
+                  : buyPreview.valid
+                    ? `Comprar ${buyPreview.desiredDisplay} RMZ`
+                    : 'Comprar RMZ'}
               </button>
             </div>
             {buyTxid && (

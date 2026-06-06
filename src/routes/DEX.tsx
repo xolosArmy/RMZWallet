@@ -25,6 +25,7 @@ import {
   buildAlpAgoraListOutputs,
   calcPriceNanoSatsFromTotal,
   calcPriceNanoSatsPerAtom,
+  formatAtomsToDecimal,
   formatOfferSummary,
   formatSatsToXec,
   parseAgoraOfferFromTx,
@@ -97,6 +98,7 @@ function DEX() {
   const [offerBusy, setOfferBusy] = useState(false)
   const [buyBusy, setBuyBusy] = useState(false)
   const [buyTxid, setBuyTxid] = useState<string | null>(null)
+  const [buyAdjustmentNotice, setBuyAdjustmentNotice] = useState<string | null>(null)
 
   const [ownedNfts, setOwnedNfts] = useState<NftAsset[]>([])
   const [nftTokenIdInput, setNftTokenIdInput] = useState('')
@@ -460,6 +462,7 @@ function DEX() {
     setOfferDetails(null)
     setOfferOutpoint(null)
     setBuyTxid(null)
+    setBuyAdjustmentNotice(null)
 
     let outpoint
     try {
@@ -482,22 +485,77 @@ function DEX() {
     }
   }
 
-  const handleBuyOffer = async () => {
+  const handleBuyOffer = async (buyAmountInput?: string) => {
     if (!offerDetails || !offerOutpoint || !address) return
     setBuyTxid(null)
     setOfferLookupError(null)
+    setBuyAdjustmentNotice(null)
 
     if (!initialized || !backupVerified) {
       setOfferLookupError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
+      return
+    }
+    if (rmzDecimals === null) {
+      setOfferLookupError('No pudimos cargar los decimales del token RMZ.')
+      return
+    }
+
+    let desiredAtoms: bigint | undefined
+    try {
+      if (buyAmountInput?.trim()) {
+        desiredAtoms = parseDecimalToAtoms(buyAmountInput, rmzDecimals)
+        if (desiredAtoms <= 0n) {
+          throw new Error('La cantidad a comprar debe ser mayor a cero.')
+        }
+        if (desiredAtoms > offerDetails.offeredAtoms) {
+          throw new Error('La cantidad a comprar supera los RMZ disponibles en la oferta.')
+        }
+      }
+    } catch (err) {
+      setOfferLookupError((err as Error).message)
+      return
+    }
+
+    const acceptedAtoms = offerDetails.agoraPartial.prepareAcceptedAtoms(desiredAtoms ?? offerDetails.offeredAtoms)
+    if (acceptedAtoms <= 0n) {
+      setOfferLookupError('La cantidad aceptada por Agora debe ser mayor a cero.')
+      return
+    }
+    if (acceptedAtoms > offerDetails.offeredAtoms) {
+      setOfferLookupError('La cantidad aceptada por Agora supera los RMZ disponibles en la oferta.')
       return
     }
 
     setBuyBusy(true)
     try {
       const offerId = `${offerOutpoint.txid}:${offerOutpoint.vout}`
-      const { txid } = await buyOfferById(offerId)
+      const { txid, remainingOfferId } = await buyOfferById(offerId, desiredAtoms)
+      if (desiredAtoms !== undefined && acceptedAtoms !== desiredAtoms) {
+        setBuyAdjustmentNotice(
+          `La cantidad fue ajustada a ${formatAtomsToDecimal(acceptedAtoms, rmzDecimals)} RMZ por la granularidad de esta oferta.`
+        )
+      }
       setBuyTxid(txid)
       await refreshBalances()
+
+      if (remainingOfferId) {
+        try {
+          const nextOutpoint = parseOfferId(remainingOfferId)
+          const nextTx = await getChronik().tx(nextOutpoint.txid)
+          const nextDetails = parseAgoraOfferFromTx(nextTx, nextOutpoint.vout, RMZ_ETOKEN_ID)
+          setOfferIdInput(remainingOfferId)
+          setOfferOutpoint(nextOutpoint)
+          setOfferDetails(nextDetails)
+        } catch {
+          setOfferIdInput(remainingOfferId)
+          setOfferDetails(null)
+          setOfferOutpoint(null)
+          setOfferLookupError('Compra completada. No pudimos recargar todavia la oferta restante; intenta cargar el nuevo Offer ID en unos segundos.')
+        }
+      } else {
+        setOfferDetails(null)
+        setOfferOutpoint(null)
+      }
     } catch (err) {
       setOfferLookupError((err as Error).message || 'No se pudo completar la compra.')
     } finally {
@@ -846,11 +904,16 @@ function DEX() {
 
   const offerSummary =
     offerDetails && rmzDecimals !== null
-      ? formatOfferSummary({
+      ? {
+          ...formatOfferSummary({
+            offeredAtoms: offerDetails.offeredAtoms,
+            tokenDecimals: rmzDecimals,
+            askedSats: offerDetails.askedSats
+          }),
           offeredAtoms: offerDetails.offeredAtoms,
-          tokenDecimals: rmzDecimals,
-          askedSats: offerDetails.askedSats
-        })
+          askedSats: offerDetails.askedSats,
+          tokenDecimals: rmzDecimals
+        }
       : null
 
   return (
@@ -1044,6 +1107,7 @@ function DEX() {
             buyTxid={buyTxid}
             offerSummary={offerSummary}
             payoutAddress={offerDetails?.payoutAddress ?? null}
+            adjustmentNotice={buyAdjustmentNotice}
           />
         )}
 
