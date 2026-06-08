@@ -2,7 +2,9 @@ import type { FormEvent } from 'react'
 import { useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import TopBar from '../components/TopBar'
+import AliasResolutionStatus from '../components/AliasResolutionStatus'
 import { useWallet } from '../context/useWallet'
+import { useAliasResolution } from '../hooks/useAliasResolution'
 import { fetchNftDetails, sendNft } from '../services/nftService'
 
 function SendNft() {
@@ -14,6 +16,14 @@ function SendNft() {
   const [localError, setLocalError] = useState<string | null>(null)
   const [nftName, setNftName] = useState<string>('')
   const [nftImage, setNftImage] = useState<string>('')
+  const aliasResolution = useAliasResolution(destination)
+  const canSubmit =
+    initialized &&
+    backupVerified &&
+    !loading &&
+    Boolean(tokenId) &&
+    aliasResolution.status === 'confirmed' &&
+    Boolean(aliasResolution.resolvedAddress)
 
   useEffect(() => {
     let active = true
@@ -50,13 +60,14 @@ function SendNft() {
       return
     }
 
-    if (!destination.startsWith('ecash:')) {
-      setLocalError('La dirección debe ser una dirección eCash (prefijo ecash:).')
+    const destinationAddress = aliasResolution.resolvedAddress
+    if (aliasResolution.status !== 'confirmed' || !destinationAddress) {
+      setLocalError(aliasResolution.errorMessage || 'El destinatario debe resolverse antes de enviar.')
       return
     }
 
     try {
-      const result = await sendNft({ tokenId, destinationAddress: destination.trim() })
+      const result = await sendNft({ tokenId, destinationAddress })
       setTxid(result.txid)
       await refreshBalances()
     } catch (err) {
@@ -92,13 +103,14 @@ function SendNft() {
       </div>
 
       <form className="card" onSubmit={handleSubmit}>
-        <label htmlFor="destination">Destino (ecash:...)</label>
+        <label htmlFor="destination">Destino (ecash:... o alias .xec)</label>
         <input
           id="destination"
           value={destination}
           onChange={(e) => setDestination(e.target.value)}
-          placeholder="ecash:..."
+          placeholder="ecash:... o xolosarmy.xec"
         />
+        <AliasResolutionStatus resolution={aliasResolution} />
 
         <label htmlFor="amount" style={{ marginTop: 12 }}>
           Cantidad
@@ -106,7 +118,7 @@ function SendNft() {
         <input id="amount" type="text" value="1" readOnly />
 
         <div className="actions" style={{ marginTop: 12 }}>
-          <button className="cta" type="submit" disabled={!initialized || !backupVerified || loading}>
+          <button className="cta" type="submit" disabled={!canSubmit}>
             Enviar NFT
           </button>
         </div>

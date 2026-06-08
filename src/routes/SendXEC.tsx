@@ -3,7 +3,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
+import AliasResolutionStatus from '../components/AliasResolutionStatus'
 import { TONALLI_SERVICE_FEE_XEC, XEC_SATS_PER_XEC, XEC_TONALLI_TREASURY_ADDRESS } from '../config/xecFees'
+import { useAliasResolution } from '../hooks/useAliasResolution'
 
 const MAX_OP_RETURN_BYTES = 221
 const MAX_PREFILL_CHARS = 140
@@ -66,11 +68,19 @@ function SendXECForm({ initialDestination, initialMessage, initialReplyToTxid }:
   const [localError, setLocalError] = useState<string | null>(null)
   const [estimatedFeeSats, setEstimatedFeeSats] = useState<number | null>(null)
   const [estimatedTotalSats, setEstimatedTotalSats] = useState<number | null>(null)
+  const aliasResolution = useAliasResolution(destination)
 
   const amountInSats = Math.round(amount * XEC_SATS_PER_XEC)
   const formatXecFromSats = (sats: number) => (sats / XEC_SATS_PER_XEC).toFixed(2)
   const formatXecValue = (xec: number) => xec.toFixed(2)
   const shortenedCommission = `${XEC_TONALLI_TREASURY_ADDRESS.slice(0, 12)}...${XEC_TONALLI_TREASURY_ADDRESS.slice(-6)}`
+  const canSubmit =
+    initialized &&
+    backupVerified &&
+    !loading &&
+    amountInSats > 0 &&
+    aliasResolution.status === 'confirmed' &&
+    Boolean(aliasResolution.resolvedAddress)
 
   useEffect(() => {
     let cancelled = false
@@ -112,8 +122,9 @@ function SendXECForm({ initialDestination, initialMessage, initialReplyToTxid }:
       return
     }
 
-    if (!destination.startsWith('ecash:')) {
-      setLocalError('La dirección debe ser una dirección eCash (prefijo ecash:).')
+    const destinationAddress = aliasResolution.resolvedAddress
+    if (aliasResolution.status !== 'confirmed' || !destinationAddress) {
+      setLocalError(aliasResolution.errorMessage || 'El destinatario debe resolverse antes de enviar.')
       return
     }
 
@@ -154,7 +165,7 @@ function SendXECForm({ initialDestination, initialMessage, initialReplyToTxid }:
     }
 
     try {
-      const tx = await sendXEC(destination.trim(), amountInSats, message)
+      const tx = await sendXEC(destinationAddress, amountInSats, message)
       setTxid(tx)
     } catch (err) {
       setLocalError((err as Error).message)
@@ -188,13 +199,14 @@ function SendXECForm({ initialDestination, initialMessage, initialReplyToTxid }:
             Respondiendo a: <span className="address-box">{replyToTxid}</span>
           </div>
         )}
-        <label htmlFor="destination">Destino (ecash:...)</label>
+        <label htmlFor="destination">Destino (ecash:... o alias .xec)</label>
         <input
           id="destination"
           value={destination}
           onChange={(e) => setDestination(e.target.value)}
-          placeholder="ecash:..."
+          placeholder="ecash:... o xolosarmy.xec"
         />
+        <AliasResolutionStatus resolution={aliasResolution} />
 
         <label htmlFor="amount">Monto XEC</label>
         <input
@@ -244,7 +256,7 @@ function SendXECForm({ initialDestination, initialMessage, initialReplyToTxid }:
         </div>
 
         <div className="actions">
-          <button className="cta" type="submit" disabled={!initialized || !backupVerified || loading}>
+          <button className="cta" type="submit" disabled={!canSubmit}>
             Enviar
           </button>
         </div>

@@ -2,6 +2,8 @@ import type { FormEvent } from 'react'
 import { useState } from 'react'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
+import AliasResolutionStatus from '../components/AliasResolutionStatus'
+import { useAliasResolution } from '../hooks/useAliasResolution'
 
 function SendRMZ() {
   const { sendRMZ, initialized, backupVerified, loading, error } = useWallet()
@@ -9,6 +11,14 @@ function SendRMZ() {
   const [amount, setAmount] = useState<string>('')
   const [txid, setTxid] = useState<string | null>(null)
   const [localError, setLocalError] = useState<string | null>(null)
+  const aliasResolution = useAliasResolution(destination)
+  const canSubmit =
+    initialized &&
+    backupVerified &&
+    !loading &&
+    amount.trim().length > 0 &&
+    aliasResolution.status === 'confirmed' &&
+    Boolean(aliasResolution.resolvedAddress)
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
@@ -20,8 +30,9 @@ function SendRMZ() {
       return
     }
 
-    if (!destination.startsWith('ecash:')) {
-      setLocalError('La dirección debe ser una dirección eCash (prefijo ecash:).')
+    const destinationAddress = aliasResolution.resolvedAddress
+    if (aliasResolution.status !== 'confirmed' || !destinationAddress) {
+      setLocalError(aliasResolution.errorMessage || 'El destinatario debe resolverse antes de enviar.')
       return
     }
 
@@ -31,7 +42,7 @@ function SendRMZ() {
     }
 
     try {
-      const tx = await sendRMZ(destination.trim(), amount)
+      const tx = await sendRMZ(destinationAddress, amount)
       setTxid(tx)
     } catch (err) {
       setLocalError((err as Error).message)
@@ -56,13 +67,14 @@ function SendRMZ() {
       )}
 
       <form className="card" onSubmit={handleSubmit}>
-        <label htmlFor="destination">Destino (ecash:...)</label>
+        <label htmlFor="destination">Destino (ecash:... o alias .xec)</label>
         <input
           id="destination"
           value={destination}
           onChange={(e) => setDestination(e.target.value)}
-          placeholder="ecash:..."
+          placeholder="ecash:... o xolosarmy.xec"
         />
+        <AliasResolutionStatus resolution={aliasResolution} />
 
         <label htmlFor="amount">Monto RMZ</label>
         <input
@@ -75,7 +87,7 @@ function SendRMZ() {
         />
 
         <div className="actions">
-          <button className="cta" type="submit" disabled={!initialized || !backupVerified || loading}>
+          <button className="cta" type="submit" disabled={!canSubmit}>
             Enviar
           </button>
         </div>

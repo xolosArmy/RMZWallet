@@ -634,6 +634,35 @@ textarea:focus {
   text-decoration: underline;
 }
 
+.alias-status {
+  margin-top: 8px;
+  margin-bottom: 12px;
+  font-size: 0.9rem;
+}
+
+.alias-status.success {
+  padding: 10px 12px;
+}
+
+.alias-resolution-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0 0;
+  word-break: break-word;
+}
+
+.alias-resolution-line .address-box {
+  padding: 6px 8px;
+  border-radius: 10px;
+}
+
+.alias-blockheight {
+  margin: 8px 0 0;
+  font-size: 0.82rem;
+}
+
 .fee-breakdown {
   margin-top: 16px;
   padding: 14px;
