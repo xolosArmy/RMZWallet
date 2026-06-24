@@ -358,6 +358,9 @@ function Dashboard() {
           <Link className="cta outline" to="/receive">
             Recibir
           </Link>
+          <Link className="cta outline" to="/multisig">
+            Multifirma eCash
+          </Link>
           <Link className="cta outline" to="/walletconnect">
             Conectar dApp (WalletConnect)
           </Link>

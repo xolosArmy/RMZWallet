@@ -16,6 +16,10 @@ import SendNft from './routes/SendNft'
 import ConnectRequest from './routes/ConnectRequest'
 import WalletConnect from './routes/WalletConnect'
 import ExternalSign from './routes/ExternalSign'
+import CreateVault from './routes/multisig/CreateVault'
+import VaultDashboard from './routes/multisig/VaultDashboard'
+import CreateProposal from './routes/multisig/CreateProposal'
+import SignProposal from './routes/multisig/SignProposal'
 import ApproveRequestModal from './components/walletconnect/ApproveRequestModal'
 import { wcWallet } from './lib/walletconnect/WcWallet'
 
@@ -48,6 +52,10 @@ function App() {
           <Route path="/connect/sign-message" element={<ConnectRequest />} />
           <Route path="/walletconnect" element={<WalletConnect />} />
           <Route path="/external-sign" element={<ExternalSign />} />
+          <Route path="/multisig" element={<VaultDashboard />} />
+          <Route path="/multisig/create" element={<CreateVault />} />
+          <Route path="/multisig/:vaultId/propose" element={<CreateProposal />} />
+          <Route path="/multisig/:vaultId/sign" element={<SignProposal />} />
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/backup" element={<BackupSeed />} />
           <Route path="/reveal-seed" element={<RevealSeed />} />
