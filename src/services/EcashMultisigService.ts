@@ -5,6 +5,7 @@ import {
   Ecc,
   OP_0,
   OP_CHECKMULTISIG,
+  OP_RETURN,
   Script,
   SigHashType,
   Tx,
@@ -49,6 +50,7 @@ export type EcashMultisigProposal = {
   vaultId: string
   to: string
   amountSats: string
+  memo?: string
   partialTxHex: string
   signaturesCount: number
   requiredSignatures: number
@@ -76,7 +78,10 @@ export type EcashMultisigProposalInspection = {
     sats: string
     address?: string
     scriptHex: string
-    role: 'destination' | 'tonalli_fee' | 'change' | 'unknown'
+    role: 'destination' | 'tonalli_fee' | 'change' | 'op_return' | 'unknown'
+    memoText?: string
+    memoHex?: string
+    warning?: string
   }>
   signaturesByInput: Array<{
     inputIndex: number
@@ -93,10 +98,80 @@ const STORAGE_KEY_VAULTS = 'tonalli_ecash_multisig_vaults'
 const STORAGE_KEY_PROPOSALS = 'tonalli_ecash_multisig_proposals'
 const FEE_PER_KB = BigInt(Math.ceil(FEE_RATE_SATS_PER_BYTE * 1000))
 const MULTISIG_FEE_PER_KB = 2000n
+const MAX_OP_RETURN_MEMO_BYTES = 80
 
 const nowId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
 const normalizePubkeyHex = (value: string) => value.trim().toLowerCase()
+
+export const normalizeMemo = (input?: string): string | undefined => {
+  const memo = input?.trim()
+  return memo ? memo : undefined
+}
+
+export const utf8Bytes = (value: string): Uint8Array => new TextEncoder().encode(value)
+
+export const validateMemoBytes = (bytes: Uint8Array) => {
+  if (bytes.length > MAX_OP_RETURN_MEMO_BYTES) {
+    throw new Error('El memo excede el limite de 80 bytes para OP_RETURN.')
+  }
+}
+
+const validateMemoText = (memo: string) => {
+  for (const char of memo) {
+    const codePoint = char.codePointAt(0) ?? 0
+    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) {
+      throw new Error('El memo contiene caracteres de control no permitidos.')
+    }
+  }
+}
+
+const opReturnScript = (memo: string): Script => {
+  const memoBytes = utf8Bytes(memo)
+  validateMemoBytes(memoBytes)
+  validateMemoText(memo)
+  return Script.fromOps([OP_RETURN, pushBytesOp(memoBytes)])
+}
+
+const parseOpReturnOutput = (
+  script: Script
+): { memoText: string; memoHex: string; warning?: string } | null => {
+  let ops: ReturnType<Script['ops']>
+  try {
+    ops = script.ops()
+  } catch {
+    return null
+  }
+
+  const allOps = []
+  try {
+    let op = ops.next()
+    while (op !== undefined) {
+      allOps.push(op)
+      op = ops.next()
+    }
+  } catch {
+    return null
+  }
+
+  if (allOps[0] !== OP_RETURN) {
+    return null
+  }
+
+  if (allOps.length === 2 && isPushOp(allOps[1])) {
+    const memoHex = toHex(allOps[1].data)
+    return {
+      memoText: new TextDecoder().decode(allOps[1].data),
+      memoHex
+    }
+  }
+
+  return {
+    memoText: '',
+    memoHex: script.toHex().slice(2),
+    warning: 'OP_RETURN no estandar detectado.'
+  }
+}
 
 const compareHexBytes = (left: string, right: string) => {
   const leftBytes = fromHex(left)
@@ -411,6 +486,23 @@ const inspectTx = (
     inputsCount: tx.inputs.length,
     outputs: tx.outputs.map((output, index) => {
       const scriptHex = output.script.toHex()
+      const opReturn = parseOpReturnOutput(output.script)
+      if (opReturn) {
+        const opReturnWarnings = [
+          opReturn.warning,
+          output.sats === 0n ? undefined : 'OP_RETURN con sats distintos de 0.'
+        ].filter((warning): warning is string => Boolean(warning))
+        return {
+          index,
+          sats: output.sats.toString(),
+          scriptHex,
+          role: 'op_return' as const,
+          memoText: opReturn.memoText,
+          memoHex: opReturn.memoHex,
+          ...(opReturnWarnings.length > 0 ? { warning: opReturnWarnings.join(' ') } : {})
+        }
+      }
+
       try {
         const address = Address.fromScript(output.script).toString()
         const role = address === vault.address
@@ -430,7 +522,8 @@ const inspectTx = (
           index,
           sats: output.sats.toString(),
           scriptHex,
-          role: 'unknown' as const
+          role: 'unknown' as const,
+          warning: 'Script desconocido detectado. No firmes si no esperabas este output.'
         }
       }
     }),
@@ -700,12 +793,15 @@ export class EcashMultisigService {
     to: string
     amountSats: bigint
     includeTonalliFee?: boolean
+    memo?: string
   }): Promise<EcashMultisigProposal> {
     if (input.amountSats <= 0n) {
       throw new Error('El monto debe ser mayor a cero.')
     }
     assertVaultConsensusShape(input.vault)
 
+    const memo = normalizeMemo(input.memo)
+    const memoScript = memo ? opReturnScript(memo) : null
     const redeemScript = scriptFromHex(input.vault.redeemScriptHex)
     const p2shScript = Script.fromAddress(input.vault.address)
     const destinationScript = Script.fromAddress(input.to)
@@ -748,7 +844,11 @@ export class EcashMultisigService {
               input.vault.pubkeysHex
             )
           })),
-          outputs: [...fixedOutputs, p2shScript]
+          // TxBuilder preserves output order and uses the bare Script as the change placeholder.
+          // Exact THORChain-specific ordering may still need a specialized proposal builder.
+          outputs: memoScript
+            ? [...fixedOutputs, p2shScript, { sats: 0n, script: memoScript }]
+            : [...fixedOutputs, p2shScript]
         })
 
         try {
@@ -774,6 +874,7 @@ export class EcashMultisigService {
       vaultId: input.vault.id,
       to: input.to,
       amountSats: input.amountSats.toString(),
+      ...(memo ? { memo } : {}),
       partialTxHex: signedTx.toHex(),
       signaturesCount,
       requiredSignatures: summary.requiredSignatures,

@@ -114,6 +114,20 @@ En un dispositivo firmante que tenga la bóveda:
 
 La propuesta inicial queda firmada por el dispositivo que la creó. Para una bóveda 2-de-3 todavía necesita una segunda firma válida antes de transmitir.
 
+## Propuestas con memo L1 OP_RETURN
+
+Las propuestas multifirma pueden incluir un memo L1 `OP_RETURN` opcional para coordinación auditable en cadena. El memo es XEC-only y no habilita RMZ/ALP, NFTs ni token UTXOs.
+
+Reglas del memo:
+
+- El memo es opcional; si el campo queda vacío no se agrega `OP_RETURN`.
+- El límite es 80 bytes UTF-8.
+- Todos los firmantes deben inspeccionar el memo decodificado antes de firmar.
+- No firmes scripts desconocidos ni outputs que no esperabas.
+- Para THORChain ADDLP, el memo y el orden de outputs deben revisarse cuidadosamente antes de firmar. El soporte genérico de memo no reemplaza una revisión específica de compatibilidad ADDLP.
+
+Uso Governance-Bridge: Tonalli Governance multisig puede coordinar más adelante ADDLP con THORChain / Bitcoin ABC desde una dirección XEC durable y recuperable.
+
 ## Qué revisar antes de firmar
 
 Antes de agregar tu firma:

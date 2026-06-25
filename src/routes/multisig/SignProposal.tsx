@@ -12,6 +12,7 @@ const roleLabel: Record<EcashMultisigProposalInspection['outputs'][number]['role
   destination: 'destino',
   tonalli_fee: 'fee Tonalli',
   change: 'cambio',
+  op_return: 'memo L1',
   unknown: 'desconocido'
 }
 
@@ -171,6 +172,19 @@ function SignProposal() {
                   Output {output.index} - {formatXec(output.sats)} XEC - {roleLabel[output.role]}
                 </p>
                 {output.address && <div className="address-box">{output.address}</div>}
+                {output.role === 'op_return' && (
+                  <>
+                    <p className="muted">Memo L1 (OP_RETURN)</p>
+                    <div className="address-box">{output.memoText || '(sin texto decodificado)'}</div>
+                    {output.memoHex && (
+                      <>
+                        <p className="muted">memoHex</p>
+                        <div className="address-box">{output.memoHex}</div>
+                      </>
+                    )}
+                  </>
+                )}
+                {output.warning && <div className="error">{output.warning}</div>}
                 <p className="muted">scriptHex</p>
                 <div className="address-box">{output.scriptHex}</div>
               </div>

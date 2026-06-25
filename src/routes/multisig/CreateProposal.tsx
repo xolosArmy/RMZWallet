@@ -4,7 +4,7 @@ import { Link, Navigate, useParams } from 'react-router-dom'
 import TopBar from '../../components/TopBar'
 import { XEC_SATS_PER_XEC } from '../../config/xecFees'
 import type { EcashMultisigProposal } from '../../services/EcashMultisigService'
-import { ecashMultisigService } from '../../services/EcashMultisigService'
+import { ecashMultisigService, utf8Bytes } from '../../services/EcashMultisigService'
 
 function CreateProposal() {
   const { vaultId } = useParams()
@@ -12,9 +12,12 @@ function CreateProposal() {
   const [to, setTo] = useState('')
   const [amountXec, setAmountXec] = useState('')
   const [includeTonalliFee, setIncludeTonalliFee] = useState(false)
+  const [memo, setMemo] = useState('')
   const [proposal, setProposal] = useState<EcashMultisigProposal | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const memoBytes = utf8Bytes(memo.trim()).length
 
   if (!vault) {
     return <Navigate to="/multisig" replace />
@@ -36,7 +39,8 @@ function CreateProposal() {
         vault,
         to: to.trim(),
         amountSats,
-        includeTonalliFee
+        includeTonalliFee,
+        memo
       })
       setProposal(nextProposal)
     } catch (err) {
@@ -95,6 +99,18 @@ function CreateProposal() {
           />
           Incluir fee Tonalli
         </label>
+
+        <label htmlFor="proposal-memo">Memo L1 opcional (OP_RETURN)</label>
+        <input
+          id="proposal-memo"
+          value={memo}
+          maxLength={120}
+          onChange={(event) => setMemo(event.target.value)}
+          placeholder="+:XEC.XEC:thor1..."
+        />
+        <p className={memoBytes > 80 ? 'error' : 'muted'}>
+          Max 80 bytes UTF-8. Usar sólo si todos los firmantes esperan un memo L1. {memoBytes}/80
+        </p>
 
         <div className="actions">
           <button className="cta primary" type="submit" disabled={loading}>
