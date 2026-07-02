@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import { test } from 'vitest'
 import { sanitizeWcUri } from './wcUri.ts'
 
 test('sanitizeWcUri elimina saltos de línea y whitespace interno', () => {

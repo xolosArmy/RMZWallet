@@ -150,6 +150,16 @@ export interface WalletSignatory {
   signatory: ReturnType<typeof P2PKHSignatory>
 }
 
+export interface X402WalletAccount {
+  address: string
+  publicKey: string
+}
+
+export interface X402AuthorizationSignature {
+  signature: string
+  publicKey: string
+}
+
 export type AliasRegistrationEstimate = {
   protocolFeeSats: number
   networkFeeSats: number
@@ -911,6 +921,37 @@ export class XolosWalletService {
 
   getAddress(): string | null {
     return this.wallet?.walletInfo?.xecAddress || null
+  }
+
+  getX402ActiveAccount(): X402WalletAccount | null {
+    if (!this.wallet || !this.isReady || !this.decryptedMnemonic) {
+      return null
+    }
+
+    const address = this.wallet.walletInfo?.xecAddress
+    const publicKey = this.wallet.walletInfo?.publicKey
+    if (!address || !publicKey || !/^(02|03)[0-9a-fA-F]{64}$/.test(publicKey)) {
+      return null
+    }
+
+    return { address, publicKey }
+  }
+
+  async signX402AuthorizationMessage(message: string): Promise<X402AuthorizationSignature> {
+    const account = this.getX402ActiveAccount()
+    const privateKeyHex = this.wallet?.walletInfo?.privateKey
+    if (!account || !privateKeyHex) {
+      throw new Error('X402_WALLET_UNAVAILABLE')
+    }
+
+    try {
+      return {
+        signature: signMsg(message, fromHex(privateKeyHex)),
+        publicKey: account.publicKey
+      }
+    } catch {
+      throw new Error('X402_AUTHORIZATION_SIGNING_FAILED')
+    }
   }
 
   getSignatory(): WalletSignatory {
