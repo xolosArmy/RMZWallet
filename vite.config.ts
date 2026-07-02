@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
@@ -11,6 +12,8 @@ export default defineConfig({
   },
   resolve: {
     alias: {
+      // @x402-xec/core 0.1.0 needs only synchronous SHA-256 in the browser.
+      'node:crypto': fileURLToPath(new URL('./src/shims/nodeCrypto.ts', import.meta.url)),
       buffer: 'buffer'
     }
   },

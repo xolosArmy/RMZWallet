@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
 import Dashboard from './routes/Dashboard'
 import SendRMZ from './routes/SendRMZ'
@@ -22,6 +22,8 @@ import CreateProposal from './routes/multisig/CreateProposal'
 import SignProposal from './routes/multisig/SignProposal'
 import ApproveRequestModal from './components/walletconnect/ApproveRequestModal'
 import { wcWallet } from './lib/walletconnect/WcWallet'
+import { X402_DRY_RUN_ENABLED } from './integrations/x402/x402DryRunFeature'
+const X402Demo = lazy(() => import('./routes/X402Demo'))
 
 function App() {
   const [wcState, setWcState] = useState(() => wcWallet.getState())
@@ -59,6 +61,12 @@ function App() {
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/backup" element={<BackupSeed />} />
           <Route path="/reveal-seed" element={<RevealSeed />} />
+          {X402_DRY_RUN_ENABLED && (
+            <Route
+              path="/x402-demo"
+              element={<Suspense fallback={<div className="muted">Loading dry run…</div>}><X402Demo /></Suspense>}
+            />
+          )}
           <Route path="*" element={<Navigate to="/onboarding" replace />} />
         </Routes>
       </main>

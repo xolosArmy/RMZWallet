@@ -6,6 +6,7 @@ import TopBar from '../components/TopBar'
 import { getChronik } from '../services/ChronikClient'
 import { mapChronikTxToRecord } from '../utils/txHistory'
 import type { TxRecord } from '../types/tx'
+import { X402_DRY_RUN_ENABLED } from '../integrations/x402/x402DryRunFeature'
 
 const HISTORY_PAGE_SIZE = 25
 const POLL_FAST_MS = 5000
@@ -370,6 +371,11 @@ function Dashboard() {
           <Link className="cta outline" to="/reveal-seed">
             Ver frase seed
           </Link>
+          {X402_DRY_RUN_ENABLED && (
+            <Link className="cta outline" to="/x402-demo">
+              Test 402 Authorization
+            </Link>
+          )}
         </div>
       </header>
 
