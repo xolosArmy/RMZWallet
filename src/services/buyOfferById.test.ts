@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import test from 'node:test'
+import { test } from 'vitest'
 import { parseDecimalToAtoms } from '../dex/agoraPhase1.ts'
 import { buildRmzBuyPreview } from '../features/dex/components/DexTakerRmz.tsx'
 import { assertOneshotDesiredAtoms } from './agoraExchange.ts'

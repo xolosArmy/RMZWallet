@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import { test } from 'vitest'
 import type { SessionTypes } from '@walletconnect/types'
 import { getChronik } from '../../services/ChronikClient.ts'
 import { xolosWalletService } from '../../services/XolosWalletService.ts'
@@ -290,16 +290,15 @@ test('request válido responde { txid }', async () => {
 
 test('approvePendingRequest ecash_signMessage responde signature publicKey y address', async () => {
   const originalGetAddress = xolosWalletService.getAddress
-  const originalGetKeyInfo = xolosWalletService.getKeyInfo
+  const originalGetSignatory = xolosWalletService.getSignatory
   const originalSignMessage = xolosWalletService.signMessage
 
   xolosWalletService.getAddress = () => 'ecash:qsigner'
-  xolosWalletService.getKeyInfo = () => ({
-    mnemonic: null,
-    xecAddress: 'ecash:qsigner',
+  xolosWalletService.getSignatory = () => ({
     address: 'ecash:qsigner',
     publicKeyHex: '02' + '11'.repeat(32),
-    privateKeyHex: null
+    publicKey: new Uint8Array(),
+    signatory: (() => undefined) as never
   })
   xolosWalletService.signMessage = async (message: string) => {
     assert.equal(message, 'exact challenge message')
@@ -339,7 +338,7 @@ test('approvePendingRequest ecash_signMessage responde signature publicKey y add
   assert.equal(wallet.getState().pendingRequest, null)
 
   xolosWalletService.getAddress = originalGetAddress
-  xolosWalletService.getKeyInfo = originalGetKeyInfo
+  xolosWalletService.getSignatory = originalGetSignatory
   xolosWalletService.signMessage = originalSignMessage
 })
 
