@@ -165,6 +165,9 @@ export class TonalliBrowserWalletAdapter implements BrowserWalletAdapter {
     }
 
     const invoice = copyInvoice(request.invoice)
+    if (invoice.expiresAt <= Math.floor(Date.now() / 1000)) {
+      return { status: 'rejected', reason: APPROVAL_REQUIRED_REASON }
+    }
     const safeRequest: WalletApprovalRequest = {
       invoice,
       paymentPlan: copyPaymentPlan(request.paymentPlan)
@@ -172,7 +175,10 @@ export class TonalliBrowserWalletAdapter implements BrowserWalletAdapter {
 
     try {
       const response = await this.approvalHandler(safeRequest)
-      if (response.status === 'approved') {
+      if (
+        response.status === 'approved'
+        && invoice.expiresAt > Math.floor(Date.now() / 1000)
+      ) {
         this.approvedInvoice = invoice
         return { status: 'approved' }
       }
@@ -190,6 +196,7 @@ export class TonalliBrowserWalletAdapter implements BrowserWalletAdapter {
     this.approvedInvoice = null
     if (
       !approvedInvoice
+      || approvedInvoice.expiresAt <= Math.floor(Date.now() / 1000)
       || !authorizationMatchesInvoice(request, approvedInvoice)
       || request.message !== canonicalAuthorizationMessage(request)
     ) {

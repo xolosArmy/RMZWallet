@@ -5,6 +5,7 @@ import { BrowserRouter } from 'react-router-dom'
 import './index.css'
 import App from './App'
 import { WalletProvider } from './context/WalletContext'
+import { TonalliX402ApprovalProvider } from './context/TonalliX402ApprovalContext'
 
 const normalizeExternalSignHashRoute = () => {
   const hash = window.location.hash
@@ -27,7 +28,9 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <BrowserRouter>
       <WalletProvider>
-        <App />
+        <TonalliX402ApprovalProvider>
+          <App />
+        </TonalliX402ApprovalProvider>
       </WalletProvider>
     </BrowserRouter>
   </StrictMode>

@@ -28,15 +28,15 @@ const approvalRequest: WalletApprovalRequest = {
     amountSats: '550',
     payTo: 'ecash:qpreceiver',
     nonce: 'nonce-1',
-    issuedAt: 1_700_000_000,
-    expiresAt: 1_700_000_300
+    issuedAt: 3_999_999_700,
+    expiresAt: 4_000_000_000
   },
   paymentPlan: {
     network: 'xec:mainnet',
     scheme: 'exact',
     amountSats: '550',
     payTo: 'ecash:qpreceiver',
-    expiresAt: 1_700_000_300,
+    expiresAt: 4_000_000_000,
     requiresManualApproval: true
   }
 }
