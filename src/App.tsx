@@ -23,7 +23,9 @@ import SignProposal from './routes/multisig/SignProposal'
 import ApproveRequestModal from './components/walletconnect/ApproveRequestModal'
 import { wcWallet } from './lib/walletconnect/WcWallet'
 import { X402_DRY_RUN_ENABLED } from './integrations/x402/x402DryRunFeature'
+import { X402_STAGING_TEST_ENABLED } from './integrations/x402/x402StagingFeature'
 const X402Demo = lazy(() => import('./routes/X402Demo'))
+const X402Staging = lazy(() => import('./routes/X402Staging'))
 
 function App() {
   const [wcState, setWcState] = useState(() => wcWallet.getState())
@@ -65,6 +67,12 @@ function App() {
             <Route
               path="/x402-demo"
               element={<Suspense fallback={<div className="muted">Loading dry run…</div>}><X402Demo /></Suspense>}
+            />
+          )}
+          {X402_STAGING_TEST_ENABLED && (
+            <Route
+              path="/x402-staging"
+              element={<Suspense fallback={<div className="muted">Loading staging test…</div>}><X402Staging /></Suspense>}
             />
           )}
           <Route path="*" element={<Navigate to="/onboarding" replace />} />

@@ -277,6 +277,28 @@ describe('allowlisted trusted-backend x402 client', () => {
     expect(configs).toHaveLength(2)
   })
 
+  test('reports only a validated trusted HTTP 402 offer', async () => {
+    const onPaymentRequired = vi.fn()
+    const invalidAdapter: AxiosAdapter = async (config) => {
+      throw paymentRequired(config, { invalid: true })
+    }
+    const invalid = createClient(invalidAdapter, { onPaymentRequired })
+
+    await expect(invalid.client.get(PATH)).rejects.toThrow('invalid x402 invoice')
+    expect(onPaymentRequired).not.toHaveBeenCalled()
+
+    const validAdapter: AxiosAdapter = async (config) => {
+      throw paymentRequired(config)
+    }
+    const valid = createClient(validAdapter, {
+      onPaymentRequired,
+      walletAdapter: createWalletAdapter({ status: 'rejected' }).walletAdapter
+    })
+
+    await expect(valid.client.get(PATH)).rejects.toThrow('orchestrator payment failed')
+    expect(onPaymentRequired).toHaveBeenCalledOnce()
+  })
+
   test.each(['rejected', 'cancelled'] as const)(
     '%s approval prevents signing and retry',
     async (status) => {
