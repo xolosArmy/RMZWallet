@@ -7,6 +7,7 @@ import { getChronik } from '../services/ChronikClient'
 import { mapChronikTxToRecord } from '../utils/txHistory'
 import type { TxRecord } from '../types/tx'
 import { X402_DRY_RUN_ENABLED } from '../integrations/x402/x402DryRunFeature'
+import { X402_STAGING_TEST_ENABLED } from '../integrations/x402/x402StagingFeature'
 
 const HISTORY_PAGE_SIZE = 25
 const POLL_FAST_MS = 5000
@@ -374,6 +375,11 @@ function Dashboard() {
           {X402_DRY_RUN_ENABLED && (
             <Link className="cta outline" to="/x402-demo">
               Test 402 Authorization
+            </Link>
+          )}
+          {X402_STAGING_TEST_ENABLED && (
+            <Link className="cta outline" to="/x402-staging">
+              Test real staging authorization
             </Link>
           )}
         </div>

@@ -19,11 +19,15 @@ export function useTrustedX402Client(options: UseTrustedX402ClientOptions) {
   const requestApproval = useTonalliX402ApprovalHandler()
 
   return useMemo(() => {
-    const walletAdapter = new TonalliBrowserWalletAdapter({
-      walletService: xolosWalletService as TonalliX402Wallet,
-      approvalHandler: requestApproval
-    })
-    return createTrustedX402Client({ ...options, walletAdapter })
+    try {
+      const walletAdapter = new TonalliBrowserWalletAdapter({
+        walletService: xolosWalletService as TonalliX402Wallet,
+        approvalHandler: requestApproval
+      })
+      return createTrustedX402Client({ ...options, walletAdapter })
+    } catch {
+      return null
+    }
   }, [options, requestApproval])
 }
 

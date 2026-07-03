@@ -47,6 +47,7 @@ export interface CreateTrustedX402ClientOptions {
   readonly adapter?: AxiosAdapter
   readonly now?: () => number
   readonly onStatus?: (status: TonalliX402AuthorizationDryRunStatus) => void
+  readonly onPaymentRequired?: () => void
 }
 
 type PaymentOfferShape = {
@@ -312,6 +313,7 @@ export function createTrustedX402Client(
             maxPaymentSats,
             now()
           )
+          options.onPaymentRequired?.()
         }
       }
       return Promise.reject(error)
