@@ -3,10 +3,12 @@ import {
   Address,
   P2PKHSignatory,
   Script,
+  Tx,
   TxBuilder,
   calcTxFee,
   fromHex,
   slpGenesis,
+  slpMint,
   slpSend
 } from 'ecash-lib'
 import type { GenesisInfo, ScriptUtxo } from 'chronik-client'
@@ -17,16 +19,54 @@ import {
   XOLOSARMY_NFT_PARENT_TOKEN_ID
 } from '../config/nfts'
 import { getChronik } from './ChronikClient'
+import type { WalletSignatory } from './XolosWalletService'
 
-const SLP_NFT1_CHILD = 65
-const SLP_NFT1_GROUP = 129
+export const SLP_NFT1_CHILD = 65
+export const SLP_NFT1_GROUP = 129
+export const XOLOSARMY_MINT_PASS_ADMIN_ADDRESS = 'ecash:qq7qn90ev23ecastqmn8as00u8mcp4tzsspvt5dtlk'
+export const MINT_PASS_MAX_QUANTITY = 100
 const NFT_CHILD_GENESIS_AMOUNT = 1n
 const NFT_PARENT_GENESIS_AMOUNT = 1000n
-const NFT_PARENT_MINT_BATON_VOUT = 2
+export const NFT_PARENT_MINT_BATON_VOUT = 2
 const FEE_PER_KB = 1200n
 const P2PKH_INPUT_SIZE = 148
 const OUTPUT_SIZE = 34
 const TX_OVERHEAD = 10
+
+type MintPassWallet = {
+  getSignatory: () => WalletSignatory
+  signTxBuilder: (builder: TxBuilder, options?: { feePerKb?: bigint; dustSats?: bigint }) => ReturnType<TxBuilder['sign']>
+}
+
+type MintPassChronik = {
+  address: (address: string) => {
+    utxos: () => Promise<{ utxos: ScriptUtxo[] }>
+  }
+  broadcastTx: (rawTx: Uint8Array | string) => Promise<{ txid: string }>
+}
+
+export type MintPassBatonInfo = {
+  outpoint: string
+  txid: string
+  vout: number
+  sats: bigint
+}
+
+export type MintPassAdminState = {
+  hasBaton: boolean
+  baton: MintPassBatonInfo | null
+  mintPassBalance: bigint
+}
+
+export type MintPassMintResult = {
+  txid: string
+  rawTxHex: string
+  batonOutpoint: string
+  expectedBatonVout: number
+  expectedBatonOutpoint: string
+  estimatedFeeSats: bigint
+  outputCount: number
+}
 
 const estimateFee = (inputCount: number, outputCount: number): bigint => {
   const txSize = TX_OVERHEAD + inputCount * P2PKH_INPUT_SIZE + outputCount * OUTPUT_SIZE
@@ -86,12 +126,78 @@ const selectXecUtxos = (params: {
 
 const resolveAddressScript = (address: string) => Script.fromAddress(Address.parse(address).cash().toString())
 
+const normalizeCashAddress = (address: string) => Address.parse(address).cash().toString()
+
 const isSlpToken = (utxo: ScriptUtxo, tokenId: string, tokenType: number) =>
   utxo.token &&
   utxo.token.tokenId === tokenId &&
   utxo.token.tokenType.protocol === 'SLP' &&
   utxo.token.tokenType.number === tokenType &&
   !utxo.token.isMintBaton
+
+
+export const validateMintPassQuantity = (quantity: number | string | bigint): bigint => {
+  if (typeof quantity === 'bigint') {
+    if (quantity < 1n || quantity > BigInt(MINT_PASS_MAX_QUANTITY)) {
+      throw new Error(`La cantidad debe ser un entero entre 1 y ${MINT_PASS_MAX_QUANTITY}.`)
+    }
+    return quantity
+  }
+
+  const raw = typeof quantity === 'number' ? String(quantity) : quantity.trim()
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`La cantidad debe ser un entero entre 1 y ${MINT_PASS_MAX_QUANTITY}.`)
+  }
+  const atoms = BigInt(raw)
+  if (atoms < 1n || atoms > BigInt(MINT_PASS_MAX_QUANTITY)) {
+    throw new Error(`La cantidad debe ser un entero entre 1 y ${MINT_PASS_MAX_QUANTITY}.`)
+  }
+  return atoms
+}
+
+export const isSlpNft1GroupMintBaton = (utxo: ScriptUtxo, parentTokenId: string) =>
+  Boolean(
+    utxo.token &&
+      utxo.token.tokenId === parentTokenId &&
+      utxo.token.tokenType.protocol === 'SLP' &&
+      utxo.token.tokenType.number === SLP_NFT1_GROUP &&
+      utxo.token.isMintBaton === true
+  )
+
+export const findSlpNft1GroupMintBaton = (utxos: ScriptUtxo[], parentTokenId: string): ScriptUtxo => {
+  const batons = utxos.filter((utxo) => isSlpNft1GroupMintBaton(utxo, parentTokenId))
+  if (batons.length !== 1) {
+    throw new Error(`Se esperaba exactamente un mint baton del Parent oficial; encontrados: ${batons.length}.`)
+  }
+  return batons[0]
+}
+
+export const countMintPassAtoms = (utxos: ScriptUtxo[], parentTokenId: string): bigint =>
+  utxos.reduce((sum, utxo) => {
+    if (!isSlpToken(utxo, parentTokenId, SLP_NFT1_GROUP)) return sum
+    return sum + (utxo.token?.atoms ?? 0n)
+  }, 0n)
+
+const toBatonInfo = (utxo: ScriptUtxo): MintPassBatonInfo => ({
+  txid: utxo.outpoint.txid,
+  vout: utxo.outpoint.outIdx,
+  outpoint: `${utxo.outpoint.txid}:${utxo.outpoint.outIdx}`,
+  sats: utxo.sats
+})
+
+export const getMintPassAdminState = async (params: {
+  address: string
+  parentTokenId: string
+}): Promise<MintPassAdminState> => {
+  const response = await getChronik().address(params.address).utxos()
+  const mintPassBalance = countMintPassAtoms(response.utxos, params.parentTokenId)
+  const batons = response.utxos.filter((utxo) => isSlpNft1GroupMintBaton(utxo, params.parentTokenId))
+  return {
+    hasBaton: batons.length === 1,
+    baton: batons.length === 1 ? toBatonInfo(batons[0]) : null,
+    mintPassBalance
+  }
+}
 
 // Basado en Cashtab: getNftChildGenesisInput para asegurar burning de 1 parent por NFT child.
 const selectParentMintInput = (utxos: ScriptUtxo[], parentTokenId: string) => {
@@ -267,6 +373,81 @@ export const mintSlpNft1GroupParentGenesis = async (params: {
   const broadcast = await chronik.broadcastTx(signedTx.ser())
 
   return { txid: broadcast.txid, tokenId: broadcast.txid, batonVout: NFT_PARENT_MINT_BATON_VOUT }
+}
+
+
+export const mintSlpNft1GroupPasses = async (params: {
+  wallet: MintPassWallet
+  address: string
+  parentTokenId: string
+  quantity: number | string | bigint
+  mintDestinationAddress: string
+  batonDestinationAddress: string
+  broadcast?: boolean
+  chronik?: MintPassChronik
+}): Promise<MintPassMintResult> => {
+  const quantityAtoms = validateMintPassQuantity(params.quantity)
+  const ownerAddress = normalizeCashAddress(params.address)
+  const mintDestinationAddress = normalizeCashAddress(params.mintDestinationAddress)
+  const batonDestinationAddress = normalizeCashAddress(params.batonDestinationAddress)
+  const signer = params.wallet.getSignatory()
+  const signerAddress = normalizeCashAddress(signer.address)
+
+  if (signerAddress !== ownerAddress) {
+    throw new Error('La wallet desbloqueada no controla la dirección propietaria del mint baton.')
+  }
+
+  const chronik = params.chronik ?? getChronik()
+  const utxoResponse = await chronik.address(ownerAddress).utxos()
+  const allUtxos = utxoResponse.utxos
+  const batonInput = findSlpNft1GroupMintBaton(allUtxos, params.parentTokenId)
+  const ownerScript = resolveAddressScript(ownerAddress)
+  const mintDestinationScript = resolveAddressScript(mintDestinationAddress)
+  const batonDestinationScript = resolveAddressScript(batonDestinationAddress)
+
+  const opReturn = slpMint(params.parentTokenId, SLP_NFT1_GROUP, quantityAtoms, NFT_PARENT_MINT_BATON_VOUT)
+  const fixedOutputs = [
+    { sats: 0n, script: opReturn },
+    { sats: BigInt(XEC_DUST_SATS), script: mintDestinationScript },
+    { sats: BigInt(XEC_DUST_SATS), script: batonDestinationScript }
+  ]
+
+  const xecUtxos = allUtxos.filter((utxo) => !utxo.token)
+  const funding = selectXecUtxos({
+    xecUtxos,
+    tokenInputSats: batonInput.sats,
+    fixedOutputs,
+    tokenInputsCount: 1
+  })
+
+  const inputs = [
+    buildInput(batonInput, ownerScript, signer.signatory),
+    ...funding.selected.map((utxo) => buildInput(utxo, ownerScript, signer.signatory))
+  ]
+  const outputs = funding.includeChange ? [...fixedOutputs, ownerScript] : fixedOutputs
+  const txBuilder = new TxBuilder({ inputs, outputs })
+  const signedTx = params.wallet.signTxBuilder(txBuilder, { feePerKb: FEE_PER_KB, dustSats: BigInt(XEC_DUST_SATS) }) as Tx
+  const rawTxHex = signedTx.toHex()
+  const outputSats = signedTx.outputs.reduce((sum, output) => sum + output.sats, 0n)
+  const inputSats = [batonInput, ...funding.selected].reduce((sum, utxo) => sum + utxo.sats, 0n)
+  const estimatedFeeSats = inputSats - outputSats
+  const plannedTxid = signedTx.txid()
+
+  let txid = plannedTxid
+  if (params.broadcast === true) {
+    const broadcast = await chronik.broadcastTx(signedTx.ser())
+    txid = broadcast.txid
+  }
+
+  return {
+    txid,
+    rawTxHex,
+    batonOutpoint: `${batonInput.outpoint.txid}:${batonInput.outpoint.outIdx}`,
+    expectedBatonVout: NFT_PARENT_MINT_BATON_VOUT,
+    expectedBatonOutpoint: `${txid}:${NFT_PARENT_MINT_BATON_VOUT}`,
+    estimatedFeeSats,
+    outputCount: signedTx.outputs.length
+  }
 }
 
 export const sendNftChild = async (params: {
