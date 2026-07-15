@@ -11,7 +11,10 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "mint:parent": "ADDR=ecash:TU_ADDR npx tsx scripts/mint-parent-group.ts",
-    "send:token": "npx tsx scripts/send-token.ts"
+    "send:token": "npx tsx scripts/send-token.ts",
+    "mint:passes": "npx tsx scripts/mint-parent-passes.ts",
+    "test": "npx tsx --test src/**/*.test.ts",
+    "test:mint-passes": "npx tsx --test src/services/slpNftTxBuilder.test.ts"
   },
   "dependencies": {
     "@scure/bip39": "^2.0.1",

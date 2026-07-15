@@ -21,6 +21,15 @@ import type { OfferPublishedPayload } from '../lib/walletconnect/WcWallet'
 import WcDebugPanel from '../components/WcDebugPanel'
 import DexTakerRmz from '../features/dex/components/DexTakerRmz'
 import {
+  MINT_PASS_MAX_QUANTITY,
+  NFT_PARENT_MINT_BATON_VOUT,
+  XOLOSARMY_MINT_PASS_ADMIN_ADDRESS,
+  getMintPassAdminState,
+  mintSlpNft1GroupPasses,
+  type MintPassAdminState,
+  type MintPassMintResult
+} from '../services/slpNftTxBuilder'
+import {
   TOKEN_DUST_SATS,
   buildAlpAgoraListOutputs,
   calcPriceNanoSatsFromTotal,
@@ -41,6 +50,15 @@ const OUTPUT_SIZE = 34
 const TX_OVERHEAD = 10
 
 const OFFER_STORAGE_KEY = 'tonalli_dex_offers'
+
+const normalizeCashAddressOrNull = (value: string | null | undefined) => {
+  if (!value) return null
+  try {
+    return Address.parse(value).cash().toString()
+  } catch {
+    return null
+  }
+}
 
 type SavedOffer = {
   offerId: string
@@ -126,6 +144,16 @@ function DEX() {
   const [mintPassSellOfferId, setMintPassSellOfferId] = useState<string | null>(null)
   const [mintPassBuyBusy, setMintPassBuyBusy] = useState(false)
   const [mintPassBuyTxid, setMintPassBuyTxid] = useState<string | null>(null)
+  const [mintPassAdminState, setMintPassAdminState] = useState<MintPassAdminState | null>(null)
+  const [mintPassAdminLoading, setMintPassAdminLoading] = useState(false)
+  const [mintPassAdminError, setMintPassAdminError] = useState<string | null>(null)
+  const [mintPassIssueQty, setMintPassIssueQty] = useState('1')
+  const [mintPassIssueDestination, setMintPassIssueDestination] = useState('')
+  const [mintPassIssuePreview, setMintPassIssuePreview] = useState<MintPassMintResult | null>(null)
+  const [mintPassIssuePreviewError, setMintPassIssuePreviewError] = useState<string | null>(null)
+  const [mintPassIssuePreviewBusy, setMintPassIssuePreviewBusy] = useState(false)
+  const [mintPassIssueBusy, setMintPassIssueBusy] = useState(false)
+  const [mintPassIssueTxid, setMintPassIssueTxid] = useState<string | null>(null)
   const [savedOffers, setSavedOffers] = useState<SavedOffer[]>(() => loadSavedOffers())
 
   useEffect(() => {
@@ -227,6 +255,15 @@ function DEX() {
     }
   }, [mintPassSellAmount, mintPassSellPrice])
 
+  const isMintPassAdminAddress = useMemo(
+    () => normalizeCashAddressOrNull(address) === XOLOSARMY_MINT_PASS_ADMIN_ADDRESS,
+    [address]
+  )
+  const showMintPassAdmin = isMintPassAdminAddress && mintPassAdminState?.hasBaton === true
+  const mintPassBatonOutpoint = mintPassAdminState?.baton?.outpoint ?? null
+  const mintPassIssueBatonDestination = XOLOSARMY_MINT_PASS_ADMIN_ADDRESS
+
+
   const saveOffer = useCallback((offer: SavedOffer) => {
     setSavedOffers((prev) => {
       const next = [offer, ...prev.filter((item) => item.offerId !== offer.offerId)]
@@ -242,6 +279,81 @@ function DEX() {
     if (typeof window === 'undefined') return
     localStorage.setItem(NFT_RESCAN_STORAGE_KEY, Date.now().toString())
   }, [])
+
+
+  const refreshMintPassAdminState = useCallback(async () => {
+    if (!address || !XOLOSARMY_NFT_PARENT_TOKEN_ID || !isMintPassAdminAddress) {
+      setMintPassAdminState(null)
+      setMintPassAdminError(null)
+      return
+    }
+    setMintPassAdminLoading(true)
+    try {
+      const state = await getMintPassAdminState({ address, parentTokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID })
+      setMintPassAdminState(state)
+      setMintPassAdminError(null)
+    } catch (err) {
+      setMintPassAdminState(null)
+      setMintPassAdminError((err as Error).message || 'No pudimos confirmar el mint baton.')
+    } finally {
+      setMintPassAdminLoading(false)
+    }
+  }, [address, isMintPassAdminAddress])
+
+  useEffect(() => {
+    if (address && !mintPassIssueDestination) {
+      setMintPassIssueDestination(address)
+    }
+  }, [address, mintPassIssueDestination])
+
+  useEffect(() => {
+    if (dexTab !== 'mintpass') return
+    refreshMintPassAdminState()
+  }, [dexTab, refreshMintPassAdminState])
+
+  useEffect(() => {
+    let active = true
+    const loadPreview = async () => {
+      if (!showMintPassAdmin || !address || !XOLOSARMY_NFT_PARENT_TOKEN_ID || !mintPassIssueDestination.trim()) {
+        setMintPassIssuePreview(null)
+        setMintPassIssuePreviewError(null)
+        return
+      }
+      setMintPassIssuePreviewBusy(true)
+      try {
+        const preview = await mintSlpNft1GroupPasses({
+          wallet: xolosWalletService,
+          address,
+          parentTokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+          quantity: mintPassIssueQty,
+          mintDestinationAddress: mintPassIssueDestination,
+          batonDestinationAddress: mintPassIssueBatonDestination,
+          broadcast: false
+        })
+        if (active) {
+          setMintPassIssuePreview(preview)
+          setMintPassIssuePreviewError(null)
+        }
+      } catch (err) {
+        if (active) {
+          setMintPassIssuePreview(null)
+          setMintPassIssuePreviewError((err as Error).message || 'No pudimos preparar la previsualización.')
+        }
+      } finally {
+        if (active) setMintPassIssuePreviewBusy(false)
+      }
+    }
+    loadPreview()
+    return () => {
+      active = false
+    }
+  }, [
+    address,
+    mintPassIssueBatonDestination,
+    mintPassIssueDestination,
+    mintPassIssueQty,
+    showMintPassAdmin
+  ])
 
   const handleCopyText = useCallback(async (value: string) => {
     try {
@@ -897,6 +1009,63 @@ function DEX() {
     }
   }
 
+
+  const handleIssueMintPasses = async (event: React.FormEvent) => {
+    event.preventDefault()
+    if (!initialized || !backupVerified || !address) {
+      setMintPassAdminError('Debes completar el onboarding y respaldar tu seed antes de emitir Mint Pass.')
+      return
+    }
+    if (!showMintPassAdmin || !XOLOSARMY_NFT_PARENT_TOKEN_ID) {
+      setMintPassAdminError('Chronik no confirma que esta wallet posea el mint baton del Parent oficial.')
+      return
+    }
+    if (mintPassIssueBusy) return
+
+    const confirmed = window.confirm(
+      `Emitir ${mintPassIssueQty} Mint Pass a ${mintPassIssueDestination.trim()} y recrear el baton en ${mintPassIssueBatonDestination}?`
+    )
+    if (!confirmed) return
+
+    setMintPassIssueBusy(true)
+    setMintPassIssueTxid(null)
+    setMintPassAdminError(null)
+    try {
+      const result = await mintSlpNft1GroupPasses({
+        wallet: xolosWalletService,
+        address,
+        parentTokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        quantity: mintPassIssueQty,
+        mintDestinationAddress: mintPassIssueDestination,
+        batonDestinationAddress: mintPassIssueBatonDestination,
+        broadcast: true
+      })
+      setMintPassIssueTxid(result.txid)
+      setMintPassIssuePreview(result)
+      setMintPassAdminState((prev) => ({
+        hasBaton: true,
+        mintPassBalance: prev?.mintPassBalance ?? 0n,
+        baton: {
+          outpoint: result.expectedBatonOutpoint,
+          txid: result.txid,
+          vout: result.expectedBatonVout,
+          sats: BigInt(TOKEN_DUST_SATS)
+        }
+      }))
+      await refreshBalances()
+      try {
+        await rescanWallet({ gapLimit: EXTENDED_GAP_LIMIT })
+      } catch {
+        await refreshBalances()
+      }
+      await refreshMintPassAdminState()
+    } catch (err) {
+      setMintPassAdminError((err as Error).message || 'No se pudieron emitir los Mint Pass.')
+    } finally {
+      setMintPassIssueBusy(false)
+    }
+  }
+
   if (!initialized) {
     return (
       <div className="page">
@@ -1333,6 +1502,83 @@ function DEX() {
                 </div>
               )}
             </div>
+
+            {isMintPassAdminAddress && mintPassAdminLoading && (
+              <div className="card" style={{ marginBottom: 12 }}>
+                <p className="card-kicker">Emitir nuevos Mint Pass</p>
+                <p className="muted">Confirmando mint baton con Chronik...</p>
+              </div>
+            )}
+
+            {showMintPassAdmin && (
+              <form onSubmit={handleIssueMintPasses} className="card" style={{ marginBottom: 12 }}>
+                <p className="card-kicker">Emitir nuevos Mint Pass</p>
+                <label htmlFor="mintPassParentTokenId">Parent Token ID</label>
+                <input id="mintPassParentTokenId" value={XOLOSARMY_NFT_PARENT_TOKEN_ID} readOnly />
+
+                <label htmlFor="mintPassBatonOutpoint" style={{ marginTop: 12 }}>
+                  Mint baton actual
+                </label>
+                <input id="mintPassBatonOutpoint" value={mintPassBatonOutpoint ?? ''} readOnly />
+
+                <label htmlFor="mintPassIssueQty" style={{ marginTop: 12 }}>
+                  Cantidad
+                </label>
+                <input
+                  id="mintPassIssueQty"
+                  type="number"
+                  min="1"
+                  max={MINT_PASS_MAX_QUANTITY}
+                  step="1"
+                  value={mintPassIssueQty}
+                  onChange={(event) => setMintPassIssueQty(event.target.value)}
+                />
+
+                <label htmlFor="mintPassIssueDestination" style={{ marginTop: 12 }}>
+                  Destino
+                </label>
+                <input
+                  id="mintPassIssueDestination"
+                  value={mintPassIssueDestination}
+                  onChange={(event) => setMintPassIssueDestination(event.target.value)}
+                  placeholder="ecash:..."
+                />
+
+                <div className="address-box" style={{ marginTop: 12, whiteSpace: 'pre-line' }}>
+                  {[
+                    `cantidad: ${mintPassIssueQty || '-'}`,
+                    `destino: ${mintPassIssueDestination || '-'}`,
+                    `baton destination: ${mintPassIssueBatonDestination}`,
+                    `fee estimado: ${mintPassIssuePreview ? formatSatsToXec(mintPassIssuePreview.estimatedFeeSats) : mintPassIssuePreviewBusy ? 'calculando...' : '-' } XEC`,
+                    `nuevo baton esperado: ${mintPassIssuePreview?.expectedBatonOutpoint ?? `txid:${NFT_PARENT_MINT_BATON_VOUT}`}`
+                  ].join('\n')}
+                </div>
+
+                <div className="muted" style={{ marginTop: 8 }}>
+                  Mint Pass disponibles: {mintPassAdminState?.mintPassBalance.toString() ?? '0'}
+                </div>
+
+                <div className="actions" style={{ marginTop: 12 }}>
+                  <button
+                    className="cta primary"
+                    type="submit"
+                    disabled={mintPassIssueBusy || mintPassIssuePreviewBusy || !mintPassIssuePreview}
+                  >
+                    {mintPassIssueBusy ? 'Transmitiendo...' : 'Emitir Mint Pass'}
+                  </button>
+                  <button className="cta ghost" type="button" onClick={refreshMintPassAdminState} disabled={mintPassIssueBusy}>
+                    Refrescar baton
+                  </button>
+                </div>
+                {mintPassIssuePreviewError && <div className="error">{mintPassIssuePreviewError}</div>}
+                {mintPassAdminError && <div className="error">{mintPassAdminError}</div>}
+                {mintPassIssueTxid && (
+                  <div className="success" style={{ marginTop: 12 }}>
+                    TXID: <span className="address-box">{mintPassIssueTxid}</span>
+                  </div>
+                )}
+              </form>
+            )}
 
             <form onSubmit={handleSellMintPass} className="card" style={{ marginBottom: 12 }}>
               <p className="card-kicker">Crear oferta de Mint Pass</p>
