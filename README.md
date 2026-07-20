@@ -1,6 +1,26 @@
-# RMZWallet
+# Tonalli Wallet
 
-Tonalli RMZWallet (Vite + React + TypeScript) para eCash (XEC).
+![Tonalli Wallet](src/assets/brand/tonalli-wallet-logo-official.jpeg)
+
+Verifica. Autocustodia. Libérate.
+
+Tonalli Wallet es la marca pública oficial de este repositorio. El repositorio conserva el nombre técnico `RMZWallet` por continuidad de historial, integraciones y compatibilidad interna.
+
+Tonalli Wallet es una wallet soberana, open source y no custodial para eCash. Tus llaves permanecen en tu dispositivo; Tonalli Wallet no custodia tus fondos y tú autorizas cada operación.
+
+## Funciones
+
+- eCash (XEC) para saldo, recepción, envío, comisiones y memos on-chain con OP_RETURN.
+- eToken Xolos RMZ integrado para consulta y envío.
+- NFTs de linaje y coleccionables cuando la configuración NFT del entorno está disponible.
+- Alias .xec mediante el flujo de registro soportado por la app.
+- WalletConnect v2 para dApps eCash compatibles.
+- Tonalli Connect para solicitudes externas de firma.
+- Multifirma eCash P2SH experimental.
+- DEX / Agora en las rutas disponibles de la app; su operación puede depender de infraestructura externa, liquidez y Offer IDs válidos.
+- x402 para los flujos habilitados por configuración.
+
+Tonalli Wallet forma parte de xolosArmy Network.
 
 ## Variables de entorno
 
@@ -35,17 +55,17 @@ Configura estas variables en Vercel o tu entorno local:
 
 ### Validación manual (dev)
 
-- Flujo intent-only: conectar Flipstarter -> Donar -> debe abrir modal de RMZWallet y firmar sin mostrar `Usa el formato txid:vout.` cuando la request solo trae `outputs`.
+- Flujo intent-only: conectar Flipstarter -> Donar -> debe abrir modal de Tonalli Wallet y firmar sin mostrar `Usa el formato txid:vout.` cuando la request solo trae `outputs`.
 
 ### Mining Gateway WalletConnect flow
 
 1. `mining.ecash.mx` genera un URI `wc:`.
-2. El usuario pega el URI `wc:` en RMZWallet -> Conectar dApps.
+2. El usuario pega el URI `wc:` en Tonalli Wallet -> Conectar dApps.
 3. El usuario aprueba la sesión de WalletConnect.
 4. Mining Gateway envía `ecash_signMessage` con el challenge exacto.
-5. RMZWallet muestra una pantalla de aprobación `Firmar mensaje`.
-6. RMZWallet firma con `xolosWalletService.signMessage(message)`.
-7. RMZWallet devuelve `address`, `publicKey`/`pubkey`, `signature` y `challengeId`.
+5. Tonalli Wallet muestra una pantalla de aprobación `Firmar mensaje`.
+6. Tonalli Wallet firma con `xolosWalletService.signMessage(message)`.
+7. Tonalli Wallet devuelve `address`, `publicKey`/`pubkey`, `signature` y `challengeId`.
 8. Mining Gateway verifica la firma y emite el token de sesión de minería.
 
 ## NFTs
