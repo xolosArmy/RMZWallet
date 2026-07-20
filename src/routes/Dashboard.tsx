@@ -319,8 +319,8 @@ function Dashboard() {
     return (
       <div className="page">
         <TopBar />
-        <h1 className="section-title">Bienvenido</h1>
-        <p className="muted">Configura tu billetera para ver tus saldos.</p>
+        <h1 className="section-title">Bienvenido a Tonalli Wallet</h1>
+        <p className="muted">Configura tu wallet para ver tus saldos.</p>
         <div className="actions">
           <Link className="cta primary" to="/onboarding">
             Ir a onboarding
@@ -336,23 +336,23 @@ function Dashboard() {
       <header className="section-header">
         <div>
           <p className="eyebrow">Panel principal</p>
-          <h1 className="section-title">Guardianía RMZ sobre eCash</h1>
+          <h1 className="section-title">Tu patrimonio digital, bajo tus llaves</h1>
           <p className="muted">
-            Saldos, gas y tu dirección protegida en una sola vista. La seed nunca sale de tu dispositivo.
+            Consulta XEC, eToken Xolos RMZ, NFTs, actividad y herramientas on-chain desde una sola interfaz no custodial.
           </p>
         </div>
         <div className="actions">
           <Link className="cta primary" to="/send">
-            Enviar RMZ
+            Enviar Xolos RMZ
           </Link>
           <Link className="cta outline" to="/send-xec">
             Enviar XEC
           </Link>
           <Link className="cta outline" to="/register-alias">
-            Register Alias / Identidad
+            Alias .xec
           </Link>
           <Link className="cta outline" to="/dex">
-            DEX (Phase 1)
+            DEX / Agora
           </Link>
           <Link className="cta outline" to="/nfts">
             NFTs
@@ -367,7 +367,7 @@ function Dashboard() {
             Conectar dApp (WalletConnect)
           </Link>
           <Link className="cta outline" to="/scan">
-            Escanear QR para recibir RMZ
+            Escanear QR
           </Link>
           <Link className="cta outline" to="/reveal-seed">
             Ver frase seed
@@ -387,8 +387,8 @@ function Dashboard() {
 
       <div className="grid">
         <div className="card">
-          <p className="muted">Balance RMZ</p>
-          <h2 style={{ marginTop: 4, fontSize: 32 }}>
+          <p className="muted">eToken Xolos RMZ</p>
+          <h2 className="metric-value" style={{ marginTop: 4, fontSize: 32 }}>
             {balance ? `${balance.rmzFormatted} RMZ` : 'Cargando...'}
           </h2>
           <div className="actions">
@@ -403,15 +403,15 @@ function Dashboard() {
           </div>
         </div>
         <div className="card">
-          <p className="muted">Gas de red (XEC)</p>
-          <h3 style={{ marginTop: 4 }}>{balance ? `${balance.xecFormatted} XEC` : 'Cargando...'}</h3>
+          <p className="muted">eCash (XEC) para comisiones</p>
+          <h3 className="metric-value" style={{ marginTop: 4 }}>{balance ? `${balance.xecFormatted} XEC` : 'Cargando...'}</h3>
           <p className="muted">({balance ? `${balance.xec.toString()} sats` : 'sats...'})</p>
         </div>
       </div>
 
       <div className="card">
         <p className="muted">Dirección eCash</p>
-        <div className="address-box">{address}</div>
+        <div className="address-box" title={address || undefined} aria-label={address ? `Dirección eCash completa: ${address}` : undefined}>{address}</div>
       </div>
 
       <div className="card">
@@ -426,7 +426,7 @@ function Dashboard() {
         <div className="tx-list">
           {txHistory.map((tx) => (
             <div key={tx.txid} className="tx-item">
-              <div className="address-box">{tx.txid}</div>
+              <div className="address-box" title={tx.txid} aria-label={`TXID completo: ${tx.txid}`}>{tx.txid}</div>
               <p className="muted tx-meta">{formatTxTime(tx.timestamp)}</p>
               {tx.opReturnMessage && (
                 <div className="tx-opreturn">
@@ -436,8 +436,12 @@ function Dashboard() {
                   <p className="tx-message">{tx.opReturnMessage}</p>
                   {tx.opReturnApp === 'tonalli' && (
                     <div className="tx-from">
-                      <span className="muted">From:</span>
-                      <span className="tx-address">
+                      <span className="muted">Firmante:</span>
+                      <span
+                        className="tx-address"
+                        title={tx.senderAddress || undefined}
+                        aria-label={tx.senderAddress ? `Dirección completa del firmante: ${tx.senderAddress}` : undefined}
+                      >
                         {tx.senderAddress ? formatAddressMiddle(tx.senderAddress) : 'unknown'}
                       </span>
                       {tx.senderAddress && (

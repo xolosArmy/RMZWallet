@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "vitest run",
+    "test": "vitest run --exclude src/services/slpNftTxBuilder.test.ts && npx tsx --test src/services/slpNftTxBuilder.test.ts",
     "typecheck": "tsc -b",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
@@ -13,10 +13,12 @@
     "mint:parent": "ADDR=ecash:TU_ADDR npx tsx scripts/mint-parent-group.ts",
     "send:token": "npx tsx scripts/send-token.ts",
     "mint:passes": "npx tsx scripts/mint-parent-passes.ts",
-    "test": "npx tsx --test src/**/*.test.ts",
     "test:mint-passes": "npx tsx --test src/services/slpNftTxBuilder.test.ts"
   },
   "dependencies": {
+    "@fontsource/inter": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@fontsource/space-grotesk": "^5.3.0",
     "@scure/bip39": "^2.0.1",
     "@walletconnect/core": "^2.23.4",
     "@walletconnect/web3wallet": "^1.16.1",

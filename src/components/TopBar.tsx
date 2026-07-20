@@ -1,20 +1,23 @@
-import logo from '../assets/xolosarmy-logo-dark.png'
+import BrandLogo from './BrandLogo'
 
 function TopBar() {
   return (
     <div className="topbar">
       <div className="brand">
         <div className="brand-mark">
-          <img src={logo} alt="Logo XolosArmy" />
+          <BrandLogo variant="pictogram" alt="Pictograma derivado del logo oficial de Tonalli Wallet" />
         </div>
         <div className="brand-copy">
-          <p className="brand-title">RMZWallet</p>
-          <p className="brand-subtitle">XolosArmy Network · eToken &amp; wallet on eCash (XEC)</p>
+          <p className="brand-title">
+            <span className="brand-title-full">Tonalli Wallet</span>
+            <span className="brand-title-short">Tonalli</span>
+          </p>
+          <p className="brand-subtitle">Autocustodia para eCash, Xolos RMZ e identidad on-chain</p>
         </div>
       </div>
-      <div className="status-pill" aria-hidden>
+      <div className="status-pill" role="status">
         <span className="dot" />
-        Seguridad en tu dispositivo
+        Llaves en tu dispositivo
       </div>
     </div>
   )
