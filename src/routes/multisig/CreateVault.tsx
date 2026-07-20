@@ -52,7 +52,7 @@ function CreateVault() {
       <TopBar />
       <header className="section-header">
         <div>
-          <p className="eyebrow">Nueva boveda</p>
+          <p className="eyebrow">Nueva bóveda</p>
           <h1 className="section-title">Crear multifirma eCash</h1>
           <p className="muted">Multifirma experimental. Usa primero montos pequeños.</p>
         </div>

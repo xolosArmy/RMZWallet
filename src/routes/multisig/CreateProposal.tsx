@@ -65,7 +65,7 @@ function CreateProposal() {
       </header>
 
       <div className="card">
-        <p className="muted">Boveda P2SH</p>
+        <p className="muted">Bóveda P2SH</p>
         <div className="address-box">{vault.address}</div>
       </div>
 

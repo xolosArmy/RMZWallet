@@ -82,7 +82,7 @@ function SendNft() {
         <div>
           <p className="eyebrow">Enviar</p>
           <h1 className="section-title">NFT hacia otra dirección</h1>
-          <p className="muted">Transfiere tu guardián a otra wallet eCash.</p>
+          <p className="muted">Transfiere tu NFT a otra wallet eCash después de verificar el token ID y la dirección.</p>
         </div>
         <Link className="cta ghost" to="/nfts">
           Volver a NFTs

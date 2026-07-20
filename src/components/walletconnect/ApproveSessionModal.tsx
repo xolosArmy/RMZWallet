@@ -227,9 +227,9 @@ export default function ApproveSessionModal({
               border: '1px solid rgba(245, 158, 11, 0.5)',
               background: 'rgba(245, 158, 11, 0.12)',
               padding: '10px 12px',
-              fontFamily: 'ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+              fontFamily: 'JetBrains Mono, SFMono-Regular, monospace',
               fontSize: 12,
-              color: '#f97316',
+              color: 'var(--color-warning)',
               wordBreak: 'break-word'
             }}
           >

@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
+import BrandLogo from '../components/BrandLogo'
 import { EXTERNAL_SIGN_REQUEST_STORAGE_KEY, EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY } from '../utils/externalSign'
 import { resolvePendingConnectTarget, TONALLI_PENDING_REQUEST_KEY } from '../utils/tonalliConnect'
 
@@ -107,46 +108,47 @@ function Onboarding() {
 
       <section className="hero">
         <div className="hero-copy">
-          <p className="eyebrow">Bienvenido a RMZWallet</p>
-          <h1 className="hero-title">Tu templo seguro para XEC y el eToken RMZ</h1>
+          <p className="eyebrow">Bienvenido a Tonalli Wallet</p>
+          <h1 className="hero-title">Tus llaves. Tu dinero. Tu Tonalli.</h1>
           <p className="lead">
-            Configura tu cartera para ver saldos y mover XEC con seguridad. Explora tus tokens, NFTs y el ecosistema
-            XolosArmy desde una sola interfaz.
+            Controla eCash (XEC), eToken Xolos RMZ, NFTs e identidad on-chain desde una wallet abierta y no custodial.
+            Tus llaves permanecen en tu dispositivo.
           </p>
           <div className="hero-actions">
             <a className="cta primary" href="#crear">
-              Crear nueva cartera RMZWallet
+              Crear nueva wallet
             </a>
             <a className="cta outline" href="#importar">
-              Conectar cartera existente
+              Desbloquear wallet
             </a>
             <a className="cta outline" href="#restaurar">
-              Importar cartera desde seed
+              Importar desde seed
             </a>
             <a className="cta ghost" href="#lectura">
-              Ver saldos de tokens y NFTs
+              Explorar en modo lectura
             </a>
           </div>
         </div>
 
         <div className="hero-card">
-          <p className="muted">Cyber-aztec · XolosArmy Network</p>
-          <div className="hero-badge">Guardianía digital</div>
+          <div className="logo-plate">
+            <BrandLogo variant="primary" size={210} />
+          </div>
+          <div className="hero-badge">Verifica. Autocustodia. Libérate.</div>
           <p className="hero-note">
-            La seed y el cifrado viven solo en tu dispositivo. Usa un password local que recuerdes y respalda tu frase
-            de 12 palabras.
+            La frase de recuperación y las llaves permanecen en tu dispositivo. Tonalli Wallet no custodia tus fondos.
           </p>
           <div className="hero-stats">
-            <span className="pill">RMZ listo para eCash (XEC)</span>
-            <span className="pill pill-ghost">Modo lectura disponible</span>
+            <span className="pill">eCash (XEC)</span>
+            <span className="pill pill-ghost">eToken Xolos RMZ integrado</span>
           </div>
         </div>
       </section>
 
       <div className="grid onboarding-grid">
         <form id="crear" className="card" onSubmit={handleCreate}>
-          <p className="card-kicker">Nuevo templo</p>
-          <h2>Crear billetera nueva</h2>
+          <p className="card-kicker">Nueva wallet</p>
+          <h2>Crear wallet nueva</h2>
           <p className="muted">La seed se genera localmente y nunca sale de tu dispositivo.</p>
           <label htmlFor="new-password">Password/PIN local</label>
           <input
@@ -184,7 +186,7 @@ function Onboarding() {
 
         <form id="restaurar" className="card" onSubmit={handleImport}>
           <p className="card-kicker">Importar</p>
-          <h2>Importar cartera desde seed</h2>
+          <h2>Importar desde seed</h2>
           <p className="muted">
             Pega tu frase de 12 o 24 palabras para restaurar tu cartera. Nota: la seed nunca sale de tu dispositivo.
           </p>
@@ -206,20 +208,20 @@ function Onboarding() {
           />
           <div className="actions">
             <button className="cta outline" type="submit" disabled={loading}>
-              Importar cartera
+              Importar wallet
             </button>
           </div>
         </form>
 
         <div id="lectura" className="card highlight">
           <p className="card-kicker">Modo lectura</p>
-          <h2>Ver saldos de tokens y NFTs</h2>
+          <h2>Explorar en modo lectura</h2>
           <p className="muted">
-            Puedes entrar en modo solo lectura para revisar tu dirección, saldo RMZ y gas en XEC sin exponer tu seed.
+            Puedes entrar en modo solo lectura para revisar tu dirección, eToken Xolos RMZ y eCash (XEC) sin exponer tu seed.
           </p>
           <div className="actions">
             <Link className="cta ghost" to="/">
-              Abrir vista de saldos
+              Abrir panel
             </Link>
           </div>
         </div>

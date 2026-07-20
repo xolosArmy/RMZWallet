@@ -55,8 +55,8 @@ function SendRMZ() {
       <header className="section-header">
         <div>
           <p className="eyebrow">Enviar</p>
-          <h1 className="section-title">RMZ hacia otra dirección</h1>
-          <p className="muted">Mueve RMZ con confianza sobre la red eCash.</p>
+          <h1 className="section-title">Enviar eToken Xolos RMZ</h1>
+          <p className="muted">Verifica dirección, monto y comisiones antes de firmar el envío de Xolos RMZ.</p>
         </div>
       </header>
 

@@ -183,7 +183,7 @@ function SendXECForm({ initialDestination, initialMessage, initialReplyToTxid }:
         <div>
           <p className="eyebrow">Enviar</p>
           <h1 className="section-title">XEC hacia otra dirección</h1>
-          <p className="muted">Mueve XEC con confianza sobre la red eCash.</p>
+          <p className="muted">Verifica dirección, monto, memo OP_RETURN y comisiones antes de firmar el envío de eCash (XEC).</p>
         </div>
       </header>
 

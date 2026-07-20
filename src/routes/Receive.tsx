@@ -35,7 +35,7 @@ function Receive() {
     const imageData = canvas.toDataURL('image/png')
     const link = document.createElement('a')
     link.href = imageData
-    link.download = 'RMZWallet_QR.png'
+    link.download = 'TonalliWallet_QR.png'
     link.click()
     setStatusMessage('QR descargado en tu dispositivo.')
   }
@@ -44,8 +44,8 @@ function Receive() {
     return (
       <div className="page">
         <TopBar />
-        <h1 className="section-title">Configura tu billetera</h1>
-        <p className="muted">Ve al onboarding para generar o desbloquear tu seed.</p>
+        <h1 className="section-title">Configura tu wallet</h1>
+        <p className="muted">Ve al onboarding para generar, importar o desbloquear tu wallet.</p>
         <div className="actions">
           <Link className="cta primary" to="/onboarding">
             Ir a onboarding
@@ -62,7 +62,7 @@ function Receive() {
         <div>
           <p className="eyebrow">Recibir</p>
           <h1 className="section-title">Comparte tu dirección eCash</h1>
-          <p className="muted">Recibe RMZ y XEC en la misma dirección cifrada en tu dispositivo.</p>
+          <p className="muted">Recibe eCash (XEC) y eToken Xolos RMZ en la misma dirección controlada por tus llaves.</p>
         </div>
         <div className="actions">
           <Link className="cta outline" to="/scan">
@@ -72,8 +72,8 @@ function Receive() {
       </header>
 
       <div className="card">
-        <p className="muted">Puedes recibir RMZ y XEC en la misma dirección.</p>
-        <label htmlFor="amount">Monto opcional a solicitar (RMZ):</label>
+        <p className="muted">Puedes recibir eCash (XEC) y eToken Xolos RMZ en la misma dirección.</p>
+        <label htmlFor="amount">Monto opcional a solicitar:</label>
         <input
           id="amount"
           type="number"
@@ -88,8 +88,8 @@ function Receive() {
               id="address-qr"
               value={qrValue}
               size={180}
-              bgColor="#0f172a"
-              fgColor="#f97316"
+              bgColor="#0A0A0A"
+              fgColor="#C99E44"
               level="H"
             />
           ) : (

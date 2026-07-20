@@ -332,7 +332,7 @@ function Nfts() {
           </div>
         )}
         <h1 className="section-title">NFTs</h1>
-        <p className="muted">Configura tu billetera para mintear y mover NFTs.</p>
+        <p className="muted">Configura tu wallet para mintear y mover NFTs.</p>
         <div className="actions">
           <Link className="cta primary" to="/onboarding">
             Ir a onboarding
@@ -352,9 +352,9 @@ function Nfts() {
       )}
       <header className="section-header">
         <div>
-          <p className="eyebrow">Guardianía</p>
-          <h1 className="section-title">xolosArmy NFTs</h1>
-          <p className="muted">Crea, resguarda y mueve NFTs dentro del templo Tonalli.</p>
+          <p className="eyebrow">NFTs de linaje</p>
+          <h1 className="section-title">NFTs de linaje y coleccionables</h1>
+          <p className="muted">Crea, verifica y mueve NFTs desde tu wallet no custodial.</p>
         </div>
         <div className="pill pill-ghost">Colección única</div>
       </header>
@@ -398,7 +398,7 @@ function Nfts() {
           <div>
             {nftsLoading && <div className="muted">Cargando NFTs...</div>}
             {nftsError && <div className="error">{nftsError}</div>}
-            {!nftsLoading && nfts.length === 0 && <div className="muted">Aún no tienes NFTs en tu guardianía.</div>}
+            {!nftsLoading && nfts.length === 0 && <div className="muted">Aún no tienes NFTs en esta wallet.</div>}
             {/* Dev check: start app, open /nfts, verify token name/ticker render and Open on IPFS opens. */}
 
             <div className="grid" style={{ marginTop: 12 }}>
@@ -501,7 +501,7 @@ function Nfts() {
               )}
             </div>
             <label htmlFor="nftName">Nombre</label>
-            <input id="nftName" value={name} onChange={(e) => setName(e.target.value)} placeholder="Ej. Guardian #23" />
+            <input id="nftName" value={name} onChange={(e) => setName(e.target.value)} placeholder="Ej. Linaje #23" />
 
             <label htmlFor="nftDescription" style={{ marginTop: 12 }}>
               Descripción
@@ -707,7 +707,7 @@ function Nfts() {
             <div className="card" style={{ marginBottom: 12 }}>
               <p className="card-kicker">Colección</p>
               <h2>xolosArmy NFTs</h2>
-              <p className="muted">Guardianía exclusiva de Tonalli.</p>
+              <p className="muted">Colección vinculada a Tonalli Wallet.</p>
             </div>
             <div className="card">
               <p className="muted">Parent Token ID</p>

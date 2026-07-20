@@ -23,31 +23,44 @@ export default defineConfig({
     topLevelAwait(),
     VitePWA({
       registerType: 'autoUpdate',
-      includeAssets: ['favicon.ico', 'robots.txt', 'apple-touch-icon.png', 'vite.svg'],
+      includeAssets: ['brand/favicon.ico', 'brand/apple-touch-icon.png', 'brand/favicon-16x16.png', 'brand/favicon-32x32.png', 'brand/favicon-48x48.png'],
       workbox: {
         // El bundle WASM es grande; ampliamos límite de precache.
         maximumFileSizeToCacheInBytes: 12 * 1024 * 1024
       },
       manifest: {
-        name: 'xolosArmy Wallet',
-        short_name: 'xolosWallet',
-        description: 'Billetera no custodial para $RMZ y XEC',
-        theme_color: '#0f172a',
-        background_color: '#0f172a',
+        name: 'Tonalli Wallet',
+        short_name: 'Tonalli',
+        description: 'Wallet soberana y open source para eCash (XEC), eToken Xolos RMZ e identidad on-chain.',
+        theme_color: '#0A0A0A',
+        background_color: '#0A0A0A',
         display: 'standalone',
         start_url: '/',
+        lang: 'es-MX',
         icons: [
           {
-            src: '/vite.svg',
+            src: '/brand/tonalli-pwa-192.png',
             sizes: '192x192',
-            type: 'image/svg+xml',
+            type: 'image/png',
             purpose: 'any'
           },
           {
-            src: '/vite.svg',
+            src: '/brand/tonalli-pwa-512.png',
             sizes: '512x512',
-            type: 'image/svg+xml',
+            type: 'image/png',
             purpose: 'any'
+          },
+          {
+            src: '/brand/tonalli-pwa-maskable-192.png',
+            sizes: '192x192',
+            type: 'image/png',
+            purpose: 'maskable'
+          },
+          {
+            src: '/brand/tonalli-pwa-maskable-512.png',
+            sizes: '512x512',
+            type: 'image/png',
+            purpose: 'maskable'
           }
         ]
       }
