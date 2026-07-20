@@ -66,13 +66,13 @@ function App() {
           {X402_DRY_RUN_ENABLED && (
             <Route
               path="/x402-demo"
-              element={<Suspense fallback={<div className="muted">Loading dry run…</div>}><X402Demo /></Suspense>}
+              element={<Suspense fallback={<div className="muted">Cargando prueba seca...</div>}><X402Demo /></Suspense>}
             />
           )}
           {X402_STAGING_TEST_ENABLED && (
             <Route
               path="/x402-staging"
-              element={<Suspense fallback={<div className="muted">Loading staging test…</div>}><X402Staging /></Suspense>}
+              element={<Suspense fallback={<div className="muted">Cargando prueba staging...</div>}><X402Staging /></Suspense>}
             />
           )}
           <Route path="*" element={<Navigate to="/onboarding" replace />} />
@@ -106,9 +106,11 @@ function App() {
         </div>
       )}
       <footer className="app-footer">
+        Tonalli Wallet · Open source · Parte de xolosArmy Network ·{' '}
         <a href="https://github.com/xolosArmy/RMZWallet" target="_blank" rel="noopener noreferrer">
-          Código fuente en GitHub ↗
+          Código fuente en GitHub
         </a>
+        <span className="footer-claim"> · Verifica. Autocustodia. Libérate.</span>
       </footer>
     </div>
   )

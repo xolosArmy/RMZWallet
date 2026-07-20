@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'vitest'
 import { parseDecimalToAtoms } from '../dex/agoraPhase1.ts'
-import { buildRmzBuyPreview } from '../features/dex/components/DexTakerRmz.tsx'
+import { buildRmzBuyPreview } from '../features/dex/components/rmzBuyPreview.ts'
 import { assertOneshotDesiredAtoms } from './agoraExchange.ts'
 import {
   MISSING_OR_SPENT_MESSAGE,

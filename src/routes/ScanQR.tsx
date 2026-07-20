@@ -6,7 +6,7 @@ import TopBar from '../components/TopBar'
 export function ScanQR() {
   const [scannedAddress, setScannedAddress] = useState<string>('')
   const [statusMessage, setStatusMessage] = useState<string | null>(
-    'Activando cámara... apunta al código de guardianía.'
+    'Activando cámara... apunta al código QR.'
   )
   const [isScanning, setIsScanning] = useState<boolean>(true)
   const [cameraError, setCameraError] = useState<string | null>(null)
@@ -22,7 +22,7 @@ export function ScanQR() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setCameraError(null)
     setIsScanning(true)
-    setStatusMessage('Activando cámara... apunta al código de guardianía.')
+    setStatusMessage('Activando cámara... apunta al código QR.')
     qr
       .start(
         { facingMode: 'environment' },
@@ -99,8 +99,8 @@ export function ScanQR() {
     if (!scannedAddress || !navigator.share) return
     try {
       await navigator.share({
-        title: 'Dirección RMZWallet',
-        text: `Recibe RMZ/XEC en: ${scannedAddress}`
+        title: 'Dirección Tonalli Wallet',
+        text: `Recibe XEC/RMZ en: ${scannedAddress}`
       })
       setStatusMessage('Dirección compartida.')
     } catch {
@@ -117,8 +117,7 @@ export function ScanQR() {
           <p className="eyebrow">Escáner QR</p>
           <h1 className="section-title">Escanear código QR</h1>
           <p className="muted">
-            Apunta tu cámara al código QR que contiene una dirección eCash. Guardianía digital dentro de tu templo
-            seguro.
+            Apunta tu cámara al código QR que contiene una dirección eCash. Verifica la dirección antes de enviar.
           </p>
         </div>
         <div className="actions">
@@ -130,15 +129,15 @@ export function ScanQR() {
 
       <div className="card">
         <p className="muted">
-          Usa la cámara trasera para mayor nitidez. Mantén el recuadro centrado mientras la app descifra la dirección.
+          Usa la cámara trasera para mayor nitidez. Mantén el recuadro centrado mientras la app lee la dirección.
         </p>
         <div
           style={{
             marginTop: 12,
-            border: '1px solid rgba(255,255,255,0.08)',
+            border: '1px solid var(--color-border)',
             borderRadius: 12,
             padding: 12,
-            background: 'rgba(15,23,42,0.6)',
+            background: 'rgba(249,248,246,0.04)',
             boxShadow: '0 12px 32px rgba(0,0,0,0.35)'
           }}
         >

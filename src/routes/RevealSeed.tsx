@@ -94,12 +94,12 @@ function RevealSeed() {
         <div>
           <p className="eyebrow">Seguridad local</p>
           <h1 className="section-title">Frase semilla</h1>
-          <p className="muted">Estas son tus 12/24 palabras. No las compartas con nadie.</p>
+          <p className="muted">Estas son tus 12/24 palabras. No las compartas con nadie; dan control total sobre tus fondos.</p>
         </div>
       </header>
 
       <div className="card reveal-card">
-        <div className="warning">⚠️ Revelar tu seed es riesgoso si hay alguien mirando.</div>
+        <div className="warning">Advertencia: revelar tu seed es riesgoso si hay alguien mirando.</div>
         <p className="muted">
           Tu seed vive cifrada y nunca sale del dispositivo. Usa tu PIN local para desbloquearla solo cuando estés en
           un lugar seguro.
@@ -125,7 +125,7 @@ function RevealSeed() {
         {mnemonic && (
           <>
             <SensitiveSeedPhrase key={mnemonic} mnemonic={mnemonic} />
-            <p className="muted">Guarda esta frase en un lugar seguro. Es la clave de tu templo.</p>
+            <p className="muted">Guarda esta frase fuera de línea. Es la llave para recuperar tu wallet.</p>
             <div className="actions">
               <button className="cta outline" type="button" onClick={handleCopy}>
                 Copiar frase

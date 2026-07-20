@@ -137,7 +137,7 @@ function VaultDashboard() {
       <header className="section-header">
         <div>
           <p className="eyebrow">eCash P2SH</p>
-          <h1 className="section-title">Bovedas multifirma</h1>
+          <h1 className="section-title">Bóvedas multifirma</h1>
           <p className="muted">Multifirma experimental. Usa primero montos pequeños.</p>
         </div>
         <div className="actions">
@@ -155,7 +155,7 @@ function VaultDashboard() {
       </div>
 
       <div className="card">
-        <p className="eyebrow">Importar boveda</p>
+        <p className="eyebrow">Importar bóveda</p>
         <label htmlFor="vault-import-json">JSON publico de boveda</label>
         <textarea
           id="vault-import-json"
@@ -170,7 +170,7 @@ function VaultDashboard() {
         />
         <div className="actions">
           <button className="cta outline" type="button" onClick={handleImport} disabled={!importJson.trim()}>
-            Importar boveda
+            Importar bóveda
           </button>
         </div>
         {importError && <div className="error">{importError}</div>}
@@ -179,7 +179,7 @@ function VaultDashboard() {
 
       {exportJson && (
         <div className="card">
-          <p className="eyebrow">Export publico</p>
+          <p className="eyebrow">Export público</p>
           <label htmlFor="vault-export-json">JSON sin private keys</label>
           <textarea id="vault-export-json" readOnly rows={10} value={exportJson} />
         </div>
@@ -187,7 +187,7 @@ function VaultDashboard() {
 
       {vaults.length === 0 && (
         <div className="card">
-          <p className="muted">No hay bovedas guardadas en este dispositivo.</p>
+          <p className="muted">No hay bóvedas guardadas en este dispositivo.</p>
           <Link className="cta primary" to="/multisig/create">
             Crear primera boveda
           </Link>
@@ -201,7 +201,7 @@ function VaultDashboard() {
             <div className="card" key={vault.id}>
               <p className="eyebrow">{vault.m}-de-{vault.n}</p>
               <h2 style={{ marginTop: 0 }}>{vault.label}</h2>
-              <p className="muted">Direccion P2SH para recibir fondos</p>
+              <p className="muted">Dirección P2SH para recibir fondos</p>
               <div className="address-box">{vault.address}</div>
               <p className="muted">
                 Balance XEC puro:{' '}
@@ -213,7 +213,7 @@ function VaultDashboard() {
               </p>
               {balance?.error && <div className="error">{balance.error}</div>}
               <div className="fund-vault">
-                <p className="eyebrow">Fondear boveda</p>
+                <p className="eyebrow">Fondear bóveda</p>
                 <p className="muted">
                   Este fondeo usa la wallet actual single-sig para enviar XEC a la direccion P2SH de la boveda.
                 </p>
@@ -255,7 +255,7 @@ function VaultDashboard() {
                   disabled={(fundForms[vault.id] ?? emptyFundState()).loading || !(fundForms[vault.id] ?? emptyFundState()).amountXec.trim()}
                   onClick={() => void handleFundVault(vault)}
                 >
-                  {(fundForms[vault.id] ?? emptyFundState()).loading ? 'Fondeando...' : 'Fondear boveda'}
+                  {(fundForms[vault.id] ?? emptyFundState()).loading ? 'Fondeando...' : 'Fondear bóveda'}
                 </button>
                 {(fundForms[vault.id] ?? emptyFundState()).error && (
                   <div className="error">{(fundForms[vault.id] ?? emptyFundState()).error}</div>

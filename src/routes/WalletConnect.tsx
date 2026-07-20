@@ -327,7 +327,7 @@ function WalletConnect() {
         <div>
           <p className="eyebrow">WalletConnect</p>
           <h1 className="section-title">Conectar dApps</h1>
-          <p className="muted">Empareja RMZWallet con xolo-legend u otras dApps eCash compatibles.</p>
+          <p className="muted">Empareja Tonalli Wallet con xolo-legend u otras dApps eCash compatibles. Verifica antes de firmar.</p>
         </div>
         <div className="actions">
           <Link className="cta ghost" to="/settings">

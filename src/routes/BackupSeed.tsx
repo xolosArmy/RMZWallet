@@ -71,8 +71,8 @@ function BackupSeed() {
       <header className="section-header">
         <div>
           <p className="eyebrow">Respalda tu seed</p>
-          <h1 className="section-title">Sin seed, no hay $RMZ</h1>
-          <p className="muted">Guarda tus 12 palabras como si fueran tu tesoro más valioso.</p>
+          <h1 className="section-title">Sin seed, no hay recuperación</h1>
+          <p className="muted">Guarda tus 12 palabras fuera de línea. Tonalli Wallet no puede recuperarlas por ti.</p>
         </div>
       </header>
 

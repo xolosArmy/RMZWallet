@@ -92,7 +92,7 @@ export const buildXolosarmyNftMetadata = ({
     attributes: appendLineageTraits(attributes, lineageMetadata),
     lineage: lineageMetadata,
     parent: XOLOSARMY_NFT_PARENT_TOKEN_ID,
-    app: 'Tonalli RMZWallet',
+    app: 'Tonalli Wallet',
     schema_version: lineageMetadata ? '1.1.0' : undefined
   }
   return metadata

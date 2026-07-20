@@ -246,9 +246,9 @@ function RegisterAlias() {
       <TopBar />
       <header className="section-header">
         <div>
-          <p className="eyebrow">Register Alias / Identidad</p>
+          <p className="eyebrow">Alias .xec / Identidad</p>
           <h1 className="section-title">Registra tu alias .xec</h1>
-          <p className="muted">Reserva una identidad eCash para esta direccion con una operacion de dos pasos.</p>
+          <p className="muted">Reserva una identidad eCash para esta dirección con una operación verificable de dos pasos.</p>
         </div>
       </header>
 

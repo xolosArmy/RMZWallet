@@ -1,52 +1,9 @@
 import type { Dispatch, SetStateAction } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import { RMZ_ETOKEN_ID } from '../../../config/rmzToken'
-import { formatAtomsToDecimal, formatSatsToXec, parseDecimalToAtoms } from '../../../dex/agoraPhase1'
 import { useActiveOffers } from '../hooks/useActiveOffers'
 
-export type RmzOfferSummary = {
-  offeredDisplay: string
-  askedDisplay: string
-  offeredAtoms: bigint
-  askedSats: bigint
-  tokenDecimals: number
-}
-
-export type RmzBuyPreview =
-  | { valid: false; error: string }
-  | {
-      valid: true
-      desiredDisplay: string
-      estimatedXec: string
-      remainingDisplay: string
-    }
-
-export const buildRmzBuyPreview = (offerSummary: RmzOfferSummary | null, buyAmountInput: string): RmzBuyPreview => {
-  if (!offerSummary || !buyAmountInput.trim()) {
-    return { valid: false, error: 'Ingresa una cantidad de RMZ.' }
-  }
-
-  try {
-    const desiredAtoms = parseDecimalToAtoms(buyAmountInput, offerSummary.tokenDecimals)
-    if (desiredAtoms <= 0n) {
-      return { valid: false, error: 'La cantidad debe ser mayor a cero.' }
-    }
-    if (desiredAtoms > offerSummary.offeredAtoms) {
-      return { valid: false, error: 'La cantidad supera los RMZ disponibles.' }
-    }
-
-    const estimatedSats = (offerSummary.askedSats * desiredAtoms) / offerSummary.offeredAtoms
-    const remainingAtoms = offerSummary.offeredAtoms - desiredAtoms
-    return {
-      valid: true,
-      desiredDisplay: formatAtomsToDecimal(desiredAtoms, offerSummary.tokenDecimals),
-      estimatedXec: formatSatsToXec(estimatedSats),
-      remainingDisplay: formatAtomsToDecimal(remainingAtoms, offerSummary.tokenDecimals)
-    }
-  } catch (err) {
-    return { valid: false, error: (err as Error).message }
-  }
-}
+import { buildRmzBuyPreview, type RmzOfferSummary } from './rmzBuyPreview'
 
 type DexTakerRmzProps = {
   offerIdInput: string
@@ -121,7 +78,8 @@ export default function DexTakerRmz({
   const activeOfferCount = useMemo(() => offers.length, [offers])
 
   useEffect(() => {
-    setBuyAmountInput('')
+    const resetTimer = window.setTimeout(() => setBuyAmountInput(''), 0)
+    return () => window.clearTimeout(resetTimer)
   }, [offerSummary?.offeredAtoms, offerSummary?.askedSats])
 
   const buyPreview = useMemo(() => buildRmzBuyPreview(offerSummary, buyAmountInput), [buyAmountInput, offerSummary])
