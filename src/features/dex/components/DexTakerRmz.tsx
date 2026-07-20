@@ -88,6 +88,16 @@ const FEATURED_OFFERS: FeaturedOffer[] = [
     id: 'b000e816b45aa2b835d74b275d5882651bb6c57d249700712c308068b3fbcb72:1',
     label: 'Paquete para Crear Teyolias',
     summary: 'Consigue los recursos necesarios para crear Teyolias'
+  },
+  {
+    id: '56517579a41f084bdcafc253895ea4a7e717188dc3f92ddf608bf34584de87e6:1',
+    label: 'Oferta Mayorista RMZ',
+    summary: '406,999.04 RMZ disponibles'
+  },
+  {
+    id: 'c2d5f0fc309b0b8ca755ca8caa89dffdb60a898537f755d2a5a3a08fce2757c2:1',
+    label: 'Oferta de Liquidez RMZ',
+    summary: '20,999.68 RMZ disponibles'
   }
 ]
 
