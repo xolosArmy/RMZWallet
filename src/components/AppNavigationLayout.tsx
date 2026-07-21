@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import { useLocation } from 'react-router-dom'
 import { useWallet } from '../context/useWallet'
 import MobileBottomNav from './MobileBottomNav'
-import { isMobileBottomNavHidden } from './mobileBottomNavRules'
+import { shouldShowWalletNavigation } from './walletNavigation'
 
 type AppNavigationLayoutProps = {
   children: ReactNode
@@ -11,7 +11,7 @@ type AppNavigationLayoutProps = {
 function AppNavigationLayout({ children }: AppNavigationLayoutProps) {
   const { pathname } = useLocation()
   const { initialized } = useWallet()
-  const showMobileBottomNav = initialized && !isMobileBottomNavHidden(pathname)
+  const showMobileBottomNav = shouldShowWalletNavigation(initialized, pathname)
 
   return (
     <>
