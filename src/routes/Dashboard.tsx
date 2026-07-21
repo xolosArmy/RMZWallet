@@ -6,8 +6,6 @@ import TopBar from '../components/TopBar'
 import { getChronik } from '../services/ChronikClient'
 import { mapChronikTxToRecord } from '../utils/txHistory'
 import type { TxRecord } from '../types/tx'
-import { X402_DRY_RUN_ENABLED } from '../integrations/x402/x402DryRunFeature'
-import { X402_STAGING_TEST_ENABLED } from '../integrations/x402/x402StagingFeature'
 
 const HISTORY_PAGE_SIZE = 25
 const POLL_FAST_MS = 5000
@@ -341,47 +339,16 @@ function Dashboard() {
             Consulta XEC, eToken Xolos RMZ, NFTs, actividad y herramientas on-chain desde una sola interfaz no custodial.
           </p>
         </div>
-        <div className="actions">
-          <Link className="cta primary" to="/send">
-            Enviar Xolos RMZ
-          </Link>
-          <Link className="cta outline" to="/send-xec">
-            Enviar XEC
-          </Link>
-          <Link className="cta outline" to="/register-alias">
-            Alias .xec
-          </Link>
-          <Link className="cta outline" to="/dex">
-            DEX / Agora
-          </Link>
-          <Link className="cta outline" to="/nfts">
-            NFTs
+        <div className="quick-actions" aria-label="Acciones rápidas">
+          <Link className="cta primary" to="/send-menu">
+            Enviar
           </Link>
           <Link className="cta outline" to="/receive">
             Recibir
           </Link>
-          <Link className="cta outline" to="/multisig">
-            Multifirma eCash
-          </Link>
-          <Link className="cta outline" to="/walletconnect">
-            Conectar dApp (WalletConnect)
-          </Link>
           <Link className="cta outline" to="/scan">
-            Escanear QR
+            Escanear
           </Link>
-          <Link className="cta outline" to="/reveal-seed">
-            Ver frase seed
-          </Link>
-          {X402_DRY_RUN_ENABLED && (
-            <Link className="cta outline" to="/x402-demo">
-              Test 402 Authorization
-            </Link>
-          )}
-          {X402_STAGING_TEST_ENABLED && (
-            <Link className="cta outline" to="/x402-staging">
-              Test real staging authorization
-            </Link>
-          )}
         </div>
       </header>
 
