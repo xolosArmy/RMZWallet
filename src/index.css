@@ -255,6 +255,110 @@ textarea:focus-visible {
 
 .lead { margin: 0 0 20px; color: #dedbd3; max-width: 760px; }
 
+.onboarding-page {
+  max-width: 960px;
+}
+
+.onboarding-selector {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 18px;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+.onboarding-intro {
+  padding: 24px 0 2px;
+  text-align: left;
+}
+
+.onboarding-claim {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  margin: 0;
+  padding: 7px 12px;
+  border-radius: var(--radius-pill);
+  background: rgba(201, 158, 68, 0.13);
+  border: 1px solid rgba(201, 158, 68, 0.32);
+  color: var(--tonalli-solar-gold);
+  font-weight: 700;
+}
+
+.onboarding-action-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.onboarding-action-card {
+  min-height: 44px;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  padding: 16px;
+  border-radius: var(--radius-lg);
+  background: rgba(23, 24, 23, 0.94);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow);
+  text-align: left;
+  transition: background-color 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+}
+
+.onboarding-action-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(45, 180, 173, 0.48);
+  background: rgba(32, 33, 31, 0.98);
+}
+
+.onboarding-action-title {
+  color: var(--tonalli-ivory);
+  font-family: 'Space Grotesk', 'Inter', sans-serif;
+  font-size: 1.1rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.onboarding-action-card .cta {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.security-note {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(249, 248, 246, 0.12);
+  background: rgba(249, 248, 246, 0.04);
+  color: var(--color-text-muted);
+  text-align: left;
+}
+
+.onboarding-flow {
+  width: min(100%, 560px);
+  margin: 0 auto;
+}
+
+.back-link {
+  margin-bottom: 12px;
+}
+
+.onboarding-form {
+  text-align: left;
+}
+
+.onboarding-form .section-title {
+  font-size: clamp(1.8rem, 3vw, 2.35rem);
+}
+
+.onboarding-form label {
+  margin-top: 14px;
+}
+
+.read-only-panel .actions .cta {
+  width: 100%;
+}
+
 .hero-actions,
 .actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .hero-actions { margin-top: 20px; }
@@ -268,15 +372,6 @@ textarea:focus-visible {
   background: linear-gradient(160deg, rgba(32, 33, 31, 0.98), rgba(18, 19, 17, 0.98));
 }
 
-.logo-plate {
-  border-radius: var(--radius-lg);
-  background: var(--tonalli-ivory);
-  padding: 14px;
-  display: grid;
-  place-items: center;
-  border: 1px solid rgba(10, 10, 10, 0.12);
-  max-width: 240px;
-}
 
 .hero-badge {
   display: inline-flex;
@@ -434,17 +529,32 @@ code {
   .hero-actions, .actions { align-items: stretch; }
   .hero-actions .cta, .actions .cta { width: 100%; }
   .brand-subtitle { display: none; }
+  .onboarding-page { max-width: 720px; }
+  .onboarding-selector { gap: 14px; }
+  .onboarding-intro { padding-top: 10px; }
+  .onboarding-action-list { grid-template-columns: 1fr; gap: 10px; }
+  .onboarding-action-card { padding: 14px; }
 }
 
 @media (max-width: 560px) {
-  .topbar { flex-wrap: nowrap; align-items: center; padding: 10px; }
-  .brand { gap: 10px; }
-  .brand-mark { width: 44px; height: 44px; min-width: 44px; }
+  .topbar { flex-wrap: nowrap; align-items: center; gap: 8px; padding: 10px; margin-bottom: 18px; }
+  .brand { gap: 8px; flex: 1 1 auto; }
+  .brand-mark { width: 54px; height: 54px; min-width: 54px; padding: 5px; }
   .brand-title { font-size: 18px; }
   .brand-title-full { display: none; }
   .brand-title-short { display: inline; }
-  .status-pill { font-size: 0.82rem; padding: 8px 10px; }
+  .status-pill { flex: 0 1 auto; min-height: 44px; font-size: 0.72rem; padding: 6px 7px; gap: 6px; white-space: nowrap; }
+  .status-pill .dot { width: 8px; height: 8px; box-shadow: 0 0 0 4px rgba(45, 180, 173, 0.14); }
   .hero-copy, .hero-card, .card { padding: 16px; }
+  .hero-title { font-size: clamp(1.9rem, 9vw, 2.35rem); }
+  .lead { margin-bottom: 14px; }
+  .onboarding-claim { width: 100%; justify-content: center; }
+  .security-note { font-size: 0.92rem; }
   .wc-session, .nft-inline { flex-direction: column; align-items: flex-start; }
   .fee-breakdown div { flex-direction: column; align-items: flex-start; }
+}
+
+@media (max-width: 340px) {
+  .topbar { flex-wrap: wrap; }
+  .status-pill { width: 100%; justify-content: center; }
 }

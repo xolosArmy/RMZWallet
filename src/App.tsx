@@ -6,7 +6,7 @@ import SendXEC from './routes/SendXEC'
 import RegisterAlias from './routes/RegisterAlias'
 import Receive from './routes/Receive'
 import Settings from './routes/Settings'
-import Onboarding from './routes/Onboarding'
+import Onboarding, { CreateWallet, ImportWallet, ReadOnlyWallet, UnlockWallet } from './routes/Onboarding'
 import BackupSeed from './routes/BackupSeed'
 import { ScanQR } from './routes/ScanQR'
 import RevealSeed from './routes/RevealSeed'
@@ -61,6 +61,10 @@ function App() {
           <Route path="/multisig/:vaultId/propose" element={<CreateProposal />} />
           <Route path="/multisig/:vaultId/sign" element={<SignProposal />} />
           <Route path="/onboarding" element={<Onboarding />} />
+          <Route path="/onboarding/create" element={<CreateWallet />} />
+          <Route path="/onboarding/unlock" element={<UnlockWallet />} />
+          <Route path="/onboarding/import" element={<ImportWallet />} />
+          <Route path="/onboarding/read-only" element={<ReadOnlyWallet />} />
           <Route path="/backup" element={<BackupSeed />} />
           <Route path="/reveal-seed" element={<RevealSeed />} />
           {X402_DRY_RUN_ENABLED && (
