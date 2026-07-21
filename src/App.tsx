@@ -1,9 +1,11 @@
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
 import Dashboard from './routes/Dashboard'
+import SendMenu from './routes/SendMenu'
 import SendRMZ from './routes/SendRMZ'
 import SendXEC from './routes/SendXEC'
 import RegisterAlias from './routes/RegisterAlias'
+import More from './routes/More'
 import Receive from './routes/Receive'
 import Settings from './routes/Settings'
 import Onboarding, { CreateWallet, ImportWallet, ReadOnlyWallet, UnlockWallet } from './routes/Onboarding'
@@ -24,6 +26,7 @@ import ApproveRequestModal from './components/walletconnect/ApproveRequestModal'
 import { wcWallet } from './lib/walletconnect/WcWallet'
 import { X402_DRY_RUN_ENABLED } from './integrations/x402/x402DryRunFeature'
 import { X402_STAGING_TEST_ENABLED } from './integrations/x402/x402StagingFeature'
+import AppNavigationLayout from './components/AppNavigationLayout'
 const X402Demo = lazy(() => import('./routes/X402Demo'))
 const X402Staging = lazy(() => import('./routes/X402Staging'))
 
@@ -40,9 +43,10 @@ function App() {
   return (
     <div className="app-shell">
       <div className="app-glow" aria-hidden />
-      <main className="app-content">
+      <AppNavigationLayout>
         <Routes>
           <Route path="/" element={<Dashboard />} />
+          <Route path="/send-menu" element={<SendMenu />} />
           <Route path="/send" element={<SendRMZ />} />
           <Route path="/send-xec" element={<SendXEC />} />
           <Route path="/register-alias" element={<RegisterAlias />} />
@@ -55,6 +59,7 @@ function App() {
           <Route path="/connect" element={<ConnectRequest />} />
           <Route path="/connect/sign-message" element={<ConnectRequest />} />
           <Route path="/walletconnect" element={<WalletConnect />} />
+          <Route path="/more" element={<More />} />
           <Route path="/external-sign" element={<ExternalSign />} />
           <Route path="/multisig" element={<VaultDashboard />} />
           <Route path="/multisig/create" element={<CreateVault />} />
@@ -81,7 +86,7 @@ function App() {
           )}
           <Route path="*" element={<Navigate to="/onboarding" replace />} />
         </Routes>
-      </main>
+      </AppNavigationLayout>
       <ApproveRequestModal
         open={Boolean(wcState.pendingRequest)}
         request={wcState.pendingRequest}
@@ -109,13 +114,6 @@ function App() {
           Compra completada. Txid: {wcState.lastSuccessTxid}
         </div>
       )}
-      <footer className="app-footer">
-        Tonalli Wallet · Open source · Parte de xolosArmy Network ·{' '}
-        <a href="https://github.com/xolosArmy/RMZWallet" target="_blank" rel="noopener noreferrer">
-          Código fuente en GitHub
-        </a>
-        <span className="footer-claim"> · Verifica. Autocustodia. Libérate.</span>
-      </footer>
     </div>
   )
 }
