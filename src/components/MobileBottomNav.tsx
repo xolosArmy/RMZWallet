@@ -1,13 +1,9 @@
 import type { ReactElement } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { isMobileBottomNavActive } from './mobileBottomNavRules'
+import { isWalletNavigationActive, walletNavigationItems } from './walletNavigation'
+import type { WalletNavigationItemId } from './walletNavigation'
 
-type NavItem = {
-  label: string
-  to: string
-  match: (pathname: string) => boolean
-  icon: ReactElement
-}
+type NavIconMap = Record<WalletNavigationItemId, ReactElement>
 
 const IconHome = () => (
   <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
@@ -39,21 +35,21 @@ const IconMore = () => (
   </svg>
 )
 
-const navItems: NavItem[] = [
-  { label: 'Inicio', to: '/', match: (pathname) => isMobileBottomNavActive('home', pathname), icon: <IconHome /> },
-  { label: 'Enviar', to: '/send-menu', match: (pathname) => isMobileBottomNavActive('send', pathname), icon: <IconSend /> },
-  { label: 'Recibir', to: '/receive', match: (pathname) => isMobileBottomNavActive('receive', pathname), icon: <IconReceive /> },
-  { label: 'NFTs', to: '/nfts', match: (pathname) => isMobileBottomNavActive('nfts', pathname), icon: <IconNfts /> },
-  { label: 'Más', to: '/more', match: (pathname) => isMobileBottomNavActive('more', pathname), icon: <IconMore /> }
-]
+const navIcons: NavIconMap = {
+  home: <IconHome />,
+  send: <IconSend />,
+  receive: <IconReceive />,
+  nfts: <IconNfts />,
+  more: <IconMore />
+}
 
 function MobileBottomNav() {
   const { pathname } = useLocation()
 
   return (
     <nav className="mobile-bottom-nav" aria-label="Navegación principal">
-      {navItems.map((item) => {
-        const active = item.match(pathname)
+      {walletNavigationItems.map((item) => {
+        const active = isWalletNavigationActive(item.id, pathname)
         return (
           <Link
             key={item.to}
@@ -62,7 +58,7 @@ function MobileBottomNav() {
             aria-label={item.label}
             aria-current={active ? 'page' : undefined}
           >
-            <span className="mobile-bottom-nav__icon">{item.icon}</span>
+            <span className="mobile-bottom-nav__icon">{navIcons[item.id]}</span>
             <span className="mobile-bottom-nav__label">{item.label}</span>
           </Link>
         )

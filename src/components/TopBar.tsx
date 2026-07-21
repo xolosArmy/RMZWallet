@@ -1,4 +1,5 @@
 import BrandLogo from './BrandLogo'
+import DesktopNavigation from './DesktopNavigation'
 
 function TopBar() {
   return (
@@ -19,6 +20,7 @@ function TopBar() {
         <span className="dot" />
         Llaves en tu dispositivo
       </div>
+      <DesktopNavigation />
     </div>
   )
 }
