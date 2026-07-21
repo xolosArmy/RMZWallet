@@ -4,8 +4,10 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { describe, expect, test, vi } from 'vitest'
 import App from '../App'
 import AppNavigationLayout from '../components/AppNavigationLayout'
+import DesktopNavigation from '../components/DesktopNavigation'
 import MobileBottomNav from '../components/MobileBottomNav'
 import { isMobileBottomNavActive, isMobileBottomNavHidden } from '../components/mobileBottomNavRules'
+import { isWalletNavigationActive, walletNavigationItems } from '../components/walletNavigation'
 import Dashboard from './Dashboard'
 import More from './More'
 import SendMenu from './SendMenu'
@@ -68,6 +70,26 @@ describe('Tonalli mobile navigation v3', () => {
     expect(isMobileBottomNavActive('more', '/settings')).toBe(true)
   })
 
+  test('mobile navigation continues to use the shared five destinations', () => {
+    const html = renderAt('/', <MobileBottomNav />)
+
+    for (const item of walletNavigationItems) {
+      expect(html).toContain(`href="${item.to}"`)
+      expect(html).toContain(item.label)
+    }
+  })
+
+  test('shared configuration preserves mobile active route behavior', () => {
+    const items = ['home', 'send', 'receive', 'nfts', 'more'] as const
+    const paths = ['/', '/send-menu', '/send', '/send-xec', '/send-nft', '/receive', '/nfts', '/more', '/dex', '/multisig/create', '/settings']
+
+    for (const item of items) {
+      for (const path of paths) {
+        expect(isMobileBottomNavActive(item, path), `${item} ${path}`).toBe(isWalletNavigationActive(item, path))
+      }
+    }
+  })
+
   test('active state includes aria-current and a non-color class', () => {
     const html = renderAt('/send-xec', <MobileBottomNav />)
 
@@ -87,6 +109,70 @@ describe('Tonalli mobile navigation v3', () => {
     expect(renderLayout('/external-sign')).not.toContain('Navegación principal')
     expect(renderLayout('/', false)).not.toContain('Navegación principal')
     expect(renderLayout('/')).toContain('Navegación principal')
+  })
+
+  test('layout hides navigation for Tonalli Connect routes', () => {
+    expect(isMobileBottomNavHidden('/connect')).toBe(true)
+    expect(isMobileBottomNavHidden('/connect/sign-message')).toBe(true)
+
+    expect(renderLayout('/connect')).not.toContain('Navegación principal')
+    expect(renderLayout('/connect/sign-message')).not.toContain('Navegación principal')
+  })
+
+  test('DesktopNavigation shows five destinations with expected links', () => {
+    const html = renderAt('/', <DesktopNavigation />)
+
+    expect(html).toContain('aria-label="Navegación principal de escritorio"')
+    expect(html).toContain('href="/"')
+    expect(html).toContain('href="/send-menu"')
+    expect(html).toContain('href="/receive"')
+    expect(html).toContain('href="/nfts"')
+    expect(html).toContain('href="/more"')
+    expect(html).toContain('Inicio')
+    expect(html).toContain('Enviar')
+    expect(html).toContain('Recibir')
+    expect(html).toContain('NFTs')
+    expect(html).toContain('Más')
+  })
+
+  test('DesktopNavigation marks Inicio active only on root', () => {
+    const html = renderAt('/', <DesktopNavigation />)
+    const sendHtml = renderAt('/send', <DesktopNavigation />)
+
+    expect(html).toContain('desktop-navigation__item is-active" aria-current="page" href="/"')
+    expect(sendHtml).not.toContain('desktop-navigation__item is-active" aria-current="page" href="/"')
+  })
+
+  test.each(['/send', '/send-xec', '/send-nft'])('DesktopNavigation marks Enviar active on %s', (path) => {
+    const html = renderAt(path, <DesktopNavigation />)
+
+    expect(html).toContain('desktop-navigation__item is-active" aria-current="page" href="/send-menu"')
+    expect(html).toContain('desktop-navigation__item is-active')
+  })
+
+  test.each(['/dex', '/multisig', '/multisig/create', '/settings', '/scan'])('DesktopNavigation marks Más active on %s', (path) => {
+    const html = renderAt(path, <DesktopNavigation />)
+
+    expect(html).toContain('desktop-navigation__item is-active" aria-current="page" href="/more"')
+    expect(html).toContain('desktop-navigation__item is-active')
+  })
+
+  test('DesktopNavigation marks NFTs and Recibir active', () => {
+    expect(renderAt('/nfts', <DesktopNavigation />)).toContain('desktop-navigation__item is-active" aria-current="page" href="/nfts"')
+    expect(renderAt('/receive', <DesktopNavigation />)).toContain('desktop-navigation__item is-active" aria-current="page" href="/receive"')
+  })
+
+  test('DesktopNavigation hides on sensitive routes and uninitialized wallets', () => {
+    expect(renderAt('/onboarding', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
+    expect(renderAt('/onboarding/create', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
+    expect(renderAt('/backup', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
+    expect(renderAt('/external-sign', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
+    expect(renderAt('/connect', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
+    expect(renderAt('/connect/sign-message', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
+
+    walletState.initialized = false
+    expect(renderAt('/', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
+    walletState.initialized = true
   })
 
   test('/send-menu contains the four transfer options', () => {
