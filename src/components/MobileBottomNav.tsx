@@ -23,9 +23,9 @@ const IconReceive = () => (
   </svg>
 )
 
-const IconNfts = () => (
+const IconMemo = () => (
   <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
-    <path d="M6 4h7l5 5v11H6V4Zm8 1.8V10h4.2L14 5.8ZM8 12v6h8v-6H8Z" />
+    <path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9.4L5 21v-3H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm1 3v8h1.2v2l2.8-2H18V7H6Zm2 2h8v2H8V9Zm0 3h5v2H8v-2Z" />
   </svg>
 )
 
@@ -38,8 +38,8 @@ const IconMore = () => (
 const navIcons: NavIconMap = {
   home: <IconHome />,
   send: <IconSend />,
+  memo: <IconMemo />,
   receive: <IconReceive />,
-  nfts: <IconNfts />,
   more: <IconMore />
 }
 

@@ -77,6 +77,11 @@ export default defineConfig({
         target: 'https://tomato-rational-rat-921.mypinata.cloud',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/ipfs/, '/ipfs')
+      },
+      '/tonalli-memo-api': {
+        target: 'http://127.0.0.1:3000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/tonalli-memo-api/, '/api')
       }
     }
   },

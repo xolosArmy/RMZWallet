@@ -14,6 +14,8 @@ import { ScanQR } from './routes/ScanQR'
 import RevealSeed from './routes/RevealSeed'
 import DEX from './routes/DEX'
 import Nfts from './routes/Nfts'
+import MemoFeed from './routes/MemoFeed'
+import MemoTx from './routes/MemoTx'
 import SendNft from './routes/SendNft'
 import ConnectRequest from './routes/ConnectRequest'
 import WalletConnect from './routes/WalletConnect'
@@ -54,6 +56,8 @@ function App() {
           <Route path="/scan" element={<ScanQR />} />
           <Route path="/dex" element={<DEX />} />
           <Route path="/nfts" element={<Nfts />} />
+          <Route path="/memo" element={<MemoFeed />} />
+          <Route path="/memo/tx/:txid" element={<MemoTx />} />
           <Route path="/send-nft" element={<SendNft />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/connect" element={<ConnectRequest />} />
