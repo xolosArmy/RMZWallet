@@ -1,6 +1,10 @@
 {
   "rewrites": [
     {
+      "source": "/tonalli-memo-api/:path*",
+      "destination": "https://memo-api.xolosarmy.xyz/api/:path*"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
