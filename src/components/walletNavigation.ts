@@ -1,4 +1,4 @@
-export type WalletNavigationItemId = 'home' | 'send' | 'receive' | 'nfts' | 'more'
+export type WalletNavigationItemId = 'home' | 'send' | 'memo' | 'receive' | 'more'
 
 export type WalletNavigationItem = {
   id: WalletNavigationItemId
@@ -10,6 +10,7 @@ const sendPaths = new Set(['/send-menu', '/send', '/send-xec', '/send-nft'])
 const morePaths = new Set([
   '/more',
   '/dex',
+  '/nfts',
   '/register-alias',
   '/multisig',
   '/walletconnect',
@@ -23,8 +24,8 @@ const morePaths = new Set([
 export const walletNavigationItems: WalletNavigationItem[] = [
   { id: 'home', label: 'Inicio', to: '/' },
   { id: 'send', label: 'Enviar', to: '/send-menu' },
+  { id: 'memo', label: 'Memo', to: '/memo' },
   { id: 'receive', label: 'Recibir', to: '/receive' },
-  { id: 'nfts', label: 'NFTs', to: '/nfts' },
   { id: 'more', label: 'Más', to: '/more' }
 ]
 
@@ -50,8 +51,8 @@ export function isWalletNavigationHidden(pathname: string) {
 export function isWalletNavigationActive(item: WalletNavigationItemId, pathname: string) {
   if (item === 'home') return pathname === '/'
   if (item === 'send') return sendPaths.has(pathname)
+  if (item === 'memo') return pathname === '/memo' || pathname.startsWith('/memo/tx/')
   if (item === 'receive') return pathname === '/receive'
-  if (item === 'nfts') return pathname === '/nfts'
   return morePaths.has(pathname) || pathname.startsWith('/multisig/')
 }
 

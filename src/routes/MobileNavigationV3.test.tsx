@@ -52,8 +52,8 @@ describe('Tonalli mobile navigation v3', () => {
     expect(html).toContain('aria-label="Navegación principal"')
     expect(html).toContain('Inicio')
     expect(html).toContain('Enviar')
+    expect(html).toContain('Memo')
     expect(html).toContain('Recibir')
-    expect(html).toContain('NFTs')
     expect(html).toContain('Más')
   })
 
@@ -64,6 +64,8 @@ describe('Tonalli mobile navigation v3', () => {
     expect(isMobileBottomNavActive('send', '/send')).toBe(true)
     expect(isMobileBottomNavActive('send', '/send-xec')).toBe(true)
     expect(isMobileBottomNavActive('send', '/send-nft')).toBe(true)
+    expect(isMobileBottomNavActive('memo', '/memo')).toBe(true)
+    expect(isMobileBottomNavActive('memo', '/memo/tx/' + 'a'.repeat(64))).toBe(true)
     expect(isMobileBottomNavActive('more', '/dex')).toBe(true)
     expect(isMobileBottomNavActive('more', '/multisig')).toBe(true)
     expect(isMobileBottomNavActive('more', '/multisig/create')).toBe(true)
@@ -80,8 +82,8 @@ describe('Tonalli mobile navigation v3', () => {
   })
 
   test('shared configuration preserves mobile active route behavior', () => {
-    const items = ['home', 'send', 'receive', 'nfts', 'more'] as const
-    const paths = ['/', '/send-menu', '/send', '/send-xec', '/send-nft', '/receive', '/nfts', '/more', '/dex', '/multisig/create', '/settings']
+    const items = ['home', 'send', 'memo', 'receive', 'more'] as const
+    const paths = ['/', '/send-menu', '/send', '/send-xec', '/send-nft', '/memo', '/memo/tx/' + 'a'.repeat(64), '/receive', '/nfts', '/more', '/dex', '/multisig/create', '/settings']
 
     for (const item of items) {
       for (const path of paths) {
@@ -125,13 +127,13 @@ describe('Tonalli mobile navigation v3', () => {
     expect(html).toContain('aria-label="Navegación principal de escritorio"')
     expect(html).toContain('href="/"')
     expect(html).toContain('href="/send-menu"')
+    expect(html).toContain('href="/memo"')
     expect(html).toContain('href="/receive"')
-    expect(html).toContain('href="/nfts"')
     expect(html).toContain('href="/more"')
     expect(html).toContain('Inicio')
     expect(html).toContain('Enviar')
+    expect(html).toContain('Memo')
     expect(html).toContain('Recibir')
-    expect(html).toContain('NFTs')
     expect(html).toContain('Más')
   })
 
@@ -157,8 +159,9 @@ describe('Tonalli mobile navigation v3', () => {
     expect(html).toContain('desktop-navigation__item is-active')
   })
 
-  test('DesktopNavigation marks NFTs and Recibir active', () => {
-    expect(renderAt('/nfts', <DesktopNavigation />)).toContain('desktop-navigation__item is-active" aria-current="page" href="/nfts"')
+  test('DesktopNavigation marks Memo and Recibir active', () => {
+    expect(renderAt('/memo', <DesktopNavigation />)).toContain('desktop-navigation__item is-active" aria-current="page" href="/memo"')
+    expect(renderAt('/memo/tx/' + 'a'.repeat(64), <DesktopNavigation />)).toContain('desktop-navigation__item is-active" aria-current="page" href="/memo"')
     expect(renderAt('/receive', <DesktopNavigation />)).toContain('desktop-navigation__item is-active" aria-current="page" href="/receive"')
   })
 
@@ -197,6 +200,8 @@ describe('Tonalli mobile navigation v3', () => {
     expect(html).toContain('Conectividad')
     expect(html).toContain('Seguridad')
     expect(html).toContain('DEX / Agora')
+    expect(html).toContain('NFTs')
+    expect(html).toContain('href="/nfts"')
     expect(html).toContain('Alias .xec')
     expect(html).toContain('Multifirma eCash')
     expect(html).toContain('WalletConnect')
@@ -236,6 +241,8 @@ describe('Tonalli mobile navigation v3', () => {
       '/send',
       '/send-xec',
       '/send-nft',
+      '/memo',
+      '/memo/tx/' + 'a'.repeat(64),
       '/receive',
       '/nfts',
       '/more',

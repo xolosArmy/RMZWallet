@@ -22,6 +22,7 @@ const sections: MoreSection[] = [
     title: 'Ecosistema',
     items: [
       { title: 'DEX / Agora', description: 'Explora ofertas y liquidez abiertas.', to: '/dex' },
+      { title: 'NFTs', description: 'Consulta coleccionables SLP desde tu wallet.', to: '/nfts' },
       { title: 'Alias .xec', description: 'Registra identidad legible para direcciones eCash.', to: '/register-alias' },
       { title: 'Multifirma eCash', description: 'Coordina bóvedas y propuestas con varias firmas.', to: '/multisig' }
     ]
