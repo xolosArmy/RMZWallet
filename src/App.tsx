@@ -19,7 +19,7 @@ import MemoTx from './routes/MemoTx'
 import SendNft from './routes/SendNft'
 import ConnectRequest from './routes/ConnectRequest'
 import WalletConnect from './routes/WalletConnect'
-import ExternalSign from './routes/ExternalSign'
+import ExternalSign, { ExternalSignDisabled } from './routes/ExternalSign'
 import CreateVault from './routes/multisig/CreateVault'
 import VaultDashboard from './routes/multisig/VaultDashboard'
 import CreateProposal from './routes/multisig/CreateProposal'
@@ -29,6 +29,7 @@ import { wcWallet } from './lib/walletconnect/WcWallet'
 import { X402_DRY_RUN_ENABLED } from './integrations/x402/x402DryRunFeature'
 import { X402_STAGING_TEST_ENABLED } from './integrations/x402/x402StagingFeature'
 import AppNavigationLayout from './components/AppNavigationLayout'
+import { EXTERNAL_SIGN_P0_ENABLED } from './features/externalSign/config'
 const X402Demo = lazy(() => import('./routes/X402Demo'))
 const X402Staging = lazy(() => import('./routes/X402Staging'))
 
@@ -64,7 +65,7 @@ function App() {
           <Route path="/connect/sign-message" element={<ConnectRequest />} />
           <Route path="/walletconnect" element={<WalletConnect />} />
           <Route path="/more" element={<More />} />
-          <Route path="/external-sign" element={<ExternalSign />} />
+          <Route path="/external-sign" element={EXTERNAL_SIGN_P0_ENABLED ? <ExternalSign /> : <ExternalSignDisabled />} />
           <Route path="/multisig" element={<VaultDashboard />} />
           <Route path="/multisig/create" element={<CreateVault />} />
           <Route path="/multisig/:vaultId/propose" element={<CreateProposal />} />

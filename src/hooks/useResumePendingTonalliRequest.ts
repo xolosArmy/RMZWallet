@@ -1,6 +1,9 @@
 import { useEffect, useRef } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { EXTERNAL_SIGN_REQUEST_STORAGE_KEY, EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY } from '../utils/externalSign'
+import {
+  EXTERNAL_SIGN_REQUEST_STORAGE_KEY,
+  EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY
+} from '../features/externalSign/contract'
 import { resolvePendingConnectTarget, TONALLI_PENDING_REQUEST_KEY } from '../utils/tonalliConnect'
 
 type PendingResumeStorage = Pick<Storage, 'getItem' | 'removeItem'>
