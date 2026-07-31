@@ -49,6 +49,7 @@ export type ExternalSignPrevoutProvider = Readonly<{
 const txidOf = (txid: string | Uint8Array) => typeof txid === 'string' ? txid.toLowerCase() : toHexRev(txid).toLowerCase()
 const decimal = (value: bigint | number) => value.toString(10)
 const feeRateDisplay = (fee: bigint, size: bigint) => `${fee / size}.${((fee % size) * 100n / size).toString().padStart(2, '0')}`
+const P2PKH_UNLOCKING_SCRIPT_BYTES = 100
 
 const assertNonTokenTx = (tx: ChronikTx, code: string) => {
   if (
@@ -75,6 +76,9 @@ export async function buildExternalSignReview(
   }
   if (tx.toHex().toLowerCase() !== request.unsignedTxHex) throw new ExternalSignError('TRAILING_OR_NONCANONICAL_TX_BYTES')
   if (tx.inputs.length === 0) throw new ExternalSignError('NO_INPUTS')
+  if (tx.inputs.some(input => (input.script?.bytecode.length ?? 0) !== 0)) {
+    throw new ExternalSignError('UNSIGNED_INPUT_SCRIPT_NOT_EMPTY')
+  }
   if (tx.outputs.length === 0 || tx.outputs.length > EXTERNAL_SIGN_MAX_OUTPUTS) throw new ExternalSignError('OUTPUT_COUNT_FORBIDDEN')
 
   let walletScriptHex: string
@@ -174,7 +178,7 @@ export async function buildExternalSignReview(
 
   const fee = inputTotal - outputTotal
   if (fee < 0n) throw new ExternalSignError('FEE_UNDETERMINABLE')
-  const size = BigInt(tx.serSize())
+  const size = BigInt(tx.serSize() + tx.inputs.length * P2PKH_UNLOCKING_SCRIPT_BYTES)
   if (
     fee < size * EXTERNAL_SIGN_MIN_FEE_RATE_SATS_PER_BYTE ||
     fee > size * EXTERNAL_SIGN_MAX_FEE_RATE_SATS_PER_BYTE ||

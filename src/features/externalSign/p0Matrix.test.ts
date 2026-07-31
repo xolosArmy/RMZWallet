@@ -78,7 +78,7 @@ const chronikTx = (overrides: Partial<ChronikTx> = {}): ChronikTx => ({
   txid: TXID,
   version: 2,
   inputs: [],
-  outputs: [{ sats: 2_000n, outputScript: ACTIVE_SCRIPT.toHex() }],
+  outputs: [{ sats: 2_100n, outputScript: ACTIVE_SCRIPT.toHex() }],
   lockTime: 0,
   timeFirstSeen: 0,
   size: 100,
@@ -94,7 +94,7 @@ const validatedTx = (tx = makeUnsignedTx(), overrides: Partial<ChronikTx> = {}):
   inputs: tx.inputs.map(input => ({
     prevOut: { txid: TXID, outIdx: input.prevOut.outIdx },
     inputScript: '',
-    sats: 2_000n,
+    sats: 2_100n,
     sequenceNo: input.sequence ?? 0xffff_ffff
   })),
   outputs: tx.outputs.map(output => ({ sats: output.sats, outputScript: output.script.toHex() })),
@@ -113,17 +113,22 @@ const provider = (options: {
 const review = (wire = request(), prevoutProvider = provider()) => buildExternalSignReview(wire, ACTIVE_ADDRESS, prevoutProvider)
 
 const signingSpies = () => {
-  const sign = vi.fn(() => ({ toHex: () => 'signed-fixture-hex' }))
+  const sign = vi.fn<() => Tx>()
   const getSignatory = vi.fn(() => ({
     address: ACTIVE_ADDRESS,
     publicKeyHex: `02${'00'.repeat(32)}`,
     publicKey: new Uint8Array(33),
     signatory: vi.fn()
   }))
-  const builderFromTx = vi.fn((tx: Tx) => ({
-    inputs: tx.inputs.map(input => ({ input: { prevOut: input.prevOut } })),
-    sign
-  }))
+  const builderFromTx = vi.fn((tx: Tx) => {
+    const signedTx = Tx.fromHex(tx.toHex())
+    for (const input of signedTx.inputs) input.script = new Script(new Uint8Array(100))
+    sign.mockReturnValue(signedTx)
+    return {
+      inputs: tx.inputs.map(input => ({ input: { prevOut: input.prevOut } })),
+      sign
+    }
+  })
   const broadcastTx = vi.fn()
   return { sign, getSignatory, builderFromTx, broadcastTx }
 }
@@ -345,7 +350,7 @@ describe('external-sign P0 negative matrix', () => {
 
   test('N23 fee rate and absolute fee limits must all pass', async () => {
     const spies = signingSpies()
-    for (const sats of [1_850n, 4_000n, 13_000n]) {
+    for (const sats of [2_000n, 5_000n, 13_000n]) {
       const prevTx = chronikTx({ outputs: [{ sats, outputScript: ACTIVE_SCRIPT.toHex() }] })
       await expect(review(request(), provider({ prevTx }))).rejects.toMatchObject({ code: 'FEE_OUT_OF_POLICY' })
     }
@@ -364,7 +369,7 @@ describe('external-sign P0 negative matrix', () => {
     const wire = request()
     const { txReview, contentHash } = await prepared(wire)
     const capability = new ExternalSignApprovalCapabilityV1(REQUEST_ID, contentHash, wire.expiresAt, NOW)
-    const changedProvider = provider({ prevTx: chronikTx({ outputs: [{ sats: 2_100n, outputScript: ACTIVE_SCRIPT.toHex() }] }) })
+    const changedProvider = provider({ prevTx: chronikTx({ outputs: [{ sats: 2_200n, outputScript: ACTIVE_SCRIPT.toHex() }] }) })
     await expect(finalize(wire, txReview, contentHash, capability, spies, undefined, () => review(wire, changedProvider))).rejects.toMatchObject({ code: 'CONTENT_HASH_MISMATCH' })
     expectNoSigning(spies)
   })
@@ -416,6 +421,8 @@ describe('external-sign P0 negative matrix', () => {
     const spies = signingSpies()
     const locks = { request: vi.fn(async (_name: string, _options: LockOptions, callback: (lock: Lock | null) => unknown) => callback(null)) }
     await expect(acquireExternalSignLock(locks as unknown as LockManager)).rejects.toMatchObject({ code: 'EXTERNAL_SIGN_BUSY_OR_LOCK_UNAVAILABLE' })
+    const failingLocks = { request: vi.fn(async () => { throw new Error('lock manager failed') }) }
+    await expect(acquireExternalSignLock(failingLocks as unknown as LockManager)).rejects.toMatchObject({ code: 'EXTERNAL_SIGN_BUSY_OR_LOCK_UNAVAILABLE' })
     expectNoSigning(spies)
   })
 
@@ -509,7 +516,7 @@ describe('external-sign P0 positive matrix: signOnly only', () => {
     const capability = new ExternalSignApprovalCapabilityV1(REQUEST_ID, contentHash, wire.expiresAt, NOW)
     const spies = signingSpies()
     const response = await finalize(wire, txReview, contentHash, capability, spies)
-    expect(response).toMatchObject({ mode: 'signOnly', requestId: REQUEST_ID, signedTxHex: 'signed-fixture-hex' })
+    expect(response).toMatchObject({ mode: 'signOnly', requestId: REQUEST_ID, signedTxHex: expect.any(String) })
     expect(spies.getSignatory).toHaveBeenCalledTimes(1)
     expect(spies.sign).toHaveBeenCalledTimes(1)
     expect(spies.broadcastTx).not.toHaveBeenCalled()
@@ -551,7 +558,7 @@ describe('external-sign P0 positive matrix: signOnly only', () => {
   test('P04 canonical contentHash fixture is stable and mutations change it', async () => {
     const wire = request()
     const { txReview, contentHash } = await prepared(wire)
-    expect(contentHash).toBe('sha256:81b6435cb664da5cebba717536b48ae7c63d40a04103d8f43e3d74b092c0306e')
+    expect(contentHash).toBe('sha256:554fc119d8f0c8a43fd0cf2451bfe845b4c45f8eb1136dfd67c03fd88f222192')
     const upperHexWire = request({ unsignedTxHex: wire.unsignedTxHex.toUpperCase() })
     expect(upperHexWire.unsignedTxHex).toBe(wire.unsignedTxHex)
     await expect(calculateExternalSignContentHash(upperHexWire, AUTHENTICATED_ORIGIN, txReview)).resolves.toBe(contentHash)

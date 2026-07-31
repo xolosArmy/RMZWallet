@@ -30,7 +30,7 @@ export async function acquireExternalSignLock(locks: Pick<LockManager, 'request'
       }
     }))
     await hold
-  })
+  }).catch(() => resolveAcquisition?.(null))
 
   const lease = await acquisition
   if (!lease) throw new ExternalSignError('EXTERNAL_SIGN_BUSY_OR_LOCK_UNAVAILABLE')

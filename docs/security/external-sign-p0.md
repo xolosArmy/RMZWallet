@@ -19,7 +19,7 @@ El contrato wire v1 es cerrado. Acepta únicamente `protocolId: tonalli.external
 
 El revisor acepta solo XEC puro: inputs P2PKH de la wallet activa y hasta 10 outputs P2PKH, con máximo un output de cambio. Tokens, NFTs, P2SH, multifirma, OP_RETURN, scripts desconocidos y datos no interpretables fallan cerradamente.
 
-Los fees se calculan como `prevouts - outputs` y deben cumplir simultáneamente:
+Los fees se calculan como `prevouts - outputs`. La tasa usa el tamaño firmado P2PKH proyectado —100 bytes de script de desbloqueo por input— y el resultado firmado se vuelve a verificar contra ese tamaño y los mismos inputs/outputs. Deben cumplirse simultáneamente:
 
 - mínimo 1 sat/byte;
 - máximo 10 sat/byte;

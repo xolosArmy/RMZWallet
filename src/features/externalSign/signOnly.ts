@@ -1,4 +1,4 @@
-import { Address, Script, Tx, TxBuilder, fromHex } from 'ecash-lib'
+import { Address, Script, Tx, TxBuilder, fromHex, toHex, toHexRev } from 'ecash-lib'
 import type { WalletSignatory } from '../../services/XolosWalletService'
 import { ExternalSignError, type ExternalSignWireRequestV1 } from './contract'
 import type { ExternalSignTxReviewV1 } from './review'
@@ -45,6 +45,24 @@ export function signExternalTransactionOnly(
     builder.inputs[index].signatory = signer.signatory
   }
   const signedTxHex = builder.sign().toHex()
+  const signedTx = Tx.fromHex(signedTxHex)
+  if (
+    signedTx.serSize().toString(10) !== review.serializedSizeBytes ||
+    signedTx.version.toString(10) !== review.version ||
+    signedTx.locktime.toString(10) !== review.lockTime ||
+    signedTx.inputs.length !== review.inputs.length ||
+    signedTx.outputs.length !== review.outputs.length ||
+    signedTx.inputs.some((input, index) => {
+      const txid = typeof input.prevOut.txid === 'string' ? input.prevOut.txid : toHexRev(input.prevOut.txid)
+      return txid.toLowerCase() !== review.inputs[index].txid || input.prevOut.outIdx.toString(10) !== review.inputs[index].vout
+    }) ||
+    signedTx.outputs.some((output, index) => (
+      output.sats.toString(10) !== review.outputs[index].sats ||
+      toHex(output.script.bytecode).toLowerCase() !== review.outputs[index].outputScript
+    ))
+  ) {
+    throw new ExternalSignError('SIGNED_TX_MISMATCH')
+  }
   return Object.freeze({
     protocolId: request.protocolId,
     protocolVersion: request.protocolVersion,

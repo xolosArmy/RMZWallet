@@ -330,7 +330,7 @@ function ExternalSign() {
             <p><strong>Total outputs:</strong> {prepared.review.outputTotalSats} sats</p>
             <p><strong>Fee:</strong> {prepared.review.feeSats} sats ({xecFromSats(prepared.review.feeSats)})</p>
             <p><strong>Fee rate:</strong> {prepared.review.feeRateSatsPerByte} sat/byte</p>
-            <p><strong>Tamaño:</strong> {prepared.review.serializedSizeBytes} bytes</p>
+            <p><strong>Tamaño firmado proyectado:</strong> {prepared.review.serializedSizeBytes} bytes</p>
             <p><strong>Tokens:</strong> ninguno</p>
             <p><strong>OP_RETURN:</strong> ninguno</p>
             <p style={{ wordBreak: 'break-all' }}><strong>contentHash:</strong> {prepared.contentHash}</p>
