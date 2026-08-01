@@ -19,7 +19,7 @@ import MemoTx from './routes/MemoTx'
 import SendNft from './routes/SendNft'
 import ConnectRequest from './routes/ConnectRequest'
 import WalletConnect from './routes/WalletConnect'
-import ExternalSign from './routes/ExternalSign'
+import ExternalSignDisabled from './routes/ExternalSign'
 import CreateVault from './routes/multisig/CreateVault'
 import VaultDashboard from './routes/multisig/VaultDashboard'
 import CreateProposal from './routes/multisig/CreateProposal'
@@ -64,7 +64,7 @@ function App() {
           <Route path="/connect/sign-message" element={<ConnectRequest />} />
           <Route path="/walletconnect" element={<WalletConnect />} />
           <Route path="/more" element={<More />} />
-          <Route path="/external-sign" element={<ExternalSign />} />
+          <Route path="/external-sign" element={<ExternalSignDisabled />} />
           <Route path="/multisig" element={<VaultDashboard />} />
           <Route path="/multisig/create" element={<CreateVault />} />
           <Route path="/multisig/:vaultId/propose" element={<CreateProposal />} />
