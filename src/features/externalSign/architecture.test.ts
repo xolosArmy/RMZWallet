@@ -1,62 +1,59 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, test } from 'vitest'
+import { UNIVERSAL_STATE_TRANSITIONS } from './core'
+import { REGISTERED_PRODUCT_AUTHORIZATION_PROFILES } from './profileRegistry'
 
 const source = (relativePath: string) => readFileSync(
   fileURLToPath(new URL(relativePath, import.meta.url)),
   'utf8'
 )
 
-describe('external-sign P0 architectural boundaries', () => {
-  test('the signer cannot import Chronik or reach broadcast', () => {
-    const signer = source('./signOnly.ts')
-    expect(signer).not.toMatch(/Chronik|getChronik|broadcastTx|broadcastTxs/)
-    expect(signer).toContain('builder.sign()')
+describe('universal authorization architectural boundaries', () => {
+  test('the lifecycle graph contains only explicit transitions', () => {
+    expect(UNIVERSAL_STATE_TRANSITIONS).toEqual({
+      disabled: ['receiving', 'expired', 'aborted', 'failed'],
+      receiving: ['preparing', 'expired', 'aborted', 'failed'],
+      preparing: ['reviewReady', 'expired', 'aborted', 'failed'],
+      reviewReady: ['approving', 'rejected', 'expired', 'aborted', 'failed'],
+      approving: ['revalidating', 'rejected', 'expired', 'aborted', 'failed'],
+      revalidating: ['signing', 'rejected', 'expired', 'aborted', 'failed'],
+      signing: ['completed', 'expired', 'aborted', 'failed'],
+      completed: [],
+      rejected: [],
+      expired: [],
+      aborted: [],
+      failed: []
+    })
   })
 
-  test('the finalizer revalidates and consumes before invoking the signer', () => {
-    const session = source('./session.ts')
-    const reviewIndex = session.indexOf('await dependencies.reviewAgain()')
-    const hashIndex = session.indexOf('await calculateExternalSignContentHash')
-    const consumeIndex = session.indexOf('await capability.consume')
-    const signerIndex = session.indexOf('return signExternalTransactionOnly')
-    expect(reviewIndex).toBeGreaterThan(-1)
-    expect(hashIndex).toBeGreaterThan(reviewIndex)
-    expect(consumeIndex).toBeGreaterThan(hashIndex)
-    expect(signerIndex).toBeGreaterThan(consumeIndex)
+  test('runtime core has no protocol, wallet, indexer, or transmission dependency', () => {
+    const runtime = [
+      './adapters.ts',
+      './approval.ts',
+      './contentHash.ts',
+      './contract.ts',
+      './core.ts',
+      './lock.ts',
+      './profileRegistry.ts'
+    ].map(source).join('\n')
+    expect(runtime).not.toMatch(/Chronik|getChronik|XolosWalletService|ecash-lib/)
+    expect(runtime).not.toMatch(/broadcastTx|broadcastTxs|sign-and-broadcast/)
+    expect(runtime).not.toMatch(/P2PKH|P2SH|\bALP\b|\bSLP\b|\bNFT\b|OP_RETURN/)
   })
 
-  test('the route signs only from the explicit approval handler', () => {
+  test('production route is statically disabled and exposes no approval handler', () => {
+    const app = source('../../App.tsx')
     const route = source('../../routes/ExternalSign.tsx')
-    expect(route).not.toContain('signExternalRequest')
-    expect(route).toContain("onClick={() => void approveAndSign()}")
-    expect(route).not.toMatch(/broadcastTx|broadcastTxs/)
-  })
-
-  test('approval capability has no persistence or logging dependency', () => {
-    const approval = source('./approval.ts')
-    expect(approval).not.toMatch(/sessionStorage|localStorage|indexedDB|console\./)
-    expect(approval).toContain("private currentState: ExternalSignApprovalState = 'fresh'")
-  })
-
-  test('production configuration is disabled and has an empty allowlist', () => {
     const environment = source('../../../.env.example')
+    expect(app).toContain('<Route path="/external-sign" element={<ExternalSignDisabled />} />')
+    expect(route).toContain('EXTERNAL_SIGN_DISABLED')
+    expect(route).not.toMatch(/onClick|approve|signApprovedContent/)
     expect(environment).toContain('VITE_EXTERNAL_SIGN_P0_ENABLED=false')
     expect(environment).toContain('VITE_EXTERNAL_SIGN_ALLOWED_ORIGINS=\n')
   })
 
-  test('external-sign modules do not log raw or signed transaction data', () => {
-    for (const file of [
-      './approval.ts',
-      './contentHash.ts',
-      './contract.ts',
-      './origin.ts',
-      './replayStore.ts',
-      './review.ts',
-      './session.ts',
-      './signOnly.ts'
-    ]) {
-      expect(source(file)).not.toMatch(/console\.(log|info|warn|error)/)
-    }
+  test('no product authorization profile is registered', () => {
+    expect(REGISTERED_PRODUCT_AUTHORIZATION_PROFILES).toEqual([])
   })
 })

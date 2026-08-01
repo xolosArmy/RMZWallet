@@ -1,8 +1,5 @@
 import { describe, expect, test, vi } from 'vitest'
-import {
-  EXTERNAL_SIGN_REQUEST_STORAGE_KEY,
-  EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY
-} from '../features/externalSign/contract'
+import { EXTERNAL_SIGN_REQUEST_STORAGE_KEY, EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY } from '../utils/externalSign'
 import { TONALLI_PENDING_REQUEST_KEY } from '../utils/tonalliConnect'
 import { resolvePendingTonalliResume } from './useResumePendingTonalliRequest'
 
@@ -37,7 +34,7 @@ describe('resolvePendingTonalliResume', () => {
     expect(localStorageRef.removeItem).not.toHaveBeenCalled()
   })
 
-  test('resumes the versioned external-sign onboarding request', () => {
+  test('resumes external sign requests without changing storage key names', () => {
     const sessionStorageRef = createStorage({
       [EXTERNAL_SIGN_REQUEST_STORAGE_KEY]: '{"unsignedTxHex":"00"}',
       [EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY]: '/external-sign?flow=pledge'
@@ -52,8 +49,8 @@ describe('resolvePendingTonalliResume', () => {
       sessionStorageRef
     })
 
-    expect(EXTERNAL_SIGN_REQUEST_STORAGE_KEY).toBe('tonalli_external_sign_request_v1')
-    expect(EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY).toBe('tonalli_external_sign_return_to_v1')
+    expect(EXTERNAL_SIGN_REQUEST_STORAGE_KEY).toBe('rmz_external_sign_request')
+    expect(EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY).toBe('rmz_external_sign_return_to')
     expect(result).toEqual({ target: '/external-sign?flow=pledge', type: 'external-sign' })
     expect(sessionStorageRef.removeItem).toHaveBeenCalledWith(EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY)
   })
