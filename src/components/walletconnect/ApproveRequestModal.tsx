@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import type { PendingRequest, PendingRequestStatus } from '../../lib/walletconnect/WcWallet'
+import {
+  isRawTxPreviewApprovalReady,
+  type PendingRequest,
+  type PendingRequestStatus
+} from '../../lib/walletconnect/WcWallet'
 import { xolosWalletService } from '../../services/XolosWalletService'
 
 type ApproveRequestModalProps = {
@@ -73,6 +77,8 @@ export default function ApproveRequestModal({
   const verifyWarning = request.verifyContext?.warning
   const verifyBlocked = Boolean(request.verifyContext?.isScam || request.verifyContext?.validation === 'INVALID')
   const txPreview = request.rawTxPreview
+  const hasRawHex = Boolean(params.rawHex)
+  const rawTxPreviewBlocked = hasRawHex && !isRawTxPreviewApprovalReady(request)
   const keyInfo = xolosWalletService.getKeyInfo()
   const walletAddress = keyInfo.xecAddress ?? keyInfo.address ?? params.address
   const dialogLabel = isSignMessage ? 'Firmar mensaje' : 'Ritual de Compra'
@@ -241,22 +247,35 @@ export default function ApproveRequestModal({
               <span className="muted">{params.rawHex.slice(0, 32)}...</span>
             </SectionRow>
           )}
-          {!isSignMessage && txPreview && (
+          {!isSignMessage && hasRawHex && (
             <SectionRow label="Resumen tx">
               <div style={{ display: 'grid', gap: 6 }}>
-                <span className="muted">
-                  {txPreview.inputs} inputs / {txPreview.outputs} outputs / {txPreview.bytes} bytes
-                </span>
-                <span className="muted">
-                  Total outputs: {txPreview.totalOutputXec} XEC ({txPreview.totalOutputSats} sats)
-                </span>
-                {txPreview.feeXec && <span className="muted">Fee aprox: {txPreview.feeXec} XEC</span>}
-                {txPreview.outputSummary.map((output, idx) => (
-                  <span key={`${output.script}-${idx}`} className="muted">
-                    Output {idx + 1}: {output.xec} XEC ({output.script}...)
+                {request.rawTxPreviewStatus === 'loading' ? (
+                  <span className="muted">Calculando resumen…</span>
+                ) : request.rawTxPreviewStatus === 'error' ? (
+                  <span className="error">
+                    {txPreview?.summaryError || 'No se puede aprobar sin un resumen válido'}
                   </span>
-                ))}
-                {txPreview.summaryError && <span className="error">{txPreview.summaryError}</span>}
+                ) : txPreview?.summaryError ? (
+                  <span className="error">{txPreview.summaryError}</span>
+                ) : txPreview && request.rawTxPreviewStatus === 'ready' && !txPreview.summaryError ? (
+                  <>
+                    <span className="muted">
+                      {txPreview.inputs} inputs / {txPreview.outputs} outputs / {txPreview.bytes} bytes
+                    </span>
+                    <span className="muted">
+                      Total outputs: {txPreview.totalOutputXec} XEC ({txPreview.totalOutputSats} sats)
+                    </span>
+                    {txPreview.feeXec && <span className="muted">Fee aprox: {txPreview.feeXec} XEC</span>}
+                    {txPreview.outputSummary.map((output, idx) => (
+                      <span key={`${output.script}-${idx}`} className="muted">
+                        Output {idx + 1}: {output.xec} XEC ({output.script}...)
+                      </span>
+                    ))}
+                  </>
+                ) : (
+                  <span className="error">No se puede aprobar sin un resumen válido</span>
+                )}
               </div>
             </SectionRow>
           )}
@@ -286,7 +305,7 @@ export default function ApproveRequestModal({
               className="cta"
               type="button"
               onClick={onApproved}
-              disabled={busy || isExpired || verifyBlocked}
+              disabled={busy || isExpired || verifyBlocked || rawTxPreviewBlocked}
               style={{
                 background: 'linear-gradient(120deg, rgba(249, 115, 22, 0.95), rgba(245, 158, 11, 0.95))',
                 boxShadow: '0 0 14px rgba(249, 115, 22, 0.4)',

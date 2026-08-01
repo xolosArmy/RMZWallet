@@ -155,6 +155,12 @@ export type RawTxPreview = {
   summaryError?: string
 }
 
+export type RawTxPreviewStatus = 'idle' | 'loading' | 'ready' | 'error'
+
+export type RawHexAnalysis =
+  | { status: 'SIGNED' | 'UNSIGNED'; tx: Tx; normalizedRawHex: string }
+  | { status: 'UNPARSEABLE'; tx: null; normalizedRawHex: string }
+
 export type PeerVerifyContext = {
   warning: string | null
   host: string | null
@@ -228,6 +234,14 @@ export type PendingRequest = {
   }
   verifyContext?: PeerVerifyContext
   rawTxPreview?: RawTxPreview
+  rawTxPreviewStatus: RawTxPreviewStatus
+}
+
+export function isRawTxPreviewApprovalReady(request: PendingRequest): boolean {
+  if (!request.params.rawHex) return true
+  return request.rawTxPreviewStatus === 'ready' &&
+    Boolean(request.rawTxPreview) &&
+    !request.rawTxPreview?.summaryError
 }
 
 export type OfferPublishedPayload = {
@@ -314,6 +328,9 @@ export class WcWallet {
   private pendingExpiryTimer: number | null = null
   private pendingQueue: SessionRequestPayload[] = []
   private handlersRegistered = false
+  private rawTxPreviewGeneration = 0
+  private activeRawTxPreviewKey: string | null = null
+  private activeRawHexAnalysis: (RawHexAnalysis & { requestKey: string; generation: number }) | null = null
 
   private constructor() {}
 
@@ -332,6 +349,7 @@ export class WcWallet {
 
   private resetPendingState() {
     this.clearPendingExpiryTimer()
+    this.invalidateRawTxPreview()
     this.pendingQueue = []
     this.setState({
       sessions: [],
@@ -472,6 +490,22 @@ export class WcWallet {
     this.pendingExpiryTimer = window.setTimeout(() => {
       void this.expirePendingRequest()
     }, delayMs)
+  }
+
+  private pendingRequestKey(request: Pick<PendingRequest, 'topic' | 'id'>): string {
+    return `${request.topic}:${request.id}`
+  }
+
+  private invalidateRawTxPreview() {
+    this.rawTxPreviewGeneration += 1
+    this.activeRawTxPreviewKey = null
+    this.activeRawHexAnalysis = null
+  }
+
+  private beginRawTxPreview(requestKey: string): number {
+    this.invalidateRawTxPreview()
+    this.activeRawTxPreviewKey = requestKey
+    return this.rawTxPreviewGeneration
   }
 
   private getChainForSession(session: SessionTypes.Struct): string {
@@ -918,24 +952,60 @@ export class WcWallet {
     }
   }
 
-  private isUnsignedRawHex(rawHex: string): boolean {
+  private classifyRawHex(rawHex: string): RawHexAnalysis {
     const normalizedRawHex = rawHex.trim()
-    if (!isHexString(normalizedRawHex)) return false
+    if (!normalizedRawHex || !isHexString(normalizedRawHex)) {
+      return { status: 'UNPARSEABLE', tx: null, normalizedRawHex }
+    }
     try {
       const parsedTx = Tx.fromHex(normalizedRawHex)
-      return parsedTx.inputs.some((input) => (input.script?.bytecode.length ?? 0) === 0)
+      return {
+        status: parsedTx.inputs.some((input) => (input.script?.bytecode.length ?? 0) === 0)
+          ? 'UNSIGNED'
+          : 'SIGNED',
+        tx: parsedTx,
+        normalizedRawHex
+      }
     } catch {
-      return false
+      return { status: 'UNPARSEABLE', tx: null, normalizedRawHex }
     }
   }
 
-  private deriveOutputsFromRawHex(rawHex: string): Array<{ address: string; valueSats: number }> {
-    const normalizedRawHex = rawHex.trim()
-    if (!isHexString(normalizedRawHex)) {
-      throw new Error('rawHex inválido')
+  private getRawHexAnalysis(request: PendingRequest): RawHexAnalysis {
+    const requestKey = this.pendingRequestKey(request)
+    const normalizedRawHex = request.params.rawHex?.trim() ?? ''
+    const cached = this.activeRawHexAnalysis
+    if (
+      cached &&
+      cached.requestKey === requestKey &&
+      cached.generation === this.rawTxPreviewGeneration &&
+      cached.normalizedRawHex === normalizedRawHex
+    ) {
+      return cached
     }
-    const parsedTx = Tx.fromHex(normalizedRawHex)
-    const outputs = parsedTx.outputs.map((output, index) => {
+    const analysis = this.classifyRawHex(normalizedRawHex)
+    if (this.activeRawTxPreviewKey === requestKey) {
+      this.activeRawHexAnalysis = {
+        ...analysis,
+        requestKey,
+        generation: this.rawTxPreviewGeneration
+      }
+    }
+    return analysis
+  }
+
+  private deriveOutputsFromRawHex(
+    rawHex: string,
+    parsedTx?: Tx
+  ): Array<{ address: string; valueSats: number }> {
+    const normalizedRawHex = rawHex.trim()
+    const analysis = parsedTx
+      ? { status: 'UNSIGNED' as const, tx: parsedTx, normalizedRawHex }
+      : this.classifyRawHex(normalizedRawHex)
+    if (analysis.status === 'UNPARSEABLE') {
+      throw new Error('No se pudo analizar la transacción rawHex localmente.')
+    }
+    const outputs = analysis.tx.outputs.map((output, index) => {
       const sats = typeof output.sats === 'bigint' ? Number(output.sats) : Number(output.sats)
       if (!Number.isSafeInteger(sats) || sats <= 0) {
         throw new Error(`No se pudo reconstruir output ${index}: sats inválidos`)
@@ -1008,19 +1078,18 @@ export class WcWallet {
     }
   }
 
-  private async signAndBroadcastRawHex(rawHex: string): Promise<{ txid: string }> {
+  private async signAndBroadcastRawHex(
+    rawHex: string,
+    existingAnalysis?: RawHexAnalysis
+  ): Promise<{ txid: string }> {
     const normalizedRawHex = rawHex.trim()
-    if (!isHexString(normalizedRawHex)) {
-      throw new Error('rawHex inválido')
+    const analysis = existingAnalysis?.normalizedRawHex === normalizedRawHex
+      ? existingAnalysis
+      : this.classifyRawHex(normalizedRawHex)
+    if (analysis.status === 'UNPARSEABLE') {
+      throw new Error('No se pudo analizar la transacción rawHex localmente.')
     }
-
-    let parsedTx: Tx
-    try {
-      parsedTx = Tx.fromHex(normalizedRawHex)
-    } catch {
-      await getChronik().validateRawTx(normalizedRawHex)
-      return getChronik().broadcastTx(normalizedRawHex)
-    }
+    const parsedTx = analysis.tx
     const unsignedInputs = parsedTx.inputs
       .map((input, idx) => ({ input, idx }))
       .filter(({ input }) => (input.script?.bytecode.length ?? 0) === 0)
@@ -1295,19 +1364,19 @@ export class WcWallet {
   }
 
   private async activatePendingRequest(payload: SessionRequestPayload) {
+    const requestKey = this.pendingRequestKey(payload)
+    let previewGeneration: number
+    if (payload.params.rawHex) {
+      previewGeneration = this.beginRawTxPreview(requestKey)
+    } else {
+      this.invalidateRawTxPreview()
+      previewGeneration = this.rawTxPreviewGeneration
+    }
     const request: PendingRequest = {
       ...payload,
       createdAt: payload.createdAt,
-      rawTxPreview: payload.params.rawHex
-        ? {
-            bytes: Math.floor(payload.params.rawHex.length / 2),
-            inputs: 0,
-            outputs: 0,
-            totalOutputSats: '0',
-            totalOutputXec: '0.00',
-            outputSummary: []
-          }
-        : undefined
+      rawTxPreview: undefined,
+      rawTxPreviewStatus: payload.params.rawHex ? 'loading' : 'idle'
     }
 
     this.setState({
@@ -1321,20 +1390,37 @@ export class WcWallet {
     this.schedulePendingExpiry(payload.expiresAt)
 
     if (request.params.rawHex) {
-      const preview = await this.buildRawTxPreview(request.params.rawHex)
+      const analysis = this.classifyRawHex(request.params.rawHex)
+      if (
+        this.activeRawTxPreviewKey === requestKey &&
+        this.rawTxPreviewGeneration === previewGeneration
+      ) {
+        this.activeRawHexAnalysis = {
+          ...analysis,
+          requestKey,
+          generation: previewGeneration
+        }
+      }
+      const preview = await this.buildRawTxPreview(request.params.rawHex, analysis)
       const active = this.state.pendingRequest
-      if (active && active.id === request.id && active.topic === request.topic) {
+      if (
+        active &&
+        this.pendingRequestKey(active) === requestKey &&
+        this.activeRawTxPreviewKey === requestKey &&
+        this.rawTxPreviewGeneration === previewGeneration
+      ) {
         this.setState({
           pendingRequest: {
             ...active,
-            rawTxPreview: preview
+            rawTxPreview: preview,
+            rawTxPreviewStatus: preview.summaryError ? 'error' : 'ready'
           }
         })
       }
     }
   }
 
-  private async buildRawTxPreview(rawHex: string): Promise<RawTxPreview> {
+  private async buildRawTxPreview(rawHex: string, existingAnalysis?: RawHexAnalysis): Promise<RawTxPreview> {
     const normalized = rawHex.trim()
     const fallback: RawTxPreview = {
       bytes: Math.floor(normalized.length / 2),
@@ -1345,10 +1431,11 @@ export class WcWallet {
       outputSummary: []
     }
 
-    if (!normalized || !isHexString(normalized)) {
+    const analysis = existingAnalysis ?? this.classifyRawHex(normalized)
+    if (analysis.status === 'UNPARSEABLE') {
       return {
         ...fallback,
-        summaryError: 'rawHex inválido'
+        summaryError: 'No se pudo analizar la transacción rawHex localmente.'
       }
     }
 
@@ -1996,6 +2083,33 @@ export class WcWallet {
       return
     }
 
+    if (pending.params.rawHex && !isRawTxPreviewApprovalReady(pending)) {
+      const message = 'No se puede aprobar sin un resumen válido.'
+      this.invalidateRawTxPreview()
+      this.setState({
+        pendingRequest: {
+          ...pending,
+          rawTxPreviewStatus: 'error'
+        },
+        pendingRequestBusy: false,
+        pendingRequestError: message,
+        pendingRequestResolved: true,
+        pendingRequestTxid: null,
+        pendingRequestStatus: 'error'
+      })
+      await this.respondError(pending.topic, pending.id, { code: 4001, message })
+      appendWcRequestHistory({
+        offerId: pending.params.offerId ?? '',
+        peer: pending.peer?.name ?? pending.peer?.url ?? 'unknown',
+        topic: pending.topic,
+        status: 'error',
+        error: message,
+        createdAt: pending.createdAt,
+        method: pending.method
+      })
+      return
+    }
+
     this.setState({ pendingRequestBusy: true, pendingRequestError: null, pendingRequestStatus: 'signing' })
 
     if (pending.verifyContext && (pending.verifyContext.isScam || pending.verifyContext.validation === 'INVALID')) {
@@ -2121,30 +2235,38 @@ export class WcWallet {
       } else if (mode === 'tx' && pending.params.rawHex) {
         console.info('[WC] tx rawHex flow')
         this.setState({ pendingRequestStatus: 'broadcasting' })
-        if (this.isUnsignedRawHex(pending.params.rawHex)) {
+        const analysis = this.getRawHexAnalysis(pending)
+        if (analysis.status === 'UNPARSEABLE') {
+          throw new Error('No se pudo analizar la transacción rawHex localmente.')
+        }
+        if (analysis.status === 'UNSIGNED') {
           const outputsForRebuild =
             pending.params.outputs && pending.params.outputs.length > 0
               ? pending.params.outputs
-              : this.deriveOutputsFromRawHex(pending.params.rawHex)
+              : this.deriveOutputsFromRawHex(pending.params.rawHex, analysis.tx)
           const broadcast = await this.buildSignBroadcastFromOutputs(outputsForRebuild, pending.params.message)
           txid = broadcast.txid
         } else {
-          const broadcast = await this.signAndBroadcastRawHex(pending.params.rawHex)
+          const broadcast = await this.signAndBroadcastRawHex(pending.params.rawHex, analysis)
           txid = broadcast.txid
         }
       } else {
         if (pending.params.rawHex) {
           console.info('[WC] legacy rawHex flow')
           this.setState({ pendingRequestStatus: 'broadcasting' })
-          if (this.isUnsignedRawHex(pending.params.rawHex)) {
+          const analysis = this.getRawHexAnalysis(pending)
+          if (analysis.status === 'UNPARSEABLE') {
+            throw new Error('No se pudo analizar la transacción rawHex localmente.')
+          }
+          if (analysis.status === 'UNSIGNED') {
             const outputsForRebuild =
               pending.params.outputs && pending.params.outputs.length > 0
                 ? pending.params.outputs
-                : this.deriveOutputsFromRawHex(pending.params.rawHex)
+                : this.deriveOutputsFromRawHex(pending.params.rawHex, analysis.tx)
             const broadcast = await this.buildSignBroadcastFromOutputs(outputsForRebuild, pending.params.message)
             txid = broadcast.txid
           } else {
-            const broadcast = await this.signAndBroadcastRawHex(pending.params.rawHex)
+            const broadcast = await this.signAndBroadcastRawHex(pending.params.rawHex, analysis)
             txid = broadcast.txid
           }
         } else if (pending.params.outputs?.length) {
@@ -2256,6 +2378,7 @@ export class WcWallet {
       return
     }
     if (this.state.pendingRequestResolved) {
+      this.invalidateRawTxPreview()
       this.setState({
         pendingRequest: null,
         pendingRequestError: null,
@@ -2269,6 +2392,7 @@ export class WcWallet {
       return
     }
 
+    this.invalidateRawTxPreview()
     await this.respondError(pending.topic, pending.id, this.normalizeJsonRpcError('user'))
     this.setState({
       pendingRequest: null,
@@ -2298,8 +2422,12 @@ export class WcWallet {
     const pending = this.state.pendingRequest
     if (!pending || this.state.pendingRequestResolved) return
 
+    this.invalidateRawTxPreview()
     await this.respondError(pending.topic, pending.id, this.normalizeJsonRpcError('expired'))
     this.setState({
+      pendingRequest: pending.params.rawHex
+        ? { ...pending, rawTxPreviewStatus: 'error' }
+        : pending,
       pendingRequestError: 'Request expired',
       pendingRequestBusy: false,
       pendingRequestResolved: true,
