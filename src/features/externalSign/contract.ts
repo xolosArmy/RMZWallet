@@ -9,7 +9,7 @@ export type UniversalAuthorizationEnvelopeV1 = Readonly<{
   issuedAt: number
   expiresAt: number
   requester: Readonly<{
-    origin: string
+    declaredOrigin: string
     displayName: string
   }>
 }>
@@ -33,7 +33,7 @@ const ROOT_KEYS = new Set([
   'expiresAt',
   'requester'
 ])
-const REQUESTER_KEYS = new Set(['origin', 'displayName'])
+const REQUESTER_KEYS = new Set(['declaredOrigin', 'displayName'])
 const OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const PROFILE_ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/
 
@@ -165,19 +165,19 @@ const normalizedText = (value: unknown, code: string, maximumBytes: number): str
   return normalized
 }
 
-const normalizedOrigin = (value: unknown): string => {
-  const normalized = normalizedText(value, 'INVALID_REQUESTER_ORIGIN', 2048)
+const normalizedDeclaredOrigin = (value: unknown): string => {
+  const normalized = normalizedText(value, 'INVALID_DECLARED_ORIGIN', 2048)
   let parsed: URL
   try {
     parsed = new URL(normalized)
   } catch {
-    throw new UniversalAuthorizationError('INVALID_REQUESTER_ORIGIN')
+    throw new UniversalAuthorizationError('INVALID_DECLARED_ORIGIN')
   }
   const localHttp = parsed.protocol === 'http:' && (
     parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1'
   )
   if (parsed.origin !== normalized || (parsed.protocol !== 'https:' && !localHttp)) {
-    throw new UniversalAuthorizationError('INVALID_REQUESTER_ORIGIN')
+    throw new UniversalAuthorizationError('INVALID_DECLARED_ORIGIN')
   }
   return parsed.origin
 }
@@ -218,7 +218,7 @@ export function parseUniversalAuthorizationEnvelope(
     issuedAt,
     expiresAt,
     requester: Object.freeze({
-      origin: normalizedOrigin(requester.origin),
+      declaredOrigin: normalizedDeclaredOrigin(requester.declaredOrigin),
       displayName: normalizedText(requester.displayName, 'INVALID_REQUESTER_NAME', 256)
     })
   })

@@ -13,6 +13,7 @@ import {
   type UniversalContentHash
 } from './contentHash'
 import {
+  parseUniversalAuthorizationEnvelope,
   UniversalAuthorizationError,
   type UniversalAuthorizationEnvelopeV1
 } from './contract'
@@ -44,7 +45,7 @@ export const UNIVERSAL_STATE_TRANSITIONS = Object.freeze({
   reviewReady: ['approving', 'rejected', 'expired', 'aborted', 'failed'] as const,
   approving: ['revalidating', 'rejected', 'expired', 'aborted', 'failed'] as const,
   revalidating: ['signing', 'rejected', 'expired', 'aborted', 'failed'] as const,
-  signing: ['completed', 'expired', 'aborted', 'failed'] as const,
+  signing: ['completed', 'failed'] as const,
   completed: [] as const,
   rejected: [] as const,
   expired: [] as const,
@@ -176,18 +177,18 @@ export class UniversalAuthorizationCore {
   }
 
   start(
-    envelope: UniversalAuthorizationEnvelopeV1,
+    envelope: unknown,
     adapter: UniversalAuthorizationAdapter
   ): UniversalOperationHandle {
     if (!this.dependencies.enabled) throw new UniversalAuthorizationError('AUTHORIZATION_DISABLED')
     if (this.active) throw new UniversalAuthorizationError('OPERATION_ALREADY_ACTIVE')
-    if (envelope.profileId !== adapter.profileId) {
+    const validatedEnvelope = parseUniversalAuthorizationEnvelope(envelope, this.now())
+    if (validatedEnvelope.profileId !== adapter.profileId) {
       throw new UniversalAuthorizationError('PROFILE_MISMATCH')
     }
-    if (this.now() >= envelope.expiresAt) throw new UniversalAuthorizationError('REQUEST_EXPIRED')
 
     const context: OperationContext = {
-      envelope,
+      envelope: validatedEnvelope,
       adapter,
       controller: new AbortController(),
       ready: deferred<PreparedUniversalAuthorization>(),
@@ -205,12 +206,12 @@ export class UniversalAuthorizationCore {
     this.active = context
     context.expiryTimer = setTimeout(
       () => this.expire(context),
-      Math.max(0, envelope.expiresAt - this.now())
+      Math.max(0, validatedEnvelope.expiresAt - this.now())
     )
     void this.prepare(context)
 
     return Object.freeze({
-      operationId: envelope.operationId,
+      operationId: validatedEnvelope.operationId,
       ready: context.ready.promise,
       approve: () => this.approve(context),
       reject: () => this.reject(context),
@@ -222,7 +223,7 @@ export class UniversalAuthorizationCore {
   }
 
   replace(
-    envelope: UniversalAuthorizationEnvelopeV1,
+    envelope: unknown,
     adapter: UniversalAuthorizationAdapter
   ): UniversalOperationHandle {
     if (this.active) this.abort(this.active)
@@ -334,30 +335,23 @@ export class UniversalAuthorizationCore {
       this.transition(context, 'revalidating', 'signing')
       if (context.signInvoked) throw new UniversalAuthorizationError('SIGN_ALREADY_INVOKED')
       context.signInvoked = true
-      const signedResult = await this.awaitWithAbort(
-        context.adapter.signApprovedContent(Object.freeze({
-          envelope: context.envelope,
-          effectiveContent: new Uint8Array(safeFinalReview.effectiveContent),
-          contentHash: finalHash,
-          signal: context.controller.signal
-        })),
-        context.controller.signal
-      )
-      this.assertContinuation(context, 'signing')
+      const signedResult = await context.adapter.signApprovedContent(Object.freeze({
+        envelope: context.envelope,
+        effectiveContent: new Uint8Array(safeFinalReview.effectiveContent),
+        contentHash: finalHash,
+        signal: context.controller.signal
+      }))
+      this.assertSigningCompletion(context)
       if (!equalUniversalContentHashes(signedResult.contentHash, finalHash)) {
         throw new UniversalAuthorizationError('SIGNED_RESULT_HASH_MISMATCH')
       }
-      await this.awaitWithAbort(
-        context.adapter.deliverSignedResult(
-          context.envelope,
-          signedResult,
-          context.controller.signal
-        ),
-        context.controller.signal
-      )
-      this.assertContinuation(context, 'signing')
+      const safeSignedResult = Object.freeze({
+        format: signedResult.format,
+        bytes: new Uint8Array(signedResult.bytes),
+        contentHash: signedResult.contentHash
+      })
       this.enterTerminal(context, 'completed')
-      return signedResult
+      return safeSignedResult
     } catch (error) {
       this.failUnlessFinalized(context, error)
       throw error
@@ -396,19 +390,50 @@ export class UniversalAuthorizationCore {
     }
   }
 
+  private assertSigningCompletion(context: OperationContext): void {
+    if (
+      this.active !== context ||
+      this.active.envelope.operationId !== context.envelope.operationId
+    ) throw new UniversalAuthorizationError('OPERATION_OWNERSHIP_LOST')
+    if (context.state !== 'signing') throw new UniversalAuthorizationError('UNEXPECTED_OPERATION_STATE')
+    if (
+      !context.lease ||
+      context.lease.ownerOperationId !== context.envelope.operationId ||
+      !context.lease.isOwned()
+    ) throw new UniversalAuthorizationError('LEASE_NOT_OWNED')
+  }
+
   private reject(context: OperationContext): void {
     if (context.finalized) return
+    if (context.state === 'signing') {
+      this.signalSigningCancellation(context, 'OPERATION_REJECTED_AFTER_SIGNING')
+      return
+    }
     this.enterTerminal(context, 'rejected')
   }
 
   private abort(context: OperationContext): void {
     if (context.finalized) return
+    if (context.state === 'signing') {
+      this.signalSigningCancellation(context, 'OPERATION_ABORTED_AFTER_SIGNING')
+      return
+    }
     this.enterTerminal(context, 'aborted')
   }
 
   private expire(context: OperationContext): void {
     if (context.finalized || this.now() < context.envelope.expiresAt) return
+    if (context.state === 'signing') {
+      this.signalSigningCancellation(context, 'OPERATION_EXPIRED_AFTER_SIGNING')
+      return
+    }
     this.enterTerminal(context, 'expired')
+  }
+
+  private signalSigningCancellation(context: OperationContext, code: string): void {
+    if (!context.controller.signal.aborted) {
+      context.controller.abort(new UniversalAuthorizationError(code))
+    }
   }
 
   private enterTerminal(
@@ -418,14 +443,16 @@ export class UniversalAuthorizationCore {
   ): void {
     if (context.finalized) return
     if (this.active !== context || this.active.envelope.operationId !== context.envelope.operationId) return
-    const terminal = this.now() >= context.envelope.expiresAt && requestedTerminal !== 'completed'
+    const terminal = context.state !== 'signing' &&
+      this.now() >= context.envelope.expiresAt &&
+      requestedTerminal !== 'completed'
       ? 'expired'
       : requestedTerminal
     const allowed = UNIVERSAL_STATE_TRANSITIONS[context.state] as readonly UniversalAuthorizationState[]
     if (!allowed.includes(terminal)) {
       throw new UniversalAuthorizationError('INVALID_STATE_TRANSITION')
     }
-    if (!context.controller.signal.aborted && context.state !== 'disabled') {
+    if (context.state !== 'disabled') {
       if (
         !context.lease ||
         context.lease.ownerOperationId !== context.envelope.operationId ||
@@ -468,6 +495,10 @@ export class UniversalAuthorizationCore {
 
   private failUnlessFinalized(context: OperationContext, error: unknown): void {
     if (context.finalized) return
+    if (context.state === 'signing') {
+      this.enterTerminal(context, 'failed', error)
+      return
+    }
     if (this.now() >= context.envelope.expiresAt) {
       this.enterTerminal(context, 'expired', error)
       return

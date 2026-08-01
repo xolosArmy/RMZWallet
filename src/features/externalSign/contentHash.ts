@@ -13,7 +13,7 @@ const canonicalEnvelope = (envelope: UniversalAuthorizationEnvelopeV1): string =
   profileId: envelope.profileId,
   requester: {
     displayName: envelope.requester.displayName,
-    origin: envelope.requester.origin
+    declaredOrigin: envelope.requester.declaredOrigin
   },
   schema: envelope.schema,
   version: envelope.version

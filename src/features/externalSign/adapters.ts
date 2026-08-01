@@ -41,16 +41,7 @@ export interface SignApprovedContentAdapter {
   }>): Promise<UniversalSignedResult>
 }
 
-export interface DeliverSignedResultAdapter {
-  deliverSignedResult(
-    envelope: UniversalAuthorizationEnvelopeV1,
-    result: UniversalSignedResult,
-    signal: AbortSignal
-  ): Promise<void>
-}
-
 export type UniversalAuthorizationAdapter = Readonly<{ profileId: string }> &
   PrepareReviewAdapter &
   RevalidateReviewAdapter &
-  SignApprovedContentAdapter &
-  DeliverSignedResultAdapter
+  SignApprovedContentAdapter

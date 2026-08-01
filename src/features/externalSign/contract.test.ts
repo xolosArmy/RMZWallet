@@ -13,7 +13,7 @@ const rawEnvelope = () => ({
   issuedAt: 999,
   expiresAt: 2_000,
   requester: {
-    origin: 'https://fixture.invalid',
+    declaredOrigin: 'https://fixture.invalid',
     displayName: 'Fixture'
   }
 })
@@ -32,6 +32,21 @@ describe('universal envelope and content binding', () => {
     )
     expect(() => parseUniversalAuthorizationEnvelopeJson(duplicated, 1_000))
       .toThrowError('DUPLICATE_JSON_MEMBER')
+  })
+
+  test('declaredOrigin is normalized metadata and the legacy origin field is rejected', () => {
+    const parsed = parseUniversalAuthorizationEnvelope(rawEnvelope(), 1_000)
+    expect(parsed.requester).toEqual({
+      declaredOrigin: 'https://fixture.invalid',
+      displayName: 'Fixture'
+    })
+    expect(() => parseUniversalAuthorizationEnvelope({
+      ...rawEnvelope(),
+      requester: {
+        origin: 'https://fixture.invalid',
+        displayName: 'Fixture'
+      }
+    }, 1_000)).toThrowError('origin')
   })
 
   test('domain-separated hash binds only the universal envelope and effective bytes', async () => {

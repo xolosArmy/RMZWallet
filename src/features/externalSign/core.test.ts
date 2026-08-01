@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type {
   UniversalAuthorizationAdapter,
-  UniversalReviewSnapshot
+  UniversalReviewSnapshot,
+  UniversalSignedResult
 } from './adapters'
 import type {
   ApprovalConsumption,
@@ -38,10 +39,10 @@ const controlled = <T>(): Controlled<T> => {
   return Object.freeze({ promise, resolve: resolvePromise, reject: rejectPromise })
 }
 
-const envelope = (
+const rawEnvelope = (
   operationId = 'operation-a',
   expiresInMs = 10_000
-): UniversalAuthorizationEnvelopeV1 => parseUniversalAuthorizationEnvelope({
+): Record<string, unknown> => ({
   schema: 'tonalli.authorization-envelope',
   version: 1,
   operationId,
@@ -49,10 +50,17 @@ const envelope = (
   issuedAt: Date.now() - 1,
   expiresAt: Date.now() + expiresInMs,
   requester: {
-    origin: 'https://fixture.invalid',
+    declaredOrigin: 'https://fixture.invalid',
     displayName: 'Synthetic fixture'
   }
 })
+
+const envelope = (
+  operationId = 'operation-a',
+  expiresInMs = 10_000
+): UniversalAuthorizationEnvelopeV1 => parseUniversalAuthorizationEnvelope(
+  rawEnvelope(operationId, expiresInMs)
+)
 
 const review = (bytes: readonly number[] = [1, 2, 3]): UniversalReviewSnapshot => Object.freeze({
   fields: Object.freeze([
@@ -128,7 +136,6 @@ type AdapterFunctions = Readonly<{
   prepare?: UniversalAuthorizationAdapter['prepareReview']
   revalidate?: UniversalAuthorizationAdapter['revalidateReview']
   sign?: UniversalAuthorizationAdapter['signApprovedContent']
-  deliver?: UniversalAuthorizationAdapter['deliverSignedResult']
 }>
 
 const syntheticAdapter = (
@@ -154,10 +161,6 @@ const syntheticAdapter = (
       bytes: new Uint8Array([9, ...input.effectiveContent]),
       contentHash: input.contentHash
     })
-  })),
-  deliverSignedResult: vi.fn(functions.deliver ?? (async (_envelope, _result, signal) => {
-    events.push('deliver')
-    if (signal.aborted) throw new UniversalAuthorizationError('OPERATION_ABORTED')
   }))
 })
 
@@ -204,6 +207,67 @@ afterEach(() => {
 })
 
 describe('universal authorization ownership and lifecycle', () => {
+  test('the synthetic adapter exposes only prepare, revalidate, and sign capabilities', () => {
+    const testHarness = harness()
+    expect(Object.keys(testHarness.adapter).sort()).toEqual([
+      'prepareReview',
+      'profileId',
+      'revalidateReview',
+      'signApprovedContent'
+    ])
+  })
+
+  test('start runtime-validates structurally cast envelopes before acquiring a lease', () => {
+    const testHarness = harness()
+    const cast = (value: unknown) => value as UniversalAuthorizationEnvelopeV1
+    const invalidEnvelopes = [
+      { ...rawEnvelope(), schema: 'forged.authorization-envelope' },
+      { ...rawEnvelope(), version: 2 },
+      { ...rawEnvelope(), issuedAt: 'not-a-timestamp' },
+      { ...rawEnvelope(), extra: true },
+      {
+        ...rawEnvelope(),
+        requester: {
+          origin: 'https://fixture.invalid',
+          displayName: 'Legacy cast'
+        }
+      },
+      {
+        ...rawEnvelope(),
+        requester: {
+          declaredOrigin: 'https://fixture.invalid/path',
+          displayName: 'Untrusted path'
+        }
+      }
+    ]
+
+    for (const candidate of invalidEnvelopes) {
+      expect(() => testHarness.core.start(cast(candidate), testHarness.adapter))
+        .toThrowError(UniversalAuthorizationError)
+    }
+    expect(testHarness.lock.acquireCalls).toBe(0)
+  })
+
+  test('start normalizes a cast envelope before exposing it to an adapter', async () => {
+    const testHarness = harness()
+    const candidate = {
+      ...rawEnvelope('operation-normalized'),
+      requester: {
+        declaredOrigin: 'https://fixture.invalid',
+        displayName: 'Cafe\u0301 fixture'
+      }
+    } as unknown as UniversalAuthorizationEnvelopeV1
+
+    const handle = testHarness.core.start(candidate, testHarness.adapter)
+    await handle.ready
+    expect(vi.mocked(testHarness.adapter.prepareReview).mock.calls[0][0].requester)
+      .toEqual({
+        declaredOrigin: 'https://fixture.invalid',
+        displayName: 'Café fixture'
+      })
+    handle.abort()
+  })
+
   test('double approval interaction creates one capability and at most one synthetic signature', async () => {
     const testHarness = harness()
     const handle = testHarness.core.start(envelope(), testHarness.adapter)
@@ -328,10 +392,9 @@ describe('universal authorization ownership and lifecycle', () => {
     await expectRejected(approval)
     await Promise.resolve()
     expect(testHarness.events).not.toContain('sign')
-    expect(testHarness.events).not.toContain('deliver')
   })
 
-  test('the lease remains owned from preparation through delivery and releases after completion', async () => {
+  test('the lease remains owned from preparation through signing and releases after completion', async () => {
     const events: string[] = []
     const lock = new InstrumentedLock(events)
     const ledger = new InstrumentedLedger(events)
@@ -350,10 +413,6 @@ describe('universal authorization ownership and lifecycle', () => {
         expect(lock.leases.get(input.envelope.operationId)?.isOwned()).toBe(true)
         events.push('sign')
         return { format: 'synthetic/bytes', bytes: new Uint8Array([9]), contentHash: input.contentHash }
-      },
-      deliver: async envelopeValue => {
-        expect(lock.leases.get(envelopeValue.operationId)?.isOwned()).toBe(true)
-        events.push('deliver')
       }
     })
     const core = new UniversalAuthorizationCore({ enabled: true, lock, approvalLedger: ledger })
@@ -366,7 +425,6 @@ describe('universal authorization ownership and lifecycle', () => {
       'revalidate',
       'consume:operation-a',
       'sign',
-      'deliver',
       'release:operation-a'
     ])
     expect(lock.leases.get('operation-a')?.isOwned()).toBe(false)
@@ -444,7 +502,106 @@ describe('universal authorization ownership and lifecycle', () => {
     expect(testHarness.adapter.signApprovedContent).toHaveBeenCalledTimes(1)
   })
 
-  test('all negative terminals have zero synthetic signatures', async () => {
+  test('abort after signing starts is cooperative and a later signer resolution completes once', async () => {
+    const signing = controlled<UniversalSignedResult>()
+    let signingInput: Parameters<UniversalAuthorizationAdapter['signApprovedContent']>[0] | undefined
+    const testHarness = harness({
+      sign: input => {
+        signingInput = input
+        return signing.promise
+      }
+    })
+    const handle = testHarness.core.start(envelope(), testHarness.adapter)
+    await handle.ready
+    const approval = handle.approve()
+    await vi.waitFor(() => expect(testHarness.adapter.signApprovedContent).toHaveBeenCalledTimes(1))
+    if (!signingInput) throw new Error('signer input was not captured')
+
+    expect(handle.state()).toBe('signing')
+    handle.abort()
+    expect(handle.state()).toBe('signing')
+    handle.reject()
+    expect(handle.state()).toBe('signing')
+    expect(signingInput.signal.aborted).toBe(true)
+    expect(testHarness.lock.leases.get('operation-a')?.isOwned()).toBe(true)
+
+    signing.resolve(Object.freeze({
+      format: 'synthetic/bytes',
+      bytes: new Uint8Array([9, 1, 2, 3]),
+      contentHash: signingInput.contentHash
+    }))
+    const result = await approval
+
+    expect(result.bytes).toEqual(new Uint8Array([9, 1, 2, 3]))
+    expect(handle.state()).toBe('completed')
+    expect(handle.history()).not.toContain('aborted')
+    expect(testHarness.adapter.signApprovedContent).toHaveBeenCalledTimes(1)
+    expect(testHarness.lock.leases.get('operation-a')?.releaseCalls).toBe(1)
+    expect(testHarness.events).not.toContain('deliver')
+  })
+
+  test('cleanup after signing starts cannot claim zero signatures and a later rejection fails once', async () => {
+    const signing = controlled<UniversalSignedResult>()
+    let signingSignal: AbortSignal | undefined
+    const testHarness = harness({
+      sign: input => {
+        signingSignal = input.signal
+        return signing.promise
+      }
+    })
+    const handle = testHarness.core.start(envelope(), testHarness.adapter)
+    await handle.ready
+    const approval = handle.approve()
+    await vi.waitFor(() => expect(testHarness.adapter.signApprovedContent).toHaveBeenCalledTimes(1))
+
+    handle.cleanup()
+    expect(handle.state()).toBe('signing')
+    expect(signingSignal?.aborted).toBe(true)
+    signing.reject(new Error('synthetic signer rejected after cleanup'))
+    await expect(approval).rejects.toThrowError('synthetic signer rejected after cleanup')
+
+    expect(handle.state()).toBe('failed')
+    expect(handle.history()).not.toContain('aborted')
+    expect(testHarness.adapter.signApprovedContent).toHaveBeenCalledTimes(1)
+    expect(testHarness.lock.leases.get('operation-a')?.releaseCalls).toBe(1)
+    expect(testHarness.events).not.toContain('deliver')
+  })
+
+  test('expiration after signing starts does not reclassify the operation as expired', async () => {
+    const signing = controlled<UniversalSignedResult>()
+    let signingInput: Parameters<UniversalAuthorizationAdapter['signApprovedContent']>[0] | undefined
+    const testHarness = harness({
+      sign: input => {
+        signingInput = input
+        return signing.promise
+      }
+    })
+    const handle = testHarness.core.start(
+      envelope('operation-signing-expiry', 100),
+      testHarness.adapter
+    )
+    await handle.ready
+    const approval = handle.approve()
+    await vi.waitFor(() => expect(testHarness.adapter.signApprovedContent).toHaveBeenCalledTimes(1))
+    if (!signingInput) throw new Error('signer input was not captured')
+
+    await vi.advanceTimersByTimeAsync(101)
+    expect(handle.state()).toBe('signing')
+    expect(signingInput.signal.aborted).toBe(true)
+    signing.resolve(Object.freeze({
+      format: 'synthetic/bytes',
+      bytes: new Uint8Array([9]),
+      contentHash: signingInput.contentHash
+    }))
+    await approval
+
+    expect(handle.state()).toBe('completed')
+    expect(handle.history()).not.toContain('expired')
+    expect(testHarness.adapter.signApprovedContent).toHaveBeenCalledTimes(1)
+    expect(testHarness.lock.leases.get('operation-signing-expiry')?.releaseCalls).toBe(1)
+  })
+
+  test('negative terminals reached before signing have zero synthetic signatures', async () => {
     const cases: Array<Readonly<{
       expected: 'rejected' | 'aborted' | 'expired' | 'failed'
       run: (handle: UniversalOperationHandle) => Promise<void>

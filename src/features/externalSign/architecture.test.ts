@@ -18,7 +18,7 @@ describe('universal authorization architectural boundaries', () => {
       reviewReady: ['approving', 'rejected', 'expired', 'aborted', 'failed'],
       approving: ['revalidating', 'rejected', 'expired', 'aborted', 'failed'],
       revalidating: ['signing', 'rejected', 'expired', 'aborted', 'failed'],
-      signing: ['completed', 'expired', 'aborted', 'failed'],
+      signing: ['completed', 'failed'],
       completed: [],
       rejected: [],
       expired: [],
@@ -38,7 +38,7 @@ describe('universal authorization architectural boundaries', () => {
       './profileRegistry.ts'
     ].map(source).join('\n')
     expect(runtime).not.toMatch(/Chronik|getChronik|XolosWalletService|ecash-lib/)
-    expect(runtime).not.toMatch(/broadcastTx|broadcastTxs|sign-and-broadcast/)
+    expect(runtime).not.toMatch(/broadcastTx|broadcastTxs|sign-and-broadcast|postMessage/)
     expect(runtime).not.toMatch(/P2PKH|P2SH|\bALP\b|\bSLP\b|\bNFT\b|OP_RETURN/)
   })
 
