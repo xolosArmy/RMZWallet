@@ -2,7 +2,9 @@
 
 ## Estado y alcance
 
-Este Draft PR contiene un núcleo experimental, universal y agnóstico de protocolo. No contiene un perfil funcional para XEC ni para otro protocolo. La ruta `/external-sign` siempre muestra `EXTERNAL_SIGN_DISABLED` y no instancia el núcleo.
+Este PR contiene un núcleo universal, inerte y agnóstico de protocolo. No contiene un perfil funcional para XEC ni para otro protocolo. El merge integra esta infraestructura inerte y elimina la antigua ruta automática de firma y broadcast; no activa external signing.
+
+La ruta `/external-sign` permanece deshabilitada, monta únicamente `ExternalSignDisabled`, muestra `EXTERNAL_SIGN_DISABLED` y no instancia el núcleo.
 
 La configuración normal permanece:
 
@@ -11,7 +13,21 @@ VITE_EXTERNAL_SIGN_P0_ENABLED=false
 VITE_EXTERNAL_SIGN_ALLOWED_ORIGINS=
 ```
 
-Las variables se conservan como evidencia operativa de contención; ninguna configuración incluida en este PR registra o habilita un perfil productivo.
+Las variables se conservan como evidencia operativa de contención. El registro de perfiles productivos permanece vacío y ninguna configuración incluida registra o habilita un perfil funcional.
+
+## Gate de integración
+
+```text
+INTEGRATION GATE: AUTHORIZED BY INTERNAL PROJECT CONTROL
+
+La integración del núcleo universal inerte está autorizada por Fernando bajo el control interno de xolosArmy.
+
+Esta autorización no habilita perfiles productivos, external signing, signatory real, entrega automática, broadcast ni acciones on-chain.
+
+La producción permanece deshabilitada y cualquier capacidad operativa futura requiere un PR y autorización separados.
+```
+
+La autoridad de integración corresponde a Fernando y al control interno de xolosArmy. No se requiere revisión humana ni revisión independiente adicional. El núcleo universal fue evaluado mediante criterios técnicos objetivos y su integración está autorizada dentro de los límites documentados.
 
 ## Frontera universal
 
@@ -70,8 +86,20 @@ acquire
 
 El núcleo no acepta transmisores, no importa servicios de wallet, proveedores de indexación ni librerías de protocolo, y no entrega ni difunde automáticamente el resultado.
 
-## Evidencia pendiente
+## Contención productiva y límites de alcance
 
-Las pruebas usan fake timers, promesas controladas y contextos sintéticos sin red. La evidencia cross-tab se limita todavía a contextos simulados. Antes de activar cualquier perfil siguen pendientes una prueba en navegador real, revisión humana independiente y un gate de seguridad separado.
+No existe conexión con Chronik, `XolosWalletService`, `ecash-lib`, signatory real, entrega automática o broadcast. WalletConnect no fue modificado y permanece fuera del alcance de este PR.
 
-El rollback seguro consiste en conservar la ruta deshabilitada. Este PR no autoriza merge, activación, despliegue ni acciones on-chain.
+Cualquier perfil XEC, RMZ, ALP, NFT, `OP_RETURN`, multisig o capacidad de transmisión requerirá un trabajo separado, un PR separado y autorización nueva. El merge no habilita un host productivo ni altera variables de entorno, perfiles de autorización o mecanismos de transmisión.
+
+## Validación y excepción ambiental
+
+Las pruebas usan fake timers, promesas controladas y contextos sintéticos sin red. El núcleo universal fue evaluado mediante criterios técnicos objetivos, incluidos typecheck, lint, pruebas focalizadas, build y las suites registradas en la descripción del PR.
+
+La excepción ambiental de `npm test` fue evaluada y aceptada conscientemente: el comando agregado terminó con exit 1; Vitest pasó 201/201; la suite NFT pasó 4/4 mediante `node --import tsx --test`; y la causa registrada fue el socket IPC de `tsx` bloqueado por el sandbox. `npm test` no debe describirse como un comando aprobado.
+
+## Evidencia requerida antes de producción
+
+La evidencia cross-tab se limita todavía a contextos simulados. La evidencia cross-tab en navegador real será obligatoria antes de habilitar un host o perfil productivo, pero no bloquea el merge del núcleo inerte.
+
+El rollback seguro consiste en conservar la ruta deshabilitada. La integración documental y del núcleo inerte está autorizada; cualquier activación, perfil productivo, signatory real, entrega, broadcast o acción on-chain futura requiere un PR y autorización separados.
