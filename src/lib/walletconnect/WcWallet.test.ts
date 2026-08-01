@@ -515,160 +515,177 @@ test('request con outputs usa ruta build+sign+broadcast desde outputs', async ()
   xolosWalletService.getAddress = originalGetAddress
 })
 
-test('intent con output token ALP usa el sender de tokens y preserva token', async () => {
+test('intent RMZ/ALP puro conserva la delegación productiva a wallet.sendETokens', async () => {
   const originalGetAddress = xolosWalletService.getAddress
-  const originalSendToken = xolosWalletService.sendToken
   xolosWalletService.getAddress = () => 'ecash:qtestaddress'
+  const chronik = getChronik() as unknown as {
+    token: (tokenId: string) => Promise<unknown>
+  }
+  const originalToken = chronik.token
+  const serviceInternals = xolosWalletService as unknown as {
+    wallet: unknown
+    isReady: boolean
+  }
+  const originalWallet = serviceInternals.wallet
+  const originalIsReady = serviceInternals.isReady
 
   const { wallet, responses, sessionRequest } = buildWalletHarness()
-  let sendTokenCalled = false
+  let sendETokensCalled = false
 
-  xolosWalletService.sendToken = async (tokenId, outputs, options) => {
-    sendTokenCalled = true
+  chronik.token = async (tokenId) => {
     assert.equal(tokenId, 'c923bd0f09c630c5e9980cf518c8d34b6353802a3cb7c3f34fa7cc85c9305908')
-    assert.deepEqual(outputs, [{ address: 'ecash:qrecipient', amountAtoms: 160000n }])
-    assert.deepEqual(options, { expectedProtocol: 'ALP' })
-    return 'e'.repeat(64)
+    return {
+      tokenType: { protocol: 'ALP' },
+      genesisInfo: { decimals: 0 }
+    }
   }
+  serviceInternals.wallet = {
+    async sendETokens(tokenId: string, outputs: Array<{ address: string; amount: number }>) {
+      sendETokensCalled = true
+      assert.equal(tokenId, 'c923bd0f09c630c5e9980cf518c8d34b6353802a3cb7c3f34fa7cc85c9305908')
+      assert.deepEqual(outputs, [{ address: 'ecash:qrecipient', amount: 160000 }])
+      return 'e'.repeat(64)
+    }
+  }
+  serviceInternals.isReady = true
 
-  await sessionRequest({
-    topic: 't1',
-    id: 1071,
-    params: {
-      chainId: 'ecash:1',
-      request: {
-        method: 'ecash_signAndBroadcastTransaction',
-        params: {
-          offerId: 'offer-token-output',
-          mode: 'intent',
-          outputs: [
-            {
-              address: 'ecash:qrecipient',
-              valueSats: '546',
-              token: {
-                protocol: 'ALP',
-                tokenId: 'c923bd0f09c630c5e9980cf518c8d34b6353802a3cb7c3f34fa7cc85c9305908',
-                amount: '160000'
+  try {
+    await sessionRequest({
+      topic: 't1',
+      id: 1071,
+      params: {
+        chainId: 'ecash:1',
+        request: {
+          method: 'ecash_signAndBroadcastTransaction',
+          params: {
+            offerId: 'offer-token-output',
+            mode: 'intent',
+            outputs: [
+              {
+                address: 'ecash:qrecipient',
+                valueSats: '546',
+                token: {
+                  protocol: 'ALP',
+                  tokenId: 'c923bd0f09c630c5e9980cf518c8d34b6353802a3cb7c3f34fa7cc85c9305908',
+                  amount: '160000'
+                }
               }
-            }
-          ]
+            ]
+          }
         }
       }
-    }
-  })
+    })
 
-  assert.equal(
-    (
-      wallet.getState().pendingRequest?.params.outputs?.[0] as
-        | { token?: { protocol: string; tokenId: string; amount: string } }
-        | undefined
-    )?.token?.amount,
-    '160000'
-  )
+    assert.equal(
+      (
+        wallet.getState().pendingRequest?.params.outputs?.[0] as
+          | { token?: { protocol: string; tokenId: string; amount: string } }
+          | undefined
+      )?.token?.amount,
+      '160000'
+    )
 
-  await wallet.approvePendingRequest()
+    await wallet.approvePendingRequest()
 
-  assert.equal(sendTokenCalled, true)
-  assert.equal(responses.length, 1)
-  assert.equal((responses[0].response.result as { txid: string }).txid, 'e'.repeat(64))
-
-  xolosWalletService.sendToken = originalSendToken
-  xolosWalletService.getAddress = originalGetAddress
+    assert.equal(sendETokensCalled, true)
+    assert.equal(responses.length, 1)
+    assert.equal((responses[0].response.result as { txid: string }).txid, 'e'.repeat(64))
+  } finally {
+    chronik.token = originalToken
+    serviceInternals.wallet = originalWallet
+    serviceInternals.isReady = originalIsReady
+    xolosWalletService.getAddress = originalGetAddress
+  }
 })
 
-test('si vienen rawHex unsigned y outputs, se reconstruye desde outputs', async () => {
+const ambiguousTransactionSourceCases: Array<{
+  label: string
+  params: Record<string, unknown>
+}> = [
+  {
+    label: 'rawHex + outputs con modo implícito',
+    params: { rawHex: SIGNED_RAW_HEX, outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }] }
+  },
+  {
+    label: 'rawHex + outputs con mode intent',
+    params: { mode: 'intent', rawHex: SIGNED_RAW_HEX, outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }] }
+  },
+  {
+    label: 'rawHex + outputs con mode tx',
+    params: { mode: 'tx', rawHex: SIGNED_RAW_HEX, outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }] }
+  },
+  {
+    label: 'rawHex + outputs con mode legacy',
+    params: { mode: 'legacy', rawHex: SIGNED_RAW_HEX, outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }] }
+  },
+  {
+    label: 'unsignedTxHex + outputs',
+    params: { unsignedTxHex: SIGNED_RAW_HEX, outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }] }
+  }
+]
+
+for (const ambiguousCase of ambiguousTransactionSourceCases) {
+  test(`parser rechaza ${ambiguousCase.label} con -32602`, () => {
+    const wallet = new (WcWallet as unknown as { new (): WcWallet })() as unknown as {
+      parseSignAndBroadcastParams: (input: unknown) => {
+        params: unknown
+        error: { code: number; message: string } | null
+      }
+    }
+    const parsed = wallet.parseSignAndBroadcastParams(ambiguousCase.params)
+
+    assert.equal(parsed.params, null)
+    assert.equal(parsed.error?.code, -32602)
+    assert.match(parsed.error?.message ?? '', /AMBIGUOUS_TRANSACTION_SOURCE/)
+    assert.match(parsed.error?.message ?? '', /rawHex y params\.outputs no pueden utilizarse juntos/)
+  })
+}
+
+test('solicitud mixta se rechaza antes de activación y preview', async () => {
   const originalGetAddress = xolosWalletService.getAddress
   xolosWalletService.getAddress = () => 'ecash:qtestaddress'
 
-  const { wallet, responses, sessionRequest } = buildWalletHarness()
-  installReadyRawPreview(wallet)
-  let outputsRouteCalled = false
-  let rawHexRouteCalled = false
-
-  ;(wallet as unknown as { signAndBroadcastRawHex: (rawHex: string) => Promise<{ txid: string }> }).signAndBroadcastRawHex =
-    async () => {
-      rawHexRouteCalled = true
-      return { txid: 'c'.repeat(64) }
+  try {
+    const { wallet, responses, sessionRequest } = buildWalletHarness()
+    let activationCalls = 0
+    let previewCalls = 0
+    ;(wallet as unknown as {
+      activatePendingRequest: () => Promise<void>
+      buildRawTxPreview: () => Promise<RawTxPreview>
+    }).activatePendingRequest = async () => {
+      activationCalls += 1
     }
-  ;(wallet as unknown as {
-    buildSignBroadcastFromOutputs: (outputs: Array<{ address: string; valueSats: number }>) => Promise<{ txid: string }>
-  }).buildSignBroadcastFromOutputs = async (outputs) => {
-    outputsRouteCalled = true
-    assert.equal(outputs.length, 1)
-    assert.equal(outputs[0].address, 'ecash:qrecipient')
-    assert.equal(outputs[0].valueSats, '1200')
-    return { txid: 'd'.repeat(64) }
-  }
+    ;(wallet as unknown as {
+      buildRawTxPreview: () => Promise<RawTxPreview>
+    }).buildRawTxPreview = async () => {
+      previewCalls += 1
+      return { ...VALID_RAW_TX_PREVIEW }
+    }
 
-  await sessionRequest({
-    topic: 't1',
-    id: 108,
-    params: {
-      chainId: 'ecash:1',
-      request: {
-        method: 'ecash_signAndBroadcastTransaction',
-        params: {
-          offerId: 'offer-priority',
-          mode: 'tx',
-          rawHex: UNSIGNED_RAW_HEX,
-          outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }]
+    await sessionRequest({
+      topic: 't1',
+      id: 109,
+      params: {
+        chainId: 'ecash:1',
+        request: {
+          method: 'ecash_signAndBroadcastTransaction',
+          params: {
+            rawHex: SIGNED_RAW_HEX,
+            outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }]
+          }
         }
       }
-    }
-  })
+    })
 
-  await wallet.approvePendingRequest()
-
-  assert.equal(rawHexRouteCalled, false)
-  assert.equal(outputsRouteCalled, true)
-  assert.equal(responses.length, 1)
-  assert.equal((responses[0].response.result as { txid: string }).txid, 'd'.repeat(64))
-  xolosWalletService.getAddress = originalGetAddress
-})
-
-test('si vienen rawHex firmado y outputs con mode tx, rawHex mantiene prioridad', async () => {
-  const originalGetAddress = xolosWalletService.getAddress
-  xolosWalletService.getAddress = () => 'ecash:qtestaddress'
-
-  const { wallet, responses, sessionRequest } = buildWalletHarness()
-  installReadyRawPreview(wallet)
-  let outputsRouteCalled = false
-
-  ;(wallet as unknown as { signAndBroadcastRawHex: (rawHex: string) => Promise<{ txid: string }> }).signAndBroadcastRawHex =
-    async (rawHex) => {
-      assert.equal(rawHex, SIGNED_RAW_HEX)
-      return { txid: 'c'.repeat(64) }
-    }
-  ;(wallet as unknown as {
-    buildSignBroadcastFromOutputs: (outputs: Array<{ address: string; valueSats: number }>) => Promise<{ txid: string }>
-  }).buildSignBroadcastFromOutputs = async () => {
-    outputsRouteCalled = true
-    return { txid: 'd'.repeat(64) }
+    assert.equal(responses.length, 1)
+    assert.equal(responses[0].response.error?.code, -32602)
+    assert.match(responses[0].response.error?.message ?? '', /AMBIGUOUS_TRANSACTION_SOURCE/)
+    assert.equal(activationCalls, 0)
+    assert.equal(previewCalls, 0)
+    assert.equal(wallet.getState().pendingRequest, null)
+  } finally {
+    xolosWalletService.getAddress = originalGetAddress
   }
-
-  await sessionRequest({
-    topic: 't1',
-    id: 109,
-    params: {
-      chainId: 'ecash:1',
-      request: {
-        method: 'ecash_signAndBroadcastTransaction',
-        params: {
-          offerId: 'offer-signed-priority',
-          mode: 'tx',
-          rawHex: SIGNED_RAW_HEX,
-          outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }]
-        }
-      }
-    }
-  })
-
-  await wallet.approvePendingRequest()
-
-  assert.equal(outputsRouteCalled, false)
-  assert.equal(responses.length, 1)
-  assert.equal((responses[0].response.result as { txid: string }).txid, 'c'.repeat(64))
-  xolosWalletService.getAddress = originalGetAddress
 })
 
 test('parser: intent-only (sin inputs) => mode intent', () => {
@@ -799,6 +816,95 @@ test('UNPARSEABLE falla cerrado sin fee policy, validateRawTx ni broadcastTx', a
   }
 })
 
+test('rawHex parseable pero UNSIGNED se rechaza sin firma, reconstrucción, fee ni red', async () => {
+  const chronik = getChronik() as unknown as {
+    validateRawTx: (rawTx: string) => Promise<unknown>
+    broadcastTx: (rawTx: string) => Promise<{ txid: string }>
+  }
+  const originalValidateRawTx = chronik.validateRawTx
+  const originalBroadcastTx = chronik.broadcastTx
+  const originalGetAddress = xolosWalletService.getAddress
+  const originalGetSignatory = xolosWalletService.getSignatory
+  let signerCalls = 0
+  let outputsRouteCalls = 0
+  let rawRouteCalls = 0
+  let feePolicyCalls = 0
+  let validateCalls = 0
+  let broadcastCalls = 0
+
+  xolosWalletService.getAddress = () => 'ecash:qtestaddress'
+  xolosWalletService.getSignatory = () => {
+    signerCalls += 1
+    throw new Error('getSignatory no debe ejecutarse para rawHex unsigned')
+  }
+  chronik.validateRawTx = async () => {
+    validateCalls += 1
+    return {}
+  }
+  chronik.broadcastTx = async () => {
+    broadcastCalls += 1
+    return { txid: '9'.repeat(64) }
+  }
+
+  try {
+    const { wallet, responses, sessionRequest } = buildWalletHarness()
+    ;(wallet as unknown as {
+      buildSignBroadcastFromOutputs: () => Promise<{ txid: string }>
+      signAndBroadcastRawHex: () => Promise<{ txid: string }>
+      assertBroadcastFeePolicy: () => Promise<void>
+    }).buildSignBroadcastFromOutputs = async () => {
+      outputsRouteCalls += 1
+      return { txid: '7'.repeat(64) }
+    }
+    ;(wallet as unknown as {
+      signAndBroadcastRawHex: () => Promise<{ txid: string }>
+    }).signAndBroadcastRawHex = async () => {
+      rawRouteCalls += 1
+      return { txid: '8'.repeat(64) }
+    }
+    ;(wallet as unknown as {
+      assertBroadcastFeePolicy: () => Promise<void>
+    }).assertBroadcastFeePolicy = async () => {
+      feePolicyCalls += 1
+    }
+
+    await sessionRequest({
+      topic: 't1',
+      id: 902,
+      params: {
+        chainId: 'ecash:1',
+        request: {
+          method: 'ecash_signAndBroadcastTransaction',
+          params: { offerId: 'offer-unsigned', mode: 'tx', rawHex: UNSIGNED_RAW_HEX }
+        }
+      }
+    })
+
+    assert.equal(wallet.getState().pendingRequest?.rawTxPreviewStatus, 'error')
+    assert.match(
+      wallet.getState().pendingRequest?.rawTxPreview?.summaryError ?? '',
+      /rawHex unsigned no está habilitado/
+    )
+
+    await wallet.approvePendingRequest()
+
+    assert.equal(responses.length, 1)
+    assert.equal(responses[0].response.error?.code, 4001)
+    assert.match(responses[0].response.error?.message ?? '', /rawHex unsigned no está habilitado/)
+    assert.equal(signerCalls, 0)
+    assert.equal(outputsRouteCalls, 0)
+    assert.equal(rawRouteCalls, 0)
+    assert.equal(feePolicyCalls, 0)
+    assert.equal(validateCalls, 0)
+    assert.equal(broadcastCalls, 0)
+  } finally {
+    chronik.validateRawTx = originalValidateRawTx
+    chronik.broadcastTx = originalBroadcastTx
+    xolosWalletService.getAddress = originalGetAddress
+    xolosWalletService.getSignatory = originalGetSignatory
+  }
+})
+
 test('rawHex firmado ejecuta parseo local, fee policy, validación y broadcast en orden', async () => {
   const chronik = getChronik() as unknown as {
     validateRawTx: (rawTx: string) => Promise<unknown>
@@ -848,6 +954,109 @@ test('rawHex firmado ejecuta parseo local, fee policy, validación y broadcast e
   } finally {
     chronik.validateRawTx = originalValidateRawTx
     chronik.broadcastTx = originalBroadcastTx
+  }
+})
+
+test('rawHex firmado conserva el mismo raw normalizado y Tx desde preview hasta broadcast', async () => {
+  const chronik = getChronik() as unknown as {
+    validateRawTx: (rawTx: string) => Promise<unknown>
+    broadcastTx: (rawTx: string) => Promise<{ txid: string }>
+  }
+  const originalValidateRawTx = chronik.validateRawTx
+  const originalBroadcastTx = chronik.broadcastTx
+  const originalGetAddress = xolosWalletService.getAddress
+  const normalizedRawHex = SIGNED_RAW_HEX
+  let classifiedTx: unknown = null
+  let feePolicyTx: unknown = null
+  const validatedRawHex: string[] = []
+  const broadcastRawHex: string[] = []
+  const order: string[] = []
+
+  xolosWalletService.getAddress = () => 'ecash:qtestaddress'
+  chronik.validateRawTx = async (rawTx) => {
+    validatedRawHex.push(rawTx)
+    if (validatedRawHex.length === 1) {
+      order.push('preview')
+      return {
+        size: 86,
+        inputs: [{ sats: 1500n }],
+        outputs: [{
+          sats: 1000n,
+          outputScript: '76a91400112233445566778899aabbccddeeff0011223388ac'
+        }]
+      }
+    }
+    order.push('validateRawTx')
+    return {}
+  }
+  chronik.broadcastTx = async (rawTx) => {
+    broadcastRawHex.push(rawTx)
+    order.push('broadcastTx')
+    return { txid: '6'.repeat(64) }
+  }
+
+  try {
+    const { wallet, responses, sessionRequest } = buildWalletHarness()
+    const classifyRawHex = (wallet as unknown as {
+      classifyRawHex: (rawHex: string) => RawHexAnalysis
+    }).classifyRawHex.bind(wallet)
+    ;(wallet as unknown as {
+      classifyRawHex: (rawHex: string) => RawHexAnalysis
+    }).classifyRawHex = (rawHex) => {
+      order.push('Tx.fromHex')
+      const analysis = classifyRawHex(rawHex)
+      classifiedTx = analysis.status === 'SIGNED' ? analysis.tx : null
+      return analysis
+    }
+    ;(wallet as unknown as {
+      assertBroadcastFeePolicy: (tx: unknown) => Promise<void>
+    }).assertBroadcastFeePolicy = async (tx) => {
+      order.push('assertBroadcastFeePolicy')
+      feePolicyTx = tx
+    }
+    ;(wallet as unknown as { emitOfferConsumed: () => Promise<void> }).emitOfferConsumed = async () => {}
+
+    await sessionRequest({
+      topic: 't1',
+      id: 903,
+      params: {
+        chainId: 'ecash:1',
+        request: {
+          method: 'ecash_signAndBroadcastTransaction',
+          params: {
+            offerId: 'offer-content-binding',
+            mode: 'tx',
+            rawHex: `  ${normalizedRawHex.toUpperCase()}\n`
+          }
+        }
+      }
+    })
+
+    assert.equal(wallet.getState().pendingRequest?.params.rawHex, normalizedRawHex)
+    assert.equal(wallet.getState().pendingRequest?.rawTxPreviewStatus, 'ready')
+    assert.ok(classifiedTx)
+    assert.deepEqual(validatedRawHex, [normalizedRawHex])
+    assert.deepEqual(order, ['Tx.fromHex', 'preview'])
+
+    await wallet.approvePendingRequest()
+
+    assert.equal(feePolicyTx, classifiedTx)
+    assert.deepEqual(validatedRawHex, [normalizedRawHex, normalizedRawHex])
+    assert.deepEqual(broadcastRawHex, [normalizedRawHex])
+    assert.equal(broadcastRawHex.length, 1)
+    assert.deepEqual(order, [
+      'Tx.fromHex',
+      'preview',
+      'assertBroadcastFeePolicy',
+      'validateRawTx',
+      'broadcastTx'
+    ])
+    assert.equal(responses.length, 1)
+    assert.equal((responses[0].response.result as { txid: string }).txid, '6'.repeat(64))
+  } finally {
+    chronik.validateRawTx = originalValidateRawTx
+    chronik.broadcastTx = originalBroadcastTx
+    xolosWalletService.getAddress = originalGetAddress
   }
 })
 
@@ -1016,7 +1225,10 @@ for (const previewCase of blockedPreviewCases) {
     assert.equal(rawProcessingCalls, 0)
     assert.equal(responses.length, 1)
     assert.equal(responses[0].response.error?.code, 4001)
-    assert.match(responses[0].response.error?.message ?? '', /resumen válido/)
+    assert.equal(
+      responses[0].response.error?.message,
+      previewCase.preview?.summaryError ?? 'No se puede aprobar sin un resumen válido.'
+    )
   })
 }
 
