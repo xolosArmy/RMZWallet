@@ -1,89 +1,45 @@
-import { Tx } from 'ecash-lib'
-import {
-  EXTERNAL_SIGN_CHAIN_ID,
-  EXTERNAL_SIGN_MAX_REQUEST_TTL_MS,
-  EXTERNAL_SIGN_MAX_TX_BYTES,
-  EXTERNAL_SIGN_MODE,
-  EXTERNAL_SIGN_PROTOCOL_ID,
-  EXTERNAL_SIGN_PROTOCOL_VERSION
-} from './config'
+export const UNIVERSAL_AUTHORIZATION_SCHEMA = 'tonalli.authorization-envelope'
+export const UNIVERSAL_AUTHORIZATION_VERSION = 1
 
-export const EXTERNAL_SIGN_REQUEST_STORAGE_KEY = 'tonalli_external_sign_request_v1'
-export const EXTERNAL_SIGN_RETURN_TO_STORAGE_KEY = 'tonalli_external_sign_return_to_v1'
-
-export type ExternalSignWireRequestV1 = Readonly<{
-  protocolId: typeof EXTERNAL_SIGN_PROTOCOL_ID
-  protocolVersion: typeof EXTERNAL_SIGN_PROTOCOL_VERSION
-  chainId: typeof EXTERNAL_SIGN_CHAIN_ID
-  requestId: string
-  intentId?: string
+export type UniversalAuthorizationEnvelopeV1 = Readonly<{
+  schema: typeof UNIVERSAL_AUTHORIZATION_SCHEMA
+  version: typeof UNIVERSAL_AUTHORIZATION_VERSION
+  operationId: string
+  profileId: string
+  issuedAt: number
   expiresAt: number
-  mode: typeof EXTERNAL_SIGN_MODE
-  unsignedTxHex: string
   requester: Readonly<{
+    origin: string
     displayName: string
-    applicationUrl?: string
-    declaredOrigin?: string
   }>
 }>
 
-export type OriginContextV1 = Readonly<{
-  status: 'authenticated' | 'declared-unverified' | 'unknown'
-  authenticatedOrigin: string | null
-  declaredOrigin: string | null
-  evidence: 'postMessage-opener' | 'metadata-only' | 'none'
-}>
-
-export class ExternalSignError extends Error {
+export class UniversalAuthorizationError extends Error {
   readonly code: string
 
   constructor(code: string, message = code) {
     super(message)
-    this.name = 'ExternalSignError'
+    this.name = 'UniversalAuthorizationError'
     this.code = code
   }
 }
 
 const ROOT_KEYS = new Set([
-  'protocolId',
-  'protocolVersion',
-  'chainId',
-  'requestId',
-  'intentId',
+  'schema',
+  'version',
+  'operationId',
+  'profileId',
+  'issuedAt',
   'expiresAt',
-  'mode',
-  'unsignedTxHex',
   'requester'
 ])
-const REQUESTER_KEYS = new Set(['displayName', 'applicationUrl', 'declaredOrigin'])
-const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const HEX = /^[0-9a-fA-F]+$/
-const hasControlCharacter = (value: string) => Array.from(value).some(character => {
-  const code = character.codePointAt(0) ?? 0
-  return code <= 0x1f || code === 0x7f
-})
-const hasUnpairedSurrogate = (value: string) => {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index)
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1)
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return true
-      index += 1
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return true
-    }
-  }
-  return false
-}
+const REQUESTER_KEYS = new Set(['origin', 'displayName'])
+const OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const PROFILE_ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/
 
-const utf8Length = (value: string) => new TextEncoder().encode(value).length
-
-function parseJsonWithoutDuplicateMembers(input: string): unknown {
+const parseJsonWithoutDuplicateMembers = (input: string): unknown => {
   let index = 0
-
-  const fail = (code: string): never => {
-    throw new ExternalSignError(code)
-  }
+  const fail = (code: string): never => { throw new UniversalAuthorizationError(code) }
   const skipWhitespace = () => {
     while (' \t\r\n'.includes(input[index] ?? '\0')) index += 1
   }
@@ -92,8 +48,8 @@ function parseJsonWithoutDuplicateMembers(input: string): unknown {
     const start = index
     index += 1
     while (index < input.length) {
-      const char = input[index]
-      if (char === '"') {
+      const character = input[index]
+      if (character === '"') {
         index += 1
         try {
           return JSON.parse(input.slice(start, index)) as string
@@ -101,34 +57,33 @@ function parseJsonWithoutDuplicateMembers(input: string): unknown {
           return fail('INVALID_JSON')
         }
       }
-      if (char === '\\') {
-        index += 2
-      } else {
-        if ((char?.charCodeAt(0) ?? 0) < 0x20) fail('INVALID_JSON')
+      if (character === '\\') index += 2
+      else {
+        if ((character?.charCodeAt(0) ?? 0) < 0x20) fail('INVALID_JSON')
         index += 1
       }
     }
     return fail('INVALID_JSON')
   }
-  const parseValue = (): unknown => {
+  const parseArray = (): unknown[] => {
+    const array: unknown[] = []
+    index += 1
     skipWhitespace()
-    const char = input[index]
-    if (char === '"') return parseString()
-    if (char === '{') return parseObject()
-    if (char === '[') return parseArray()
-    const remainder = input.slice(index)
-    for (const [literal, value] of [['true', true], ['false', false], ['null', null]] as const) {
-      if (remainder.startsWith(literal)) {
-        index += literal.length
-        return value
-      }
+    if (input[index] === ']') {
+      index += 1
+      return array
     }
-    const numberMatch = remainder.match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/)
-    if (!numberMatch) return fail('INVALID_JSON')
-    index += numberMatch[0].length
-    const value = Number(numberMatch[0])
-    if (!Number.isFinite(value)) return fail('INVALID_JSON')
-    return value
+    while (index < input.length) {
+      array.push(parseValue())
+      skipWhitespace()
+      if (input[index] === ']') {
+        index += 1
+        return array
+      }
+      if (input[index] !== ',') fail('INVALID_JSON')
+      index += 1
+    }
+    return fail('INVALID_JSON')
   }
   const parseObject = (): Record<string, unknown> => {
     const object: Record<string, unknown> = {}
@@ -158,178 +113,113 @@ function parseJsonWithoutDuplicateMembers(input: string): unknown {
     }
     return fail('INVALID_JSON')
   }
-  const parseArray = (): unknown[] => {
-    const array: unknown[] = []
-    index += 1
+  const parseValue = (): unknown => {
     skipWhitespace()
-    if (input[index] === ']') {
-      index += 1
-      return array
-    }
-    while (index < input.length) {
-      array.push(parseValue())
-      skipWhitespace()
-      if (input[index] === ']') {
-        index += 1
-        return array
+    const character = input[index]
+    if (character === '"') return parseString()
+    if (character === '{') return parseObject()
+    if (character === '[') return parseArray()
+    const remainder = input.slice(index)
+    for (const [literal, value] of [['true', true], ['false', false], ['null', null]] as const) {
+      if (remainder.startsWith(literal)) {
+        index += literal.length
+        return value
       }
-      if (input[index] !== ',') fail('INVALID_JSON')
-      index += 1
     }
-    return fail('INVALID_JSON')
+    const number = remainder.match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/)
+    if (!number) return fail('INVALID_JSON')
+    index += number[0].length
+    const value = Number(number[0])
+    if (!Number.isFinite(value)) return fail('INVALID_JSON')
+    return value
   }
-
   const parsed = parseValue()
   skipWhitespace()
   if (index !== input.length) fail('INVALID_JSON')
   return parsed
 }
 
-const assertClosedObject = (value: unknown, allowed: Set<string>, code: string): Record<string, unknown> => {
+const assertClosedObject = (
+  value: unknown,
+  allowedKeys: ReadonlySet<string>,
+  code: string
+): Record<string, unknown> => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new ExternalSignError(code)
+    throw new UniversalAuthorizationError(code)
   }
   const object = value as Record<string, unknown>
-  if (Object.hasOwn(object, 'broadcast')) throw new ExternalSignError('LEGACY_BROADCAST_FORBIDDEN')
-  const unknown = Object.keys(object).find(key => !allowed.has(key))
-  if (unknown) throw new ExternalSignError('UNKNOWN_FIELD', unknown)
+  const unknownKey = Object.keys(object).find(key => !allowedKeys.has(key))
+  if (unknownKey) throw new UniversalAuthorizationError('UNKNOWN_ENVELOPE_FIELD', unknownKey)
   return object
 }
 
-const normalizeText = (value: unknown, min: number, max: number, code: string): string => {
-  if (typeof value !== 'string') throw new ExternalSignError(code)
+const normalizedText = (value: unknown, code: string, maximumBytes: number): string => {
+  if (typeof value !== 'string') throw new UniversalAuthorizationError(code)
   const normalized = value.normalize('NFC')
-  const length = utf8Length(normalized)
-  if (length < min || length > max || hasControlCharacter(normalized) || hasUnpairedSurrogate(normalized)) {
-    throw new ExternalSignError(code)
-  }
+  const bytes = new TextEncoder().encode(normalized)
+  if (bytes.length === 0 || bytes.length > maximumBytes) throw new UniversalAuthorizationError(code)
+  if (Array.from(normalized).some(character => {
+    const point = character.codePointAt(0) ?? 0
+    return point <= 0x1f || point === 0x7f
+  })) throw new UniversalAuthorizationError(code)
   return normalized
 }
 
-const normalizeApplicationUrl = (value: unknown): string | undefined => {
-  if (value === undefined) return undefined
-  const normalized = normalizeText(value, 1, 2048, 'INVALID_APPLICATION_URL')
+const normalizedOrigin = (value: unknown): string => {
+  const normalized = normalizedText(value, 'INVALID_REQUESTER_ORIGIN', 2048)
   let parsed: URL
   try {
     parsed = new URL(normalized)
   } catch {
-    throw new ExternalSignError('INVALID_APPLICATION_URL')
+    throw new UniversalAuthorizationError('INVALID_REQUESTER_ORIGIN')
   }
-  const isLocalHttp = parsed.protocol === 'http:' && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
-  if (parsed.protocol !== 'https:' && !isLocalHttp) throw new ExternalSignError('INVALID_APPLICATION_URL')
-  return parsed.href
+  const localHttp = parsed.protocol === 'http:' && (
+    parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1'
+  )
+  if (parsed.origin !== normalized || (parsed.protocol !== 'https:' && !localHttp)) {
+    throw new UniversalAuthorizationError('INVALID_REQUESTER_ORIGIN')
+  }
+  return parsed.origin
 }
 
-const normalizeDeclaredOrigin = (value: unknown): string | undefined => {
-  if (value === undefined) return undefined
-  const normalized = normalizeText(value, 1, 2048, 'INVALID_DECLARED_ORIGIN')
-  try {
-    const parsed = new URL(normalized)
-    if (parsed.origin !== normalized || parsed.protocol !== 'https:') throw new Error()
-    return parsed.origin
-  } catch {
-    throw new ExternalSignError('INVALID_DECLARED_ORIGIN')
-  }
-}
-
-const deepFreeze = <T>(value: T): Readonly<T> => {
-  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
-    Object.freeze(value)
-    for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested)
-  }
-  return value
-}
-
-export function parseExternalSignRequestObject(payload: unknown, now = Date.now()): ExternalSignWireRequestV1 {
-  const object = assertClosedObject(payload, ROOT_KEYS, 'INVALID_REQUEST')
-  if (object.protocolId !== EXTERNAL_SIGN_PROTOCOL_ID) throw new ExternalSignError('UNSUPPORTED_PROTOCOL')
-  if (object.protocolVersion !== EXTERNAL_SIGN_PROTOCOL_VERSION) throw new ExternalSignError('UNSUPPORTED_VERSION')
-  if (object.chainId !== EXTERNAL_SIGN_CHAIN_ID) throw new ExternalSignError('WRONG_NETWORK')
-  if (object.mode !== EXTERNAL_SIGN_MODE) throw new ExternalSignError('MODE_FORBIDDEN')
-  if (typeof object.requestId !== 'string' || !UUID_V4.test(object.requestId)) {
-    throw new ExternalSignError('INVALID_REQUEST_ID')
-  }
-  if (!Number.isSafeInteger(object.expiresAt)) throw new ExternalSignError('INVALID_EXPIRATION')
-  const expiresAt = object.expiresAt as number
-  if (expiresAt <= now) throw new ExternalSignError('REQUEST_EXPIRED')
-  if (expiresAt > now + EXTERNAL_SIGN_MAX_REQUEST_TTL_MS) throw new ExternalSignError('EXPIRATION_TOO_FAR')
-
-  if (typeof object.unsignedTxHex !== 'string' || !HEX.test(object.unsignedTxHex) || object.unsignedTxHex.length % 2 !== 0) {
-    throw new ExternalSignError('INVALID_UNSIGNED_TX_HEX')
-  }
-  const unsignedTxHex = object.unsignedTxHex.toLowerCase()
-  if (unsignedTxHex.length / 2 > EXTERNAL_SIGN_MAX_TX_BYTES) throw new ExternalSignError('TX_TOO_LARGE')
-  try {
-    if (Tx.fromHex(unsignedTxHex).toHex().toLowerCase() !== unsignedTxHex) {
-      throw new ExternalSignError('TRAILING_OR_NONCANONICAL_TX_BYTES')
-    }
-  } catch (error) {
-    if (error instanceof ExternalSignError) throw error
-    throw new ExternalSignError('INVALID_UNSIGNED_TX_HEX')
-  }
-
-  const requesterObject = assertClosedObject(object.requester, REQUESTER_KEYS, 'INVALID_REQUESTER')
-  const applicationUrl = normalizeApplicationUrl(requesterObject.applicationUrl)
-  const declaredOrigin = normalizeDeclaredOrigin(requesterObject.declaredOrigin)
-  const requester = {
-    displayName: normalizeText(requesterObject.displayName, 1, 80, 'INVALID_DISPLAY_NAME'),
-    ...(applicationUrl ? { applicationUrl } : {}),
-    ...(declaredOrigin ? { declaredOrigin } : {})
-  }
-  const intentId = object.intentId === undefined
-    ? undefined
-    : normalizeText(object.intentId, 1, 128, 'INVALID_INTENT_ID')
-
-  return deepFreeze({
-    protocolId: EXTERNAL_SIGN_PROTOCOL_ID,
-    protocolVersion: EXTERNAL_SIGN_PROTOCOL_VERSION,
-    chainId: EXTERNAL_SIGN_CHAIN_ID,
-    requestId: object.requestId,
-    ...(intentId ? { intentId } : {}),
-    expiresAt,
-    mode: EXTERNAL_SIGN_MODE,
-    unsignedTxHex,
-    requester
-  }) as ExternalSignWireRequestV1
-}
-
-export function parseExternalSignRequestJson(json: string, now = Date.now()): ExternalSignWireRequestV1 {
-  return parseExternalSignRequestObject(parseJsonWithoutDuplicateMembers(json), now)
-}
-
-const decodeBase64UrlUtf8 = (encoded: string): string => {
-  if (!/^[A-Za-z0-9_-]+$/.test(encoded) || encoded.includes('=')) throw new ExternalSignError('INVALID_REQUEST_ENCODING')
-  const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/')
-  const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4)
-  try {
-    const binary = atob(padded)
-    const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-  } catch {
-    throw new ExternalSignError('INVALID_REQUEST_ENCODING')
-  }
-}
-
-export function parseExternalSignRequestParam(paramValue: string, now = Date.now()): ExternalSignWireRequestV1 {
-  return parseExternalSignRequestJson(decodeBase64UrlUtf8(paramValue), now)
-}
-
-type StoredPendingRequestV1 = Readonly<{ request: ExternalSignWireRequestV1; persistedAt: number }>
-
-export function storePendingExternalSignRequest(storage: Pick<Storage, 'setItem'>, request: ExternalSignWireRequestV1, now = Date.now()) {
-  const pending: StoredPendingRequestV1 = { request, persistedAt: now }
-  storage.setItem(EXTERNAL_SIGN_REQUEST_STORAGE_KEY, JSON.stringify(pending))
-}
-
-export function takePendingExternalSignRequest(
-  storage: Pick<Storage, 'getItem' | 'removeItem'>,
+export function parseUniversalAuthorizationEnvelopeJson(
+  input: string,
   now = Date.now()
-): ExternalSignWireRequestV1 | null {
-  const raw = storage.getItem(EXTERNAL_SIGN_REQUEST_STORAGE_KEY)
-  storage.removeItem(EXTERNAL_SIGN_REQUEST_STORAGE_KEY)
-  if (!raw) return null
-  const stored = parseJsonWithoutDuplicateMembers(raw)
-  const object = assertClosedObject(stored, new Set(['request', 'persistedAt']), 'INVALID_STORED_REQUEST')
-  if (!Number.isSafeInteger(object.persistedAt)) throw new ExternalSignError('INVALID_STORED_REQUEST')
-  return parseExternalSignRequestObject(object.request, now)
+): UniversalAuthorizationEnvelopeV1 {
+  return parseUniversalAuthorizationEnvelope(parseJsonWithoutDuplicateMembers(input), now)
+}
+
+export function parseUniversalAuthorizationEnvelope(
+  value: unknown,
+  now = Date.now()
+): UniversalAuthorizationEnvelopeV1 {
+  const root = assertClosedObject(value, ROOT_KEYS, 'INVALID_ENVELOPE')
+  const requester = assertClosedObject(root.requester, REQUESTER_KEYS, 'INVALID_REQUESTER')
+  const operationId = normalizedText(root.operationId, 'INVALID_OPERATION_ID', 128)
+  const profileId = normalizedText(root.profileId, 'INVALID_PROFILE_ID', 128)
+  if (!OPERATION_ID.test(operationId)) throw new UniversalAuthorizationError('INVALID_OPERATION_ID')
+  if (!PROFILE_ID.test(profileId)) throw new UniversalAuthorizationError('INVALID_PROFILE_ID')
+  if (!Number.isSafeInteger(root.issuedAt) || !Number.isSafeInteger(root.expiresAt)) {
+    throw new UniversalAuthorizationError('INVALID_LIFETIME')
+  }
+  const issuedAt = root.issuedAt as number
+  const expiresAt = root.expiresAt as number
+  if (issuedAt > now || expiresAt <= issuedAt || expiresAt <= now) {
+    throw new UniversalAuthorizationError('REQUEST_EXPIRED_OR_NOT_YET_VALID')
+  }
+  if (root.schema !== UNIVERSAL_AUTHORIZATION_SCHEMA || root.version !== UNIVERSAL_AUTHORIZATION_VERSION) {
+    throw new UniversalAuthorizationError('UNSUPPORTED_ENVELOPE')
+  }
+  return Object.freeze({
+    schema: UNIVERSAL_AUTHORIZATION_SCHEMA,
+    version: UNIVERSAL_AUTHORIZATION_VERSION,
+    operationId,
+    profileId,
+    issuedAt,
+    expiresAt,
+    requester: Object.freeze({
+      origin: normalizedOrigin(requester.origin),
+      displayName: normalizedText(requester.displayName, 'INVALID_REQUESTER_NAME', 256)
+    })
+  })
 }
