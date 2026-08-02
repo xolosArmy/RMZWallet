@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'vitest'
 import type { SessionTypes } from '@walletconnect/types'
+import { OP_RETURN_MAX_BYTES, getStackArray } from 'ecash-lib'
 import { getChronik } from '../../services/ChronikClient.ts'
 import { xolosWalletService } from '../../services/XolosWalletService.ts'
 import { getWcDebugState } from './wcDebug.ts'
@@ -29,6 +30,58 @@ const buildRawTxFixture = (inputScriptHex: string) =>
 
 const SIGNED_RAW_HEX = buildRawTxFixture('00')
 const UNSIGNED_RAW_HEX = buildRawTxFixture('')
+const TONALLI_MESSAGE_PREFIX_HEX = '6d02'
+
+type OpReturnScriptLike = {
+  bytecode: Uint8Array
+  toHex: () => string
+}
+
+function getOpReturnBuilder(wallet: WcWallet) {
+  return (wallet as unknown as {
+    buildOpReturnScript: (message: string) => OpReturnScriptLike | null
+  }).buildOpReturnScript.bind(wallet)
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function assertTonalliOpReturnRoundTrip(script: OpReturnScriptLike, originalMessage: string) {
+  const normalizedMessage = originalMessage.trim()
+  const messageBytes = new TextEncoder().encode(normalizedMessage)
+  const payloadByteLength = messageBytes.length + 2
+  const expectedScriptByteLength = messageBytes.length <= 73
+    ? messageBytes.length + 4
+    : messageBytes.length + 5
+  const bytecode = script.bytecode
+
+  assert.equal(bytecode[0], 0x6a)
+  assert.equal(bytecode.length, expectedScriptByteLength)
+
+  let payloadStart: number
+  let declaredPayloadByteLength: number
+  if (payloadByteLength <= 75) {
+    assert.equal(bytecode[1], payloadByteLength)
+    payloadStart = 2
+    declaredPayloadByteLength = bytecode[1]
+  } else {
+    assert.equal(bytecode[1], 0x4c)
+    assert.equal(bytecode[2], payloadByteLength)
+    payloadStart = 3
+    declaredPayloadByteLength = bytecode[2]
+  }
+
+  const payload = bytecode.slice(payloadStart)
+  assert.equal(declaredPayloadByteLength, payload.length)
+  assert.equal(bytesToHex(payload.slice(0, 2)), TONALLI_MESSAGE_PREFIX_HEX)
+  assert.deepEqual(payload.slice(2), messageBytes)
+  assert.equal(payload.length, payloadByteLength)
+  assert.equal(script.toHex(), bytesToHex(bytecode))
+  assert.deepEqual(getStackArray(script.toHex()), [TONALLI_MESSAGE_PREFIX_HEX + bytesToHex(messageBytes)])
+}
 
 const VALID_RAW_TX_PREVIEW: RawTxPreview = {
   bytes: 86,
@@ -150,6 +203,106 @@ function buildWalletHarness(sessionChainId = 'ecash:1') {
 
   return { wallet, responses, sessionRequest }
 }
+
+test('buildOpReturnScript aplica la política pública de ecash-lib en la matriz UTF-8 completa', () => {
+  const wallet = new (WcWallet as unknown as { new (): WcWallet })()
+  const buildOpReturnScript = getOpReturnBuilder(wallet)
+  const messageByteLengths = [0, 1, 72, 73, 74, 75, 76, 217, 218, 219, 220, 221] as const
+  const derivedMaxMessageByteLength = OP_RETURN_MAX_BYTES - 5
+
+  assert.equal(OP_RETURN_MAX_BYTES, 223)
+  assert.equal(derivedMaxMessageByteLength, 218)
+
+  for (const messageByteLength of messageByteLengths) {
+    const message = messageByteLength === 0 ? ' \n\t ' : 'a'.repeat(messageByteLength)
+
+    if (messageByteLength === 0) {
+      assert.equal(buildOpReturnScript(message), null)
+      continue
+    }
+
+    if (messageByteLength <= derivedMaxMessageByteLength) {
+      const script = buildOpReturnScript(message)
+      assert.ok(script)
+      assertTonalliOpReturnRoundTrip(script, message)
+      if (messageByteLength === 73) {
+        assert.equal(script.toHex().slice(0, 4), '6a4b')
+        assert.equal(script.bytecode.length, 77)
+      }
+      if (messageByteLength === 74) {
+        assert.equal(script.toHex().slice(0, 6), '6a4c4c')
+        assert.equal(script.bytecode.length, 79)
+      }
+      if (messageByteLength === derivedMaxMessageByteLength) {
+        assert.equal(script.bytecode.length, OP_RETURN_MAX_BYTES)
+        assert.doesNotThrow(() => getStackArray(script.toHex()))
+      }
+      continue
+    }
+
+    const candidateScriptByteLength = messageByteLength + 5
+    let rejectedScript: OpReturnScriptLike | null | undefined
+    assert.throws(
+      () => {
+        rejectedScript = buildOpReturnScript(message)
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof Error)
+        assert.match(err.message, new RegExp(`produce ${candidateScriptByteLength} bytes`))
+        assert.match(err.message, new RegExp(`máximo permitido es ${OP_RETURN_MAX_BYTES} bytes`))
+        assert.match(err.message, new RegExp(`Longitud UTF-8 del mensaje: ${messageByteLength} bytes`))
+        return true
+      }
+    )
+    assert.equal(rejectedScript, undefined)
+  }
+})
+
+test('buildOpReturnScript conserva prefijo, contenido y fronteras con Unicode multibyte', () => {
+  const wallet = new (WcWallet as unknown as { new (): WcWallet })()
+  const buildOpReturnScript = getOpReturnBuilder(wallet)
+  const unicodeCases = [
+    { label: 'ASCII', message: 'A', expectedBytes: 1, accepted: true },
+    { label: 'UTF-8 de dos bytes', message: 'é', expectedBytes: 2, accepted: true },
+    { label: 'UTF-8 de tres bytes', message: '€', expectedBytes: 3, accepted: true },
+    { label: 'emoji de cuatro bytes', message: '😀', expectedBytes: 4, accepted: true },
+    { label: 'composición exacta de 73 bytes', message: `${'a'.repeat(64)}é€😀`, expectedBytes: 73, accepted: true },
+    { label: 'composición exacta de 74 bytes', message: `${'a'.repeat(65)}é€😀`, expectedBytes: 74, accepted: true },
+    { label: 'composición exacta de 218 bytes', message: `${'a'.repeat(209)}é€😀`, expectedBytes: 218, accepted: true },
+    { label: 'composición exacta de 219 bytes', message: `${'a'.repeat(210)}é€😀`, expectedBytes: 219, accepted: false }
+  ] as const
+
+  for (const unicodeCase of unicodeCases) {
+    assert.equal(new TextEncoder().encode(unicodeCase.message.trim()).length, unicodeCase.expectedBytes, unicodeCase.label)
+    if (unicodeCase.label !== 'ASCII') {
+      assert.notEqual(unicodeCase.message.length, unicodeCase.expectedBytes, unicodeCase.label)
+    }
+
+    if (unicodeCase.accepted) {
+      const script = buildOpReturnScript(`  ${unicodeCase.message}  `)
+      assert.ok(script)
+      assertTonalliOpReturnRoundTrip(script, `  ${unicodeCase.message}  `)
+      continue
+    }
+
+    assert.throws(
+      () => buildOpReturnScript(unicodeCase.message),
+      /produce 224 bytes; el máximo permitido es 223 bytes\. Longitud UTF-8 del mensaje: 219 bytes\./
+    )
+  }
+})
+
+test('buildOpReturnScript conserva trim sin truncamiento ni bytes adicionales', () => {
+  const wallet = new (WcWallet as unknown as { new (): WcWallet })()
+  const buildOpReturnScript = getOpReturnBuilder(wallet)
+  const normalized = buildOpReturnScript('Tonalli 😀')
+  const padded = buildOpReturnScript('  Tonalli 😀  ')
+
+  assert.ok(normalized)
+  assert.ok(padded)
+  assert.equal(padded.toHex(), normalized.toHex())
+  assertTonalliOpReturnRoundTrip(padded, '  Tonalli 😀  ')
+})
 
 test('session_request con offerId faltante responde -32602', async () => {
   const originalGetAddress = xolosWalletService.getAddress
@@ -514,6 +667,279 @@ test('request con outputs usa ruta build+sign+broadcast desde outputs', async ()
   assert.equal(responses.length, 1)
   assert.equal((responses[0].response.result as { txid: string }).txid, 'b'.repeat(64))
   xolosWalletService.getAddress = originalGetAddress
+})
+
+test('XEC estructurado con mensaje de 219 bytes responde -32602 antes de estado, cola o efectos', async () => {
+  const chronik = getChronik() as unknown as {
+    address: (address: string) => { utxos: () => Promise<unknown> }
+    validateRawTx: (rawTx: string) => Promise<unknown>
+    broadcastTx: (rawTx: string) => Promise<{ txid: string }>
+  }
+  const originalAddress = chronik.address
+  const originalValidateRawTx = chronik.validateRawTx
+  const originalBroadcastTx = chronik.broadcastTx
+  const originalGetAddress = xolosWalletService.getAddress
+  const originalGetSignatory = xolosWalletService.getSignatory
+  let enqueueCalls = 0
+  let activationCalls = 0
+  let signerCalls = 0
+  let utxoCalls = 0
+  let outputsRouteCalls = 0
+  let feePolicyCalls = 0
+  let validateCalls = 0
+  let broadcastCalls = 0
+
+  xolosWalletService.getAddress = () => 'ecash:qtestaddress'
+  xolosWalletService.getSignatory = () => {
+    signerCalls += 1
+    throw new Error('getSignatory no debe ejecutarse para un OP_RETURN fuera de política')
+  }
+  chronik.address = () => ({
+    utxos: async () => {
+      utxoCalls += 1
+      return { utxos: [] }
+    }
+  })
+  chronik.validateRawTx = async () => {
+    validateCalls += 1
+    return {}
+  }
+  chronik.broadcastTx = async () => {
+    broadcastCalls += 1
+    return { txid: '9'.repeat(64) }
+  }
+
+  try {
+    const { wallet, responses, sessionRequest } = buildWalletHarness()
+    ;(wallet as unknown as {
+      enqueuePendingRequest: () => Promise<boolean>
+      activatePendingRequest: () => Promise<void>
+      buildSignBroadcastFromOutputs: () => Promise<{ txid: string }>
+      assertBroadcastFeePolicy: () => Promise<void>
+    }).enqueuePendingRequest = async () => {
+      enqueueCalls += 1
+      return true
+    }
+    ;(wallet as unknown as { activatePendingRequest: () => Promise<void> }).activatePendingRequest = async () => {
+      activationCalls += 1
+    }
+    ;(wallet as unknown as { buildSignBroadcastFromOutputs: () => Promise<{ txid: string }> }).buildSignBroadcastFromOutputs = async () => {
+      outputsRouteCalls += 1
+      return { txid: '8'.repeat(64) }
+    }
+    ;(wallet as unknown as { assertBroadcastFeePolicy: () => Promise<void> }).assertBroadcastFeePolicy = async () => {
+      feePolicyCalls += 1
+    }
+    const debugStateBefore = getWcDebugState()
+
+    await sessionRequest({
+      topic: 't1',
+      id: 1072,
+      params: {
+        chainId: 'ecash:1',
+        request: {
+          method: 'ecash_signAndBroadcastTransaction',
+          params: {
+            offerId: 'offer-op-return-219',
+            outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }],
+            message: 'a'.repeat(219)
+          }
+        }
+      }
+    })
+
+    assert.equal(responses.length, 1)
+    assert.equal(responses[0].response.error?.code, -32602)
+    assert.equal(
+      responses[0].response.error?.message,
+      'message OP_RETURN produce 224 bytes; el máximo permitido es 223 bytes. Longitud UTF-8 del mensaje: 219 bytes.'
+    )
+    assert.equal(wallet.getState().pendingRequest, null)
+    assert.equal(wallet.getState().pendingQueueSize, 0)
+    assert.equal(getWcDebugState(), debugStateBefore)
+    assert.deepEqual(
+      {
+        enqueueCalls,
+        activationCalls,
+        signerCalls,
+        utxoCalls,
+        outputsRouteCalls,
+        feePolicyCalls,
+        validateCalls,
+        broadcastCalls
+      },
+      {
+        enqueueCalls: 0,
+        activationCalls: 0,
+        signerCalls: 0,
+        utxoCalls: 0,
+        outputsRouteCalls: 0,
+        feePolicyCalls: 0,
+        validateCalls: 0,
+        broadcastCalls: 0
+      }
+    )
+  } finally {
+    chronik.address = originalAddress
+    chronik.validateRawTx = originalValidateRawTx
+    chronik.broadcastTx = originalBroadcastTx
+    xolosWalletService.getAddress = originalGetAddress
+    xolosWalletService.getSignatory = originalGetSignatory
+  }
+})
+
+test('XEC estructurado con mensaje de 218 bytes puede continuar y aprobarse', async () => {
+  const originalGetAddress = xolosWalletService.getAddress
+  xolosWalletService.getAddress = () => 'ecash:qtestaddress'
+  const message = 'a'.repeat(OP_RETURN_MAX_BYTES - 5)
+
+  try {
+    const { wallet, responses, sessionRequest } = buildWalletHarness()
+    let outputsRouteCalls = 0
+    ;(wallet as unknown as {
+      buildSignBroadcastFromOutputs: (
+        outputs: Array<{ address: string; valueSats: string }>,
+        message?: string
+      ) => Promise<{ txid: string }>
+      emitOfferConsumed: () => Promise<void>
+    }).buildSignBroadcastFromOutputs = async (outputs, receivedMessage) => {
+      outputsRouteCalls += 1
+      assert.equal(outputs.length, 1)
+      assert.equal(receivedMessage, message)
+      return { txid: '2'.repeat(64) }
+    }
+    ;(wallet as unknown as { emitOfferConsumed: () => Promise<void> }).emitOfferConsumed = async () => {}
+
+    await sessionRequest({
+      topic: 't1',
+      id: 1073,
+      params: {
+        chainId: 'ecash:1',
+        request: {
+          method: 'ecash_signAndBroadcastTransaction',
+          params: {
+            offerId: 'offer-op-return-218',
+            outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }],
+            message
+          }
+        }
+      }
+    })
+
+    assert.equal(responses.length, 0)
+    assert.equal(wallet.getState().pendingRequest?.params.message, message)
+    await wallet.approvePendingRequest()
+    assert.equal(outputsRouteCalls, 1)
+    assert.equal((responses[0].response.result as { txid: string }).txid, '2'.repeat(64))
+  } finally {
+    xolosWalletService.getAddress = originalGetAddress
+  }
+})
+
+test('XEC estructurado fuera de política no se encola cuando otra solicitud está activa', async () => {
+  const originalGetAddress = xolosWalletService.getAddress
+  xolosWalletService.getAddress = () => 'ecash:qtestaddress'
+
+  try {
+    const { wallet, responses, sessionRequest } = buildWalletHarness()
+    const activeRequest: PendingRequest = {
+      id: 1075,
+      topic: 't1',
+      method: 'ecash_signAndBroadcastTransaction',
+      chainId: 'ecash:1',
+      params: {
+        offerId: 'active-op-return-intent',
+        requestMode: 'intent',
+        outputs: [{ address: 'ecash:qrecipient', valueSats: '1200' }]
+      },
+      expiresAt: Math.floor(Date.now() / 1000) + 300,
+      createdAt: Math.floor(Date.now() / 1000),
+      rawTxPreviewStatus: 'idle'
+    }
+    setPendingRequest(wallet, activeRequest)
+    let enqueueCalls = 0
+    ;(wallet as unknown as { enqueuePendingRequest: () => Promise<boolean> }).enqueuePendingRequest = async () => {
+      enqueueCalls += 1
+      return true
+    }
+    const debugStateBefore = getWcDebugState()
+
+    await sessionRequest({
+      topic: 't1',
+      id: 1076,
+      params: {
+        chainId: 'ecash:1',
+        request: {
+          method: 'ecash_signAndBroadcastTransaction',
+          params: {
+            offerId: 'queued-op-return-219',
+            outputs: [{ address: 'ecash:qrecipient', valueSats: 1200 }],
+            message: 'a'.repeat(219)
+          }
+        }
+      }
+    })
+
+    assert.equal(responses.length, 1)
+    assert.equal(responses[0].response.error?.code, -32602)
+    assert.equal(wallet.getState().pendingRequest?.id, activeRequest.id)
+    assert.equal(wallet.getState().pendingQueueSize, 0)
+    assert.equal(enqueueCalls, 0)
+    assert.equal(getWcDebugState(), debugStateBefore)
+  } finally {
+    xolosWalletService.getAddress = originalGetAddress
+  }
+})
+
+test('RMZ/ALP con message no soportado conserva su error existente fuera del gate XEC', async () => {
+  const originalGetAddress = xolosWalletService.getAddress
+  xolosWalletService.getAddress = () => 'ecash:qtestaddress'
+
+  try {
+    const { wallet, responses, sessionRequest } = buildWalletHarness()
+    await sessionRequest({
+      topic: 't1',
+      id: 1074,
+      params: {
+        chainId: 'ecash:1',
+        request: {
+          method: 'ecash_signAndBroadcastTransaction',
+          params: {
+            offerId: 'offer-token-message',
+            mode: 'intent',
+            outputs: [
+              {
+                address: 'ecash:qrecipient',
+                valueSats: '546',
+                token: {
+                  protocol: 'ALP',
+                  tokenId: 'c923bd0f09c630c5e9980cf518c8d34b6353802a3cb7c3f34fa7cc85c9305908',
+                  amount: '1'
+                }
+              }
+            ],
+            message: 'a'.repeat(219)
+          }
+        }
+      }
+    })
+
+    assert.equal(responses.length, 0)
+    assert.equal(wallet.getState().pendingRequest?.params.message?.length, 219)
+    await wallet.approvePendingRequest()
+    assert.equal(responses.length, 1)
+    assert.equal(responses[0].response.error?.code, -32000)
+    assert.equal(
+      wallet.getState().pendingRequestError,
+      'WalletConnect token intents no soportan message OP_RETURN adicional.'
+    )
+    assert.match(
+      responses[0].response.error?.message ?? '',
+      /WalletConnect token intents no soportan message OP_RETURN adicional\./
+    )
+  } finally {
+    xolosWalletService.getAddress = originalGetAddress
+  }
 })
 
 test('intent RMZ/ALP puro conserva la delegación productiva a wallet.sendETokens', async () => {
