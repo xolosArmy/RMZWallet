@@ -2,7 +2,7 @@ import { Core } from '@walletconnect/core'
 import { Web3Wallet } from '@walletconnect/web3wallet'
 import type { IWeb3Wallet, Web3WalletTypes } from '@walletconnect/web3wallet'
 import type { SessionTypes, Verify } from '@walletconnect/types'
-import { Script, Tx, TxBuilder, fromHex, toHexRev } from 'ecash-lib'
+import { OP_RETURN_MAX_BYTES, Script, Tx, TxBuilder, fromHex, toHexRev } from 'ecash-lib'
 import { getChronik } from '../../services/ChronikClient'
 import { xolosWalletService } from '../../services/XolosWalletService'
 import { XEC_DUST_SATS } from '../../config/xecFees'
@@ -126,6 +126,56 @@ function parseLegacyOutpointString(value: string): { txid: string; vout: number 
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+type OpReturnScriptCandidate = {
+  normalizedMessage: string
+  messageByteLength: number
+  payloadByteLength: number
+  pushOpHex: string
+  scriptHex: string
+  scriptByteLength: number
+}
+
+function buildOpReturnScriptCandidate(message: string): OpReturnScriptCandidate | null {
+  const normalizedMessage = message.trim()
+  if (!normalizedMessage) return null
+
+  const messageBytes = new TextEncoder().encode(normalizedMessage)
+  const messageByteLength = messageBytes.length
+  const payloadHex =
+    '6d02' +
+    Array.from(messageBytes)
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('')
+  const payloadByteLength = payloadHex.length / 2
+  const usesDirectPush = payloadByteLength <= 75
+  const pushHeaderByteLength = usesDirectPush ? 1 : 2
+  const scriptByteLength = 1 + pushHeaderByteLength + payloadByteLength
+  const pushOpHex = usesDirectPush
+    ? payloadByteLength.toString(16).padStart(2, '0')
+    : payloadByteLength <= 0xff
+      ? `4c${payloadByteLength.toString(16).padStart(2, '0')}`
+      : ''
+
+  if (scriptByteLength > OP_RETURN_MAX_BYTES) {
+    throw new Error(
+      `message OP_RETURN produce ${scriptByteLength} bytes; el máximo permitido es ${OP_RETURN_MAX_BYTES} bytes. ` +
+      `Longitud UTF-8 del mensaje: ${messageByteLength} bytes.`
+    )
+  }
+  if (!pushOpHex) {
+    throw new Error('message OP_RETURN demasiado grande')
+  }
+
+  return {
+    normalizedMessage,
+    messageByteLength,
+    payloadByteLength,
+    pushOpHex,
+    scriptHex: `6a${pushOpHex}${payloadHex}`,
+    scriptByteLength
+  }
 }
 
 function unwrapWcParams(input: unknown): Record<string, unknown> {
@@ -869,6 +919,22 @@ export class WcWallet {
       modeCandidate === 'intent' || modeCandidate === 'legacy' || modeCandidate === 'tx' ? modeCandidate : undefined
     const requestMode: 'legacy' | 'intent' | 'tx' = explicitMode ?? (hasOutputs ? 'intent' : hasRawHex ? 'tx' : 'legacy')
 
+    const usesStructuredXecOpReturn =
+      hasOutputs && normalizedOutputs.every((output) => output.token === undefined)
+    if (usesStructuredXecOpReturn && normalizedMessage) {
+      try {
+        buildOpReturnScriptCandidate(normalizedMessage)
+      } catch (err) {
+        return {
+          params: null,
+          error: {
+            code: -32602,
+            message: err instanceof Error ? err.message : 'Params inválidos: message OP_RETURN fuera de política'
+          }
+        }
+      }
+    }
+
     const normalizeOutpointValue = (item: unknown): string | null => {
       if (typeof item === 'string') return item.trim()
       if (!item || typeof item !== 'object') return null
@@ -1096,31 +1162,9 @@ export class WcWallet {
   }
 
   private buildOpReturnScript(message: string): Script | null {
-    const trimmed = message.trim()
-    if (!trimmed) return null
-
-    const payloadBytes = new TextEncoder().encode(trimmed)
-    if (payloadBytes.length > 220) {
-      throw new Error('message OP_RETURN excede 220 bytes')
-    }
-
-    const payloadHex =
-      '6d02' +
-      Array.from(payloadBytes)
-        .map((byte) => byte.toString(16).padStart(2, '0'))
-        .join('')
-    const payloadLength = payloadHex.length / 2
-
-    let pushOpHex = ''
-    if (payloadLength <= 75) {
-      pushOpHex = payloadLength.toString(16).padStart(2, '0')
-    } else if (payloadLength <= 0xff) {
-      pushOpHex = `4c${payloadLength.toString(16).padStart(2, '0')}`
-    } else {
-      throw new Error('message OP_RETURN demasiado grande')
-    }
-
-    return new Script(fromHex(`6a${pushOpHex}${payloadHex}`))
+    const candidate = buildOpReturnScriptCandidate(message)
+    if (!candidate) return null
+    return new Script(fromHex(candidate.scriptHex))
   }
 
   private async buildSignBroadcastFromOutputs(
