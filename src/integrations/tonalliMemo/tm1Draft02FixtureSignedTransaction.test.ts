@@ -113,9 +113,9 @@ describe('TM1 Draft 0.2 deterministic fixture signed transaction audit', () => {
 
     const changedSequence = candidate({
       inputs: [
-        { ...original.inputs[0]!, sequence: 0xfffffffen },
+        { ...original.inputs[0]!, sequence: 0xfffffffe },
         original.inputs[1]!
-      ] as never
+      ]
     })
     expect(() => auditTm1Draft02FixtureSignedTransaction({
       candidate: original,
