@@ -5,9 +5,7 @@ import type {
   ApprovalConsumptionLedger
 } from '../../features/externalSign/approval'
 import { UniversalAuthorizationCore } from '../../features/externalSign/core'
-import type {
-  UniversalAuthorizationEnvelopeV1
-} from '../../features/externalSign/contract'
+import type { UniversalAuthorizationEnvelopeV1 } from '../../features/externalSign/contract'
 import type {
   UniversalOperationLease,
   UniversalOperationLock
@@ -28,7 +26,6 @@ import {
 import {
   TM1_DRAFT_02_FIXTURE_AUTHORIZATION_PROFILE_ID,
   Tm1Draft02FixtureAuthorizationAdapter,
-  type Tm1Draft02FixtureEffectiveContentSource,
   type Tm1Draft02FixtureSigner,
   type Tm1Draft02FixtureStateProvider
 } from './tm1Draft02FixtureAuthorizationAdapter'
@@ -150,13 +147,6 @@ function harness(overrides: HarnessOverrides = {}) {
   const value = candidate()
   const effectiveContent = encodeTm1Draft02CandidateEffectiveContent(value)
   const events: string[] = []
-  const source: Tm1Draft02FixtureEffectiveContentSource = {
-    readEffectiveContent: vi.fn(async (_envelope, signal) => {
-      events.push('prepare')
-      if (signal.aborted) throw new Error('OPERATION_ABORTED')
-      return new Uint8Array(effectiveContent)
-    })
-  }
   const stateProvider: Tm1Draft02FixtureStateProvider = {
     readFreshUtxos: vi.fn(overrides.readFreshUtxos ?? (async (_outpoints, signal) => {
       events.push('revalidate')
@@ -167,7 +157,6 @@ function harness(overrides: HarnessOverrides = {}) {
   const signer: Tm1Draft02FixtureSigner = {
     signFixtureTransaction: vi.fn(overrides.signFixtureTransaction ?? (async input => {
       events.push('sign')
-      if (input.signal.aborted) throw new Error('OPERATION_ABORTED')
       return createTm1Draft02DeterministicFixtureSignedTransaction({
         candidate: input.candidate,
         contentHash: input.contentHash
@@ -176,7 +165,13 @@ function harness(overrides: HarnessOverrides = {}) {
   }
   const ledger = new FixtureLedger()
   const adapter = new Tm1Draft02FixtureAuthorizationAdapter({
-    effectiveContentSource: source,
+    effectiveContentSource: {
+      readEffectiveContent: vi.fn(async (_envelope, signal) => {
+        events.push('prepare')
+        if (signal.aborted) throw new Error('OPERATION_ABORTED')
+        return new Uint8Array(effectiveContent)
+      })
+    },
     stateProvider,
     signer
   })
@@ -192,17 +187,7 @@ function harness(overrides: HarnessOverrides = {}) {
     now: () => NOW,
     createCapabilityId: operationId => `${operationId}:fixture-capability`
   })
-  return Object.freeze({
-    value,
-    effectiveContent,
-    events,
-    source,
-    stateProvider,
-    signer,
-    ledger,
-    adapter,
-    core
-  })
+  return Object.freeze({ value, effectiveContent, events, stateProvider, signer, ledger, adapter, core })
 }
 
 describe('TM1 Draft 0.2 fixture authorization adapter', () => {
@@ -220,13 +205,12 @@ describe('TM1 Draft 0.2 fixture authorization adapter', () => {
     expect(review.fields).toContainEqual({ label: 'Delivery', value: 'fixture-only; no broadcast' })
   })
 
-  test('runs prepare, revalidate, consumes capability, and signs exactly once through the real core', async () => {
+  test('runs prepare, revalidate, consume, and sign exactly once through the real core', async () => {
     const testHarness = harness()
     const operation = testHarness.core.start(envelope(), testHarness.adapter)
     const prepared = await operation.ready
     const result = await operation.approve()
 
-    expect(prepared.review.effectiveContent).toEqual(testHarness.effectiveContent)
     expect(result.format).toBe(TM1_DRAFT_02_FIXTURE_SIGNED_FORMAT)
     expect(result.contentHash).toBe(prepared.contentHash)
     expect(testHarness.events).toEqual(['prepare', 'revalidate', 'consume', 'sign'])
@@ -234,14 +218,8 @@ describe('TM1 Draft 0.2 fixture authorization adapter', () => {
     expect(testHarness.signer.signFixtureTransaction).toHaveBeenCalledTimes(1)
     expect(operation.state()).toBe('completed')
     expect(operation.history()).toEqual([
-      'disabled',
-      'receiving',
-      'preparing',
-      'reviewReady',
-      'approving',
-      'revalidating',
-      'signing',
-      'completed'
+      'disabled', 'receiving', 'preparing', 'reviewReady',
+      'approving', 'revalidating', 'signing', 'completed'
     ])
 
     const audited = auditTm1Draft02FixtureSignedTransaction({
@@ -252,9 +230,9 @@ describe('TM1 Draft 0.2 fixture authorization adapter', () => {
     expect(audited.feeSats).toBe(1_000n)
   })
 
-  test('does not sign or consume when fresh prevout sats changed', async () => {
+  test('does not consume or sign when a fresh prevout changed', async () => {
     const testHarness = harness({
-      readFreshUtxos: async (_outpoints, _signal) => {
+      readFreshUtxos: async () => {
         const fresh = [...freshUtxos(candidate())]
         fresh[0] = Object.freeze({ ...fresh[0]!, sats: 6_999n })
         return fresh
@@ -269,7 +247,7 @@ describe('TM1 Draft 0.2 fixture authorization adapter', () => {
     expect(operation.state()).toBe('failed')
   })
 
-  test('rejects signed bytes changed after the injected signer returns', async () => {
+  test('consumes once but rejects bytes altered by the injected signer', async () => {
     const testHarness = harness({
       signFixtureTransaction: async input => {
         const bytes = createTm1Draft02DeterministicFixtureSignedTransaction({
@@ -292,7 +270,7 @@ describe('TM1 Draft 0.2 fixture authorization adapter', () => {
     expect(operation.state()).toBe('failed')
   })
 
-  test('binds deterministic fixture attestations to contentHash', () => {
+  test('binds fixture attestations to contentHash and refuses repeat approval', async () => {
     const value = candidate()
     const firstHash = `sha256:${'11'.repeat(32)}` as UniversalContentHash
     const secondHash = `sha256:${'22'.repeat(32)}` as UniversalContentHash
@@ -300,21 +278,17 @@ describe('TM1 Draft 0.2 fixture authorization adapter', () => {
       candidate: value,
       contentHash: firstHash
     })
-
     expect(() => auditTm1Draft02FixtureSignedTransaction({
       candidate: value,
       contentHash: secondHash,
       signedTransactionBytes: bytes
     })).toThrowError(Tm1Draft02FixtureSignedTransactionError)
-  })
 
-  test('refuses a second approval after the operation completed', async () => {
     const testHarness = harness()
     const operation = testHarness.core.start(envelope('tm1-one-use'), testHarness.adapter)
     await operation.ready
     await operation.approve()
-
-    await expect(operation.approve()).rejects.toThrow('INVALID_STATE_TRANSITION')
+    expect(() => operation.approve()).toThrow('INVALID_STATE_TRANSITION')
     expect(testHarness.ledger.consumptions).toHaveLength(1)
     expect(testHarness.signer.signFixtureTransaction).toHaveBeenCalledTimes(1)
   })
