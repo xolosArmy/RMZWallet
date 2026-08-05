@@ -55,6 +55,7 @@ function MemoFeed() {
           <p className="muted">Mensajes oficiales de Tonalli Memo validados por la politica publica del registro.</p>
         </div>
         <div className="quick-actions" aria-label="Acciones del feed Memo">
+          <Link className="cta outline" to="/memo/draft/tm1">Vista previa TM1</Link>
           <button className="cta outline" type="button" onClick={retry} disabled={state.status === 'loading'}>
             Reintentar
           </button>
