@@ -88,11 +88,12 @@ export function decodeTm1Draft02CandidateEffectiveContent(
   const maxFeeSats = reader.readUint64()
   const encodedFeeSats = reader.readUint64()
 
-  const inputCount = reader.readBoundedCount()
-  const inputs = Array.from({ length: inputCount }, (_, expectedIndex) => {
+  const inputs = Array.from({ length: reader.readBoundedCount() }, (_, expectedIndex) => {
     const index = reader.readUint32()
     const role = reader.readUint8()
-    if (index !== expectedIndex || role !== (expectedIndex === 0 ? 0 : 1)) fail('INVALID_EFFECTIVE_CONTENT')
+    if (index !== expectedIndex || role !== (expectedIndex === 0 ? 0 : 1)) {
+      fail('INVALID_EFFECTIVE_CONTENT')
+    }
     return Object.freeze({
       txid: bytesToHex(reader.readBytes(32)),
       outIdx: reader.readUint32(),
@@ -102,11 +103,12 @@ export function decodeTm1Draft02CandidateEffectiveContent(
     })
   })
 
-  const outputCount = reader.readBoundedCount()
-  const outputs = Array.from({ length: outputCount }, (_, expectedIndex) => {
+  const outputs = Array.from({ length: reader.readBoundedCount() }, (_, expectedIndex) => {
     const index = reader.readUint32()
     const role = reader.readUint8()
-    if (index !== expectedIndex || role !== (expectedIndex === 0 ? 0 : 1)) fail('INVALID_EFFECTIVE_CONTENT')
+    if (index !== expectedIndex || role !== (expectedIndex === 0 ? 0 : 1)) {
+      fail('INVALID_EFFECTIVE_CONTENT')
+    }
     return Object.freeze({
       sats: reader.readUint64(),
       scriptHex: bytesToHex(reader.readBytesWithLength(MAX_SCRIPT_BYTES))
@@ -178,20 +180,17 @@ export function parseTm1Draft02UnsignedTransaction(
 ): ParsedTm1Draft02UnsignedTransaction {
   const reader = new TxReader(bytes)
   const transactionVersion = reader.readUint32()
-  const inputCount = reader.readCompactSizeCount()
-  const inputs = Array.from({ length: inputCount }, (_, index) => {
+  const inputs = Array.from({ length: reader.readCompactSizeCount() }, (_, index) => {
     const txid = bytesToHex(reverseBytes(reader.readBytes(32)))
     const outIdx = reader.readUint32()
-    const scriptLength = reader.readCompactSizeLength(MAX_SCRIPT_BYTES)
-    const scriptSigHex = bytesToHex(reader.readBytes(scriptLength))
+    const scriptSigHex = bytesToHex(reader.readBytes(reader.readCompactSizeLength(MAX_SCRIPT_BYTES)))
     const sequence = reader.readUint32()
     return Object.freeze({ index, txid, outIdx, sequence, scriptSigHex })
   })
-  const outputCount = reader.readCompactSizeCount()
-  const outputs = Array.from({ length: outputCount }, (_, index) => {
+  const outputs = Array.from({ length: reader.readCompactSizeCount() }, (_, index) => {
     const sats = reader.readUint64()
-    const scriptLength = reader.readCompactSizeLength(MAX_SCRIPT_BYTES)
-    return Object.freeze({ index, sats, scriptHex: bytesToHex(reader.readBytes(scriptLength)) })
+    const scriptHex = bytesToHex(reader.readBytes(reader.readCompactSizeLength(MAX_SCRIPT_BYTES)))
+    return Object.freeze({ index, sats, scriptHex })
   })
   const locktime = reader.readUint32()
   reader.assertFinished()
@@ -244,14 +243,15 @@ export function auditTm1Draft02UnsignedTransaction(input: Readonly<{
   if (
     transaction.outputs[1]?.scriptHex !== candidate.authorLockingScriptHex ||
     transaction.outputs[1]?.sats !== candidate.outputs[1].sats
-  ) fail('CHANGE_OUTPUT_MISMATCH')
+  ) {
+    fail('CHANGE_OUTPUT_MISMATCH')
+  }
 
   const inputSats = candidate.inputs.reduce((sum, item) => sum + item.sats, 0n)
   const outputSats = transaction.outputs.reduce((sum, item) => sum + item.sats, 0n)
   const feeSats = inputSats - outputSats
   if (feeSats !== candidate.feePolicy.feeSats) fail('FEE_MISMATCH')
   if (feeSats > candidate.feePolicy.maxFeeSats) fail('FEE_LIMIT_EXCEEDED')
-
   if (!bytesEqual(serializeTm1Draft02UnsignedTransaction(candidate), input.unsignedTransactionBytes)) {
     fail('NON_CANONICAL_UNSIGNED_TRANSACTION')
   }
@@ -293,11 +293,13 @@ function serializeParsed(parsed: ParsedTm1Draft02UnsignedTransaction): Uint8Arra
 
 class FixedReader {
   private offset = 0
+  private readonly bytes: Uint8Array
+  private readonly code: Tm1Draft02UnsignedTransactionErrorCode
 
-  constructor(
-    private readonly bytes: Uint8Array,
-    private readonly code: Tm1Draft02UnsignedTransactionErrorCode
-  ) {}
+  constructor(bytes: Uint8Array, code: Tm1Draft02UnsignedTransactionErrorCode) {
+    this.bytes = bytes
+    this.code = code
+  }
 
   readUint8(): number {
     return this.readBytes(1)[0] as number
@@ -361,8 +363,11 @@ class FixedReader {
 
 class TxReader {
   private offset = 0
+  private readonly bytes: Uint8Array
 
-  constructor(private readonly bytes: Uint8Array) {}
+  constructor(bytes: Uint8Array) {
+    this.bytes = bytes
+  }
 
   readUint32(): number {
     const b = this.readBytes(4)
