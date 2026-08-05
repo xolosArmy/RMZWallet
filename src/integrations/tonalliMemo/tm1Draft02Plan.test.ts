@@ -88,6 +88,7 @@ describe('TM1 Draft 0.2 deterministic funding plan', () => {
     const oneInputFee = BigInt(Math.ceil(oneInputSize * feeRateSatsPerByte))
     const twoInputFee = BigInt(Math.ceil(twoInputSize * feeRateSatsPerByte))
     const firstSats = oneInputFee + 545n
+    const secondSats = 1_000n
 
     const plan = planTm1Draft02Post({
       preview,
@@ -96,7 +97,7 @@ describe('TM1 Draft 0.2 deterministic funding plan', () => {
       dustSats: 546n,
       utxos: [
         utxo('a', 0, firstSats),
-        utxo('b', 0, 2_000n)
+        utxo('b', 0, secondSats)
       ]
     })
 
@@ -104,7 +105,7 @@ describe('TM1 Draft 0.2 deterministic funding plan', () => {
     expect(plan.inputs.map((input) => input.role)).toEqual(['author', 'funding'])
     expect(plan.estimatedSizeBytes).toBe(twoInputSize)
     expect(plan.estimatedFeeSats).toBe(twoInputFee)
-    expect(plan.changeSats).toBe(firstSats + 2_000n - twoInputFee)
+    expect(plan.changeSats).toBe(firstSats + secondSats - twoInputFee)
     expect(plan.changeSats).toBeGreaterThanOrEqual(546n)
   })
 
