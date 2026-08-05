@@ -146,7 +146,8 @@ describe('TM1 Draft 0.2 unsigned deterministic fixture transaction', () => {
   })
 
   it('rejects a non-empty scriptSig before signing', () => {
-    const bytes = serializeTm1Draft02UnsignedTransaction(candidate())
+    const original = candidate()
+    const bytes = serializeTm1Draft02UnsignedTransaction(original)
     const firstScriptLengthOffset = 4 + 1 + 32 + 4
     const altered = new Uint8Array([
       ...bytes.slice(0, firstScriptLengthOffset),
@@ -156,7 +157,7 @@ describe('TM1 Draft 0.2 unsigned deterministic fixture transaction', () => {
     ])
     expectCode(
       () => auditTm1Draft02UnsignedTransaction({
-        effectiveContent: encodeTm1Draft02CandidateEffectiveContent(candidate()),
+        effectiveContent: encodeTm1Draft02CandidateEffectiveContent(original),
         unsignedTransactionBytes: altered
       }),
       'INVALID_UNSIGNED_TRANSACTION'
@@ -207,56 +208,42 @@ describe('TM1 Draft 0.2 unsigned deterministic fixture transaction', () => {
     )
   })
 
-  it('rejects an altered TM1 OP_RETURN', () => {
+  it('rejects an altered TM1 OP_RETURN script', () => {
     const original = candidate()
-    const altered = candidate({
-      outputs: [
-        original.outputs[0],
-        { sats: 9_999n, scriptHex: AUTHOR_SCRIPT }
-      ]
-    })
-    const bytes = serializeTm1Draft02UnsignedTransaction(altered)
+    const bytes = serializeTm1Draft02UnsignedTransaction(original)
+    const script = hexBytes(original.outputs[0].scriptHex)
+    const offset = findSubarray(bytes, script)
+    const altered = new Uint8Array(bytes)
+    altered[offset + script.length - 1] ^= 0x01
 
     expectCode(
       () => auditTm1Draft02UnsignedTransaction({
         effectiveContent: encodeTm1Draft02CandidateEffectiveContent(original),
-        unsignedTransactionBytes: bytes
+        unsignedTransactionBytes: altered
       }),
-      'OUTPUT_SATS_MISMATCH'
+      'OUTPUT_SCRIPT_MISMATCH'
     )
   })
 
   it('rejects change script and amount substitutions', () => {
     const original = candidate()
-    const tm1 = original.outputs[0]
-    const otherScript = `76a914${'33'.repeat(20)}88ac`
     const amountChanged = candidate({
-      inputs: original.inputs.map(input => ({
-        txid: input.txid,
-        outIdx: input.outIdx,
-        sequence: input.sequence,
-        sats: input.sats,
-        lockingScriptHex: input.lockingScriptHex
-      })),
-      outputs: [tm1, { sats: 9_900n, scriptHex: AUTHOR_SCRIPT }],
+      outputs: [original.outputs[0], { sats: 9_900n, scriptHex: AUTHOR_SCRIPT }],
       maxFeeSats: 2_000n
     })
-    const bytes = serializeTm1Draft02UnsignedTransaction(amountChanged)
     expectCode(
       () => auditTm1Draft02UnsignedTransaction({
         effectiveContent: encodeTm1Draft02CandidateEffectiveContent(original),
-        unsignedTransactionBytes: bytes
+        unsignedTransactionBytes: serializeTm1Draft02UnsignedTransaction(amountChanged)
       }),
       'OUTPUT_SATS_MISMATCH'
     )
 
+    const otherScript = `76a914${'33'.repeat(20)}88ac`
     const raw = serializeTm1Draft02UnsignedTransaction(original)
-    const scriptHex = AUTHOR_SCRIPT
-    const script = Uint8Array.from(scriptHex.match(/../g)!.map(byte => Number.parseInt(byte, 16)))
-    const replacement = Uint8Array.from(otherScript.match(/../g)!.map(byte => Number.parseInt(byte, 16)))
-    const offset = findSubarray(raw, script)
+    const offset = findSubarray(raw, hexBytes(AUTHOR_SCRIPT))
     const scriptChanged = new Uint8Array(raw)
-    scriptChanged.set(replacement, offset)
+    scriptChanged.set(hexBytes(otherScript), offset)
     expectCode(
       () => auditTm1Draft02UnsignedTransaction({
         effectiveContent: encodeTm1Draft02CandidateEffectiveContent(original),
@@ -266,12 +253,20 @@ describe('TM1 Draft 0.2 unsigned deterministic fixture transaction', () => {
     )
   })
 
-  it('rejects input count and output count substitutions', () => {
+  it('rejects input count and malformed output count substitutions', () => {
     const original = candidate()
     const bytes = serializeTm1Draft02UnsignedTransaction(original)
     const effectiveContent = encodeTm1Draft02CandidateEffectiveContent(original)
+    const oneInputCandidate = candidate({
+      inputs: [{
+        txid: AUTHOR_TXID,
+        outIdx: 1,
+        sequence: TM1_DRAFT_02_SEQUENCE,
+        sats: 11_000n,
+        lockingScriptHex: AUTHOR_SCRIPT
+      }]
+    })
 
-    const oneInputCandidate = candidate({ inputs: [original.inputs[0]!] })
     expectCode(
       () => auditTm1Draft02UnsignedTransaction({
         effectiveContent,
@@ -287,11 +282,9 @@ describe('TM1 Draft 0.2 unsigned deterministic fixture transaction', () => {
   })
 })
 
-function serializeTm1Draft02UnsignedTransaction(value: Tm1Draft02Candidate): Uint8Array {
-  return serializeTm1Draft02UnsignedTransactionImported(value)
+function hexBytes(hex: string): Uint8Array {
+  return Uint8Array.from(hex.match(/../g)!.map(byte => Number.parseInt(byte, 16)))
 }
-
-import { serializeTm1Draft02UnsignedTransaction as serializeTm1Draft02UnsignedTransactionImported } from './tm1Draft02UnsignedTransaction'
 
 function findSubarray(haystack: Uint8Array, needle: Uint8Array): number {
   outer: for (let index = 0; index <= haystack.length - needle.length; index += 1) {
