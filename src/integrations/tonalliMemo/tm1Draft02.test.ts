@@ -36,8 +36,9 @@ describe('TM1 Draft 0.2 preview encoder', () => {
     const preview = encodeTm1Draft02Post({ eventData: 'a'.repeat(TM1_DRAFT_02_WALLET_MAX_EVENT_DATA_BYTES) })
 
     expect(preview.eventDataByteLength).toBe(80)
+    expect(preview.envelopeByteLength).toBe(83)
     expect(preview.scriptHex.startsWith(`6a04${TM1_DRAFT_02_LOKAD_ID_HEX}4c53`)).toBe(true)
-    expect(preview.scriptByteLength).toBe(90)
+    expect(preview.scriptByteLength).toBe(91)
   })
 
   it('rejects empty data, oversized data, and invalid input indexes with stable codes', () => {
