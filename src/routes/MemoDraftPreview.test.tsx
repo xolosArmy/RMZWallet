@@ -80,7 +80,7 @@ describe('TM1 Draft 0.2 wallet-backed review UI', () => {
     expect(screen.getByText('Política de Tonalli Wallet para publicaciones ordinarias autofinanciadas.')).toBeTruthy()
     expect(screen.getAllByText('0').length).toBeGreaterThan(0)
     expect(screen.queryByRole('spinbutton')).toBeNull()
-    expect(screen.getByRole('button', { name: 'Calcular plan estimado' })).toBeDisabled()
+    expect((screen.getByRole('button', { name: 'Calcular plan estimado' }) as HTMLButtonElement).disabled).toBe(true)
     expect(screen.queryByRole('button', { name: /autorizar|firmar|publicar|transmitir/i })).toBeNull()
   })
 
@@ -116,6 +116,6 @@ describe('TM1 Draft 0.2 wallet-backed review UI', () => {
     await Promise.resolve()
 
     expect(screen.queryByText('Snapshot estimado de fondeo')).toBeNull()
-    expect(screen.getByRole('button', { name: 'Calcular plan estimado' })).not.toBeDisabled()
+    expect((screen.getByRole('button', { name: 'Calcular plan estimado' }) as HTMLButtonElement).disabled).toBe(false)
   })
 })
