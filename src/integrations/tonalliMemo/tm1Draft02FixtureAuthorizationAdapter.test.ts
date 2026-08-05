@@ -288,7 +288,7 @@ describe('TM1 Draft 0.2 fixture authorization adapter', () => {
     const operation = testHarness.core.start(envelope('tm1-one-use'), testHarness.adapter)
     await operation.ready
     await operation.approve()
-    expect(() => operation.approve()).toThrow('INVALID_STATE_TRANSITION')
+    expect(() => operation.approve()).toThrow('OPERATION_OWNERSHIP_LOST')
     expect(testHarness.ledger.consumptions).toHaveLength(1)
     expect(testHarness.signer.signFixtureTransaction).toHaveBeenCalledTimes(1)
   })
