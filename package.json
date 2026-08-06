@@ -13,7 +13,8 @@
     "mint:parent": "ADDR=ecash:TU_ADDR npx tsx scripts/mint-parent-group.ts",
     "send:token": "npx tsx scripts/send-token.ts",
     "mint:passes": "npx tsx scripts/mint-parent-passes.ts",
-    "test:mint-passes": "npx tsx --test src/services/slpNftTxBuilder.test.ts"
+    "test:mint-passes": "npx tsx --test src/services/slpNftTxBuilder.test.ts",
+    "test:tm1-regtest-e2e": "npx tsx scripts/run-tm1-regtest-e2e.ts"
   },
   "dependencies": {
     "@fontsource/inter": "^5.3.0",
