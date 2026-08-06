@@ -39,7 +39,7 @@ export class Tm1ChronikRegtestDeliveryTransportError extends Error {
 
   constructor(
     code: Tm1ChronikRegtestDeliveryTransportErrorCode,
-    message = code
+    message: string = code
   ) {
     super(message)
     this.name = 'Tm1ChronikRegtestDeliveryTransportError'
@@ -255,7 +255,7 @@ function errorMessage(error: unknown): string {
 
 function fail(
   code: Tm1ChronikRegtestDeliveryTransportErrorCode,
-  message = code
+  message: string = code
 ): never {
   throw new Tm1ChronikRegtestDeliveryTransportError(code, message)
 }
