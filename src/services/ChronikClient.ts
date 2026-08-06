@@ -1,6 +1,6 @@
 import { ChronikClient } from 'chronik-client'
 
-const DEFAULT_CHRONIK_URLS = ['https://chronik.e.cash', 'https://chronik.xolosarmy.xyz']
+const DEFAULT_CHRONIK_URLS = ['https://chronik.xolosarmy.xyz', 'https://chronik.e.cash']
 
 type ViteEnv = Record<string, string | undefined> & { DEV?: boolean }
 
