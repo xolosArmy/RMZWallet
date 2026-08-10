@@ -6,6 +6,7 @@ import type { ScriptUtxo } from 'chronik-client'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
+import { FIRMA_ALPHA_TOKEN_ID } from '../config/firmaAlpha'
 import {
   NFT_RESCAN_STORAGE_KEY,
   XOLOSARMY_NFT_PARENT_TOKEN_ID,
@@ -20,6 +21,7 @@ import { wcWallet } from '../lib/walletconnect/WcWallet'
 import type { OfferPublishedPayload } from '../lib/walletconnect/WcWallet'
 import WcDebugPanel from '../components/WcDebugPanel'
 import DexTakerRmz from '../features/dex/components/DexTakerRmz'
+import FirmaAlphaMarket from '../features/dex/components/FirmaAlphaMarket'
 import {
   MINT_PASS_MAX_QUANTITY,
   NFT_PARENT_MINT_BATON_VOUT,
@@ -94,7 +96,7 @@ const persistSavedOffers = (offers: SavedOffer[]) => {
 function DEX() {
   const { address, initialized, refreshBalances, rescanWallet, loading, error, backupVerified } = useWallet()
   const [rmzDecimals, setRmzDecimals] = useState<number | null>(null)
-  const [dexTab, setDexTab] = useState<'maker' | 'taker' | 'nft' | 'mintpass'>('maker')
+  const [dexTab, setDexTab] = useState<'firma' | 'maker' | 'taker' | 'nft' | 'mintpass'>('maker')
   const [searchParams] = useSearchParams()
   const debugEnabled = useMemo(() => searchParams.get('debug') === '1', [searchParams])
 
@@ -186,6 +188,10 @@ function DEX() {
   useEffect(() => {
     const mode = searchParams.get('mode') || ''
     const tokenId = searchParams.get('tokenId') || ''
+    if (mode === 'firma' || tokenId === FIRMA_ALPHA_TOKEN_ID) {
+      setDexTab('firma')
+      return
+    }
     if (mode === 'mintpass' && tokenId === XOLOSARMY_NFT_PARENT_TOKEN_ID) {
       setDexTab('mintpass')
       return
@@ -1111,9 +1117,16 @@ function DEX() {
       <div className="card">
         <p className="muted">DEX (Phase 1)</p>
         <div className="muted" style={{ marginTop: 8 }}>
-          Atomic DEX (oneshot): funciona por Offer ID (txid:vout). No hay orderbook en la red.
+          Mercado on-chain con ofertas Agora. Firma Alpha descubre liquidez automáticamente; los flujos heredados conservan Offer ID.
         </div>
         <div className="actions" style={{ marginTop: 8 }}>
+          <button
+            className={`cta ${dexTab === 'firma' ? 'primary' : 'ghost'}`}
+            type="button"
+            onClick={() => setDexTab('firma')}
+          >
+            Firma Alpha
+          </button>
           <button
             className={`cta ${dexTab === 'maker' ? 'primary' : 'ghost'}`}
             type="button"
@@ -1161,6 +1174,8 @@ function DEX() {
             🛒 ¡Comprar eToken $RMZ aquí!
           </a>
         </div>
+
+        {dexTab === 'firma' && <FirmaAlphaMarket />}
 
         {dexTab === 'maker' && (
           <form onSubmit={handleCreateOffer} style={{ marginTop: 16 }}>

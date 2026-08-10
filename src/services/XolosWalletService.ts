@@ -4,6 +4,7 @@ import { AgoraOneshotAdSignatory } from 'ecash-agora'
 import type { ScriptUtxo } from 'chronik-client'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
+import { FIRMA_ALPHA } from '../config/firmaAlpha'
 import {
   FEE_RATE_SATS_PER_BYTE,
   TONALLI_SERVICE_FEE_SATS,
@@ -127,6 +128,9 @@ export interface WalletBalance {
   rmzAtoms: bigint
   rmzFormatted: string
   rmzDecimals: number
+  firmaAtoms: bigint
+  firmaFormatted: string
+  firmaDecimals: number
   xecFormatted: string // XEC con 2 decimales
 }
 
@@ -596,6 +600,7 @@ export class XolosWalletService {
 
       let totalSats = 0n
       let totalRmzAtoms = 0n
+      let totalFirmaAtoms = 0n
 
       for (const scan of scans) {
         for (const utxo of scan.utxos) {
@@ -603,16 +608,30 @@ export class XolosWalletService {
           if (utxo.token && utxo.token.tokenId === RMZ_ETOKEN_ID && !utxo.token.isMintBaton) {
             totalRmzAtoms += utxo.token.atoms
           }
+          if (
+            utxo.token?.tokenId === FIRMA_ALPHA.tokenId &&
+            utxo.token.tokenType.protocol === FIRMA_ALPHA.protocol &&
+            utxo.token.tokenType.number === FIRMA_ALPHA.tokenType &&
+            !utxo.token.isMintBaton
+          ) {
+            totalFirmaAtoms += utxo.token.atoms
+          }
         }
       }
 
-      const rmzDecimals = await this.getRmzDecimals()
+      const [rmzDecimals, firmaDecimals] = await Promise.all([
+        this.getRmzDecimals(),
+        this.getFirmaAlphaDecimals()
+      ])
       const xec = totalSats
       const balances: WalletBalance = {
         xec,
         rmzAtoms: totalRmzAtoms,
         rmzFormatted: formatTokenAmount(totalRmzAtoms, rmzDecimals),
         rmzDecimals,
+        firmaAtoms: totalFirmaAtoms,
+        firmaFormatted: formatTokenAmount(totalFirmaAtoms, firmaDecimals),
+        firmaDecimals,
         xecFormatted: this.formatXecFromSats(totalSats)
       }
 
@@ -648,24 +667,40 @@ export class XolosWalletService {
       const cache = await this.scanAddresses(gapLimit, false)
       return cache.balances
     } catch {
-      const [xecBalance, rmzBalanceObj] = await Promise.all([
+      const fallbackAddress = this.getAddress()
+      const [xecBalance, rmzBalanceObj, firmaUtxos] = await Promise.all([
         wallet.getXecBalance(),
-        wallet.getETokenBalance({ tokenId: RMZ_ETOKEN_ID })
+        wallet.getETokenBalance({ tokenId: RMZ_ETOKEN_ID }),
+        fallbackAddress
+          ? getChronik().address(fallbackAddress).utxos().then((response) => response.utxos).catch(() => [])
+          : Promise.resolve([] as ScriptUtxo[])
       ])
 
-      const rmzDecimals = await this.getRmzDecimals()
-      const rmzDisplayValue =
-        typeof rmzBalanceObj === 'number'
-          ? rmzBalanceObj
-          : rmzBalanceObj.balance?.display || 0
-      const rmzDisplayString = (() => {
-        const raw = rmzDisplayValue.toString()
+      const [rmzDecimals, firmaDecimals] = await Promise.all([
+        this.getRmzDecimals(),
+        this.getFirmaAlphaDecimals()
+      ])
+      const parseBalanceAtoms = (
+        balanceObj: Awaited<ReturnType<MinimalXecWallet['getETokenBalance']>>,
+        decimals: number
+      ) => {
+        const displayValue = typeof balanceObj === 'number' ? balanceObj : balanceObj.balance?.display || 0
+        const raw = displayValue.toString()
         if (/e/i.test(raw)) {
-          return rmzDisplayValue.toFixed(rmzDecimals)
+          return parseTokenAmount(displayValue.toFixed(decimals), decimals)
         }
-        return raw
-      })()
-      const rmzAtoms = parseTokenAmount(rmzDisplayString, rmzDecimals)
+        return parseTokenAmount(raw, decimals)
+      }
+      const rmzAtoms = parseBalanceAtoms(rmzBalanceObj, rmzDecimals)
+      const firmaAtoms = firmaUtxos.reduce((total, utxo) => {
+        const token = utxo.token
+        return token?.tokenId === FIRMA_ALPHA.tokenId &&
+          token.tokenType.protocol === FIRMA_ALPHA.protocol &&
+          token.tokenType.number === FIRMA_ALPHA.tokenType &&
+          !token.isMintBaton
+          ? total + token.atoms
+          : total
+      }, 0n)
 
       const xecInSats = BigInt(Math.round((xecBalance || 0) * 100))
 
@@ -674,6 +709,9 @@ export class XolosWalletService {
         rmzAtoms,
         rmzFormatted: formatTokenAmount(rmzAtoms, rmzDecimals),
         rmzDecimals,
+        firmaAtoms,
+        firmaFormatted: formatTokenAmount(firmaAtoms, firmaDecimals),
+        firmaDecimals,
         xecFormatted: this.formatXecFromSats(xecInSats)
       }
     }
@@ -1153,6 +1191,10 @@ export class XolosWalletService {
     }
   }
 
+  async getFirmaAlphaDecimals(): Promise<number> {
+    return FIRMA_ALPHA.decimals
+  }
+
   private atomsToDisplayNumber(atoms: bigint, decimals: number): number {
     const display = Number(formatTokenAmount(atoms, decimals))
     if (!Number.isFinite(display)) {
@@ -1183,6 +1225,7 @@ export class XolosWalletService {
     const change: string[] = []
     let totalSats = 0n
     let totalRmzAtoms = 0n
+    let totalFirmaAtoms = 0n
     let consecutiveUnused = 0
     let scannedCount = 0
     let index = startIndex
@@ -1228,6 +1271,14 @@ export class XolosWalletService {
             if (utxo.token && utxo.token.tokenId === RMZ_ETOKEN_ID && !utxo.token.isMintBaton) {
               totalRmzAtoms += utxo.token.atoms
             }
+            if (
+              utxo.token?.tokenId === FIRMA_ALPHA.tokenId &&
+              utxo.token.tokenType.protocol === FIRMA_ALPHA.protocol &&
+              utxo.token.tokenType.number === FIRMA_ALPHA.tokenType &&
+              !utxo.token.isMintBaton
+            ) {
+              totalFirmaAtoms += utxo.token.atoms
+            }
           }
         }
 
@@ -1251,12 +1302,18 @@ export class XolosWalletService {
       }
     }
 
-    const rmzDecimals = await this.getRmzDecimals()
+    const [rmzDecimals, firmaDecimals] = await Promise.all([
+      this.getRmzDecimals(),
+      this.getFirmaAlphaDecimals()
+    ])
     const balances: WalletBalance = {
       xec: totalSats,
       rmzAtoms: totalRmzAtoms,
       rmzFormatted: formatTokenAmount(totalRmzAtoms, rmzDecimals),
       rmzDecimals,
+      firmaAtoms: totalFirmaAtoms,
+      firmaFormatted: formatTokenAmount(totalFirmaAtoms, firmaDecimals),
+      firmaDecimals,
       xecFormatted: this.formatXecFromSats(totalSats)
     }
 

@@ -1,13 +1,22 @@
 declare module 'ecash-agora' {
+  import type { ScriptUtxo } from 'chronik-client'
   import type { Script } from 'ecash-lib'
   export type AgoraPartialParams = Record<string, unknown>
   export type AgoraOfferParams = Record<string, unknown>
 
   export const AGORA_LOKAD_ID: Uint8Array
+  export const DUMMY_KEYPAIR: { sk: Uint8Array; pk: Uint8Array }
+  export const getAgoraPartialAcceptFuelInputs: (
+    offer: AgoraOffer,
+    utxos: ScriptUtxo[],
+    acceptedAtoms: bigint,
+    feePerKb?: bigint
+  ) => ScriptUtxo[]
 
   export class Agora {
     constructor(chronik: unknown, dustSats?: bigint)
     activeOffersByTokenId: (tokenId: string) => Promise<AgoraOffer[]>
+    selectParams(params: AgoraPartialParams): Promise<AgoraPartial>
   }
 
   export class AgoraPartial {
@@ -19,12 +28,16 @@ declare module 'ecash-agora' {
     minAcceptedAtoms(): bigint
     script(): { bytecode: Uint8Array }
     prepareAcceptedAtoms(atoms: bigint): bigint
+    preventUnacceptableRemainder(atoms: bigint): void
     askedSats(atoms: bigint): bigint
     priceNanoSatsPerAtom(atoms: bigint): bigint
     updateScriptLen(): void
     tokenType: number
     tokenId: string
+    tokenProtocol: 'ALP' | 'SLP'
+    makerPk: Uint8Array
     dustSats: bigint
+    enforcedLockTime: number
   }
 
   export class AgoraOneshot {
@@ -50,7 +63,15 @@ declare module 'ecash-agora' {
     askedSats(atoms?: bigint): bigint
     acceptFeeSats(params: Record<string, unknown>): bigint
     acceptTx(params: Record<string, unknown>): { ser: () => Uint8Array }
-    token: { atoms: bigint }
+    variant: { type: 'PARTIAL'; params: AgoraPartial } | { type: 'ONESHOT'; params: AgoraOneshot }
+    token: {
+      tokenId: string
+      tokenType: { protocol: string; number: number }
+      atoms: bigint
+      isMintBaton: boolean
+    }
     outpoint: { txid: string; outIdx: number }
+    txBuilderInput: unknown
+    status: 'OPEN' | 'TAKEN' | 'CANCELED'
   }
 }

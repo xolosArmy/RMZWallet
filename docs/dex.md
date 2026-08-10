@@ -1,10 +1,14 @@
-# DEX (Atomic oneshot)
+# DEX Agora
 
-El DEX de Tonalli funciona en modo oneshot por Offer ID (txid:vout). No hay orderbook on-chain.
+El DEX de Tonalli combina ofertas parciales ALP y ofertas oneshot. Firma Alpha usa descubrimiento automático del orderbook Agora; los flujos heredados RMZ, NFT y Mint Pass conservan sus mecanismos actuales y pueden requerir un Offer ID (`txid:vout`).
+
+## Firma Alpha
+
+La pestaña Firma Alpha ofrece mercado `XEC ↔ FIRMA`, saldo verificado, compra, venta y redención on-chain con preview obligatorio y firma local. Consulta identidad, seguridad, infraestructura y prueba manual en [firma-alpha.md](firma-alpha.md).
 
 ## Vender (crear oferta)
 1) Abre `/dex`.
-2) Selecciona la tab correspondiente (RMZ, NFT Market o Mint Pass).
+2) Selecciona la tab correspondiente (Firma Alpha, RMZ, NFT Market o Mint Pass).
 3) Define precio y publica la oferta.
 4) Copia el Offer ID y compártelo con el comprador.
 
