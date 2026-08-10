@@ -28,6 +28,7 @@ declare module 'ecash-agora' {
     minAcceptedAtoms(): bigint
     script(): { bytecode: Uint8Array }
     prepareAcceptedAtoms(atoms: bigint): bigint
+    preventUnacceptableRemainder(atoms: bigint): void
     askedSats(atoms: bigint): bigint
     priceNanoSatsPerAtom(atoms: bigint): bigint
     updateScriptLen(): void

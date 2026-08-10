@@ -43,6 +43,7 @@ const preview: FirmaBuyPreview = {
   requestedAtoms: 10_000n,
   acceptedAtoms: 10_000n,
   askedSats: 700_000n,
+  effectivePriceXecPerFirma: '7000',
   networkFeeSats: 800n,
   totalSats: 700_800n,
   payoutAddress: 'ecash:qptest',
@@ -83,6 +84,8 @@ describe('FirmaAlphaMarket preview boundary', () => {
     await screen.findByRole('region', { name: 'Previsualización obligatoria FIRMA' })
     expect(mocks.prepareBestFirmaBuy).toHaveBeenCalledWith('1')
     expect(mocks.executeFirmaBuy).not.toHaveBeenCalled()
+    expect(screen.getByText(/Precio efectivo: 7000 XEC\/FIRMA/)).toBeTruthy()
+    expect(screen.getByText(/Pago al maker: 7000 XEC/)).toBeTruthy()
   })
 
   it('presents permissionless FIRMA liquidity without claiming every maker is official', async () => {

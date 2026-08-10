@@ -67,6 +67,7 @@ export type FirmaBuyPreview = {
   requestedAtoms: bigint
   acceptedAtoms: bigint
   askedSats: bigint
+  effectivePriceXecPerFirma: string
   networkFeeSats: bigint
   totalSats: bigint
   payoutAddress: string
@@ -181,6 +182,52 @@ export function compareFirmaOffersByPrice(a: FirmaOfferSummary, b: FirmaOfferSum
   return left < right ? -1 : 1
 }
 
+export type FirmaPurchaseQuote = {
+  offer: FirmaPartialOffer
+  offerId: string
+  offeredAtoms: bigint
+  acceptedAtoms: bigint
+  askedSats: bigint
+}
+
+const quoteFirmaPurchase = (offer: FirmaPartialOffer, requestedAtoms: bigint): FirmaPurchaseQuote => {
+  const partial = offer.variant.params
+  const offeredAtoms = partial.offeredAtoms()
+  const acceptedAtoms = partial.prepareAcceptedAtoms(requestedAtoms)
+
+  if (acceptedAtoms <= 0n || acceptedAtoms > offeredAtoms) {
+    throw new Error('Agora no puede representar esta cantidad FIRMA.')
+  }
+  if (acceptedAtoms < partial.minAcceptedAtoms()) {
+    throw new Error('La cantidad está por debajo del mínimo de esta oferta FIRMA.')
+  }
+  try {
+    partial.preventUnacceptableRemainder(acceptedAtoms)
+  } catch {
+    throw new Error(
+      'Esta cantidad dejaría un remainder FIRMA inaceptable en la oferta. Compra menos o acepta la oferta completa.'
+    )
+  }
+
+  const askedSats = offer.askedSats(acceptedAtoms)
+  if (askedSats <= 0n) throw new Error('La oferta FIRMA no produce un precio comprable.')
+
+  return {
+    offer,
+    offerId: `${offer.outpoint.txid}:${offer.outpoint.outIdx}`,
+    offeredAtoms,
+    acceptedAtoms,
+    askedSats
+  }
+}
+
+const compareFirmaPurchaseQuotes = (a: FirmaPurchaseQuote, b: FirmaPurchaseQuote): number => {
+  const left = a.askedSats * b.acceptedAtoms
+  const right = b.askedSats * a.acceptedAtoms
+  if (left === right) return a.offerId.localeCompare(b.offerId)
+  return left < right ? -1 : 1
+}
+
 export function toFirmaOfferSummary(offer: FirmaPartialOffer, ownPubkeyHex?: string): FirmaOfferSummary {
   const partial = offer.variant.params
   const offeredAtoms = partial.offeredAtoms()
@@ -202,22 +249,15 @@ export function toFirmaOfferSummary(offer: FirmaPartialOffer, ownPubkeyHex?: str
   }
 }
 
-export async function discoverFirmaOffers(ownPubkeyHex?: string): Promise<FirmaOrderbook> {
+const loadActiveCanonicalFirmaOffers = async () => {
   const tokenInfo = await verifyFirmaAlphaGenesis()
-  const activeWalletPubkey = ownPubkeyHex ?? xolosWalletService.getX402ActiveAccount()?.publicKey
 
   try {
     const agora = new Agora(getAgoraChronik() as never)
     const activeOffers = await agora.activeOffersByTokenId(FIRMA_ALPHA.tokenId)
-    const offers = activeOffers
-      .filter((offer): offer is FirmaPartialOffer => isCanonicalFirmaOffer(offer))
-      .map((offer) => toFirmaOfferSummary(offer, activeWalletPubkey))
-      .sort(compareFirmaOffersByPrice)
-
     return {
       tokenInfo,
-      offers,
-      totalLiquidityAtoms: offers.reduce((total, offer) => total + offer.offeredAtoms, 0n)
+      offers: activeOffers.filter((offer): offer is FirmaPartialOffer => isCanonicalFirmaOffer(offer))
     }
   } catch (error) {
     if (isAgoraPluginUnavailable(error)) throw new FirmaAgoraUnavailableError()
@@ -225,19 +265,42 @@ export async function discoverFirmaOffers(ownPubkeyHex?: string): Promise<FirmaO
   }
 }
 
-export function selectBestFirmaOffer(offers: FirmaOfferSummary[], desiredAtoms: bigint): FirmaOfferSummary {
+export async function discoverFirmaOffers(ownPubkeyHex?: string): Promise<FirmaOrderbook> {
+  const activeWalletPubkey = ownPubkeyHex ?? xolosWalletService.getX402ActiveAccount()?.publicKey
+  const market = await loadActiveCanonicalFirmaOffers()
+  const offers = market.offers
+    .map((offer) => toFirmaOfferSummary(offer, activeWalletPubkey))
+    .sort(compareFirmaOffersByPrice)
+
+  return {
+    tokenInfo: market.tokenInfo,
+    offers,
+    totalLiquidityAtoms: offers.reduce((total, offer) => total + offer.offeredAtoms, 0n)
+  }
+}
+
+export function selectBestFirmaOffer(offers: AgoraOffer[], desiredAtoms: bigint): FirmaPurchaseQuote {
   if (desiredAtoms <= 0n) throw new Error('La cantidad a comprar debe ser mayor a cero.')
 
-  const candidates = offers.filter(
-    (offer) => desiredAtoms <= offer.offeredAtoms && desiredAtoms >= offer.minAcceptedAtoms
-  )
+  const canonicalOffers = offers.filter((offer): offer is FirmaPartialOffer => isCanonicalFirmaOffer(offer))
+  const candidates: FirmaPurchaseQuote[] = []
+  for (const offer of canonicalOffers) {
+    if (desiredAtoms > offer.variant.params.offeredAtoms()) continue
+    try {
+      candidates.push(quoteFirmaPurchase(offer, desiredAtoms))
+    } catch {
+      // A different canonical offer can still accept the requested amount.
+    }
+  }
   if (candidates.length === 0) {
-    if (!offers.some((offer) => offer.offeredAtoms >= desiredAtoms)) {
+    if (!canonicalOffers.some((offer) => offer.variant.params.offeredAtoms() >= desiredAtoms)) {
       throw new Error('No hay suficiente liquidez FIRMA en una sola oferta para esta compra.')
     }
-    throw new Error('La cantidad no cumple el mínimo de las ofertas FIRMA disponibles.')
+    throw new Error(
+      'Ninguna oferta FIRMA puede aceptar esta cantidad sin violar su mínimo, granularidad o remainder permitido.'
+    )
   }
-  return [...candidates].sort(compareFirmaOffersByPrice)[0]
+  return candidates.sort(compareFirmaPurchaseQuotes)[0]
 }
 
 const assertOfferOutputUnspent = (tx: Tx, vout: number) => {
@@ -273,10 +336,28 @@ const loadCanonicalFirmaOffer = async (offerId: string) => {
   return { outpoint, details, offer }
 }
 
-export async function prepareFirmaBuyByOfferId(
+const formatFirmaEffectivePrice = (askedSats: bigint, acceptedAtoms: bigint): string => {
+  if (askedSats <= 0n || acceptedAtoms <= 0n) throw new Error('No se puede calcular el precio efectivo FIRMA.')
+  const displayDecimals = 8
+  const atomsPerFirma = 10n ** BigInt(FIRMA_ALPHA.decimals)
+  const scale = 10n ** BigInt(displayDecimals)
+  const numerator = askedSats * atomsPerFirma
+  const denominator = acceptedAtoms * 100n
+  const rounded = (numerator * scale + denominator / 2n) / denominator
+  return formatAtomsToDecimal(rounded, displayDecimals)
+}
+
+const buildFirmaBuyPlan = async (
   offerId: string,
   requestedAtoms: bigint
-): Promise<FirmaBuyPreview> {
+): Promise<{
+  preview: FirmaBuyPreview
+  account: NonNullable<ReturnType<typeof xolosWalletService.getX402ActiveAccount>>
+  details: Awaited<ReturnType<typeof loadCanonicalFirmaOffer>>['details']
+  offer: FirmaPartialOffer
+  recipientScript: Script
+  funding: ScriptUtxo[]
+}> => {
   await verifyFirmaAlphaGenesis()
   const account = xolosWalletService.getX402ActiveAccount()
   if (!account) throw new Error('Desbloquea la billetera para preparar la compra.')
@@ -286,16 +367,10 @@ export async function prepareFirmaBuyByOfferId(
     throw new Error('La cantidad FIRMA solicitada no está disponible en esta oferta.')
   }
 
-  const acceptedAtoms = details.agoraPartial.prepareAcceptedAtoms(requestedAtoms)
-  if (acceptedAtoms <= 0n || acceptedAtoms > details.offeredAtoms) {
-    throw new Error('Agora no puede representar esta cantidad FIRMA.')
-  }
-  if (acceptedAtoms < details.agoraPartial.minAcceptedAtoms()) {
-    throw new Error('La cantidad está por debajo del mínimo de esta oferta FIRMA.')
-  }
+  const quote = quoteFirmaPurchase(offer, requestedAtoms)
+  const { acceptedAtoms, askedSats } = quote
 
   const recipientScript = Script.fromAddress(account.address)
-  const askedSats = offer.askedSats(acceptedAtoms)
   const addressUtxos = await getChronik().address(account.address).utxos()
   const xecUtxos = sortXecUtxos(addressUtxos.utxos.filter((utxo) => !utxo.token))
   const funding = getAgoraPartialAcceptFuelInputs(offer, xecUtxos, acceptedAtoms, FIRMA_FEE_PER_KB)
@@ -309,41 +384,43 @@ export async function prepareFirmaBuyByOfferId(
   })
 
   return {
-    kind: 'buy',
-    offerId,
-    requestedAtoms,
-    acceptedAtoms,
-    askedSats,
-    networkFeeSats,
-    totalSats: askedSats + networkFeeSats,
-    payoutAddress: details.payoutAddress,
-    adjustedForAgora: acceptedAtoms !== requestedAtoms,
-    inputOutpoints: funding.map(outpointKey)
+    preview: {
+      kind: 'buy',
+      offerId,
+      requestedAtoms,
+      acceptedAtoms,
+      askedSats,
+      effectivePriceXecPerFirma: formatFirmaEffectivePrice(askedSats, acceptedAtoms),
+      networkFeeSats,
+      totalSats: askedSats + networkFeeSats,
+      payoutAddress: details.payoutAddress,
+      adjustedForAgora: acceptedAtoms !== requestedAtoms,
+      inputOutpoints: funding.map(outpointKey)
+    },
+    account,
+    details,
+    offer,
+    recipientScript,
+    funding
   }
+}
+
+export async function prepareFirmaBuyByOfferId(
+  offerId: string,
+  requestedAtoms: bigint
+): Promise<FirmaBuyPreview> {
+  return (await buildFirmaBuyPlan(offerId, requestedAtoms)).preview
 }
 
 export async function prepareBestFirmaBuy(amount: string): Promise<FirmaBuyPreview> {
   const requestedAtoms = parseDecimalToAtoms(amount, FIRMA_ALPHA.decimals)
-  const account = xolosWalletService.getX402ActiveAccount()
-  const orderbook = await discoverFirmaOffers(account?.publicKey)
-  const bestOffer = selectBestFirmaOffer(orderbook.offers, requestedAtoms)
-  return prepareFirmaBuyByOfferId(bestOffer.offerId, requestedAtoms)
+  const market = await loadActiveCanonicalFirmaOffers()
+  const bestQuote = selectBestFirmaOffer(market.offers, requestedAtoms)
+  return prepareFirmaBuyByOfferId(bestQuote.offerId, requestedAtoms)
 }
 
 const sortXecUtxos = (utxos: ScriptUtxo[]) =>
   [...utxos].sort((a, b) => (a.sats === b.sats ? 0 : a.sats > b.sats ? -1 : 1))
-
-const selectXecUtxosForTarget = (utxos: ScriptUtxo[], targetSats: bigint): ScriptUtxo[] => {
-  const sorted = sortXecUtxos(utxos)
-  const selected: ScriptUtxo[] = []
-  let total = 0n
-  for (const utxo of sorted) {
-    selected.push(utxo)
-    total += utxo.sats
-    if (total >= targetSats) return selected
-  }
-  throw new Error('No hay suficiente XEC para el precio y la comisión de red.')
-}
 
 const buildInput = (utxo: ScriptUtxo, outputScript: Script, signatory: WalletSignatory['signatory']) => ({
   input: {
@@ -354,10 +431,12 @@ const buildInput = (utxo: ScriptUtxo, outputScript: Script, signatory: WalletSig
 })
 
 export async function executeFirmaBuy(preview: FirmaBuyPreview): Promise<string> {
-  const freshPreview = await prepareFirmaBuyByOfferId(preview.offerId, preview.requestedAtoms)
+  const freshPlan = await buildFirmaBuyPlan(preview.offerId, preview.requestedAtoms)
+  const freshPreview = freshPlan.preview
   if (
     freshPreview.acceptedAtoms !== preview.acceptedAtoms ||
     freshPreview.askedSats !== preview.askedSats ||
+    freshPreview.effectivePriceXecPerFirma !== preview.effectivePriceXecPerFirma ||
     freshPreview.networkFeeSats !== preview.networkFeeSats ||
     freshPreview.inputOutpoints.join('|') !== preview.inputOutpoints.join('|')
   ) {
@@ -365,26 +444,21 @@ export async function executeFirmaBuy(preview: FirmaBuyPreview): Promise<string>
   }
 
   const signer = xolosWalletService.getSignatory()
-  const recipientScript = Script.fromAddress(signer.address)
-  const { details, offer } = await loadCanonicalFirmaOffer(preview.offerId)
-  const addressUtxos = await getChronik().address(signer.address).utxos()
-  const fuelUtxos = selectXecUtxosForTarget(
-    addressUtxos.utxos.filter((utxo) => !utxo.token),
-    preview.totalSats
-  )
-  if (fuelUtxos.map(outpointKey).join('|') !== preview.inputOutpoints.join('|')) {
-    throw new Error('Tus UTXOs XEC cambiaron. Genera otra previsualización antes de firmar.')
+  if (signer.address !== freshPlan.account.address || signer.publicKeyHex !== freshPlan.account.publicKey) {
+    throw new Error('La cuenta activa cambió. Genera otra previsualización.')
   }
-  const fuelInputs = fuelUtxos.map((utxo) => buildInput(utxo, recipientScript, signer.signatory))
+  const fuelInputs = freshPlan.funding.map((utxo) =>
+    buildInput(utxo, freshPlan.recipientScript, signer.signatory)
+  )
 
   const acceptTx = xolosWalletService.withPrivateKey((privateKey) =>
-    offer.acceptTx({
+    freshPlan.offer.acceptTx({
       covenantSk: privateKey,
       covenantPk: signer.publicKey,
       fuelInputs,
-      recipientScript,
+      recipientScript: freshPlan.recipientScript,
       acceptedAtoms: preview.acceptedAtoms,
-      dustSats: details.offerOutput.sats,
+      dustSats: freshPlan.details.offerOutput.sats,
       feePerKb: FIRMA_FEE_PER_KB
     })
   )

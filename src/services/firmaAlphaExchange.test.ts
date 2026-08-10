@@ -11,8 +11,7 @@ import {
   getFirmaBalanceFromUtxos,
   isCanonicalFirmaOffer,
   selectBestFirmaOffer,
-  toFirmaOfferSummary,
-  type FirmaOfferSummary
+  toFirmaOfferSummary
 } from './firmaAlphaExchange'
 
 const outpoint = (suffix: string, outIdx = 1) => ({ txid: suffix.padStart(64, '0'), outIdx })
@@ -50,9 +49,10 @@ const partial = (params: {
   type?: number
   offered?: bigint
   min?: bigint
+  price?: bigint
 }) => AgoraPartial.approximateParams({
   offeredAtoms: params.offered ?? 10_000n,
-  priceNanoSatsPerAtom: 70_000_000_000n,
+  priceNanoSatsPerAtom: params.price ?? 70_000_000_000n,
   makerPk: bytes(params.maker ?? FIRMA_ALPHA.genesisAuthPubkeyHex),
   minAcceptedAtoms: params.min ?? 100n,
   tokenId: params.tokenId ?? FIRMA_ALPHA.tokenId,
@@ -64,11 +64,11 @@ const partial = (params: {
 
 const offer = (
   partialParams: Parameters<typeof partial>[0] & { asked?: bigint } = {},
-  tokenId = FIRMA_ALPHA.tokenId
+  tokenId = FIRMA_ALPHA.tokenId,
+  offerOutpoint = outpoint('a')
 ) => {
   const agoraPartial = partial(partialParams)
   const atoms = agoraPartial.offeredAtoms()
-  const offerOutpoint = outpoint('a')
   const created = new AgoraOffer({
     variant: { type: 'PARTIAL', params: agoraPartial },
     outpoint: offerOutpoint,
@@ -140,38 +140,121 @@ describe('Firma Alpha balance and permissionless offers', () => {
 })
 
 describe('Firma Alpha liquidity selection', () => {
-  const summary = (
-    offerId: string,
-    offeredAtoms: bigint,
-    minAcceptedAtoms: bigint,
-    askedSats: bigint,
-    source: FirmaOfferSummary['source'] = 'peer'
-  ): FirmaOfferSummary => ({
-    offerId,
-    offeredAtoms,
-    minAcceptedAtoms,
-    askedSats,
-    makerPubkeyHex: peerPubkeyHex,
-    priceNanoSatsPerAtom: 1n,
-    source
-  })
-
-  it('selects the best compatible offer regardless of maker label', () => {
+  it('selects the best compatible covenant by effective price for the requested amount', () => {
     const offers = [
-      summary('official-expensive', 10_000n, 100n, 8_000n, 'official'),
-      summary('peer-too-small', 500n, 100n, 100n),
-      summary('alice-best', 10_000n, 100n, 7_000n)
+      offer({ maker: FIRMA_ALPHA.genesisAuthPubkeyHex, price: 80_000_000_000n }, FIRMA_ALPHA.tokenId, outpoint('1')),
+      offer({ maker: peerPubkeyHex, offered: 500n, price: 10_000_000_000n }, FIRMA_ALPHA.tokenId, outpoint('2')),
+      offer({ maker: peerPubkeyHex, price: 70_000_000_000n }, FIRMA_ALPHA.tokenId, outpoint('3'))
     ]
-    expect(selectBestFirmaOffer(offers, 1_000n).offerId).toBe('alice-best')
+    expect(selectBestFirmaOffer(offers, 1_000n).offerId).toBe(`${outpoint('3').txid}:1`)
   })
 
   it('rejects insufficient one-offer liquidity and minimum violations', () => {
-    expect(() => selectBestFirmaOffer([summary('a', 500n, 100n, 100n)], 501n)).toThrow(/liquidez/)
     expect(() => selectBestFirmaOffer([
-      summary('a', 600n, 100n, 100n),
-      summary('b', 600n, 100n, 100n)
+      offer({ offered: 500n }, FIRMA_ALPHA.tokenId, outpoint('1'))
+    ], 501n)).toThrow(/liquidez/)
+    expect(() => selectBestFirmaOffer([
+      offer({ offered: 600n }, FIRMA_ALPHA.tokenId, outpoint('1')),
+      offer({ offered: 600n }, FIRMA_ALPHA.tokenId, outpoint('2'))
     ], 1_000n)).toThrow(/una sola oferta/)
-    expect(() => selectBestFirmaOffer([summary('a', 500n, 200n, 100n)], 100n)).toThrow(/mínimo/)
+    expect(() => selectBestFirmaOffer([
+      offer({ offered: 2_000n, min: 1_000n }, FIRMA_ALPHA.tokenId, outpoint('1'))
+    ], 500n)).toThrow(/mínimo/)
+  })
+
+  it('allows a partial accept with a remainder at least the covenant minimum', () => {
+    const candidate = offer(
+      { offered: 2_000n, min: 546n, price: 1_000_000_000n },
+      FIRMA_ALPHA.tokenId,
+      outpoint('1')
+    )
+    const quote = selectBestFirmaOffer([candidate], 546n)
+    expect(quote.acceptedAtoms).toBe(546n)
+    expect(quote.offeredAtoms - quote.acceptedAtoms).toBeGreaterThanOrEqual(
+      candidate.variant.type === 'PARTIAL' ? candidate.variant.params.minAcceptedAtoms() : 0n
+    )
+  })
+
+  it('allows accepting an offer in full with a zero remainder', () => {
+    const candidate = offer(
+      { offered: 1_000n, min: 546n, price: 1_000_000_000n },
+      FIRMA_ALPHA.tokenId,
+      outpoint('1')
+    )
+    const quote = selectBestFirmaOffer([candidate], 1_000n)
+    expect(quote.acceptedAtoms).toBe(quote.offeredAtoms)
+  })
+
+  it('discards a nominally cheaper offer when it would leave an unacceptable remainder', () => {
+    const invalidNominalBest = offer(
+      { offered: 1_000n, min: 546n, price: 1_000_000_000n },
+      FIRMA_ALPHA.tokenId,
+      outpoint('1')
+    )
+    const validFallback = offer(
+      { offered: 2_000n, min: 546n, price: 2_000_000_000n },
+      FIRMA_ALPHA.tokenId,
+      outpoint('2')
+    )
+
+    expect(invalidNominalBest.askedSats(1_000n) * 2_000n).toBeLessThan(
+      validFallback.askedSats(2_000n) * 1_000n
+    )
+    expect(selectBestFirmaOffer([invalidNominalBest, validFallback], 546n).offerId)
+      .toBe(`${outpoint('2').txid}:1`)
+  })
+
+  it('uses real partial-accept rounding instead of the apparently best full-offer price', () => {
+    const apparentlyCheaperAtFullSize = offer(
+      { offered: 1_000_000n, min: 100n, price: 60_000_000_000n },
+      FIRMA_ALPHA.tokenId,
+      outpoint('1')
+    )
+    const cheaperForThisPurchase = offer(
+      { offered: 30_000n, min: 100n, price: 60_000_000_000n },
+      FIRMA_ALPHA.tokenId,
+      outpoint('2')
+    )
+    const partialA = apparentlyCheaperAtFullSize.variant.type === 'PARTIAL'
+      ? apparentlyCheaperAtFullSize.variant.params
+      : null
+    const partialB = cheaperForThisPurchase.variant.type === 'PARTIAL'
+      ? cheaperForThisPurchase.variant.params
+      : null
+    expect(partialA).not.toBeNull()
+    expect(partialB).not.toBeNull()
+
+    const offeredA = partialA!.offeredAtoms()
+    const offeredB = partialB!.offeredAtoms()
+    expect(apparentlyCheaperAtFullSize.askedSats(offeredA) * offeredB).toBeLessThan(
+      cheaperForThisPurchase.askedSats(offeredB) * offeredA
+    )
+
+    const acceptedA = partialA!.prepareAcceptedAtoms(500n)
+    const acceptedB = partialB!.prepareAcceptedAtoms(500n)
+    expect({ acceptedA, askedA: apparentlyCheaperAtFullSize.askedSats(acceptedA) })
+      .toEqual({ acceptedA: 256n, askedA: 15_616n })
+    expect({ acceptedB, askedB: cheaperForThisPurchase.askedSats(acceptedB) })
+      .toEqual({ acceptedB: 500n, askedB: 30_001n })
+    expect(cheaperForThisPurchase.askedSats(acceptedB) * acceptedA).toBeLessThan(
+      apparentlyCheaperAtFullSize.askedSats(acceptedA) * acceptedB
+    )
+    expect(selectBestFirmaOffer([apparentlyCheaperAtFullSize, cheaperForThisPurchase], 500n).offerId)
+      .toBe(`${outpoint('2').txid}:1`)
+  })
+
+  it('breaks equal effective prices deterministically by Offer ID', () => {
+    const later = offer(
+      { offered: 10_000n, min: 100n, price: 70_000_000_000n },
+      FIRMA_ALPHA.tokenId,
+      outpoint('b')
+    )
+    const earlier = offer(
+      { offered: 10_000n, min: 100n, price: 70_000_000_000n },
+      FIRMA_ALPHA.tokenId,
+      outpoint('a')
+    )
+    expect(selectBestFirmaOffer([later, earlier], 1_000n).offerId).toBe(`${outpoint('a').txid}:1`)
   })
 })
 

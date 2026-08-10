@@ -220,12 +220,13 @@ export default function FirmaAlphaMarket() {
             {preview.kind === 'buy'
               ? [
                   `Recibir: ${formatFirmaAtoms(preview.acceptedAtoms)} FIRMA`,
-                  `Precio: ${formatSatsToXec(preview.askedSats)} XEC`,
+                  `Precio efectivo: ${preview.effectivePriceXecPerFirma} XEC/FIRMA`,
+                  `Pago al maker: ${formatSatsToXec(preview.askedSats)} XEC`,
                   `Comisión estimada: ${formatSatsToXec(preview.networkFeeSats)} XEC`,
                   `Total máximo: ${formatSatsToXec(preview.totalSats)} XEC`,
                   `Inputs XEC: ${preview.inputOutpoints.length}`,
                   `Offer ID: ${preview.offerId}`,
-                  `Pago maker: ${preview.payoutAddress}`
+                  `Dirección maker: ${preview.payoutAddress}`
                 ].join('\n')
               : [
                   `Bloquear: ${formatFirmaAtoms(preview.offeredAtoms)} FIRMA`,

@@ -38,21 +38,23 @@ El escaneo HD existente suma FIRMA junto con XEC y RMZ para las ramas receive/ch
 4. contener una pubkey comprimida de maker, una cantidad y un mínimo representables, un precio positivo y un redeem script que coincida byte por byte con el covenant anunciado;
 5. superar nuevamente la validación del covenant y del output P2SH al preparar la compra.
 
-Las ofertas válidas se ordenan por precio usando aritmética racional con `bigint`, sin convertir cantidades financieras a `number`. Cualquier wallet puede publicar una oferta FIRMA canónica: la identidad del maker se etiqueta como `peer`, `propia` u `oficial` solamente si existe una pubkey de liquidez oficial verificada de forma independiente. La etiqueta nunca cambia la validez ni excluye liquidez. La primera versión consume una sola oferta por compra; si ninguna oferta individual cubre la cantidad, la interfaz informa liquidez insuficiente en vez de producir un swap parcial inesperado.
+El orderbook visible se ordena por el precio indicativo de aceptar cada oferta completa. Esa vista no decide la compra automática. Para la cantidad concreta solicitada, Tonalli ejecuta `prepareAcceptedAtoms` en cada covenant, descarta cantidades no representables, inferiores al mínimo o que fallen `preventUnacceptableRemainder`, calcula `askedSats(preparedAcceptedAtoms)` y compara racionalmente `askedSats / acceptedAtoms` con productos cruzados `bigint`. Un empate se resuelve de forma determinista por Offer ID. Así, un maker no gana prioridad mostrando un precio atractivo para `offeredAtoms` si el redondeo de una aceptación parcial produce un precio efectivo peor.
+
+Cualquier wallet puede publicar una oferta FIRMA canónica: la identidad del maker se etiqueta como `peer`, `propia` u `oficial` solamente si existe una pubkey de liquidez oficial verificada de forma independiente. La etiqueta nunca cambia la validez ni excluye liquidez. La primera versión consume una sola oferta por compra; si ninguna oferta individual cubre la cantidad de forma válida, la interfaz informa el problema en vez de producir un swap parcial inesperado.
 
 El endpoint Chronik debe tener cargado el plugin Agora. Se configura de forma aislada con `VITE_AGORA_CHRONIK_URL` (lista separada por comas) o `AGORA_CHRONIK_URL`; por defecto se usan los nodos Agora publicados en la configuración vigente de Cashtab. `VITE_CHRONIK_URL`/`CHRONIK_URL` siguen controlando consultas generales y broadcast. Si el plugin responde `404`, la UI muestra el estado explícitamente y no sustituye el descubrimiento con IDs históricos ni con un servidor RPC.
 
 ## Comprar Firma
 
 1. El usuario introduce la cantidad FIRMA.
-2. La wallet descubre la mejor oferta canónica compatible entre todos los makers.
+2. La wallet cotiza la cantidad solicitada en cada oferta canónica y elige el menor precio efectivo real entre todos los makers.
 3. Chronik vuelve a cargar la transacción, comprueba que el output no esté gastado y reconstruye el covenant.
-4. La pantalla muestra cantidad efectiva, XEC al maker, comisión, total, Offer ID y dirección de pago.
-5. Solo después de una confirmación explícita se vuelve a validar la misma cotización, se seleccionan UTXOs XEC puros, se firma localmente y se transmite por Chronik.
+4. La pantalla muestra cantidad efectiva, precio efectivo XEC/FIRMA, XEC al maker, comisión, total, Offer ID y dirección de pago.
+5. Solo después de una confirmación explícita se vuelve a validar la misma cotización y se reconstruye la selección de UTXOs XEC puros con `getAgoraPartialAcceptFuelInputs`; si los outpoints difieren del preview se exige otra previsualización antes de acceder a llaves. Después se firma localmente y se transmite por Chronik.
 
-Si Agora ajusta la cantidad por granularidad, el preview lo indica. Una oferta gastada, modificada o con un covenant distinto obliga a generar un preview nuevo.
+Si Agora ajusta la cantidad por granularidad, el preview lo indica. Una aceptación total con remainder cero es válida; una aceptación parcial solo llega al preview si el remainder conserva el mínimo y valor dust exigidos por el covenant. Una oferta gastada, modificada, con un covenant distinto o con un remainder inaceptable obliga a elegir otra oferta o generar un preview nuevo.
 
-La estimación de comisión usa `getAgoraPartialAcceptFuelInputs`, `DUMMY_KEYPAIR`, `P2PKHSignatory` dummy y el `EccDummy` interno de `acceptFeeSats`. Descubrimiento, cotización, preparación y preview no llaman `getSignatory`, `withPrivateKey` ni `signTxBuilder`; la llave real solo se materializa después de la confirmación explícita.
+La estimación de comisión usa `getAgoraPartialAcceptFuelInputs`, `DUMMY_KEYPAIR`, `P2PKHSignatory` dummy y el `EccDummy` interno de `acceptFeeSats`. La confirmación reconstruye el mismo plan y usa el mismo helper oficial, en lugar de una segunda estrategia local de coin selection. Descubrimiento, cotización, preparación y preview no llaman `getSignatory`, `withPrivateKey` ni `signTxBuilder`; la llave real solo se materializa después de comparar oferta, cantidad, precio, fee y outpoints actuales con el preview.
 
 ## Vender Firma
 
@@ -89,6 +91,7 @@ El preview utiliza datos públicos, UTXOs y scripts. Las llaves privadas solo se
 - oferta gastada o cambiada;
 - maker/covenant inválido o token falso;
 - cantidad inferior al mínimo o granularidad no representable;
+- remainder no-cero inferior al mínimo o cuyo valor queda bajo dust;
 - liquidez FIRMA insuficiente;
 - XEC insuficiente para precio, dust o comisión;
 - FIRMA insuficiente en la dirección activa;

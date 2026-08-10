@@ -8,12 +8,30 @@ import { getAgoraChronik, getChronik } from './ChronikClient'
 import { xolosWalletService } from './XolosWalletService'
 import {
   discoverFirmaOffers,
+  executeFirmaBuy,
   executeFirmaSale,
   fetchFirmaBidPrice,
   prepareBestFirmaBuy,
   prepareFirmaBuyByOfferId,
   prepareFirmaSale
 } from './firmaAlphaExchange'
+
+const agoraMocks = vi.hoisted(() => ({
+  selectAcceptFuelInputs: vi.fn()
+}))
+
+vi.mock('ecash-agora', async (importOriginal) => {
+  const original = await importOriginal<typeof import('ecash-agora')>()
+  return {
+    ...original,
+    getAgoraPartialAcceptFuelInputs: (
+      ...args: Parameters<typeof original.getAgoraPartialAcceptFuelInputs>
+    ) => {
+      agoraMocks.selectAcceptFuelInputs(...args)
+      return original.getAgoraPartialAcceptFuelInputs(...args)
+    }
+  }
+})
 
 const alicePubkey = DUMMY_KEYPAIR.pk
 const alicePubkeyHex = toHex(alicePubkey)
@@ -118,6 +136,7 @@ describe('Firma Alpha security boundaries', () => {
   let accountUtxos: ScriptUtxo[] = []
 
   beforeEach(() => {
+    agoraMocks.selectAcceptFuelInputs.mockClear()
     currentBid = 7_000
     currentCapacitySats = 5_000_000n
     accountUtxos = [firmaUtxo('b', 50_000n), xecUtxo('c', 2_000_000n)]
@@ -193,6 +212,48 @@ describe('Firma Alpha security boundaries', () => {
     expect(getSignatory).not.toHaveBeenCalled()
     expect(withPrivateKey).not.toHaveBeenCalled()
     expect(signTxBuilder).not.toHaveBeenCalled()
+  })
+
+  it('rejects an unacceptable remainder before producing a confirmable preview', async () => {
+    const invalidRemainder = AgoraPartial.approximateParams({
+      offeredAtoms: 1_000n,
+      priceNanoSatsPerAtom: 1_000_000_000n,
+      makerPk: alicePubkey,
+      minAcceptedAtoms: 546n,
+      tokenId: FIRMA_ALPHA.tokenId,
+      tokenType: 0,
+      tokenProtocol: 'ALP',
+      enforcedLockTime: 600_000_002,
+      dustSats: TOKEN_DUST_SATS
+    })
+    vi.mocked(chronik.tx).mockResolvedValueOnce(makeOfferTx(invalidRemainder))
+
+    await expect(
+      prepareFirmaBuyByOfferId(`${offerOutpoint.txid}:${offerOutpoint.outIdx}`, 546n)
+    ).rejects.toThrow(/remainder FIRMA inaceptable/)
+    expect(xolosWalletService.getSignatory).not.toHaveBeenCalled()
+    expect(xolosWalletService.withPrivateKey).not.toHaveBeenCalled()
+    expect(xolosWalletService.signTxBuilder).not.toHaveBeenCalled()
+  })
+
+  it('uses the official Agora fuel-input strategy in both preview and confirmation', async () => {
+    const preview = await prepareFirmaBuyByOfferId(
+      `${offerOutpoint.txid}:${offerOutpoint.outIdx}`,
+      10_000n
+    )
+    expect(preview.effectivePriceXecPerFirma).toBe('7001.9')
+    expect(agoraMocks.selectAcceptFuelInputs).toHaveBeenCalledTimes(1)
+    expect(xolosWalletService.getSignatory).not.toHaveBeenCalled()
+
+    await expect(executeFirmaBuy(preview)).resolves.toBe('e'.repeat(64))
+
+    expect(agoraMocks.selectAcceptFuelInputs).toHaveBeenCalledTimes(2)
+    expect(agoraMocks.selectAcceptFuelInputs.mock.calls[0][2]).toBe(10_000n)
+    expect(agoraMocks.selectAcceptFuelInputs.mock.calls[1][2]).toBe(10_000n)
+    expect(agoraMocks.selectAcceptFuelInputs.mock.calls[0][1].map((utxo: ScriptUtxo) => utxo.outpoint))
+      .toEqual(agoraMocks.selectAcceptFuelInputs.mock.calls[1][1].map((utxo: ScriptUtxo) => utxo.outpoint))
+    expect(agoraMocks.selectAcceptFuelInputs.mock.invocationCallOrder[1])
+      .toBeLessThan(vi.mocked(xolosWalletService.getSignatory).mock.invocationCallOrder[0])
   })
 
   it('validates the authoritative bid response and XEC-per-FIRMA units', async () => {
