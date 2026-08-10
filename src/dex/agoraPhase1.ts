@@ -8,7 +8,8 @@ import {
   fromHex,
   parseAlp,
   parseEmppScript,
-  shaRmd160
+  shaRmd160,
+  toHex
 } from 'ecash-lib'
 import type { AlpSend, TxOutput as EcashTxOutput } from 'ecash-lib'
 import type { Token, Tx, TxOutput as ChronikTxOutput } from 'chronik-client'
@@ -128,7 +129,7 @@ export function parseAgoraOfferFromTx(tx: Tx, offerVout: number, tokenId: string
     throw new Error('El OP_RETURN no contiene un ALP SEND válido.')
   }
   if (alpSendData.tokenId !== tokenId) {
-    throw new Error('La oferta no corresponde al token RMZ.')
+    throw new Error('La oferta no corresponde al Token ID esperado.')
   }
   if (!agoraAd) {
     throw new Error('El OP_RETURN no contiene la publicidad Agora esperada.')
@@ -162,6 +163,11 @@ export function parseAgoraOfferFromTx(tx: Tx, offerVout: number, tokenId: string
   })
   agoraPartial.updateScriptLen()
 
+  const expectedOfferScript = Script.p2sh(shaRmd160(agoraPartial.script().bytecode))
+  if (toHex(expectedOfferScript.bytecode) !== offerOutput.outputScript.toLowerCase()) {
+    throw new Error('El covenant Agora no coincide con el P2SH de la oferta.')
+  }
+
   const payoutAddress = Address.p2pkh(shaRmd160(agoraAd.makerPk)).toString()
   const preparedAtoms = agoraPartial.prepareAcceptedAtoms(offeredAtoms)
   const askedSats = agoraPartial.askedSats(preparedAtoms)
@@ -169,6 +175,15 @@ export function parseAgoraOfferFromTx(tx: Tx, offerVout: number, tokenId: string
 
   if (!offerOutput.token) {
     throw new Error('Chronik no pudo validar el token de esta oferta.')
+  }
+  if (
+    offerOutput.token.tokenId !== tokenId ||
+    offerOutput.token.tokenType.protocol !== 'ALP' ||
+    offerOutput.token.tokenType.number !== alpSendData.tokenType ||
+    offerOutput.token.atoms !== offeredAtoms ||
+    offerOutput.token.isMintBaton
+  ) {
+    throw new Error('El output Agora no contiene el token ALP esperado.')
   }
 
   return {

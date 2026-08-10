@@ -8,6 +8,7 @@ declare module 'ecash-agora' {
   export class Agora {
     constructor(chronik: unknown, dustSats?: bigint)
     activeOffersByTokenId: (tokenId: string) => Promise<AgoraOffer[]>
+    selectParams(params: AgoraPartialParams): Promise<AgoraPartial>
   }
 
   export class AgoraPartial {
@@ -24,6 +25,8 @@ declare module 'ecash-agora' {
     updateScriptLen(): void
     tokenType: number
     tokenId: string
+    tokenProtocol: 'ALP' | 'SLP'
+    makerPk: Uint8Array
     dustSats: bigint
   }
 
@@ -50,7 +53,15 @@ declare module 'ecash-agora' {
     askedSats(atoms?: bigint): bigint
     acceptFeeSats(params: Record<string, unknown>): bigint
     acceptTx(params: Record<string, unknown>): { ser: () => Uint8Array }
-    token: { atoms: bigint }
+    variant: { type: 'PARTIAL'; params: AgoraPartial } | { type: 'ONESHOT'; params: AgoraOneshot }
+    token: {
+      tokenId: string
+      tokenType: { protocol: string; number: number }
+      atoms: bigint
+      isMintBaton: boolean
+    }
     outpoint: { txid: string; outIdx: number }
+    txBuilderInput: unknown
+    status: 'OPEN' | 'TAKEN' | 'CANCELED'
   }
 }

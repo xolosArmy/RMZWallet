@@ -11,7 +11,7 @@ Tonalli Wallet es una wallet soberana, open source y no custodial para eCash. Tu
 ## Funciones
 
 - eCash (XEC) para saldo, recepción, envío, comisiones y memos on-chain con OP_RETURN.
-- eToken Xolos RMZ integrado para consulta y envío.
+- eTokens Xolos RMZ y Firma Alpha integrados para consulta; Firma Alpha incluye mercado XEC ↔ FIRMA en Agora.
 - NFTs de linaje y coleccionables cuando la configuración NFT del entorno está disponible.
 - Alias .xec mediante el flujo de registro soportado por la app.
 - WalletConnect v2 para dApps eCash compatibles.
@@ -33,6 +33,8 @@ Configura estas variables en Vercel o tu entorno local:
 - `VITE_WALLETCONNECT_PROJECT_ID` (principal, requerido para WalletConnect v2)
 - `VITE_WC_PROJECT_ID` (legacy compatible; fallback si falta la principal)
 - `VITE_WC_ALLOWED_DOMAINS` (opcional, lista CSV para warning anti-phishing en UI; sugerido: `teyolia.cash,www.teyolia.cash`)
+- `VITE_CHRONIK_URL` (opcional, lista CSV) para consultas generales y broadcast de Chronik
+- `VITE_AGORA_CHRONIK_URL` (opcional, lista CSV) para nodos con el plugin Agora; si se omite, usa los nodos Agora de referencia de Cashtab
 
 ## WalletConnect v2 (CAIP-25)
 

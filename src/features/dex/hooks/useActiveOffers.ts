@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Agora } from 'ecash-agora'
-import { getChronik } from '../../../services/ChronikClient'
+import { getAgoraChronik } from '../../../services/ChronikClient'
 
 export type ActiveOfferPreview = {
   offerId: string
@@ -46,7 +46,7 @@ export function useActiveOffers(tokenId: string) {
     void (async () => {
       try {
         setLoading(true)
-        const agora = new Agora(getChronik() as never)
+        const agora = new Agora(getAgoraChronik() as never)
         const activeOffers = await agora.activeOffersByTokenId(tokenId)
         if (cancelled) return
         setOffers(activeOffers.map(toActiveOfferPreview).filter((offer): offer is ActiveOfferPreview => offer !== null))

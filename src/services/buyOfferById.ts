@@ -1,7 +1,7 @@
 import { Script } from 'ecash-lib'
 import { Agora, AgoraOffer } from 'ecash-agora'
 import type { ScriptUtxo, Tx } from 'chronik-client'
-import { getChronik } from './ChronikClient'
+import { getAgoraChronik, getChronik } from './ChronikClient'
 import { xolosWalletService } from './XolosWalletService'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { parseAgoraOfferFromTx, parseOfferId } from '../dex/agoraPhase1'
@@ -70,7 +70,7 @@ const fetchLiveOfferTx = async (txid: string, vout: number): Promise<Tx> => {
 
 const resolveRemainingOfferId = async (txid: string): Promise<string | undefined> => {
   const load = async () => {
-    const agora = new Agora(getChronik() as never)
+    const agora = new Agora(getAgoraChronik() as never)
     const activeOffers = await agora.activeOffersByTokenId(RMZ_ETOKEN_ID)
     return findRemainingOfferId(activeOffers as ActiveOfferCandidate[], txid)
   }
