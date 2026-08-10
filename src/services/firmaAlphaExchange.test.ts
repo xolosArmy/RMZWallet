@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ScriptUtxo } from 'chronik-client'
-import type { AgoraOffer, AgoraPartial } from 'ecash-agora'
+import { Agora, AgoraOffer, AgoraPartial } from 'ecash-agora'
+import { Script, shaRmd160, toHex } from 'ecash-lib'
 import { FIRMA_ALPHA } from '../config/firmaAlpha'
 import {
   compareFirmaOffersByPrice,
@@ -14,6 +16,8 @@ import {
 } from './firmaAlphaExchange'
 
 const outpoint = (suffix: string, outIdx = 1) => ({ txid: suffix.padStart(64, '0'), outIdx })
+const bytes = (hex: string) => Uint8Array.from(hex.match(/.{2}/g)!.map((byte) => Number.parseInt(byte, 16)))
+const peerPubkeyHex = `02${'11'.repeat(32)}`
 
 const tokenUtxo = (params: {
   tokenId?: string
@@ -46,36 +50,57 @@ const partial = (params: {
   type?: number
   offered?: bigint
   min?: bigint
-  asked?: bigint
-}) => ({
+}) => AgoraPartial.approximateParams({
+  offeredAtoms: params.offered ?? 10_000n,
+  priceNanoSatsPerAtom: 70_000_000_000n,
+  makerPk: bytes(params.maker ?? FIRMA_ALPHA.genesisAuthPubkeyHex),
+  minAcceptedAtoms: params.min ?? 100n,
   tokenId: params.tokenId ?? FIRMA_ALPHA.tokenId,
   tokenProtocol: params.protocol ?? 'ALP',
   tokenType: params.type ?? 0,
-  makerPk: Uint8Array.from((params.maker ?? FIRMA_ALPHA.makerPubkeyHex).match(/.{2}/g)!.map((byte) => Number.parseInt(byte, 16))),
-  offeredAtoms: () => params.offered ?? 10_000n,
-  minAcceptedAtoms: () => params.min ?? 100n,
-  askedSats: () => params.asked ?? 7_000n,
-  priceNanoSatsPerAtom: () => 700_000_000n
-}) as unknown as AgoraPartial
+  enforcedLockTime: 600_000_000,
+  dustSats: 546n
+})
 
-const offer = (partialParams: Parameters<typeof partial>[0] = {}, tokenId = FIRMA_ALPHA.tokenId) => {
+const offer = (
+  partialParams: Parameters<typeof partial>[0] & { asked?: bigint } = {},
+  tokenId = FIRMA_ALPHA.tokenId
+) => {
   const agoraPartial = partial(partialParams)
   const atoms = agoraPartial.offeredAtoms()
-  return {
+  const offerOutpoint = outpoint('a')
+  const created = new AgoraOffer({
     variant: { type: 'PARTIAL', params: agoraPartial },
-    outpoint: outpoint('a'),
+    outpoint: offerOutpoint,
+    txBuilderInput: {
+      prevOut: offerOutpoint,
+      signData: { sats: 546n, redeemScript: agoraPartial.script() }
+    },
     token: {
       tokenId,
-      tokenType: { protocol: 'ALP', number: 0 },
+      tokenType: { protocol: 'ALP', type: 'ALP_TOKEN_TYPE_STANDARD', number: 0 },
       atoms,
       isMintBaton: false
     },
-    status: 'OPEN',
-    askedSats: () => partialParams.asked ?? 7_000n
-  } as unknown as AgoraOffer
+    status: 'OPEN'
+  })
+  if (partialParams.asked !== undefined) {
+    created.askedSats = () => partialParams.asked as bigint
+  }
+  return created
 }
 
-describe('Firma Alpha balance and offers', () => {
+const deterministicAgora = () => {
+  let locktime = 600_000_000
+  return {
+    selectParams: async (params: Record<string, unknown>) => AgoraPartial.approximateParams({
+      ...params,
+      enforcedLockTime: locktime++
+    })
+  } as Pick<Agora, 'selectParams'>
+}
+
+describe('Firma Alpha balance and permissionless offers', () => {
   it('sums only exact, standard, non-baton FIRMA UTXOs with bigint arithmetic', () => {
     const huge = 9_007_199_254_740_993n
     expect(getFirmaBalanceFromUtxos([
@@ -92,16 +117,19 @@ describe('Firma Alpha balance and offers', () => {
     expect(formatFirmaAtoms(90_071_992_547_409_930_000n)).toBe('9007199254740993')
   })
 
-  it('accepts official-minter offers and rejects fake token IDs or makers', () => {
+  it('accepts valid peers and rejects fake token IDs or invalid covenants', () => {
     expect(isCanonicalFirmaOffer(offer())).toBe(true)
+    expect(isCanonicalFirmaOffer(offer({ maker: peerPubkeyHex }))).toBe(true)
     expect(isCanonicalFirmaOffer(offer({}, 'f'.repeat(64)))).toBe(false)
-    expect(isCanonicalFirmaOffer(offer({ maker: `02${'00'.repeat(32)}` }))).toBe(false)
+
+    const malformed = offer()
+    ;(malformed.txBuilderInput as { signData: { redeemScript: Script } }).signData.redeemScript = new Script()
+    expect(isCanonicalFirmaOffer(malformed)).toBe(false)
   })
 
-  it('keeps an active-wallet listing visible without treating it as official liquidity', () => {
-    const ownMaker = `02${'11'.repeat(32)}`
-    expect(isCanonicalFirmaOffer(offer({ maker: ownMaker }), ownMaker)).toBe(true)
-    expect(isCanonicalFirmaOffer(offer({ maker: ownMaker }))).toBe(false)
+  it('labels maker identity without using it as token authorization', () => {
+    expect(toFirmaOfferSummary(offer({ maker: peerPubkeyHex }) as never, `03${'22'.repeat(32)}`).source).toBe('peer')
+    expect(toFirmaOfferSummary(offer({ maker: peerPubkeyHex }) as never, peerPubkeyHex).source).toBe('own')
   })
 
   it('maps and sorts offers by rational XEC-per-atom price', () => {
@@ -112,23 +140,29 @@ describe('Firma Alpha balance and offers', () => {
 })
 
 describe('Firma Alpha liquidity selection', () => {
-  const summary = (offerId: string, offeredAtoms: bigint, minAcceptedAtoms: bigint, askedSats: bigint): FirmaOfferSummary => ({
+  const summary = (
+    offerId: string,
+    offeredAtoms: bigint,
+    minAcceptedAtoms: bigint,
+    askedSats: bigint,
+    source: FirmaOfferSummary['source'] = 'peer'
+  ): FirmaOfferSummary => ({
     offerId,
     offeredAtoms,
     minAcceptedAtoms,
     askedSats,
-    makerPubkeyHex: FIRMA_ALPHA.makerPubkeyHex,
+    makerPubkeyHex: peerPubkeyHex,
     priceNanoSatsPerAtom: 1n,
-    source: 'official'
+    source
   })
 
-  it('selects the best single offer that can satisfy the requested amount', () => {
+  it('selects the best compatible offer regardless of maker label', () => {
     const offers = [
-      summary('expensive', 10_000n, 100n, 8_000n),
-      summary('cheap-too-small', 500n, 100n, 100n),
-      summary('best', 10_000n, 100n, 7_000n)
+      summary('official-expensive', 10_000n, 100n, 8_000n, 'official'),
+      summary('peer-too-small', 500n, 100n, 100n),
+      summary('alice-best', 10_000n, 100n, 7_000n)
     ]
-    expect(selectBestFirmaOffer(offers, 1_000n).offerId).toBe('best')
+    expect(selectBestFirmaOffer(offers, 1_000n).offerId).toBe('alice-best')
   })
 
   it('rejects insufficient one-offer liquidity and minimum violations', () => {
@@ -141,29 +175,79 @@ describe('Firma Alpha liquidity selection', () => {
   })
 })
 
-describe('Firma Alpha sale and redemption parameters', () => {
-  const makerPk = Uint8Array.from(FIRMA_ALPHA.makerPubkeyHex.match(/.{2}/g)!.map((byte) => Number.parseInt(byte, 16)))
+describe('Firma Alpha safe sale and redemption parameters', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
 
-  it('uses all four FIRMA decimals for a regular listing', () => {
-    const result = createFirmaSalePartial({ amount: '1.2345', xecPerFirma: '7000.00', mode: 'sell', makerPk })
+  const makerPk = bytes(peerPubkeyHex)
+
+  it('uses all four FIRMA decimals for a regular listing selected by Agora', async () => {
+    const selector = deterministicAgora()
+    const selectParams = vi.spyOn(selector, 'selectParams')
+    const result = await createFirmaSalePartial(
+      { amount: '1.2345', xecPerFirma: '7000.00', mode: 'sell', makerPk },
+      selector
+    )
+    expect(selectParams).toHaveBeenCalledOnce()
     expect(result.requestedAtoms).toBe(12_345n)
     expect(result.partial.offeredAtoms()).toBeGreaterThan(0n)
     expect(result.partial.tokenId).toBe(FIRMA_ALPHA.tokenId)
     expect(result.partial.tokenProtocol).toBe('ALP')
   })
 
-  it('enforces the 0.01 FIRMA redemption minimum', () => {
-    expect(() => createFirmaSalePartial({
+  it('uses Agora.selectParams to avoid identical covenant locktimes', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-10T19:00:00Z'))
+    vi.spyOn(Math, 'random')
+      .mockReturnValueOnce(0.25)
+      .mockReturnValueOnce(0.25)
+      .mockReturnValueOnce(0.75)
+
+    const existingScripts = new Set<string>()
+    const queriedScripts: string[] = []
+    const chronik = {
+      plugin: () => ({}),
+      script: (_type: string, scriptHash: string) => ({
+        utxos: async () => {
+          queriedScripts.push(scriptHash)
+          return { utxos: existingScripts.has(scriptHash) ? [{}] : [] }
+        }
+      })
+    }
+    const agora = new Agora(chronik as never)
+    const terms = { amount: '1', xecPerFirma: '7000.00', mode: 'sell' as const, makerPk }
+    const alice = await createFirmaSalePartial(terms, agora)
+    existingScripts.add(toHex(shaRmd160(alice.partial.script().bytecode)))
+    const bob = await createFirmaSalePartial(terms, agora)
+
+    expect(queriedScripts).toHaveLength(3)
+    expect(bob.partial.enforcedLockTime).not.toBe(alice.partial.enforcedLockTime)
+    expect(toHex(bob.partial.script().bytecode)).not.toBe(toHex(alice.partial.script().bytecode))
+  })
+
+  it('does not construct a FIRMA covenant from Date.now()/1000', () => {
+    const source = readFileSync(new URL('./firmaAlphaExchange.ts', import.meta.url), 'utf8')
+    expect(source).not.toMatch(/Date\.now\(\)\s*\/\s*1000/)
+    expect(source).not.toMatch(/enforcedLockTime\s*:/)
+  })
+
+  it('enforces the 0.01 FIRMA redemption minimum', async () => {
+    await expect(createFirmaSalePartial({
       amount: '0.0099',
       mode: 'redeem',
       makerPk,
       bidSatsPerFirma: 700_000n
-    })).toThrow(/0\.01 FIRMA/)
+    }, deterministicAgora())).rejects.toThrow(/0\.01 FIRMA/)
   })
 
-  it('prices a redemption strictly below the official bid after covenant approximation', () => {
+  it('prices a redemption strictly below the official bid after covenant approximation', async () => {
     const bidSatsPerFirma = 700_000n
-    const result = createFirmaSalePartial({ amount: '1', mode: 'redeem', makerPk, bidSatsPerFirma })
+    const result = await createFirmaSalePartial(
+      { amount: '1', mode: 'redeem', makerPk, bidSatsPerFirma },
+      deterministicAgora()
+    )
     const offeredAtoms = result.partial.offeredAtoms()
     const atomsPerFirma = 10n ** BigInt(FIRMA_ALPHA.decimals)
     expect(result.partial.askedSats(offeredAtoms) * atomsPerFirma).toBeLessThan(bidSatsPerFirma * offeredAtoms)

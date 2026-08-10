@@ -1,6 +1,21 @@
 import type { ScriptUtxo, TokenInfo, Tx } from 'chronik-client'
-import { Agora, AgoraOffer, AgoraPartial } from 'ecash-agora'
-import { ALP_STANDARD, Script, TxBuilder, calcTxFee, toHex } from 'ecash-lib'
+import {
+  Agora,
+  AgoraOffer,
+  AgoraPartial,
+  DUMMY_KEYPAIR,
+  getAgoraPartialAcceptFuelInputs
+} from 'ecash-agora'
+import {
+  ALL_BIP143,
+  ALP_STANDARD,
+  P2PKHSignatory,
+  Script,
+  TxBuilder,
+  calcTxFee,
+  shaRmd160,
+  toHex
+} from 'ecash-lib'
 import { FIRMA_ALPHA, assertFirmaAlphaTokenInfo } from '../config/firmaAlpha'
 import {
   TOKEN_DUST_SATS,
@@ -37,7 +52,7 @@ export type FirmaOfferSummary = {
   askedSats: bigint
   makerPubkeyHex: string
   priceNanoSatsPerAtom: bigint
-  source: 'official' | 'own'
+  source: 'official' | 'peer' | 'own'
 }
 
 export type FirmaOrderbook = {
@@ -73,6 +88,7 @@ export type FirmaSalePreview = {
   inputOutpoints: string[]
   redemptionCapacitySats?: bigint
   bidPriceXec?: string
+  bidSatsPerFirma?: bigint
   agoraPartial: AgoraPartial
   planFingerprint: string
 }
@@ -109,15 +125,42 @@ export function getFirmaBalanceFromUtxos(utxos: ScriptUtxo[]): bigint {
   }, 0n)
 }
 
-export function isCanonicalFirmaOffer(offer: AgoraOffer, ownPubkeyHex?: string): offer is FirmaPartialOffer {
+const isCompressedPubkey = (pubkey: Uint8Array) =>
+  pubkey.length === 33 && (pubkey[0] === 0x02 || pubkey[0] === 0x03)
+
+const hasValidFirmaCovenant = (offer: FirmaPartialOffer) => {
+  try {
+    const partial = offer.variant.params
+    const offeredAtoms = partial.offeredAtoms()
+    const minAcceptedAtoms = partial.minAcceptedAtoms()
+    const input = offer.txBuilderInput as {
+      prevOut?: { txid?: string; outIdx?: number }
+      signData?: { redeemScript?: Script }
+    }
+    const redeemScript = input.signData?.redeemScript
+
+    return (
+      isCompressedPubkey(partial.makerPk) &&
+      offeredAtoms > 0n &&
+      minAcceptedAtoms > 0n &&
+      minAcceptedAtoms <= offeredAtoms &&
+      offer.askedSats(offeredAtoms) > 0n &&
+      input.prevOut?.txid === offer.outpoint.txid &&
+      input.prevOut?.outIdx === offer.outpoint.outIdx &&
+      redeemScript?.bytecode instanceof Uint8Array &&
+      toHex(redeemScript.bytecode) === toHex(partial.script().bytecode)
+    )
+  } catch {
+    return false
+  }
+}
+
+export function isCanonicalFirmaOffer(offer: AgoraOffer): offer is FirmaPartialOffer {
   if (offer.status !== 'OPEN' || offer.variant.type !== 'PARTIAL') return false
 
   const partial = offer.variant.params
-  const makerPubkeyHex = toHex(partial.makerPk).toLowerCase()
-  const makerAllowed = makerPubkeyHex === FIRMA_ALPHA.makerPubkeyHex || makerPubkeyHex === ownPubkeyHex?.toLowerCase()
 
   return (
-    makerAllowed &&
     partial.tokenId === FIRMA_ALPHA.tokenId &&
     partial.tokenProtocol === FIRMA_ALPHA.protocol &&
     partial.tokenType === FIRMA_ALPHA.tokenType &&
@@ -126,7 +169,8 @@ export function isCanonicalFirmaOffer(offer: AgoraOffer, ownPubkeyHex?: string):
     offer.token.tokenType.number === FIRMA_ALPHA.tokenType &&
     !offer.token.isMintBaton &&
     offer.token.atoms > 0n &&
-    partial.offeredAtoms() === offer.token.atoms
+    partial.offeredAtoms() === offer.token.atoms &&
+    hasValidFirmaCovenant(offer as FirmaPartialOffer)
   )
 }
 
@@ -137,10 +181,16 @@ export function compareFirmaOffersByPrice(a: FirmaOfferSummary, b: FirmaOfferSum
   return left < right ? -1 : 1
 }
 
-export function toFirmaOfferSummary(offer: FirmaPartialOffer): FirmaOfferSummary {
+export function toFirmaOfferSummary(offer: FirmaPartialOffer, ownPubkeyHex?: string): FirmaOfferSummary {
   const partial = offer.variant.params
   const offeredAtoms = partial.offeredAtoms()
   const makerPubkeyHex = toHex(partial.makerPk).toLowerCase()
+  const source = makerPubkeyHex === ownPubkeyHex?.toLowerCase()
+    ? 'own'
+    : FIRMA_ALPHA.officialLiquidityPubkeyHex &&
+        makerPubkeyHex === FIRMA_ALPHA.officialLiquidityPubkeyHex.toLowerCase()
+      ? 'official'
+      : 'peer'
   return {
     offerId: `${offer.outpoint.txid}:${offer.outpoint.outIdx}`,
     offeredAtoms,
@@ -148,7 +198,7 @@ export function toFirmaOfferSummary(offer: FirmaPartialOffer): FirmaOfferSummary
     askedSats: offer.askedSats(offeredAtoms),
     makerPubkeyHex,
     priceNanoSatsPerAtom: partial.priceNanoSatsPerAtom(offeredAtoms),
-    source: makerPubkeyHex === FIRMA_ALPHA.makerPubkeyHex ? 'official' : 'own'
+    source
   }
 }
 
@@ -160,16 +210,14 @@ export async function discoverFirmaOffers(ownPubkeyHex?: string): Promise<FirmaO
     const agora = new Agora(getAgoraChronik() as never)
     const activeOffers = await agora.activeOffersByTokenId(FIRMA_ALPHA.tokenId)
     const offers = activeOffers
-      .filter((offer): offer is FirmaPartialOffer => isCanonicalFirmaOffer(offer, activeWalletPubkey))
-      .map(toFirmaOfferSummary)
+      .filter((offer): offer is FirmaPartialOffer => isCanonicalFirmaOffer(offer))
+      .map((offer) => toFirmaOfferSummary(offer, activeWalletPubkey))
       .sort(compareFirmaOffersByPrice)
 
     return {
       tokenInfo,
       offers,
-      totalLiquidityAtoms: offers
-        .filter((offer) => offer.source === 'official')
-        .reduce((total, offer) => total + offer.offeredAtoms, 0n)
+      totalLiquidityAtoms: offers.reduce((total, offer) => total + offer.offeredAtoms, 0n)
     }
   } catch (error) {
     if (isAgoraPluginUnavailable(error)) throw new FirmaAgoraUnavailableError()
@@ -204,14 +252,6 @@ const loadCanonicalFirmaOffer = async (offerId: string) => {
   assertOfferOutputUnspent(tx, outpoint.vout)
   const details = parseAgoraOfferFromTx(tx, outpoint.vout, FIRMA_ALPHA.tokenId)
 
-  if (
-    details.agoraPartial.tokenProtocol !== FIRMA_ALPHA.protocol ||
-    details.agoraPartial.tokenType !== FIRMA_ALPHA.tokenType ||
-    toHex(details.agoraPartial.makerPk).toLowerCase() !== FIRMA_ALPHA.makerPubkeyHex
-  ) {
-    throw new Error('La oferta no pertenece al minter oficial de Firma Alpha.')
-  }
-
   const offer = new AgoraOffer({
     variant: { type: 'PARTIAL', params: details.agoraPartial },
     outpoint: { txid: outpoint.txid, outIdx: outpoint.vout },
@@ -225,6 +265,10 @@ const loadCanonicalFirmaOffer = async (offerId: string) => {
     token: details.token,
     status: 'OPEN'
   })
+
+  if (!isCanonicalFirmaOffer(offer)) {
+    throw new Error('La oferta no contiene un covenant FIRMA canónico válido.')
+  }
 
   return { outpoint, details, offer }
 }
@@ -252,25 +296,17 @@ export async function prepareFirmaBuyByOfferId(
 
   const recipientScript = Script.fromAddress(account.address)
   const askedSats = offer.askedSats(acceptedAtoms)
-  const signer = xolosWalletService.getSignatory()
   const addressUtxos = await getChronik().address(account.address).utxos()
-  const xecUtxos = addressUtxos.utxos.filter((utxo) => !utxo.token)
-  let networkFeeSats = offer.acceptFeeSats({ recipientScript, acceptedAtoms, feePerKb: FIRMA_FEE_PER_KB })
-  let funding: ScriptUtxo[] = []
-
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    funding = selectXecUtxosForTarget(xecUtxos, askedSats + networkFeeSats)
-    const extraInputs = funding.map((utxo) => buildInput(utxo, recipientScript, signer.signatory))
-    const nextFee = offer.acceptFeeSats({
-      recipientScript,
-      extraInputs,
-      acceptedAtoms,
-      feePerKb: FIRMA_FEE_PER_KB
-    })
-    if (nextFee === networkFeeSats) break
-    networkFeeSats = nextFee
-  }
-  funding = selectXecUtxosForTarget(xecUtxos, askedSats + networkFeeSats)
+  const xecUtxos = sortXecUtxos(addressUtxos.utxos.filter((utxo) => !utxo.token))
+  const funding = getAgoraPartialAcceptFuelInputs(offer, xecUtxos, acceptedAtoms, FIRMA_FEE_PER_KB)
+  const dummySignatory = P2PKHSignatory(DUMMY_KEYPAIR.sk, DUMMY_KEYPAIR.pk, ALL_BIP143)
+  const dummyInputs = funding.map((utxo) => buildInput(utxo, recipientScript, dummySignatory))
+  const networkFeeSats = offer.acceptFeeSats({
+    recipientScript,
+    extraInputs: dummyInputs,
+    acceptedAtoms,
+    feePerKb: FIRMA_FEE_PER_KB
+  })
 
   return {
     kind: 'buy',
@@ -290,15 +326,15 @@ export async function prepareBestFirmaBuy(amount: string): Promise<FirmaBuyPrevi
   const requestedAtoms = parseDecimalToAtoms(amount, FIRMA_ALPHA.decimals)
   const account = xolosWalletService.getX402ActiveAccount()
   const orderbook = await discoverFirmaOffers(account?.publicKey)
-  const bestOffer = selectBestFirmaOffer(
-    orderbook.offers.filter((offer) => offer.source === 'official'),
-    requestedAtoms
-  )
+  const bestOffer = selectBestFirmaOffer(orderbook.offers, requestedAtoms)
   return prepareFirmaBuyByOfferId(bestOffer.offerId, requestedAtoms)
 }
 
+const sortXecUtxos = (utxos: ScriptUtxo[]) =>
+  [...utxos].sort((a, b) => (a.sats === b.sats ? 0 : a.sats > b.sats ? -1 : 1))
+
 const selectXecUtxosForTarget = (utxos: ScriptUtxo[], targetSats: bigint): ScriptUtxo[] => {
-  const sorted = [...utxos].sort((a, b) => (a.sats === b.sats ? 0 : a.sats > b.sats ? -1 : 1))
+  const sorted = sortXecUtxos(utxos)
   const selected: ScriptUtxo[] = []
   let total = 0n
   for (const utxo of sorted) {
@@ -490,8 +526,15 @@ const actualPriceXecPerFirma = (askedSats: bigint, offeredAtoms: bigint): string
 export async function fetchFirmaBidPrice(): Promise<{ display: string; satsPerFirma: bigint }> {
   const response = await fetch(FIRMA_ALPHA.bidApiUrl, { headers: { Accept: 'application/json' } })
   if (!response.ok) throw new Error(`Firma bid API respondió HTTP ${response.status}.`)
-  const body = (await response.json()) as { bid?: string | number }
-  const display = String(body.bid ?? '')
+  const body = await response.json() as unknown
+  if (!body || typeof body !== 'object' || !('bid' in body)) {
+    throw new Error('Firma bid API no devolvió el campo bid esperado.')
+  }
+  const rawBid = (body as { bid?: unknown }).bid
+  if ((typeof rawBid !== 'string' && typeof rawBid !== 'number') || String(rawBid).trim() === '') {
+    throw new Error('Firma bid API devolvió un precio inválido.')
+  }
+  const display = String(rawBid)
   const satsPerFirma = parseXecToSats(display)
   if (satsPerFirma <= 0n) throw new Error('Firma bid API devolvió un precio inválido.')
   return { display: formatSatsToXec(satsPerFirma), satsPerFirma }
@@ -502,13 +545,21 @@ export async function fetchFirmaRedemptionCapacity(): Promise<bigint> {
   return response.utxos.reduce((total, utxo) => total + utxo.sats, 0n)
 }
 
-export const createFirmaSalePartial = (params: {
+const assertFirmaCovenantAvailable = async (partial: AgoraPartial) => {
+  const scriptHash = toHex(shaRmd160(partial.script().bytecode))
+  const response = await getAgoraChronik().script('p2sh', scriptHash).utxos()
+  if (response.utxos.length > 0) {
+    throw new Error('Ya existe un covenant Agora con estos parámetros. Genera otra previsualización.')
+  }
+}
+
+export const createFirmaSalePartial = async (params: {
   amount: string
   xecPerFirma?: string
   mode: FirmaSaleMode
   makerPk: Uint8Array
   bidSatsPerFirma?: bigint
-}) => {
+}, agora: Pick<Agora, 'selectParams'> = new Agora(getAgoraChronik() as never)) => {
   const requestedAtoms = parseDecimalToAtoms(params.amount, FIRMA_ALPHA.decimals)
   if (requestedAtoms <= 0n) throw new Error('La cantidad FIRMA debe ser mayor a cero.')
   if (params.mode === 'redeem' && requestedAtoms < FIRMA_MIN_REDEEM_ATOMS) {
@@ -530,7 +581,7 @@ export const createFirmaSalePartial = (params: {
       ? requestedAtoms / 1000n
       : requestedAtoms
 
-  const build = () => AgoraPartial.approximateParams({
+  const build = () => agora.selectParams({
     offeredAtoms: requestedAtoms,
     priceNanoSatsPerAtom,
     makerPk: params.makerPk,
@@ -538,11 +589,10 @@ export const createFirmaSalePartial = (params: {
     tokenId: FIRMA_ALPHA.tokenId,
     tokenType: ALP_STANDARD,
     tokenProtocol: FIRMA_ALPHA.protocol,
-    enforcedLockTime: Math.floor(Date.now() / 1000),
     dustSats: TOKEN_DUST_SATS
   })
 
-  let partial = build()
+  let partial = await build()
   if (params.mode === 'redeem' && params.bidSatsPerFirma) {
     let attempts = 0
     const atomsPerFirma = 10n ** BigInt(FIRMA_ALPHA.decimals)
@@ -555,7 +605,7 @@ export const createFirmaSalePartial = (params: {
         throw new Error('No se pudo representar un precio de redención FIRMA seguro.')
       }
       priceNanoSatsPerAtom -= REDEEM_PRICE_STEP_NANOSATS_PER_ATOM
-      partial = build()
+      partial = await build()
       attempts += 1
     }
     if (attempts >= MAX_REDEEM_PRICE_ADJUSTMENTS) {
@@ -587,7 +637,7 @@ export async function prepareFirmaSale(params: {
     : undefined
   const bid = redemption?.[0]
   const redemptionCapacitySats = redemption?.[1]
-  const created = createFirmaSalePartial({
+  const created = await createFirmaSalePartial({
     ...params,
     makerPk: hexToBytes(account.publicKey),
     bidSatsPerFirma: bid?.satsPerFirma
@@ -610,6 +660,7 @@ export async function prepareFirmaSale(params: {
     inputOutpoints: plan.inputs.map(outpointKey),
     redemptionCapacitySats,
     bidPriceXec: bid?.display,
+    bidSatsPerFirma: bid?.satsPerFirma,
     agoraPartial: created.partial,
     planFingerprint: plan.planFingerprint
   }
@@ -626,6 +677,24 @@ export async function executeFirmaSale(preview: FirmaSalePreview): Promise<{ txi
   if (freshPlan.planFingerprint !== preview.planFingerprint) {
     throw new Error('Tus UTXOs cambiaron. Genera otra previsualización antes de firmar.')
   }
+
+  if (preview.kind === 'redeem') {
+    if (preview.bidSatsPerFirma === undefined) {
+      throw new Error('La previsualización no contiene el bid FIRMA verificable. Genérala nuevamente.')
+    }
+    const [freshBid, freshCapacitySats] = await Promise.all([
+      fetchFirmaBidPrice(),
+      fetchFirmaRedemptionCapacity()
+    ])
+    if (freshBid.satsPerFirma !== preview.bidSatsPerFirma) {
+      throw new Error('El bid FIRMA cambió. Genera otra previsualización antes de firmar.')
+    }
+    if (freshCapacitySats <= freshPlan.askedSats) {
+      throw new Error('La capacidad de redención FIRMA cambió y ya no cubre la oferta. Genera otra previsualización.')
+    }
+  }
+
+  await assertFirmaCovenantAvailable(preview.agoraPartial)
 
   const signer = xolosWalletService.getSignatory()
   if (signer.address !== freshPlan.account.address || signer.publicKeyHex !== freshPlan.account.publicKey) {

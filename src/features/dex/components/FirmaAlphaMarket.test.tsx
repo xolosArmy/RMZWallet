@@ -65,7 +65,7 @@ describe('FirmaAlphaMarket preview boundary', () => {
         askedSats: 7_000_000n,
         makerPubkeyHex: '03',
         priceNanoSatsPerAtom: 1n,
-        source: 'official'
+        source: 'peer'
       }]
     })
     mocks.prepareBestFirmaBuy.mockResolvedValue(preview)
@@ -83,6 +83,13 @@ describe('FirmaAlphaMarket preview boundary', () => {
     await screen.findByRole('region', { name: 'Previsualización obligatoria FIRMA' })
     expect(mocks.prepareBestFirmaBuy).toHaveBeenCalledWith('1')
     expect(mocks.executeFirmaBuy).not.toHaveBeenCalled()
+  })
+
+  it('presents permissionless FIRMA liquidity without claiming every maker is official', async () => {
+    render(<FirmaAlphaMarket />)
+    expect(await screen.findByText('Liquidez FIRMA disponible')).toBeTruthy()
+    expect(await screen.findByText(/liquidez peer/)).toBeTruthy()
+    expect(screen.queryByText('Liquidez oficial visible')).toBeNull()
   })
 
   it('executes only after the explicit local-signing confirmation', async () => {

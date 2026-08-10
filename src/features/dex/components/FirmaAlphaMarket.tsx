@@ -136,7 +136,7 @@ export default function FirmaAlphaMarket() {
             <div>{balance?.xecFormatted ?? '0.00'} XEC</div>
           </div>
           <div className="tx-item">
-            <strong>Liquidez oficial visible</strong>
+            <strong>Liquidez FIRMA disponible</strong>
             <div>{marketBusy ? 'Sincronizando…' : `${formatFirmaAtoms(liquidityAtoms)} FIRMA`}</div>
           </div>
         </div>
@@ -189,7 +189,7 @@ export default function FirmaAlphaMarket() {
           </div>
         )}
         {action === 'buy' && !pluginUnavailable && !marketBusy && offers.length === 0 && (
-          <p className="muted" style={{ marginTop: 12 }}>No hay ofertas oficiales FIRMA activas.</p>
+          <p className="muted" style={{ marginTop: 12 }}>No hay ofertas FIRMA activas.</p>
         )}
         {action === 'redeem' && (
           <p className="muted" style={{ marginTop: 10 }}>
@@ -274,7 +274,7 @@ export default function FirmaAlphaMarket() {
             <div className="tx-item" key={offer.offerId} style={{ marginTop: 8 }}>
               <strong>{formatFirmaAtoms(offer.offeredAtoms)} FIRMA</strong>
               <div className="muted">
-                {offerPrice(offer)} XEC/FIRMA · mínimo {formatFirmaAtoms(offer.minAcceptedAtoms)} FIRMA · {offer.source === 'official' ? 'minter oficial' : 'oferta propia'}
+                {offerPrice(offer)} XEC/FIRMA · mínimo {formatFirmaAtoms(offer.minAcceptedAtoms)} FIRMA · {offer.source === 'official' ? 'liquidez oficial' : offer.source === 'own' ? 'oferta propia' : 'liquidez peer'}
               </div>
               <div className="address-box" style={{ marginTop: 6, overflowWrap: 'anywhere' }}>{offer.offerId}</div>
             </div>

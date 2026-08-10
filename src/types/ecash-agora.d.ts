@@ -1,9 +1,17 @@
 declare module 'ecash-agora' {
+  import type { ScriptUtxo } from 'chronik-client'
   import type { Script } from 'ecash-lib'
   export type AgoraPartialParams = Record<string, unknown>
   export type AgoraOfferParams = Record<string, unknown>
 
   export const AGORA_LOKAD_ID: Uint8Array
+  export const DUMMY_KEYPAIR: { sk: Uint8Array; pk: Uint8Array }
+  export const getAgoraPartialAcceptFuelInputs: (
+    offer: AgoraOffer,
+    utxos: ScriptUtxo[],
+    acceptedAtoms: bigint,
+    feePerKb?: bigint
+  ) => ScriptUtxo[]
 
   export class Agora {
     constructor(chronik: unknown, dustSats?: bigint)
@@ -28,6 +36,7 @@ declare module 'ecash-agora' {
     tokenProtocol: 'ALP' | 'SLP'
     makerPk: Uint8Array
     dustSats: bigint
+    enforcedLockTime: number
   }
 
   export class AgoraOneshot {

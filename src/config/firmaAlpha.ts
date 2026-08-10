@@ -8,7 +8,8 @@ export type VerifiedDexAsset = Readonly<{
   protocol: 'ALP'
   tokenType: number
   decimals: number
-  makerPubkeyHex: string
+  genesisAuthPubkeyHex: string
+  officialLiquidityPubkeyHex?: string
   redeemAddress: string
   bidApiUrl: string
 }>
@@ -28,7 +29,7 @@ export const FIRMA_ALPHA: VerifiedDexAsset = Object.freeze({
   protocol: 'ALP',
   tokenType: 0,
   decimals: 4,
-  makerPubkeyHex: '03fba49912622cf8bb5b3729b1b5da3e72c6b57d369c8647f6cc7c6cbed510d105',
+  genesisAuthPubkeyHex: '03fba49912622cf8bb5b3729b1b5da3e72c6b57d369c8647f6cc7c6cbed510d105',
   redeemAddress: 'ecash:qr8hdk8rxjc5nj6f450eth3nnslxa8k4gysrtyfxc5',
   bidApiUrl: 'https://firmaprotocol.com/api/bid'
 })
@@ -52,7 +53,7 @@ export function assertFirmaAlphaTokenInfo(tokenInfo: TokenInfo): TokenInfo {
   if (genesis.tokenTicker !== FIRMA_ALPHA.ticker || genesis.tokenName !== FIRMA_ALPHA.onChainName) {
     throw new Error('La metadata de la génesis FIRMA no coincide con la configuración canónica.')
   }
-  if ((genesis.authPubkey || '').toLowerCase() !== FIRMA_ALPHA.makerPubkeyHex) {
+  if ((genesis.authPubkey || '').toLowerCase() !== FIRMA_ALPHA.genesisAuthPubkeyHex) {
     throw new Error('La clave de autoridad FIRMA no coincide con la génesis verificada.')
   }
 

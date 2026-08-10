@@ -15,7 +15,7 @@ const canonicalTokenInfo = (overrides: Record<string, unknown> = {}) => ({
     url: 'firma.cash',
     decimals: 4,
     data: '',
-    authPubkey: FIRMA_ALPHA.makerPubkeyHex
+    authPubkey: FIRMA_ALPHA.genesisAuthPubkeyHex
   },
   ...overrides
 }) as TokenInfo
@@ -26,6 +26,7 @@ describe('Firma Alpha canonical config', () => {
     expect(FIRMA_ALPHA.protocol).toBe('ALP')
     expect(FIRMA_ALPHA.tokenType).toBe(0)
     expect(FIRMA_ALPHA.decimals).toBe(4)
+    expect(FIRMA_ALPHA.genesisAuthPubkeyHex).toMatch(/^(02|03)[0-9a-f]{64}$/)
   })
 
   it('accepts only the complete canonical genesis identity', () => {
