@@ -705,7 +705,7 @@ describe('TM1 regtest publication orchestrator', () => {
     const receipt = await confirmationHarness.orchestrator.approveAndBroadcast(signedReview.signedId)
     confirmationHarness.failConfirmation(abortError())
     await expectCode(confirmationHarness.orchestrator.confirm(receipt.submissionId), 'ABORTED')
-    expect(confirmationHarness.orchestrator.getState().status).toBe('aborted')
+    expect(confirmationHarness.orchestrator.getState().status).toBe('submitted')
   })
 
   test('rejects locally incoherent signed artifact bytes, hex, and txid before broadcast', async () => {
@@ -845,5 +845,235 @@ describe('TM1 regtest publication orchestrator', () => {
       submissionId: newReceipt.submissionId
     })
   })
+
+  test('blocks reset and a new prepare from a reviewReady subscriber until prepare returns', async () => {
+    const harness = createHarness()
+    let resetError: unknown = null
+    let reentrantPrepare: Promise<unknown> | null = null
+
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'reviewReady' || state.review.message !== DEFAULT_REQUEST.message) return
+      try {
+        harness.orchestrator.reset()
+      } catch (error) {
+        resetError = error
+      }
+      reentrantPrepare = harness.orchestrator.prepare({
+        ...DEFAULT_REQUEST,
+        message: 'reentrant publication B'
+      })
+    })
+
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+
+    expect(resetError).toBeInstanceOf(Tm1PublicationError)
+    expect((resetError as Tm1PublicationError).code).toBe('INVALID_STATE')
+    if (reentrantPrepare === null) throw new Error('expected reentrant prepare')
+    await expectCode(reentrantPrepare, 'PUBLICATION_ALREADY_ACTIVE')
+    expect(review.message).toBe(DEFAULT_REQUEST.message)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'reviewReady',
+      review: { preparedId: review.preparedId }
+    })
+    expect(harness.calls.attest).toBe(1)
+
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+    await expect(harness.orchestrator.prepare({
+      ...DEFAULT_REQUEST,
+      message: 'publication B after reset'
+    })).resolves.toMatchObject({ message: 'publication B after reset' })
+    expect(harness.calls.attest).toBe(2)
+  })
+
+  test('blocks reset and a new prepare from a signedReviewReady subscriber until authorizeAndSign returns', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    let resetError: unknown = null
+    let reentrantPrepare: Promise<unknown> | null = null
+
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'signedReviewReady') return
+      try {
+        harness.orchestrator.reset()
+      } catch (error) {
+        resetError = error
+      }
+      reentrantPrepare = harness.orchestrator.prepare({
+        ...DEFAULT_REQUEST,
+        message: 'reentrant publication B'
+      })
+    })
+
+    const signedReview = await harness.orchestrator.authorizeAndSign(review.preparedId)
+
+    expect(resetError).toBeInstanceOf(Tm1PublicationError)
+    expect((resetError as Tm1PublicationError).code).toBe('INVALID_STATE')
+    if (reentrantPrepare === null) throw new Error('expected reentrant prepare')
+    await expectCode(reentrantPrepare, 'PUBLICATION_ALREADY_ACTIVE')
+    expect(signedReview.preparedId).toBe(review.preparedId)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'signedReviewReady',
+      signedReview: { signedId: signedReview.signedId }
+    })
+    expect(harness.calls.attest).toBe(2)
+
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+    await expect(harness.orchestrator.prepare({
+      ...DEFAULT_REQUEST,
+      message: 'publication B after reset'
+    })).resolves.toMatchObject({ message: 'publication B after reset' })
+    expect(harness.calls.attest).toBe(3)
+  })
+
+  test('clears the active staged operation after exceptions', async () => {
+    const harness = createHarness()
+    harness.failAttestation(new Error('attestation unavailable'))
+
+    await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).rejects.toBeInstanceOf(Tm1PublicationError)
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+
+    harness.failAttestation(null)
+    await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
+      message: DEFAULT_REQUEST.message
+    })
+  })
+
+  test('keeps submitted receipt retryable when confirmation observation fails transiently', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    harness.failConfirmation(new Error('indexer unavailable'))
+
+    await expectCode(harness.orchestrator.confirm(receipt.submissionId), 'CONFIRMATION_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('submitted')
+    if (state.status !== 'submitted') throw new Error('expected submitted')
+    expect(state.receipt.submissionId).toBe(receipt.submissionId)
+    expect(state.receipt.txid).toBe(receipt.txid)
+    expect(state.signedReview.signedId).toBe(signedReview.signedId)
+    expect(harness.calls.broadcast).toBe(1)
+
+    harness.failConfirmation(null)
+    harness.setConfirmation(Object.freeze({
+      submissionId: receipt.submissionId,
+      txid: receipt.txid,
+      confirmations: 2,
+      blockHash: 'ee'.repeat(32),
+      blockHeight: 103
+    }))
+    await expect(harness.orchestrator.confirm(receipt.submissionId)).resolves.toMatchObject({
+      submissionId: receipt.submissionId,
+      txid: receipt.txid,
+      confirmations: 2
+    })
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.calls.confirm).toBe(2)
+  })
+
+  test('keeps submitted receipt retryable when confirmation observation aborts', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    const abortError = new Error('observer aborted')
+    abortError.name = 'AbortError'
+    harness.failConfirmation(abortError)
+
+    await expectCode(harness.orchestrator.confirm(receipt.submissionId), 'ABORTED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('submitted')
+    if (state.status !== 'submitted') throw new Error('expected submitted')
+    expect(state.receipt.submissionId).toBe(receipt.submissionId)
+    expect(state.receipt.txid).toBe(receipt.txid)
+    expect(harness.calls.broadcast).toBe(1)
+
+    harness.failConfirmation(null)
+    await expect(harness.orchestrator.confirm(receipt.submissionId)).resolves.toMatchObject({
+      submissionId: receipt.submissionId,
+      txid: receipt.txid,
+      confirmations: 1
+    })
+    expect(harness.calls.broadcast).toBe(1)
+  })
+
+  test('requires positive safe integer confirmations before confirming submitted publications', async () => {
+    const cases = [0, -1, Number.NaN, 1.5, 1]
+
+    for (const confirmations of cases) {
+      const harness = createHarness()
+      const signedReview = await prepareAndSign(harness)
+      const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+      harness.setConfirmation(Object.freeze({
+        submissionId: receipt.submissionId,
+        txid: receipt.txid,
+        confirmations
+      }))
+
+      if (confirmations === 1) {
+        await expect(harness.orchestrator.confirm(receipt.submissionId)).resolves.toMatchObject({
+          confirmations: 1
+        })
+        expect(harness.orchestrator.getState().status).toBe('confirmed')
+      } else {
+        await expectCode(harness.orchestrator.confirm(receipt.submissionId), 'CONFIRMATION_FAILED')
+        const state = harness.orchestrator.getState()
+        expect(state.status).toBe('submitted')
+        if (state.status !== 'submitted') throw new Error('expected submitted')
+        expect(state.receipt.submissionId).toBe(receipt.submissionId)
+        expect(state.receipt.txid).toBe(receipt.txid)
+      }
+    }
+  })
+
+  test('requires positive safe integer confirmations during reconciliation without losing uncertainty', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const deferred = harness.deferBroadcast()
+    const promise = harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    deferred.reject(new Error('timeout'))
+    await expectCode(promise, 'BROADCAST_FAILED')
+    const uncertain = harness.orchestrator.getState()
+    if (uncertain.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    harness.setConfirmation(Object.freeze({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: uncertain.uncertainty.txid,
+      confirmations: 0
+    }))
+
+    await expectCode(harness.orchestrator.reconcile(), 'CONFIRMATION_FAILED')
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('broadcastUncertain')
+    if (state.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    expect(state.uncertainty.txid).toBe(signedReview.txid)
+    expect(harness.calls.broadcast).toBe(1)
+  })
+
+  test('classifies coded operation aborts during reconciliation without losing uncertainty', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const deferred = harness.deferBroadcast()
+    const promise = harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    deferred.reject(new Error('timeout'))
+    await expectCode(promise, 'BROADCAST_FAILED')
+    const uncertain = harness.orchestrator.getState()
+    if (uncertain.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    const codedAbort = new Error('operation aborted') as Error & { code: string }
+    codedAbort.code = 'OPERATION_ABORTED'
+    harness.failConfirmation(codedAbort)
+
+    await expectCode(harness.orchestrator.reconcile(), 'ABORTED')
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('broadcastUncertain')
+    if (state.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    expect(state.uncertainty.txid).toBe(signedReview.txid)
+    expect(state.uncertainty.submissionId).toBe(uncertain.uncertainty.submissionId)
+    expect(harness.calls.broadcast).toBe(1)
+  })
+
 
 })

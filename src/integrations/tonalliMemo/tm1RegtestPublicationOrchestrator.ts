@@ -235,6 +235,14 @@ export type Tm1PublicationClock = Readonly<{
   createId: (prefix: 'prepared' | 'signed' | 'submission') => string
 }>
 
+type Tm1ActivePublicationOperation =
+  | 'prepare'
+  | 'authorizeAndSign'
+  | 'approveAndBroadcast'
+  | 'confirm'
+  | 'reconcile'
+  | null
+
 export interface Tm1RegtestPublicationOrchestrator {
   getState(): Tm1PublicationState
   subscribe(listener: (state: Tm1PublicationState) => void): () => void
@@ -252,6 +260,7 @@ implements Tm1RegtestPublicationOrchestrator {
   private readonly clock: Tm1PublicationClock
   private readonly listeners = new Set<(state: Tm1PublicationState) => void>()
   private state: Tm1PublicationState = Object.freeze({ status: 'idle' })
+  private activeOperation: Tm1ActivePublicationOperation = null
 
   constructor(dependencies: Tm1RegtestPublicationDependencies) {
     this.dependencies = dependencies
@@ -274,11 +283,12 @@ implements Tm1RegtestPublicationOrchestrator {
     request: Tm1PublicationRequest,
     signal?: AbortSignal
   ): Promise<Tm1PreparedReview> {
-    if (this.state.status !== 'idle') {
-      throw new Tm1PublicationError('PUBLICATION_ALREADY_ACTIVE')
-    }
+    this.beginOperation('prepare')
 
     try {
+      if (this.state.status !== 'idle') {
+        throw new Tm1PublicationError('PUBLICATION_ALREADY_ACTIVE')
+      }
       assertNotAborted(signal)
       this.transition({ status: 'attesting', message: request.message })
       const network = await this.dependencies.networkAttestation.attest(signal)
@@ -346,6 +356,8 @@ implements Tm1RegtestPublicationOrchestrator {
       return freezePreparedReview(review)
     } catch (error) {
       throw this.enterFailureOrAbort(error)
+    } finally {
+      this.endOperation('prepare')
     }
   }
 
@@ -353,11 +365,13 @@ implements Tm1RegtestPublicationOrchestrator {
     preparedId: string,
     signal?: AbortSignal
   ): Promise<Tm1SignedReview> {
-    if (this.state.status !== 'reviewReady') throw new Tm1PublicationError('INVALID_STATE')
-    const review = this.state.review
-    if (preparedId !== review.preparedId) throw new Tm1PublicationError('STALE_PREPARED_REVIEW')
+    this.beginOperation('authorizeAndSign')
 
     try {
+      if (this.state.status !== 'reviewReady') throw new Tm1PublicationError('INVALID_STATE')
+      const review = this.state.review
+      if (preparedId !== review.preparedId) throw new Tm1PublicationError('STALE_PREPARED_REVIEW')
+
       assertNotAborted(signal)
       this.transition({ status: 'authorizing', review })
       const decision = await this.dependencies.signingAuthorization.requestSigningAuthorization(
@@ -434,6 +448,8 @@ implements Tm1RegtestPublicationOrchestrator {
       return freezeSignedReview(signedReview)
     } catch (error) {
       throw this.enterFailureOrAbort(error)
+    } finally {
+      this.endOperation('authorizeAndSign')
     }
   }
 
@@ -441,12 +457,14 @@ implements Tm1RegtestPublicationOrchestrator {
     signedId: string,
     signal?: AbortSignal
   ): Promise<Tm1SubmissionReceipt> {
-    if (this.state.status !== 'signedReviewReady') throw new Tm1PublicationError('INVALID_STATE')
-    const signedReview = this.state.signedReview
-    const review = this.state.review
-    if (signedId !== signedReview.signedId) throw new Tm1PublicationError('STALE_SIGNED_REVIEW')
+    this.beginOperation('approveAndBroadcast')
 
     try {
+      if (this.state.status !== 'signedReviewReady') throw new Tm1PublicationError('INVALID_STATE')
+      const signedReview = this.state.signedReview
+      const review = this.state.review
+      if (signedId !== signedReview.signedId) throw new Tm1PublicationError('STALE_SIGNED_REVIEW')
+
       assertNotAborted(signal)
       this.transition({ status: 'approvingBroadcast', signedReview })
       const decision = await this.dependencies.broadcastAuthorization.requestBroadcastAuthorization(
@@ -544,15 +562,19 @@ implements Tm1RegtestPublicationOrchestrator {
       return receipt
     } catch (error) {
       throw this.enterFailureOrAbort(error)
+    } finally {
+      this.endOperation('approveAndBroadcast')
     }
   }
 
   async reconcile(signal?: AbortSignal): Promise<Tm1Confirmation> {
-    if (this.state.status !== 'broadcastUncertain') throw new Tm1PublicationError('INVALID_STATE')
-    const signedReview = this.state.signedReview
-    const uncertainty = this.state.uncertainty
+    this.beginOperation('reconcile')
 
     try {
+      if (this.state.status !== 'broadcastUncertain') throw new Tm1PublicationError('INVALID_STATE')
+      const signedReview = this.state.signedReview
+      const uncertainty = this.state.uncertainty
+
       assertNotAborted(signal)
       this.transition({ status: 'reconciling', signedReview, uncertainty })
       const confirmation = await this.dependencies.confirmationObserver.confirm({
@@ -566,6 +588,7 @@ implements Tm1RegtestPublicationOrchestrator {
       ) {
         throw new Tm1PublicationError('TXID_MISMATCH')
       }
+      assertPositiveConfirmations(confirmation)
       const receipt = freezeReceipt({
         submissionId: uncertainty.submissionId,
         signedId: uncertainty.signedId,
@@ -577,21 +600,33 @@ implements Tm1RegtestPublicationOrchestrator {
       this.transition({ status: 'confirmed', receipt, confirmation: frozenConfirmation })
       return frozenConfirmation
     } catch (error) {
+      const state = this.state
+      if (state.status !== 'reconciling') {
+        throw this.enterFailureOrAbort(error, 'CONFIRMATION_FAILED')
+      }
+      const signedReview = state.signedReview
+      const uncertainty = state.uncertainty
       this.transition({ status: 'broadcastUncertain', signedReview, uncertainty })
-      if (isAbortError(error)) {
+      if (isAbortLike(error)) {
         throw new Tm1PublicationError('ABORTED', 'ABORTED', error)
       }
       if (error instanceof Tm1PublicationError && error.code === 'TXID_MISMATCH') throw error
       throw new Tm1PublicationError('CONFIRMATION_FAILED', 'CONFIRMATION_FAILED', error)
+    } finally {
+      this.endOperation('reconcile')
     }
   }
 
   async confirm(submissionId: string, signal?: AbortSignal): Promise<Tm1Confirmation> {
-    if (this.state.status !== 'submitted') throw new Tm1PublicationError('INVALID_STATE')
-    const receipt = this.state.receipt
-    if (submissionId !== receipt.submissionId) throw new Tm1PublicationError('STALE_SUBMISSION')
+    this.beginOperation('confirm')
+    let submittedSnapshot: Extract<Tm1PublicationState, { status: 'submitted' }> | null = null
 
     try {
+      if (this.state.status !== 'submitted') throw new Tm1PublicationError('INVALID_STATE')
+      submittedSnapshot = this.state
+      const receipt = submittedSnapshot.receipt
+      if (submissionId !== receipt.submissionId) throw new Tm1PublicationError('STALE_SUBMISSION')
+
       assertNotAborted(signal)
       this.transition({ status: 'confirming', receipt })
       const confirmation = await this.dependencies.confirmationObserver.confirm({
@@ -602,14 +637,44 @@ implements Tm1RegtestPublicationOrchestrator {
       if (confirmation.submissionId !== submissionId || confirmation.txid !== receipt.txid) {
         throw new Tm1PublicationError('TXID_MISMATCH')
       }
-      this.transition({ status: 'confirmed', receipt, confirmation: freezeConfirmation(confirmation) })
-      return freezeConfirmation(confirmation)
+      assertPositiveConfirmations(confirmation)
+      const frozenConfirmation = freezeConfirmation(confirmation)
+      this.transition({ status: 'confirmed', receipt, confirmation: frozenConfirmation })
+      return frozenConfirmation
     } catch (error) {
-      throw this.enterFailureOrAbort(error, 'CONFIRMATION_FAILED')
+      const state = this.state
+      if (state.status !== 'confirming') {
+        if (submittedSnapshot !== null && isAbortLike(error)) {
+          this.transition({
+            status: 'submitted',
+            signedReview: submittedSnapshot.signedReview,
+            receipt: submittedSnapshot.receipt
+          })
+          throw new Tm1PublicationError('ABORTED', 'ABORTED', error)
+        }
+        throw this.enterFailureOrAbort(error, 'CONFIRMATION_FAILED')
+      }
+      if (submittedSnapshot === null) {
+        throw this.enterFailureOrAbort(error, 'CONFIRMATION_FAILED')
+      }
+      const receipt = state.receipt
+      this.transition({
+        status: 'submitted',
+        signedReview: submittedSnapshot.signedReview,
+        receipt
+      })
+      if (isAbortLike(error)) {
+        throw new Tm1PublicationError('ABORTED', 'ABORTED', error)
+      }
+      if (error instanceof Tm1PublicationError && error.code === 'TXID_MISMATCH') throw error
+      throw new Tm1PublicationError('CONFIRMATION_FAILED', 'CONFIRMATION_FAILED', error)
+    } finally {
+      this.endOperation('confirm')
     }
   }
 
   reset(): void {
+    if (this.activeOperation !== null) throw new Tm1PublicationError('INVALID_STATE')
     if (
       this.state.status !== 'idle' &&
       this.state.status !== 'reviewReady' &&
@@ -623,6 +688,19 @@ implements Tm1RegtestPublicationOrchestrator {
       throw new Tm1PublicationError('INVALID_STATE')
     }
     this.transition({ status: 'idle' })
+  }
+
+  private beginOperation(operation: Exclude<Tm1ActivePublicationOperation, null>): void {
+    if (this.activeOperation !== null) {
+      throw new Tm1PublicationError(
+        operation === 'prepare' ? 'PUBLICATION_ALREADY_ACTIVE' : 'INVALID_STATE'
+      )
+    }
+    this.activeOperation = operation
+  }
+
+  private endOperation(operation: Exclude<Tm1ActivePublicationOperation, null>): void {
+    if (this.activeOperation === operation) this.activeOperation = null
   }
 
   private transition(state: Tm1PublicationState): void {
@@ -719,6 +797,15 @@ function isBroadcastAuthorizationBound(
 
 function assertNotAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
+}
+
+function assertPositiveConfirmations(confirmation: Tm1Confirmation): void {
+  if (!Number.isSafeInteger(confirmation.confirmations) || confirmation.confirmations <= 0) {
+    throw new Tm1PublicationError(
+      'CONFIRMATION_FAILED',
+      'CONFIRMATION_FAILED: confirmations must be a positive safe integer'
+    )
+  }
 }
 
 function isAbortError(error: unknown): boolean {
