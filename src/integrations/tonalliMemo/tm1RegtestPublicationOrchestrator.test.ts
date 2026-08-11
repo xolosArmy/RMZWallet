@@ -83,6 +83,7 @@ function createHarness() {
     authorizationId: 'sign-auth-1'
   })
   let broadcastDecision: Tm1BroadcastAuthorizationDecision | null = null
+  let signingAuthorizationFailure: unknown = null
   let attestFailure: unknown = null
   let utxoFailure: unknown = null
   let signerFailure: unknown = null
@@ -94,6 +95,8 @@ function createHarness() {
   let confirmationOverride: Tm1Confirmation | null = null
   let confirmationFailure: unknown = null
   let confirmationDeferred: Deferred<Tm1Confirmation> | null = null
+  let signerDeferred: Deferred<RegtestSignedTransaction> | null = null
+  let auditDeferred: Deferred<RegtestSignedTransaction> | null = null
   let onSigningAuthorization: (() => void) | null = null
   let onBroadcastAuthorization: (() => void) | null = null
   let broadcastDeferred: Deferred<Readonly<{ txid: string; disposition: 'accepted' }>> | null = null
@@ -136,6 +139,7 @@ function createHarness() {
         calls.signingAuthorization += 1
         onSigningAuthorization?.()
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
+        if (signingAuthorizationFailure) throw signingAuthorizationFailure
         return signingDecision
       }
     },
@@ -144,6 +148,7 @@ function createHarness() {
         calls.signer += 1
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (signerFailure) throw signerFailure
+        if (signerDeferred) return signerDeferred.promise
         return signTm1Draft02RegtestCandidate({ candidate: review.candidate, signal })
       }
     },
@@ -151,6 +156,7 @@ function createHarness() {
       async auditSignedArtifact({ signedArtifact }) {
         calls.audit += 1
         if (auditFailure) throw auditFailure
+        if (auditDeferred) return auditDeferred.promise
         if (auditReturnUnchecked) return auditReturnUnchecked
         const audited = auditMutator ? auditMutator(signedArtifact) : signedArtifact
         await new Tm1InMemoryDeliveryTransport().submit(audited)
@@ -216,6 +222,7 @@ function createHarness() {
     setChainIdentity: (next: string) => { chainIdentity = next },
     setSigningDecision: (next: Tm1PublicationAuthorizationDecision) => { signingDecision = next },
     setBroadcastDecision: (next: Tm1BroadcastAuthorizationDecision) => { broadcastDecision = next },
+    failSigningAuthorization: (error: unknown) => { signingAuthorizationFailure = error },
     failAttestation: (error: unknown) => { attestFailure = error },
     failUtxos: (error: unknown) => { utxoFailure = error },
     failSigner: (error: unknown) => { signerFailure = error },
@@ -235,6 +242,14 @@ function createHarness() {
     deferConfirmation: () => {
       confirmationDeferred = createDeferred<Tm1Confirmation>()
       return confirmationDeferred
+    },
+    deferSigner: () => {
+      signerDeferred = createDeferred<RegtestSignedTransaction>()
+      return signerDeferred
+    },
+    deferAudit: () => {
+      auditDeferred = createDeferred<RegtestSignedTransaction>()
+      return auditDeferred
     },
     deferAttestation: () => {
       attestDeferred = createDeferred<void>()
@@ -1284,6 +1299,181 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(state.status).toBe('reviewReady')
     if (state.status !== 'reviewReady') throw new Error('expected review')
     expect(toHex(state.review.effectiveContent)).toBe(toHex(review.effectiveContent))
+  })
+
+
+  test('aborts after signer resolves when signer ignored the signal', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const deferred = harness.deferSigner()
+    const controller = new AbortController()
+    const promise = harness.orchestrator.authorizeAndSign(review.preparedId, controller.signal)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.signer).toBe(1)
+    controller.abort()
+    deferred.resolve(signTm1Draft02RegtestCandidate({ candidate: review.candidate }))
+
+    await expectCode(promise, 'ABORTED')
+    expect(harness.calls.audit).toBe(0)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState().status).toBe('aborted')
+  })
+
+  test('aborts after signed artifact audit resolves when auditor ignored the signal', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const audited = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    const deferred = harness.deferAudit()
+    const controller = new AbortController()
+    const promise = harness.orchestrator.authorizeAndSign(review.preparedId, controller.signal)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.signer).toBe(1)
+    expect(harness.calls.audit).toBe(1)
+    controller.abort()
+    deferred.resolve(audited)
+
+    await expectCode(promise, 'ABORTED')
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('aborted')
+    expect(state.status).not.toBe('signedReviewReady')
+    expect(harness.calls.broadcast).toBe(0)
+  })
+
+  test('maps authorizeAndSign dependency failures to stage codes instead of INVALID_STATE', async () => {
+    const authorizationHarness = createHarness()
+    const authorizationReview = await authorizationHarness.orchestrator.prepare(DEFAULT_REQUEST)
+    authorizationHarness.failSigningAuthorization(new Error('authorization service unavailable'))
+    await expectCode(authorizationHarness.orchestrator.authorizeAndSign(authorizationReview.preparedId), 'SIGNING_FAILED')
+    const authorizationState = authorizationHarness.orchestrator.getState()
+    expect(authorizationState.status).toBe('failed')
+    if (authorizationState.status !== 'failed') throw new Error('expected failed')
+    expect(authorizationState.error.code).not.toBe('INVALID_STATE')
+
+    const attestationHarness = createHarness()
+    const attestationReview = await attestationHarness.orchestrator.prepare(DEFAULT_REQUEST)
+    attestationHarness.failAttestation(new Error('re-attestation unavailable'))
+    await expectCode(attestationHarness.orchestrator.authorizeAndSign(attestationReview.preparedId), 'CANDIDATE_REVALIDATION_FAILED')
+
+    const utxoHarness = createHarness()
+    const utxoReview = await utxoHarness.orchestrator.prepare(DEFAULT_REQUEST)
+    utxoHarness.failUtxos(new Error('utxo refresh unavailable'))
+    await expectCode(utxoHarness.orchestrator.authorizeAndSign(utxoReview.preparedId), 'CANDIDATE_REVALIDATION_FAILED')
+
+    const signerHarness = createHarness()
+    const signerReview = await signerHarness.orchestrator.prepare(DEFAULT_REQUEST)
+    signerHarness.failSigner(new Error('signer unavailable'))
+    await expectCode(signerHarness.orchestrator.authorizeAndSign(signerReview.preparedId), 'SIGNING_FAILED')
+
+    const lifecycleHarness = createHarness()
+    await expectCode(lifecycleHarness.orchestrator.authorizeAndSign('missing'), 'INVALID_STATE')
+
+    const abortHarness = createHarness()
+    const abortReview = await abortHarness.orchestrator.prepare(DEFAULT_REQUEST)
+    const controller = new AbortController()
+    controller.abort()
+    await expectCode(abortHarness.orchestrator.authorizeAndSign(abortReview.preparedId, controller.signal), 'ABORTED')
+  })
+
+  test('isolates failed errors between thrown errors and state snapshots', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.failSigner(new Error('fixture signer failed'))
+    let thrown: Tm1PublicationError | null = null
+
+    await harness.orchestrator.authorizeAndSign(review.preparedId).catch(error => { thrown = error })
+    if (thrown === null) throw new Error('expected thrown error')
+    const first = harness.orchestrator.getState()
+    expect(first.status).toBe('failed')
+    if (first.status !== 'failed') throw new Error('expected failed')
+    expect(first.error).not.toBe(thrown)
+    expect(first.error.code).toBe('SIGNING_FAILED')
+
+    ;(thrown as { code: string; message: string }).code = 'INVALID_STATE'
+    ;(thrown as { code: string; message: string }).message = 'mutated thrown'
+    ;(first.error as { code: string; message: string }).code = 'INVALID_STATE'
+    ;(first.error as { code: string; message: string }).message = 'mutated snapshot'
+
+    const second = harness.orchestrator.getState()
+    expect(second.status).toBe('failed')
+    if (second.status !== 'failed') throw new Error('expected failed')
+    expect(second.error.code).toBe('SIGNING_FAILED')
+    expect(second.error.message).toBe('SIGNING_FAILED')
+  })
+
+  test('isolates failed errors between subscribers', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.failSigner(new Error('fixture signer failed'))
+    const listenerAErrors: Tm1PublicationError[] = []
+    const listenerBErrors: Tm1PublicationError[] = []
+
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'failed') return
+      listenerAErrors.push(state.error)
+      ;(state.error as { code: string; message: string }).code = 'INVALID_STATE'
+      ;(state.error as { code: string; message: string }).message = 'mutated listener'
+    })
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'failed') return
+      listenerBErrors.push(state.error)
+    })
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+    expect(listenerAErrors).toHaveLength(1)
+    expect(listenerBErrors).toHaveLength(1)
+    expect(listenerAErrors[0]).not.toBe(listenerBErrors[0])
+    expect(listenerBErrors[0].code).toBe('SIGNING_FAILED')
+    expect(listenerBErrors[0].message).toBe('SIGNING_FAILED')
+  })
+
+  test('isolates broadcast uncertainty errors and preserves reconciliation metadata', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.failBroadcast(new Error('transport failed after dispatch'))
+    let thrown: Tm1PublicationError | null = null
+
+    await harness.orchestrator.approveAndBroadcast(signedReview.signedId).catch(error => { thrown = error })
+    if (thrown === null) throw new Error('expected broadcast error')
+    const first = harness.orchestrator.getState()
+    expect(first.status).toBe('broadcastUncertain')
+    if (first.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    const { submissionId, txid, signedArtifactHash } = first.uncertainty
+    const signedArtifactHex = first.uncertainty.signedArtifact.rawTransactionHex
+    expect(first.uncertainty.error).not.toBe(thrown)
+
+    ;(thrown as { code: string; message: string }).code = 'INVALID_STATE'
+    ;(thrown as { code: string; message: string }).message = 'mutated thrown'
+    ;(first.uncertainty.error as { code: string; message: string }).code = 'INVALID_STATE'
+    ;(first.uncertainty.error as { code: string; message: string }).message = 'mutated uncertainty'
+
+    const second = harness.orchestrator.getState()
+    expect(second.status).toBe('broadcastUncertain')
+    if (second.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    expect(second.uncertainty.error.code).toBe('BROADCAST_FAILED')
+    expect(second.uncertainty.error.message).toBe('BROADCAST_FAILED')
+    expect(second.uncertainty.submissionId).toBe(submissionId)
+    expect(second.uncertainty.txid).toBe(txid)
+    expect(second.uncertainty.signedArtifactHash).toBe(signedArtifactHash)
+    expect(second.uncertainty.signedArtifact.rawTransactionHex).toBe(signedArtifactHex)
+
+    harness.failConfirmation(null)
+    harness.setConfirmation(Object.freeze({
+      submissionId,
+      txid,
+      confirmations: 1,
+      blockHash: 'ab'.repeat(32),
+      blockHeight: 106
+    }))
+    await expect(harness.orchestrator.reconcile()).resolves.toMatchObject({ submissionId, txid })
+    const confirmed = harness.orchestrator.getState()
+    expect(confirmed.status).toBe('confirmed')
+    if (confirmed.status !== 'confirmed') throw new Error('expected confirmed')
+    expect(confirmed.receipt.submissionId).toBe(submissionId)
+    expect(confirmed.receipt.txid).toBe(txid)
+    expect(signedReview.signedArtifactHash).toBe(signedArtifactHash)
+    expect(signedReview.signedArtifact.rawTransactionHex).toBe(signedArtifactHex)
   })
 
 })

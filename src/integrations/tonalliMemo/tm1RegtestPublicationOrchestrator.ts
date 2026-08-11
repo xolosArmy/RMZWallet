@@ -373,10 +373,17 @@ implements Tm1RegtestPublicationOrchestrator {
 
       assertNotAborted(signal)
       this.transition({ status: 'authorizing', review })
-      const decision = await this.dependencies.signingAuthorization.requestSigningAuthorization(
-        freezePreparedReview(review),
-        signal
-      )
+      let decision: Tm1PublicationAuthorizationDecision
+      try {
+        decision = await this.dependencies.signingAuthorization.requestSigningAuthorization(
+          freezePreparedReview(review),
+          signal
+        )
+      } catch (error) {
+        if (isAbortLike(error)) throw error
+        throw new Tm1PublicationError('SIGNING_FAILED', 'SIGNING_FAILED', error)
+      }
+      assertNotAborted(signal)
       if (decision.status === 'rejected') {
         this.transition(rejectedState('signing', decision.reason))
         throw new Tm1PublicationError('SIGNING_REJECTED', decision.reason ?? 'SIGNING_REJECTED')
@@ -395,14 +402,36 @@ implements Tm1RegtestPublicationOrchestrator {
         review,
         signingAuthorizationId: decision.authorizationId
       })
-      const freshNetwork = await this.dependencies.networkAttestation.attest(signal)
+      let freshNetwork: Tm1RegtestNetworkAttestation
+      try {
+        freshNetwork = await this.dependencies.networkAttestation.attest(signal)
+      } catch (error) {
+        if (isAbortLike(error)) throw error
+        throw new Tm1PublicationError(
+          'CANDIDATE_REVALIDATION_FAILED',
+          'CANDIDATE_REVALIDATION_FAILED',
+          error
+        )
+      }
+      assertNotAborted(signal)
       if (
         freshNetwork.environment !== review.network.environment ||
         freshNetwork.chainIdentity !== review.network.chainIdentity
       ) {
         throw new Tm1PublicationError('CANDIDATE_REVALIDATION_FAILED')
       }
-      const freshUtxos = await this.dependencies.utxoProvider.readUtxos(signal)
+      let freshUtxos: readonly Tm1Draft02FreshUtxo[]
+      try {
+        freshUtxos = await this.dependencies.utxoProvider.readUtxos(signal)
+      } catch (error) {
+        if (isAbortLike(error)) throw error
+        throw new Tm1PublicationError(
+          'CANDIDATE_REVALIDATION_FAILED',
+          'CANDIDATE_REVALIDATION_FAILED',
+          error
+        )
+      }
+      assertNotAborted(signal)
       assertCandidateStillValid(review, freshUtxos)
       assertBindingUnchanged(review)
       assertNotAborted(signal)
@@ -422,6 +451,7 @@ implements Tm1RegtestPublicationOrchestrator {
         if (isAbortLike(error)) throw error
         throw new Tm1PublicationError('SIGNING_FAILED', 'SIGNING_FAILED', error)
       }
+      assertNotAborted(signal)
       let auditedArtifact: RegtestSignedTransaction
       try {
         auditedArtifact = await this.dependencies.signedArtifactAudit.auditSignedArtifact({
@@ -431,6 +461,7 @@ implements Tm1RegtestPublicationOrchestrator {
       } catch (error) {
         throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID', 'SIGNED_ARTIFACT_INVALID', error)
       }
+      assertNotAborted(signal)
       const signedReview = freezeSignedReview({
         preparedId: review.preparedId,
         signedId: this.clock.createId('signed'),
@@ -929,7 +960,11 @@ function cloneState(state: Tm1PublicationState): Tm1PublicationState {
     case 'expired':
       return Object.freeze({ status: 'expired', stage: state.stage, reason: state.reason })
     case 'failed':
-      return Object.freeze({ status: 'failed', stage: state.stage, error: state.error })
+      return Object.freeze({
+        status: 'failed',
+        stage: state.stage,
+        error: clonePublicationError(state.error)
+      })
   }
 }
 
@@ -978,8 +1013,28 @@ function freezeUncertainty(uncertainty: Tm1BroadcastUncertainty): Tm1BroadcastUn
     signedArtifact: freezeSignedArtifact(uncertainty.signedArtifact),
     signedArtifactHash: uncertainty.signedArtifactHash,
     broadcastAuthorizationId: uncertainty.broadcastAuthorizationId,
-    error: uncertainty.error
+    error: clonePublicationError(uncertainty.error)
   })
+}
+
+function clonePublicationError(error: Tm1PublicationError): Tm1PublicationError {
+  const clone = new Tm1PublicationError(
+    error.code,
+    error.message,
+    cloneErrorCause(error.cause)
+  )
+  clone.name = error.name
+  return clone
+}
+
+function cloneErrorCause(cause: unknown): unknown {
+  if (cause instanceof Tm1PublicationError) return clonePublicationError(cause)
+  if (cause instanceof Error) {
+    const clone = new Error(cause.message)
+    clone.name = cause.name
+    return clone
+  }
+  return cause
 }
 
 function freezeReceipt(receipt: Tm1SubmissionReceipt): Tm1SubmissionReceipt {
