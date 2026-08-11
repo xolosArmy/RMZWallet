@@ -1,4 +1,4 @@
-import { sha256d, toHex } from 'ecash-lib'
+import { Tx, sha256d, toHex } from 'ecash-lib'
 import { XEC_DUST_SATS } from '../../config/xecFees'
 import { encodeTm1Draft02Post } from './tm1Draft02'
 import {
@@ -32,6 +32,7 @@ export type Tm1PublicationErrorCode =
   | 'PUBLICATION_ALREADY_ACTIVE'
   | 'STALE_PREPARED_REVIEW'
   | 'STALE_SIGNED_REVIEW'
+  | 'STALE_SUBMISSION'
   | 'SIGNING_REJECTED'
   | 'SIGNING_AUTHORIZATION_EXPIRED'
   | 'CANDIDATE_REVALIDATION_FAILED'
@@ -68,6 +69,18 @@ export type Tm1PublicationAuthorizationDecision = Readonly<
   | { status: 'expired'; reason?: string }
 >
 
+export type Tm1BroadcastAuthorizationDecision = Readonly<
+  | {
+    status: 'approved'
+    authorizationId: string
+    signedId: string
+    txid: string
+    signedArtifactHash: string
+  }
+  | { status: 'rejected'; reason?: string }
+  | { status: 'expired'; reason?: string }
+>
+
 export type Tm1SubmissionReceipt = Readonly<{
   submissionId: string
   signedId: string
@@ -82,6 +95,17 @@ export type Tm1Confirmation = Readonly<{
   confirmations: number
   blockHash?: string
   blockHeight?: number
+}>
+
+export type Tm1BroadcastUncertainty = Readonly<{
+  submissionId: string
+  preparedId: string
+  signedId: string
+  txid: string
+  signedArtifact: RegtestSignedTransaction
+  signedArtifactHash: string
+  broadcastAuthorizationId: string
+  error: Tm1PublicationError
 }>
 
 export type Tm1PreparedReview = Readonly<{
@@ -135,8 +159,10 @@ export type Tm1PublicationState =
   | Readonly<{ status: 'signedReviewReady'; review: Tm1PreparedReview; signedReview: Tm1SignedReview }>
   | Readonly<{ status: 'approvingBroadcast'; signedReview: Tm1SignedReview }>
   | Readonly<{ status: 'broadcasting'; signedReview: Tm1SignedReview; broadcastAuthorizationId: string }>
+  | Readonly<{ status: 'broadcastUncertain'; signedReview: Tm1SignedReview; uncertainty: Tm1BroadcastUncertainty }>
   | Readonly<{ status: 'submitted'; signedReview: Tm1SignedReview; receipt: Tm1SubmissionReceipt }>
   | Readonly<{ status: 'confirming'; receipt: Tm1SubmissionReceipt }>
+  | Readonly<{ status: 'reconciling'; signedReview: Tm1SignedReview; uncertainty: Tm1BroadcastUncertainty }>
   | Readonly<{ status: 'confirmed'; receipt: Tm1SubmissionReceipt; confirmation: Tm1Confirmation }>
   | Readonly<{ status: 'rejected'; stage: 'signing' | 'broadcast'; reason?: string }>
   | Readonly<{ status: 'aborted'; stage: Tm1PublicationNonTerminalStatus }>
@@ -190,7 +216,7 @@ export interface Tm1BroadcastAuthorizationPort {
   requestBroadcastAuthorization(
     signedReview: Tm1SignedReview,
     signal?: AbortSignal
-  ): Promise<Tm1PublicationAuthorizationDecision>
+  ): Promise<Tm1BroadcastAuthorizationDecision>
 }
 
 export interface Tm1DeliveryTransportPort {
@@ -215,6 +241,7 @@ export interface Tm1RegtestPublicationOrchestrator {
   prepare(request: Tm1PublicationRequest, signal?: AbortSignal): Promise<Tm1PreparedReview>
   authorizeAndSign(preparedId: string, signal?: AbortSignal): Promise<Tm1SignedReview>
   approveAndBroadcast(signedId: string, signal?: AbortSignal): Promise<Tm1SubmissionReceipt>
+  reconcile(signal?: AbortSignal): Promise<Tm1Confirmation>
   confirm(submissionId: string, signal?: AbortSignal): Promise<Tm1Confirmation>
   reset(): void
 }
@@ -237,7 +264,7 @@ implements Tm1RegtestPublicationOrchestrator {
 
   subscribe(listener: (state: Tm1PublicationState) => void): () => void {
     this.listeners.add(listener)
-    listener(this.getState())
+    this.notifyListener(listener, this.getState())
     return () => {
       this.listeners.delete(listener)
     }
@@ -437,6 +464,10 @@ implements Tm1RegtestPublicationOrchestrator {
           decision.reason ?? 'BROADCAST_AUTHORIZATION_EXPIRED'
         )
       }
+      if (!isBroadcastAuthorizationBound(decision, signedReview)) {
+        this.transition(rejectedState('broadcast', 'BROADCAST_REJECTED'))
+        throw new Tm1PublicationError('BROADCAST_REJECTED', 'BROADCAST_REJECTED')
+      }
 
       let auditedArtifact: RegtestSignedTransaction
       try {
@@ -454,6 +485,7 @@ implements Tm1RegtestPublicationOrchestrator {
         throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID')
       }
       assertNotAborted(signal)
+      const submissionId = this.clock.createId('submission')
       this.transition({
         status: 'broadcasting',
         signedReview,
@@ -466,13 +498,43 @@ implements Tm1RegtestPublicationOrchestrator {
           signedReview.signedArtifact
         )
       } catch (error) {
-        throw new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', error)
+        const publicationError = new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', error)
+        this.transition({
+          status: 'broadcastUncertain',
+          signedReview,
+          uncertainty: freezeUncertainty({
+            submissionId,
+            preparedId: signedReview.preparedId,
+            signedId: signedReview.signedId,
+            txid: signedReview.txid,
+            signedArtifact: signedReview.signedArtifact,
+            signedArtifactHash: signedReview.signedArtifactHash,
+            broadcastAuthorizationId: decision.authorizationId,
+            error: publicationError
+          })
+        })
+        throw publicationError
       }
       if (deliveryReceipt.txid !== signedReview.txid) {
-        throw new Tm1PublicationError('TXID_MISMATCH')
+        const publicationError = new Tm1PublicationError('TXID_MISMATCH')
+        this.transition({
+          status: 'broadcastUncertain',
+          signedReview,
+          uncertainty: freezeUncertainty({
+            submissionId,
+            preparedId: signedReview.preparedId,
+            signedId: signedReview.signedId,
+            txid: signedReview.txid,
+            signedArtifact: signedReview.signedArtifact,
+            signedArtifactHash: signedReview.signedArtifactHash,
+            broadcastAuthorizationId: decision.authorizationId,
+            error: publicationError
+          })
+        })
+        throw publicationError
       }
       const receipt = Object.freeze({
-        submissionId: this.clock.createId('submission'),
+        submissionId,
         signedId: signedReview.signedId,
         preparedId: signedReview.preparedId,
         txid: signedReview.txid,
@@ -485,10 +547,49 @@ implements Tm1RegtestPublicationOrchestrator {
     }
   }
 
+  async reconcile(signal?: AbortSignal): Promise<Tm1Confirmation> {
+    if (this.state.status !== 'broadcastUncertain') throw new Tm1PublicationError('INVALID_STATE')
+    const signedReview = this.state.signedReview
+    const uncertainty = this.state.uncertainty
+
+    try {
+      assertNotAborted(signal)
+      this.transition({ status: 'reconciling', signedReview, uncertainty })
+      const confirmation = await this.dependencies.confirmationObserver.confirm({
+        submissionId: uncertainty.submissionId,
+        txid: uncertainty.txid,
+        signal
+      })
+      if (
+        confirmation.submissionId !== uncertainty.submissionId ||
+        confirmation.txid !== uncertainty.txid
+      ) {
+        throw new Tm1PublicationError('TXID_MISMATCH')
+      }
+      const receipt = freezeReceipt({
+        submissionId: uncertainty.submissionId,
+        signedId: uncertainty.signedId,
+        preparedId: uncertainty.preparedId,
+        txid: uncertainty.txid,
+        deliveryReceipt: Object.freeze({ txid: uncertainty.txid, disposition: 'accepted' as const })
+      })
+      const frozenConfirmation = freezeConfirmation(confirmation)
+      this.transition({ status: 'confirmed', receipt, confirmation: frozenConfirmation })
+      return frozenConfirmation
+    } catch (error) {
+      this.transition({ status: 'broadcastUncertain', signedReview, uncertainty })
+      if (isAbortError(error)) {
+        throw new Tm1PublicationError('ABORTED', 'ABORTED', error)
+      }
+      if (error instanceof Tm1PublicationError && error.code === 'TXID_MISMATCH') throw error
+      throw new Tm1PublicationError('CONFIRMATION_FAILED', 'CONFIRMATION_FAILED', error)
+    }
+  }
+
   async confirm(submissionId: string, signal?: AbortSignal): Promise<Tm1Confirmation> {
     if (this.state.status !== 'submitted') throw new Tm1PublicationError('INVALID_STATE')
     const receipt = this.state.receipt
-    if (submissionId !== receipt.submissionId) throw new Tm1PublicationError('STALE_SIGNED_REVIEW')
+    if (submissionId !== receipt.submissionId) throw new Tm1PublicationError('STALE_SUBMISSION')
 
     try {
       assertNotAborted(signal)
@@ -527,7 +628,19 @@ implements Tm1RegtestPublicationOrchestrator {
   private transition(state: Tm1PublicationState): void {
     this.state = cloneState(state)
     const snapshot = this.getState()
-    for (const listener of this.listeners) listener(snapshot)
+    // Subscriber failures are isolated from state transitions and later listeners.
+    for (const listener of this.listeners) this.notifyListener(listener, snapshot)
+  }
+
+  private notifyListener(
+    listener: (state: Tm1PublicationState) => void,
+    snapshot: Tm1PublicationState
+  ): void {
+    try {
+      listener(snapshot)
+    } catch {
+      // No logger port exists in this isolated runtime; listener failures are intentionally ignored.
+    }
   }
 
   private enterFailureOrAbort(
@@ -535,6 +648,11 @@ implements Tm1RegtestPublicationOrchestrator {
     defaultCode: Tm1PublicationErrorCode = 'INVALID_STATE'
   ): Tm1PublicationError {
     const stage = toNonTerminalStatus(this.state.status)
+    if (this.state.status === 'broadcastUncertain') {
+      return error instanceof Tm1PublicationError
+        ? error
+        : new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', error)
+    }
     if (isAbortError(error)) {
       const publicationError = new Tm1PublicationError('ABORTED', 'ABORTED', error)
       this.transition({ status: 'aborted', stage })
@@ -590,12 +708,22 @@ function assertBindingUnchanged(review: Tm1PreparedReview): void {
   }
 }
 
+function isBroadcastAuthorizationBound(
+  decision: Extract<Tm1BroadcastAuthorizationDecision, { status: 'approved' }>,
+  signedReview: Tm1SignedReview
+): boolean {
+  return decision.signedId === signedReview.signedId &&
+    decision.txid === signedReview.txid &&
+    decision.signedArtifactHash === signedReview.signedArtifactHash
+}
+
 function assertNotAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
 }
 
 function isAbortError(error: unknown): boolean {
-  return error instanceof Tm1PublicationError && error.code === 'ABORTED'
+  return (error instanceof Tm1PublicationError && error.code === 'ABORTED') ||
+    (error instanceof Error && error.name === 'AbortError')
 }
 
 function isAbortLike(error: unknown): boolean {
@@ -608,6 +736,7 @@ function isNonFailureDomainError(code: Tm1PublicationErrorCode): boolean {
     code === 'PUBLICATION_ALREADY_ACTIVE' ||
     code === 'STALE_PREPARED_REVIEW' ||
     code === 'STALE_SIGNED_REVIEW' ||
+    code === 'STALE_SUBMISSION' ||
     code === 'SIGNING_REJECTED' ||
     code === 'SIGNING_AUTHORIZATION_EXPIRED' ||
     code === 'BROADCAST_REJECTED' ||
@@ -616,6 +745,7 @@ function isNonFailureDomainError(code: Tm1PublicationErrorCode): boolean {
 
 function mapUnknownFailure(error: unknown, defaultCode: Tm1PublicationErrorCode): Tm1PublicationErrorCode {
   if (error instanceof Tm1PublicationError) return error.code
+  if (error instanceof Error && error.name === 'AbortError') return 'ABORTED'
   if (error instanceof Error && 'code' in error && error.code === 'OPERATION_ABORTED') {
     return 'ABORTED'
   }
@@ -679,6 +809,12 @@ function cloneState(state: Tm1PublicationState): Tm1PublicationState {
         signedReview: freezeSignedReview(state.signedReview),
         broadcastAuthorizationId: state.broadcastAuthorizationId
       })
+    case 'broadcastUncertain':
+      return Object.freeze({
+        status: 'broadcastUncertain',
+        signedReview: freezeSignedReview(state.signedReview),
+        uncertainty: freezeUncertainty(state.uncertainty)
+      })
     case 'submitted':
       return Object.freeze({
         status: 'submitted',
@@ -687,6 +823,12 @@ function cloneState(state: Tm1PublicationState): Tm1PublicationState {
       })
     case 'confirming':
       return Object.freeze({ status: 'confirming', receipt: freezeReceipt(state.receipt) })
+    case 'reconciling':
+      return Object.freeze({
+        status: 'reconciling',
+        signedReview: freezeSignedReview(state.signedReview),
+        uncertainty: freezeUncertainty(state.uncertainty)
+      })
     case 'confirmed':
       return Object.freeze({
         status: 'confirmed',
@@ -733,9 +875,23 @@ function freezeSignedReview(review: Tm1SignedReview): Tm1SignedReview {
 }
 
 function freezeSignedArtifact(artifact: RegtestSignedTransaction): RegtestSignedTransaction {
+  assertSignedArtifactCoherent(artifact)
   return Object.freeze({
     ...artifact,
     rawTransactionBytes: new Uint8Array(artifact.rawTransactionBytes)
+  })
+}
+
+function freezeUncertainty(uncertainty: Tm1BroadcastUncertainty): Tm1BroadcastUncertainty {
+  return Object.freeze({
+    submissionId: uncertainty.submissionId,
+    preparedId: uncertainty.preparedId,
+    signedId: uncertainty.signedId,
+    txid: uncertainty.txid,
+    signedArtifact: freezeSignedArtifact(uncertainty.signedArtifact),
+    signedArtifactHash: uncertainty.signedArtifactHash,
+    broadcastAuthorizationId: uncertainty.broadcastAuthorizationId,
+    error: uncertainty.error
   })
 }
 
@@ -759,6 +915,21 @@ function freezeNetwork(network: Tm1RegtestNetworkAttestation): Tm1RegtestNetwork
 
 function hashBytes(bytes: Uint8Array): string {
   return toHex(sha256d(bytes))
+}
+
+function assertSignedArtifactCoherent(artifact: RegtestSignedTransaction): void {
+  if (toHex(artifact.rawTransactionBytes) !== artifact.rawTransactionHex) {
+    throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID')
+  }
+  let transaction: Tx
+  try {
+    transaction = Tx.fromHex(artifact.rawTransactionHex)
+  } catch (error) {
+    throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID', 'SIGNED_ARTIFACT_INVALID', error)
+  }
+  if (transaction.txid() !== artifact.txid) {
+    throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID')
+  }
 }
 
 function monotonicClock(): Tm1PublicationClock {
