@@ -12,7 +12,7 @@ import Dashboard from './Dashboard'
 import More from './More'
 import SendMenu from './SendMenu'
 
-const walletState = vi.hoisted(() => ({ initialized: true }))
+const walletState = vi.hoisted(() => ({ initialized: true, firmaFormatted: '0.0000' }))
 
 vi.mock('../components/TopBar', () => ({ default: () => <div>Top bar</div> }))
 
@@ -21,8 +21,13 @@ vi.mock('../context/useWallet', () => ({
     address: 'ecash:qptestaddress',
     balance: {
       rmzFormatted: '42',
+      rmzAtoms: 42n,
+      rmzDecimals: 0,
       xecFormatted: '1200',
-      xec: 120000n
+      xec: 120000n,
+      firmaAtoms: 0n,
+      firmaFormatted: walletState.firmaFormatted,
+      firmaDecimals: 4
     },
     initialized: walletState.initialized,
     refreshBalances: vi.fn(),
@@ -63,6 +68,7 @@ describe('Tonalli mobile navigation v3', () => {
     expect(isMobileBottomNavActive('send', '/send-menu')).toBe(true)
     expect(isMobileBottomNavActive('send', '/send')).toBe(true)
     expect(isMobileBottomNavActive('send', '/send-xec')).toBe(true)
+    expect(isMobileBottomNavActive('send', '/send-firma')).toBe(true)
     expect(isMobileBottomNavActive('send', '/send-nft')).toBe(true)
     expect(isMobileBottomNavActive('memo', '/memo')).toBe(true)
     expect(isMobileBottomNavActive('memo', '/memo/tx/' + 'a'.repeat(64))).toBe(true)
@@ -83,7 +89,7 @@ describe('Tonalli mobile navigation v3', () => {
 
   test('shared configuration preserves mobile active route behavior', () => {
     const items = ['home', 'send', 'memo', 'receive', 'more'] as const
-    const paths = ['/', '/send-menu', '/send', '/send-xec', '/send-nft', '/memo', '/memo/tx/' + 'a'.repeat(64), '/receive', '/nfts', '/more', '/dex', '/multisig/create', '/settings']
+    const paths = ['/', '/send-menu', '/send', '/send-xec', '/send-firma', '/send-nft', '/memo', '/memo/tx/' + 'a'.repeat(64), '/receive', '/nfts', '/more', '/dex', '/multisig/create', '/settings']
 
     for (const item of items) {
       for (const path of paths) {
@@ -145,7 +151,7 @@ describe('Tonalli mobile navigation v3', () => {
     expect(sendHtml).not.toContain('desktop-navigation__item is-active" aria-current="page" href="/"')
   })
 
-  test.each(['/send', '/send-xec', '/send-nft'])('DesktopNavigation marks Enviar active on %s', (path) => {
+  test.each(['/send', '/send-xec', '/send-firma', '/send-nft'])('DesktopNavigation marks Enviar active on %s', (path) => {
     const html = renderAt(path, <DesktopNavigation />)
 
     expect(html).toContain('desktop-navigation__item is-active" aria-current="page" href="/send-menu"')
@@ -178,7 +184,7 @@ describe('Tonalli mobile navigation v3', () => {
     walletState.initialized = true
   })
 
-  test('/send-menu contains the four transfer options', () => {
+  test('/send-menu preserves RMZ priority and contains the five transfer options', () => {
     const html = renderAt('/send-menu', <SendMenu />)
 
     expect(html).toContain('Operaciones')
@@ -187,10 +193,15 @@ describe('Tonalli mobile navigation v3', () => {
     expect(html).toContain('href="/send"')
     expect(html).toContain('Enviar eCash XEC')
     expect(html).toContain('href="/send-xec"')
+    expect(html).toContain('Enviar Firma Alpha')
+    expect(html).toContain('href="/send-firma"')
     expect(html).toContain('Enviar NFT')
     expect(html).toContain('href="/send-nft"')
     expect(html).toContain('Escanear código QR')
     expect(html).toContain('href="/scan"')
+    expect(html.indexOf('Enviar Xolos RMZ')).toBeLessThan(html.indexOf('Enviar eCash XEC'))
+    expect(html.indexOf('Enviar eCash XEC')).toBeLessThan(html.indexOf('Enviar Firma Alpha'))
+    expect(html.indexOf('Enviar Firma Alpha')).toBeLessThan(html.indexOf('Enviar NFT'))
   })
 
   test('/more contains expected categories and keeps x402 behind feature flags', () => {
@@ -215,6 +226,7 @@ describe('Tonalli mobile navigation v3', () => {
 
   test('dashboard no longer exposes the full tool list as primary actions', () => {
     walletState.initialized = true
+    walletState.firmaFormatted = '0.0000'
     const html = renderAt('/', <Dashboard />)
 
     expect(html).toContain('Acciones rápidas')
@@ -223,6 +235,12 @@ describe('Tonalli mobile navigation v3', () => {
     expect(html).toContain('href="/scan"')
     expect(html).toContain('eToken Xolos RMZ')
     expect(html).toContain('eCash (XEC) para comisiones')
+    expect(html).toContain('Activos compatibles')
+    expect(html).toContain('Firma Alpha')
+    expect(html).toContain('0.0000 FIRMA')
+    expect(html).toContain('href="/send-firma"')
+    expect(html).toContain('href="/dex?mode=firma"')
+    expect(html.indexOf('eToken Xolos RMZ')).toBeLessThan(html.indexOf('Activos compatibles'))
     expect(html).toContain('Dirección eCash')
     expect(html).toContain('Historial reciente')
     expect(html).not.toContain('href="/dex"')
@@ -233,6 +251,17 @@ describe('Tonalli mobile navigation v3', () => {
     expect(html).not.toContain('Test 402 Authorization')
   })
 
+  test('dashboard renders the existing non-zero FIRMA formatted balance without promoting it over RMZ', () => {
+    walletState.initialized = true
+    walletState.firmaFormatted = '12.3456'
+    const html = renderAt('/', <Dashboard />)
+
+    expect(html).toContain('12.3456 FIRMA')
+    expect(html.indexOf('eToken Xolos RMZ')).toBeLessThan(html.indexOf('Activos compatibles'))
+    expect(html.indexOf('eCash (XEC) para comisiones')).toBeLessThan(html.indexOf('Activos compatibles'))
+    walletState.firmaFormatted = '0.0000'
+  })
+
   test('existing routes remain mounted through App', () => {
     walletState.initialized = true
     const paths = [
@@ -240,6 +269,7 @@ describe('Tonalli mobile navigation v3', () => {
       '/send-menu',
       '/send',
       '/send-xec',
+      '/send-firma',
       '/send-nft',
       '/memo',
       '/memo/tx/' + 'a'.repeat(64),

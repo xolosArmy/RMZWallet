@@ -13,6 +13,11 @@ const sendOptions = [
     to: '/send-xec'
   },
   {
+    title: 'Enviar Firma Alpha',
+    description: 'Transfiere FIRMA directamente a otra dirección eCash.',
+    to: '/send-firma'
+  },
+  {
     title: 'Enviar NFT',
     description: 'Transfiere un NFT de linaje o coleccionable.',
     to: '/send-nft'

@@ -4,6 +4,7 @@ import Dashboard from './routes/Dashboard'
 import SendMenu from './routes/SendMenu'
 import SendRMZ from './routes/SendRMZ'
 import SendXEC from './routes/SendXEC'
+import SendFirma from './routes/SendFirma'
 import RegisterAlias from './routes/RegisterAlias'
 import More from './routes/More'
 import Receive from './routes/Receive'
@@ -52,6 +53,7 @@ function App() {
           <Route path="/send-menu" element={<SendMenu />} />
           <Route path="/send" element={<SendRMZ />} />
           <Route path="/send-xec" element={<SendXEC />} />
+          <Route path="/send-firma" element={<SendFirma />} />
           <Route path="/register-alias" element={<RegisterAlias />} />
           <Route path="/receive" element={<Receive />} />
           <Route path="/scan" element={<ScanQR />} />

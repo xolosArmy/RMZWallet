@@ -481,6 +481,44 @@ textarea:focus-visible {
 .card.highlight { background: linear-gradient(145deg, rgba(45, 180, 173, 0.1), var(--color-surface)); border-color: rgba(45, 180, 173, 0.32); }
 .metric-value { font-variant-numeric: tabular-nums; }
 
+.compatible-assets {
+  margin-top: 16px;
+  padding: 16px 18px;
+  border: 1px solid rgba(249, 248, 246, 0.12);
+  border-radius: var(--radius-lg);
+  background: rgba(249, 248, 246, 0.025);
+}
+.compatible-assets__header p { margin: 0; }
+.compatible-assets__header .muted { font-size: 0.88rem; }
+.compatible-asset {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(249, 248, 246, 0.09);
+}
+.compatible-asset__name { margin: 0; color: var(--tonalli-ivory); font-weight: 700; }
+.compatible-asset__name span { color: var(--color-interactive); }
+.compatible-asset__balance {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-family: 'JetBrains Mono', 'SFMono-Regular', monospace;
+}
+.compatible-asset__actions { margin-top: 0; }
+
+.send-preview { display: grid; gap: 10px; margin-top: 18px; }
+.send-preview__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(249, 248, 246, 0.08);
+}
+.send-preview__row span:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+
 .nft-card h3 { margin: 12px 0 4px; }
 .nft-thumb { width: 100%; aspect-ratio: 1 / 1; border-radius: var(--radius-lg); overflow: hidden; border: 1px solid var(--color-border); background: rgba(249, 248, 246, 0.04); display: flex; align-items: center; justify-content: center; }
 .nft-thumb.small { width: 72px; aspect-ratio: 1 / 1; border-radius: var(--radius-lg); }

@@ -4,7 +4,7 @@ import { AgoraOneshotAdSignatory } from 'ecash-agora'
 import type { ScriptUtxo } from 'chronik-client'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
-import { FIRMA_ALPHA } from '../config/firmaAlpha'
+import { FIRMA_ALPHA, assertFirmaAlphaTokenInfo } from '../config/firmaAlpha'
 import {
   FEE_RATE_SATS_PER_BYTE,
   TONALLI_SERVICE_FEE_SATS,
@@ -21,6 +21,12 @@ import type {
   SendXecOutput,
   WalletInfo
 } from '../types/wallet'
+import {
+  FIRMA_SEND_FEE_PER_KB,
+  buildFirmaSendPlan,
+  createSignedFirmaSendBuilder
+} from './firmaAlphaSend'
+import type { FirmaSendPlan, FirmaSendPreview } from './firmaAlphaSend'
 
 // The package ships a UMD/CJS build without an ES default export; grab whatever
 // is available (named export, default from CJS transform, or browser global).
@@ -750,6 +756,58 @@ export class XolosWalletService {
       [{ address: destination, amountAtoms }],
       { expectedProtocol: 'ALP', tokenLabel: 'RMZ', excludedUtxos }
     )
+  }
+
+  private async buildFirmaSendPlan(destination: string, amountAtoms: bigint): Promise<{
+    account: X402WalletAccount
+    plan: FirmaSendPlan
+  }> {
+    const account = this.getX402ActiveAccount()
+    if (!account) {
+      throw new Error('Desbloquea la wallet antes de preparar un envío FIRMA.')
+    }
+
+    const chronik = getChronik()
+    assertFirmaAlphaTokenInfo(await chronik.token(FIRMA_ALPHA.tokenId))
+    const response = await chronik.address(account.address).utxos()
+    return {
+      account,
+      plan: buildFirmaSendPlan({
+        walletAddress: account.address,
+        destination,
+        amountAtoms,
+        utxos: response.utxos
+      })
+    }
+  }
+
+  async prepareFirmaSend(destination: string, amountAtoms: bigint): Promise<FirmaSendPreview> {
+    return (await this.buildFirmaSendPlan(destination, amountAtoms)).plan.preview
+  }
+
+  async sendFirma(preview: FirmaSendPreview): Promise<string> {
+    if (preview.tokenId !== FIRMA_ALPHA.tokenId) {
+      throw new Error('La previsualización no corresponde al Token ID canónico de Firma Alpha.')
+    }
+
+    const fresh = await this.buildFirmaSendPlan(preview.destination, preview.amountAtoms)
+    if (fresh.plan.preview.planFingerprint !== preview.planFingerprint) {
+      throw new Error('Los UTXOs, la comisión o las salidas cambiaron. Genera una nueva previsualización.')
+    }
+
+    const signer = this.getSignatory()
+    if (signer.address !== fresh.account.address || signer.publicKeyHex !== fresh.account.publicKey) {
+      throw new Error('La cuenta activa cambió. Genera una nueva previsualización.')
+    }
+    const signedTx = this.signTxBuilder(
+      createSignedFirmaSendBuilder(fresh.plan, signer.signatory),
+      { feePerKb: FIRMA_SEND_FEE_PER_KB, dustSats: BigInt(XEC_DUST_SATS) }
+    )
+
+    const broadcast = await getChronik().broadcastTx(signedTx.ser())
+    this.scanCache = null
+    await this.getBalances()
+    return broadcast.txid
   }
 
   async sendToken(
