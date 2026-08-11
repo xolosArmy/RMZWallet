@@ -33,6 +33,7 @@ export type Tm1PublicationErrorCode =
   | 'STALE_PREPARED_REVIEW'
   | 'STALE_SIGNED_REVIEW'
   | 'STALE_SUBMISSION'
+  | 'PREPARATION_FAILED'
   | 'SIGNING_REJECTED'
   | 'SIGNING_AUTHORIZATION_EXPIRED'
   | 'CANDIDATE_REVALIDATION_FAILED'
@@ -286,9 +287,7 @@ implements Tm1RegtestPublicationOrchestrator {
     this.beginOperation('prepare')
 
     try {
-      if (this.state.status !== 'idle') {
-        throw new Tm1PublicationError('PUBLICATION_ALREADY_ACTIVE')
-      }
+      if (this.state.status !== 'idle') throw new Tm1PublicationError('INVALID_STATE')
       assertNotAborted(signal)
       this.transition({ status: 'attesting', message: request.message })
       const network = await this.dependencies.networkAttestation.attest(signal)
@@ -355,7 +354,7 @@ implements Tm1RegtestPublicationOrchestrator {
       this.transition({ status: 'reviewReady', review })
       return freezePreparedReview(review)
     } catch (error) {
-      throw this.enterFailureOrAbort(error)
+      throw this.enterFailureOrAbort(error, 'PREPARATION_FAILED')
     } finally {
       this.endOperation('prepare')
     }
@@ -582,6 +581,7 @@ implements Tm1RegtestPublicationOrchestrator {
         txid: uncertainty.txid,
         signal
       })
+      assertNotAborted(signal)
       if (
         confirmation.submissionId !== uncertainty.submissionId ||
         confirmation.txid !== uncertainty.txid
@@ -634,6 +634,7 @@ implements Tm1RegtestPublicationOrchestrator {
         txid: receipt.txid,
         signal
       })
+      assertNotAborted(signal)
       if (confirmation.submissionId !== submissionId || confirmation.txid !== receipt.txid) {
         throw new Tm1PublicationError('TXID_MISMATCH')
       }
@@ -705,9 +706,8 @@ implements Tm1RegtestPublicationOrchestrator {
 
   private transition(state: Tm1PublicationState): void {
     this.state = cloneState(state)
-    const snapshot = this.getState()
     // Subscriber failures are isolated from state transitions and later listeners.
-    for (const listener of this.listeners) this.notifyListener(listener, snapshot)
+    for (const listener of this.listeners) this.notifyListener(listener, this.getState())
   }
 
   private notifyListener(
