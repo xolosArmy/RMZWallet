@@ -6,7 +6,7 @@ export type WalletNavigationItem = {
   to: string
 }
 
-const sendPaths = new Set(['/send-menu', '/send', '/send-xec', '/send-nft'])
+const sendPaths = new Set(['/send-menu', '/send', '/send-xec', '/send-firma', '/send-nft'])
 const morePaths = new Set([
   '/more',
   '/dex',

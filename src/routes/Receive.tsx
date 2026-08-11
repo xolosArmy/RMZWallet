@@ -62,7 +62,7 @@ function Receive() {
         <div>
           <p className="eyebrow">Recibir</p>
           <h1 className="section-title">Comparte tu dirección eCash</h1>
-          <p className="muted">Recibe eCash (XEC) y eToken Xolos RMZ en la misma dirección controlada por tus llaves.</p>
+          <p className="muted">Recibe XEC y tokens compatibles de eCash como RMZ y FIRMA en la misma dirección controlada por tus llaves.</p>
         </div>
         <div className="actions">
           <Link className="cta outline" to="/scan">
@@ -72,7 +72,7 @@ function Receive() {
       </header>
 
       <div className="card">
-        <p className="muted">Puedes recibir eCash (XEC) y eToken Xolos RMZ en la misma dirección.</p>
+        <p className="muted">Esta dirección puede recibir XEC y tokens compatibles de eCash como RMZ y FIRMA.</p>
         <label htmlFor="amount">Monto opcional a solicitar:</label>
         <input
           id="amount"

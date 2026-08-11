@@ -376,6 +376,27 @@ function Dashboard() {
         </div>
       </div>
 
+      <section className="compatible-assets" aria-labelledby="compatible-assets-title">
+        <div className="compatible-assets__header">
+          <p className="eyebrow" id="compatible-assets-title">Activos compatibles</p>
+          <p className="muted">Activos interoperables disponibles en tu misma dirección eCash.</p>
+        </div>
+        <div className="compatible-asset">
+          <div>
+            <p className="compatible-asset__name">
+              Firma Alpha <span aria-label="Token verificado">✓</span>
+            </p>
+            <p className="compatible-asset__balance">
+              {balance ? `${balance.firmaFormatted} FIRMA` : 'Cargando...'}
+            </p>
+          </div>
+          <div className="actions compatible-asset__actions">
+            <Link className="cta outline small" to="/send-firma">Enviar</Link>
+            <Link className="cta outline small" to="/dex?mode=firma">Mercado</Link>
+          </div>
+        </div>
+      </section>
+
       <div className="card">
         <p className="muted">Dirección eCash</p>
         <div className="address-box" title={address || undefined} aria-label={address ? `Dirección eCash completa: ${address}` : undefined}>{address}</div>

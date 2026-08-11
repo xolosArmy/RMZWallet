@@ -26,6 +26,8 @@ const walletValue: WalletContextValue = {
   refreshBalances: vi.fn(),
   rescanWallet: vi.fn(),
   sendRMZ: vi.fn(),
+  prepareFirmaSend: vi.fn(),
+  sendFirma: vi.fn(),
   sendXEC: vi.fn(),
   estimateAliasRegistration: vi.fn(),
   reserveAliasRegistrationUtxos: vi.fn(),

@@ -8,6 +8,7 @@ import type {
   WalletRescanOptions
 } from '../services/XolosWalletService'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
+import type { FirmaSendPreview } from '../services/firmaAlphaSend'
 
 export interface WalletContextValue {
   address: string | null
@@ -23,6 +24,8 @@ export interface WalletContextValue {
   refreshBalances: () => Promise<void>
   rescanWallet: (options?: WalletRescanOptions) => Promise<void>
   sendRMZ: (to: string, amount: string, excludedUtxos?: AliasReservedUtxo[]) => Promise<string>
+  prepareFirmaSend: (to: string, amount: string) => Promise<FirmaSendPreview>
+  sendFirma: (preview: FirmaSendPreview) => Promise<string>
   sendXEC: (to: string, amountInSats: number, message?: string) => Promise<string>
   estimateAliasRegistration: (registration: AliasRegistrationData) => Promise<AliasRegistrationEstimate>
   reserveAliasRegistrationUtxos: (registration: AliasRegistrationData) => Promise<AliasReservedUtxo[]>
