@@ -497,10 +497,17 @@ implements Tm1RegtestPublicationOrchestrator {
 
       assertNotAborted(signal)
       this.transition({ status: 'approvingBroadcast', signedReview })
-      const decision = await this.dependencies.broadcastAuthorization.requestBroadcastAuthorization(
-        freezeSignedReview(signedReview),
-        signal
-      )
+      let decision: Tm1BroadcastAuthorizationDecision
+      try {
+        decision = await this.dependencies.broadcastAuthorization.requestBroadcastAuthorization(
+          freezeSignedReview(signedReview),
+          signal
+        )
+      } catch (error) {
+        if (isAbortLike(error)) throw error
+        throw new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', error)
+      }
+      assertNotAborted(signal)
       if (decision.status === 'rejected') {
         this.transition(rejectedState('broadcast', decision.reason))
         throw new Tm1PublicationError('BROADCAST_REJECTED', decision.reason ?? 'BROADCAST_REJECTED')
@@ -539,11 +546,12 @@ implements Tm1RegtestPublicationOrchestrator {
         signedReview,
         broadcastAuthorizationId: decision.authorizationId
       })
+      const transportArtifact = cloneSignedArtifact(signedReview.signedArtifact)
 
       let deliveryReceipt: Tm1RegtestDeliveryReceipt
       try {
         deliveryReceipt = await this.dependencies.deliveryTransport.broadcast(
-          signedReview.signedArtifact
+          transportArtifact
         )
       } catch (error) {
         const publicationError = new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', error)
@@ -997,11 +1005,15 @@ function freezeSignedReview(review: Tm1SignedReview): Tm1SignedReview {
 }
 
 function freezeSignedArtifact(artifact: RegtestSignedTransaction): RegtestSignedTransaction {
+  return Object.freeze(cloneSignedArtifact(artifact))
+}
+
+function cloneSignedArtifact(artifact: RegtestSignedTransaction): RegtestSignedTransaction {
   assertSignedArtifactCoherent(artifact)
-  return Object.freeze({
+  return {
     ...artifact,
     rawTransactionBytes: new Uint8Array(artifact.rawTransactionBytes)
-  })
+  }
 }
 
 function freezeUncertainty(uncertainty: Tm1BroadcastUncertainty): Tm1BroadcastUncertainty {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { sha256d, toHex } from 'ecash-lib'
+import { Tx, sha256d, toHex } from 'ecash-lib'
 import { XEC_DUST_SATS } from '../../config/xecFees'
 import {
   encodeTm1Draft02CandidateEffectiveContent,
@@ -83,6 +83,8 @@ function createHarness() {
     authorizationId: 'sign-auth-1'
   })
   let broadcastDecision: Tm1BroadcastAuthorizationDecision | null = null
+  let broadcastAuthorizationFailure: unknown = null
+  let broadcastAuthorizationDeferred: Deferred<Tm1BroadcastAuthorizationDecision> | null = null
   let signingAuthorizationFailure: unknown = null
   let attestFailure: unknown = null
   let utxoFailure: unknown = null
@@ -100,6 +102,8 @@ function createHarness() {
   let onSigningAuthorization: (() => void) | null = null
   let onBroadcastAuthorization: (() => void) | null = null
   let broadcastDeferred: Deferred<Readonly<{ txid: string; disposition: 'accepted' }>> | null = null
+  let broadcastMutator: ((artifact: RegtestSignedTransaction) => void) | null = null
+  let lastBroadcastArtifact: RegtestSignedTransaction | null = null
   let attestDeferred: Deferred<void> | null = null
 
   const calls = {
@@ -171,6 +175,8 @@ function createHarness() {
         calls.broadcastAuthorization += 1
         onBroadcastAuthorization?.()
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
+        if (broadcastAuthorizationFailure) throw broadcastAuthorizationFailure
+        if (broadcastAuthorizationDeferred) return broadcastAuthorizationDeferred.promise
         return broadcastDecision ?? Object.freeze({
           status: 'approved' as const,
           authorizationId: 'broadcast-auth-1',
@@ -183,6 +189,8 @@ function createHarness() {
     deliveryTransport: {
       async broadcast(signedArtifact: RegtestSignedTransaction) {
         calls.broadcast += 1
+        lastBroadcastArtifact = signedArtifact
+        broadcastMutator?.(signedArtifact)
         if (broadcastFailure) throw broadcastFailure
         if (broadcastDeferred) return broadcastDeferred.promise
         return Object.freeze({
@@ -222,6 +230,7 @@ function createHarness() {
     setChainIdentity: (next: string) => { chainIdentity = next },
     setSigningDecision: (next: Tm1PublicationAuthorizationDecision) => { signingDecision = next },
     setBroadcastDecision: (next: Tm1BroadcastAuthorizationDecision) => { broadcastDecision = next },
+    failBroadcastAuthorization: (error: unknown) => { broadcastAuthorizationFailure = error },
     failSigningAuthorization: (error: unknown) => { signingAuthorizationFailure = error },
     failAttestation: (error: unknown) => { attestFailure = error },
     failUtxos: (error: unknown) => { utxoFailure = error },
@@ -239,6 +248,12 @@ function createHarness() {
       broadcastDeferred = createDeferred<Readonly<{ txid: string; disposition: 'accepted' }>>()
       return broadcastDeferred
     },
+    deferBroadcastAuthorization: () => {
+      broadcastAuthorizationDeferred = createDeferred<Tm1BroadcastAuthorizationDecision>()
+      return broadcastAuthorizationDeferred
+    },
+    mutateBroadcastArtifact: (fn: (artifact: RegtestSignedTransaction) => void) => { broadcastMutator = fn },
+    getLastBroadcastArtifact: () => lastBroadcastArtifact,
     deferConfirmation: () => {
       confirmationDeferred = createDeferred<Tm1Confirmation>()
       return confirmationDeferred
@@ -275,6 +290,40 @@ async function expectCode(promise: Promise<unknown>, code: Tm1PublicationErrorCo
 
 function statuses(states: readonly Tm1PublicationState[]): string[] {
   return states.map(state => state.status)
+}
+
+async function expectLateBroadcastAuthorizationAbort(
+  status: Tm1BroadcastAuthorizationDecision['status']
+): Promise<void> {
+  const harness = createHarness()
+  const signedReview = await prepareAndSign(harness)
+  const deferred = harness.deferBroadcastAuthorization()
+  const controller = new AbortController()
+  const observed: Tm1PublicationState[] = []
+  harness.orchestrator.subscribe(state => observed.push(state))
+
+  const promise = harness.orchestrator.approveAndBroadcast(signedReview.signedId, controller.signal)
+
+  await new Promise(resolve => setTimeout(resolve, 0))
+  expect(harness.calls.broadcastAuthorization).toBe(1)
+  controller.abort()
+  if (status === 'approved') {
+    deferred.resolve(Object.freeze({
+      status,
+      authorizationId: 'broadcast-auth-late',
+      signedId: signedReview.signedId,
+      txid: signedReview.txid,
+      signedArtifactHash: signedReview.signedArtifactHash
+    }))
+  } else {
+    deferred.resolve(Object.freeze({ status, reason: `late ${status}` }))
+  }
+
+  await expectCode(promise, 'ABORTED')
+  expect(harness.calls.audit).toBe(1)
+  expect(harness.calls.broadcast).toBe(0)
+  expect(statuses(observed)).not.toContain('broadcasting')
+  expect(harness.orchestrator.getState().status).toBe('aborted')
 }
 
 describe('TM1 regtest publication orchestrator', () => {
@@ -438,6 +487,52 @@ describe('TM1 regtest publication orchestrator', () => {
     )
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'expired', stage: 'broadcast' })
     expect(harness.calls.broadcast).toBe(0)
+  })
+
+  test('maps broadcast authorization service failures to BROADCAST_FAILED', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.failBroadcastAuthorization(new Error('broadcast authorization service unavailable'))
+
+    await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'BROADCAST_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    expect(state.error.code).toBe('BROADCAST_FAILED')
+    expect(state.error.code).not.toBe('INVALID_STATE')
+    expect(harness.calls.broadcast).toBe(0)
+  })
+
+  test('keeps invalid approveAndBroadcast lifecycle calls classified as INVALID_STATE', async () => {
+    const harness = createHarness()
+
+    await expectCode(harness.orchestrator.approveAndBroadcast('missing'), 'INVALID_STATE')
+    expect(harness.calls.broadcastAuthorization).toBe(0)
+    expect(harness.calls.broadcast).toBe(0)
+  })
+
+  test('keeps abort during broadcast authorization classified as ABORTED', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const controller = new AbortController()
+    controller.abort()
+
+    await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId, controller.signal), 'ABORTED')
+    expect(harness.calls.broadcastAuthorization).toBe(0)
+    expect(harness.calls.broadcast).toBe(0)
+  })
+
+  test('aborts when broadcast authorization resolves approved after abort', async () => {
+    await expectLateBroadcastAuthorizationAbort('approved')
+  })
+
+  test('aborts when broadcast authorization resolves rejected after abort', async () => {
+    await expectLateBroadcastAuthorizationAbort('rejected')
+  })
+
+  test('aborts when broadcast authorization resolves expired after abort', async () => {
+    await expectLateBroadcastAuthorizationAbort('expired')
   })
 
   test('maps delivery transport failures to BROADCAST_FAILED', async () => {
@@ -823,6 +918,52 @@ describe('TM1 regtest publication orchestrator', () => {
     deferred.resolve(Object.freeze({ txid: signedReview.txid, disposition: 'accepted' as const }))
     await expect(first).resolves.toMatchObject({ txid: signedReview.txid })
     expect(broadcastHarness.calls.broadcast).toBe(1)
+  })
+
+  test('delivery transport receives a defensive copy of the signed artifact', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const stateBefore = harness.orchestrator.getState()
+    if (stateBefore.status !== 'signedReviewReady') throw new Error('expected signed review')
+    const originalHex = signedReview.signedArtifact.rawTransactionHex
+    const originalHash = signedReview.signedArtifactHash
+
+    harness.mutateBroadcastArtifact(input => {
+      expect(input.rawTransactionBytes).not.toBe(signedReview.signedArtifact.rawTransactionBytes)
+      expect(input.rawTransactionBytes).not.toBe(stateBefore.signedReview.signedArtifact.rawTransactionBytes)
+      input.rawTransactionBytes[0] ^= 0xff
+    })
+
+    await expect(harness.orchestrator.approveAndBroadcast(signedReview.signedId)).resolves.toMatchObject({
+      txid: signedReview.txid
+    })
+
+    const transportArtifact = harness.getLastBroadcastArtifact()
+    if (transportArtifact === null) throw new Error('expected transport artifact')
+    expect(toHex(transportArtifact.rawTransactionBytes)).not.toBe(originalHex)
+    expect(toHex(signedReview.signedArtifact.rawTransactionBytes)).toBe(originalHex)
+    expect(toHex(stateBefore.signedReview.signedArtifact.rawTransactionBytes)).toBe(originalHex)
+    expect(signedReview.signedArtifactHash).toBe(originalHash)
+    expect(toHex(sha256d(signedReview.signedArtifact.rawTransactionBytes))).toBe(originalHash)
+    expect(Tx.fromHex(originalHex).txid()).toBe(signedReview.txid)
+
+    const submitted = harness.orchestrator.getState()
+    expect(submitted.status).toBe('submitted')
+    if (submitted.status !== 'submitted') throw new Error('expected submitted')
+    expect(submitted.signedReview.txid).toBe(signedReview.txid)
+    expect(submitted.signedReview.signedArtifactHash).toBe(originalHash)
+    expect(toHex(submitted.signedReview.signedArtifact.rawTransactionBytes)).toBe(originalHex)
+    expect(submitted.receipt.txid).toBe(signedReview.txid)
+    expect(harness.calls.broadcast).toBe(1)
+
+    transportArtifact.rawTransactionBytes[1] ^= 0xff
+    const afterReturn = harness.orchestrator.getState()
+    expect(afterReturn.status).toBe('submitted')
+    if (afterReturn.status !== 'submitted') throw new Error('expected submitted')
+    expect(toHex(afterReturn.signedReview.signedArtifact.rawTransactionBytes)).toBe(originalHex)
+    expect(afterReturn.signedReview.signedArtifactHash).toBe(originalHash)
+    expect(afterReturn.receipt.txid).toBe(signedReview.txid)
+    expect(harness.calls.broadcast).toBe(1)
   })
 
   test('returned snapshots are defensively isolated from mutation attempts', async () => {
