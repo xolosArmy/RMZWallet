@@ -26,7 +26,12 @@ import {
   buildFirmaSendPlan,
   createSignedFirmaSendBuilder
 } from './firmaAlphaSend'
-import type { FirmaSendPlan, FirmaSendPreview } from './firmaAlphaSend'
+import type {
+  FirmaInputOwner,
+  FirmaOwnedUtxo,
+  FirmaSendPlan,
+  FirmaSendPreview
+} from './firmaAlphaSend'
 
 // The package ships a UMD/CJS build without an ES default export; grab whatever
 // is available (named export, default from CJS transform, or browser global).
@@ -75,6 +80,7 @@ type ScanCache = {
   updatedAt: number
   receive: string[]
   change: string[]
+  owners: FirmaInputOwner[]
   balances: WalletBalance
 }
 
@@ -247,6 +253,7 @@ export class XolosWalletService {
   private scanCache: ScanCache | null = null
   private scanPromise: Promise<ScanCache> | null = null
   private scanPromiseGapLimit: number | null = null
+  private hdAddressCache: FirmaInputOwner[] = []
   private rmzDecimals: number | null = null
   private rmzDecimalsPromise: Promise<number> | null = null
   private pendingAliasReservationExcludedTxids: string[] = []
@@ -271,6 +278,7 @@ export class XolosWalletService {
     this.scanCache = null
     this.scanPromise = null
     this.scanPromiseGapLimit = null
+    this.hdAddressCache = []
     return this.wallet
   }
 
@@ -446,6 +454,7 @@ export class XolosWalletService {
     this.scanCache = null
     this.scanPromise = null
     this.scanPromiseGapLimit = null
+    this.ensureHdAddressCache(this.getEffectiveGapLimit())
     return this.decryptedMnemonic || ''
   }
 
@@ -462,6 +471,7 @@ export class XolosWalletService {
     this.scanCache = null
     this.scanPromise = null
     this.scanPromiseGapLimit = null
+    this.ensureHdAddressCache(this.getEffectiveGapLimit())
   }
 
   async loadFromStorage(password: string): Promise<void> {
@@ -519,6 +529,7 @@ export class XolosWalletService {
     this.scanCache = null
     this.scanPromise = null
     this.scanPromiseGapLimit = null
+    this.hdAddressCache = []
     this.rmzDecimals = null
     this.rmzDecimalsPromise = null
   }
@@ -544,7 +555,13 @@ export class XolosWalletService {
 
   private getKeyDerivation() {
     const wallet = this.getWallet() as MinimalXecWallet & {
-      keyDerivation?: { deriveFromMnemonic: (mnemonic: string, hdPath?: string) => { address: string } }
+      keyDerivation?: {
+        deriveFromMnemonic: (mnemonic: string, hdPath?: string) => {
+          address: string
+          publicKey: string
+          privateKey: string
+        }
+      }
     }
     const keyDerivation = wallet.keyDerivation
     if (!keyDerivation || typeof keyDerivation.deriveFromMnemonic !== 'function') {
@@ -553,21 +570,56 @@ export class XolosWalletService {
     return keyDerivation
   }
 
-  private deriveAddresses(gapLimit: number) {
+  private deriveHdOwner(branch: FirmaInputOwner['branch'], index: number): FirmaInputOwner {
     const mnemonic = this.getMnemonicOrThrow()
     const keyDerivation = this.getKeyDerivation()
-    const basePath = resolveBasePath(DERIVATION_PATH)
-    const receive: string[] = []
-    const change: string[] = []
+    const hdPath = branch === 'receive' ? getWalletReceivePath(index) : getWalletChangePath(index)
+    const derived = keyDerivation.deriveFromMnemonic(mnemonic, hdPath)
+    if (!derived.address || !/^(02|03)[0-9a-fA-F]{64}$/.test(derived.publicKey)) {
+      throw new Error(`No se pudo derivar la metadata pública HD para ${hdPath}.`)
+    }
+    return {
+      address: derived.address,
+      hdPath,
+      branch,
+      index,
+      publicKeyHex: derived.publicKey.toLowerCase()
+    }
+  }
+
+  private rememberHdOwners(owners: FirmaInputOwner[]): void {
+    const byPath = new Map(this.hdAddressCache.map((owner) => [owner.hdPath, owner]))
+    for (const owner of owners) {
+      byPath.set(owner.hdPath, owner)
+    }
+    this.hdAddressCache = [...byPath.values()].sort((a, b) => {
+      if (a.branch !== b.branch) return a.branch === 'receive' ? -1 : 1
+      return a.index - b.index
+    })
+  }
+
+  private ensureHdAddressCache(gapLimit: number): FirmaInputOwner[] {
+    const cachedPaths = new Set(this.hdAddressCache.map((owner) => owner.hdPath))
+    const derived: FirmaInputOwner[] = []
 
     for (let index = 0; index < gapLimit; index += 1) {
-      const receivePath = `${basePath}/0/${index}`
-      const changePath = `${basePath}/1/${index}`
-      receive.push(keyDerivation.deriveFromMnemonic(mnemonic, receivePath).address)
-      change.push(keyDerivation.deriveFromMnemonic(mnemonic, changePath).address)
+      const receivePath = getWalletReceivePath(index)
+      const changePath = getWalletChangePath(index)
+      if (!cachedPaths.has(receivePath)) derived.push(this.deriveHdOwner('receive', index))
+      if (!cachedPaths.has(changePath)) derived.push(this.deriveHdOwner('change', index))
     }
+    if (derived.length > 0) this.rememberHdOwners(derived)
 
-    return { receive, change }
+    return this.hdAddressCache.filter((owner) => owner.index < gapLimit)
+  }
+
+  private deriveAddresses(gapLimit: number) {
+    const owners = this.ensureHdAddressCache(gapLimit)
+    return {
+      owners,
+      receive: owners.filter((owner) => owner.branch === 'receive').map((owner) => owner.address),
+      change: owners.filter((owner) => owner.branch === 'change').map((owner) => owner.address)
+    }
   }
 
   private async fetchAddressScan(address: string): Promise<AddressScan> {
@@ -597,11 +649,10 @@ export class XolosWalletService {
     }
 
     const scanPromise = (async () => {
-      const { receive, change } = this.deriveAddresses(gapLimit)
-      const allAddresses = [...receive, ...change]
+      const { receive, change, owners } = this.deriveAddresses(gapLimit)
 
-      const scans = await runWithConcurrency(allAddresses, CHRONIK_CONCURRENCY_LIMIT, async (address) =>
-        this.fetchAddressScan(address)
+      const scans = await runWithConcurrency(owners, CHRONIK_CONCURRENCY_LIMIT, async (owner) =>
+        this.fetchAddressScan(owner.address)
       )
 
       let totalSats = 0n
@@ -646,6 +697,7 @@ export class XolosWalletService {
         updatedAt: Date.now(),
         receive,
         change,
+        owners,
         balances
       }
 
@@ -758,8 +810,65 @@ export class XolosWalletService {
     )
   }
 
+  private getFirmaSpendOwners(): FirmaInputOwner[] {
+    const owners = this.scanCache?.owners.length
+      ? this.scanCache.owners
+      : this.hdAddressCache
+    if (owners.length === 0) {
+      throw new Error('Actualiza el saldo de la wallet antes de preparar un envío FIRMA.')
+    }
+    return owners
+  }
+
+  private getFirmaChangeOwner(account: X402WalletAccount): FirmaInputOwner {
+    const owner = this.hdAddressCache.find((candidate) => candidate.hdPath === DERIVATION_PATH)
+    if (
+      !owner ||
+      owner.address !== account.address ||
+      owner.publicKeyHex !== account.publicKey.toLowerCase()
+    ) {
+      throw new Error('La dirección activa no coincide con la ruta HD de cambio de la wallet.')
+    }
+    return owner
+  }
+
+  private async refreshFirmaOwnedUtxos(owners: FirmaInputOwner[]): Promise<FirmaOwnedUtxo[]> {
+    const chronik = getChronik()
+    const snapshots = await runWithConcurrency(owners, CHRONIK_CONCURRENCY_LIMIT, async (owner) => {
+      const response = await chronik.address(owner.address).utxos()
+      return response.utxos.map((utxo) => ({ utxo, owner }))
+    })
+    return snapshots.flat()
+  }
+
+  private deriveHdSignatory(owner: FirmaInputOwner): WalletSignatory {
+    const expectedPath = owner.branch === 'receive'
+      ? getWalletReceivePath(owner.index)
+      : getWalletChangePath(owner.index)
+    if (owner.hdPath !== expectedPath) {
+      throw new Error('La ruta HD del input FIRMA no coincide con su rama e índice.')
+    }
+
+    const derived = this.getKeyDerivation().deriveFromMnemonic(this.getMnemonicOrThrow(), owner.hdPath)
+    const publicKeyHex = derived.publicKey.toLowerCase()
+    if (derived.address !== owner.address || publicKeyHex !== owner.publicKeyHex.toLowerCase()) {
+      throw new Error(`La clave derivada no corresponde al input FIRMA de ${owner.hdPath}.`)
+    }
+    if (!/^[0-9a-fA-F]{64}$/.test(derived.privateKey)) {
+      throw new Error(`No se pudo derivar el signatory FIRMA de ${owner.hdPath}.`)
+    }
+
+    const privateKey = fromHex(derived.privateKey)
+    const publicKey = fromHex(publicKeyHex)
+    return {
+      address: owner.address,
+      publicKeyHex,
+      publicKey,
+      signatory: P2PKHSignatory(privateKey, publicKey, ALL_BIP143)
+    }
+  }
+
   private async buildFirmaSendPlan(destination: string, amountAtoms: bigint): Promise<{
-    account: X402WalletAccount
     plan: FirmaSendPlan
   }> {
     const account = this.getX402ActiveAccount()
@@ -768,15 +877,19 @@ export class XolosWalletService {
     }
 
     const chronik = getChronik()
-    assertFirmaAlphaTokenInfo(await chronik.token(FIRMA_ALPHA.tokenId))
-    const response = await chronik.address(account.address).utxos()
+    const owners = this.getFirmaSpendOwners()
+    const [tokenInfo, ownedUtxos] = await Promise.all([
+      chronik.token(FIRMA_ALPHA.tokenId),
+      this.refreshFirmaOwnedUtxos(owners)
+    ])
+    assertFirmaAlphaTokenInfo(tokenInfo)
+    const changeOwner = this.getFirmaChangeOwner(account)
     return {
-      account,
       plan: buildFirmaSendPlan({
-        walletAddress: account.address,
+        changeOwner,
         destination,
         amountAtoms,
-        utxos: response.utxos
+        ownedUtxos
       })
     }
   }
@@ -795,12 +908,20 @@ export class XolosWalletService {
       throw new Error('Los UTXOs, la comisión o las salidas cambiaron. Genera una nueva previsualización.')
     }
 
-    const signer = this.getSignatory()
-    if (signer.address !== fresh.account.address || signer.publicKeyHex !== fresh.account.publicKey) {
-      throw new Error('La cuenta activa cambió. Genera una nueva previsualización.')
+    const signersByPath = new Map<string, WalletSignatory>()
+    for (const { owner } of [...fresh.plan.tokenInputs, ...fresh.plan.xecInputs]) {
+      if (!signersByPath.has(owner.hdPath)) {
+        signersByPath.set(owner.hdPath, this.deriveHdSignatory(owner))
+      }
     }
     const signedTx = this.signTxBuilder(
-      createSignedFirmaSendBuilder(fresh.plan, signer.signatory),
+      createSignedFirmaSendBuilder(fresh.plan, (owner) => {
+        const signer = signersByPath.get(owner.hdPath)
+        if (!signer || signer.address !== owner.address || signer.publicKeyHex !== owner.publicKeyHex) {
+          throw new Error(`No se encontró el signatory correcto para ${owner.hdPath}.`)
+        }
+        return signer.signatory
+      }),
       { feePerKb: FIRMA_SEND_FEE_PER_KB, dustSats: BigInt(XEC_DUST_SATS) }
     )
 
@@ -1281,6 +1402,7 @@ export class XolosWalletService {
     const basePath = resolveBasePath(DERIVATION_PATH)
     const receive: string[] = []
     const change: string[] = []
+    const owners: FirmaInputOwner[] = []
     let totalSats = 0n
     let totalRmzAtoms = 0n
     let totalFirmaAtoms = 0n
@@ -1291,14 +1413,28 @@ export class XolosWalletService {
     const scanIndex = async (currentIndex: number) => {
       const receivePath = `${basePath}/0/${currentIndex}`
       const changePath = `${basePath}/1/${currentIndex}`
-      const receiveAddress = keyDerivation.deriveFromMnemonic(mnemonic, receivePath).address
-      const changeAddress = keyDerivation.deriveFromMnemonic(mnemonic, changePath).address
+      const receiveDerived = keyDerivation.deriveFromMnemonic(mnemonic, receivePath)
+      const changeDerived = keyDerivation.deriveFromMnemonic(mnemonic, changePath)
+      const receiveOwner: FirmaInputOwner = {
+        address: receiveDerived.address,
+        hdPath: receivePath,
+        branch: 'receive',
+        index: currentIndex,
+        publicKeyHex: receiveDerived.publicKey.toLowerCase()
+      }
+      const changeOwner: FirmaInputOwner = {
+        address: changeDerived.address,
+        hdPath: changePath,
+        branch: 'change',
+        index: currentIndex,
+        publicKeyHex: changeDerived.publicKey.toLowerCase()
+      }
       const [receiveScan, changeScan] = await Promise.all([
-        this.fetchAddressScan(receiveAddress),
-        this.fetchAddressScan(changeAddress)
+        this.fetchAddressScan(receiveOwner.address),
+        this.fetchAddressScan(changeOwner.address)
       ])
 
-      return { receiveAddress, changeAddress, receiveScan, changeScan }
+      return { receiveOwner, changeOwner, receiveScan, changeScan }
     }
 
     while (consecutiveUnused < gapLimit) {
@@ -1315,8 +1451,9 @@ export class XolosWalletService {
 
       for (let i = 0; i < scans.length; i += 1) {
         const scan = scans[i]
-        receive.push(scan.receiveAddress)
-        change.push(scan.changeAddress)
+        receive.push(scan.receiveOwner.address)
+        change.push(scan.changeOwner.address)
+        owners.push(scan.receiveOwner, scan.changeOwner)
         scannedCount += 1
 
         let hasActivity = false
@@ -1375,11 +1512,14 @@ export class XolosWalletService {
       xecFormatted: this.formatXecFromSats(totalSats)
     }
 
+    this.rememberHdOwners(owners)
+
     const cache: ScanCache = {
       gapLimit,
       updatedAt: now,
       receive,
       change,
+      owners,
       balances
     }
 

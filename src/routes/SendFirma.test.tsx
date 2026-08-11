@@ -59,6 +59,8 @@ const preview: FirmaSendPreview = {
   inputOutpoints: [`${'b'.repeat(64)}:0`, `${'c'.repeat(64)}:0`],
   tokenInputOutpoints: [`${'b'.repeat(64)}:0`],
   xecInputOutpoints: [`${'c'.repeat(64)}:0`],
+  changeAddress: destination,
+  changeHdPath: `m/44'/899'/0'/0/0`,
   planFingerprint: 'firma-plan'
 }
 

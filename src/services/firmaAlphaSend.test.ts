@@ -4,22 +4,63 @@ import { DUMMY_KEYPAIR } from 'ecash-agora'
 import {
   ALL_BIP143,
   Address,
+  Ecc,
   P2PKHSignatory,
+  Script,
+  Tx,
   parseAlp,
   parseEmppScript,
-  shaRmd160
+  shaRmd160,
+  toHex,
+  toHexRev
 } from 'ecash-lib'
 import { FIRMA_ALPHA } from '../config/firmaAlpha'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { TOKEN_DUST_SATS } from '../dex/agoraPhase1'
 import { parseTokenAmount } from '../utils/tokenFormat'
 import { getChronik } from './ChronikClient'
-import { xolosWalletService } from './XolosWalletService'
-import { buildFirmaSendPlan } from './firmaAlphaSend'
+import type { WalletSignatory, X402WalletAccount } from './XolosWalletService'
+import { WALLET_DERIVATION_PATH, xolosWalletService } from './XolosWalletService'
+import {
+  FIRMA_SEND_FEE_PER_KB,
+  buildFirmaSendPlan,
+  createSignedFirmaSendBuilder
+} from './firmaAlphaSend'
+import type { FirmaInputOwner, FirmaOwnedUtxo } from './firmaAlphaSend'
 
-const walletAddress = Address.p2pkh(shaRmd160(DUMMY_KEYPAIR.pk)).toString()
+const testSkA = Uint8Array.from(DUMMY_KEYPAIR.sk)
+const testPkA = Uint8Array.from(DUMMY_KEYPAIR.pk)
+const testSkB = new Uint8Array(32)
+testSkB[31] = 2
+const testPkB = new Ecc().derivePubkey(testSkB)
+
+const addressForPk = (publicKey: Uint8Array) => Address.p2pkh(shaRmd160(publicKey)).toString()
+const walletAddress = addressForPk(testPkA)
+const secondaryAddress = addressForPk(testPkB)
 const destinationPk = Uint8Array.from([0x02, ...new Uint8Array(32).fill(0x55)])
-const destinationAddress = Address.p2pkh(shaRmd160(destinationPk)).toString()
+const destinationAddress = addressForPk(destinationPk)
+const foreignPk = Uint8Array.from([0x03, ...new Uint8Array(32).fill(0x77)])
+const foreignAddress = addressForPk(foreignPk)
+
+const owner = (params: {
+  address?: string
+  publicKey?: Uint8Array
+  branch?: 'receive' | 'change'
+  index?: number
+} = {}): FirmaInputOwner => {
+  const branch = params.branch ?? 'receive'
+  const index = params.index ?? 0
+  return {
+    address: params.address ?? walletAddress,
+    publicKeyHex: toHex(params.publicKey ?? testPkA),
+    branch,
+    index,
+    hdPath: `m/44'/899'/0'/${branch === 'receive' ? 0 : 1}/${index}`
+  }
+}
+
+const primaryOwner = owner()
+const secondaryOwner = owner({ address: secondaryAddress, publicKey: testPkB, index: 1 })
 
 const canonicalTokenInfo = (): TokenInfo => ({
   tokenId: FIRMA_ALPHA.tokenId,
@@ -67,8 +108,20 @@ const tokenUtxo = (params: {
   }
 } as ScriptUtxo)
 
-describe('Firma Alpha ALP SEND plan', () => {
-  it('selects only canonical FIRMA, preserves token change and funds the fee with pure XEC', () => {
+const owned = (utxo: ScriptUtxo, inputOwner: FirmaInputOwner = primaryOwner): FirmaOwnedUtxo => ({
+  utxo,
+  owner: inputOwner
+})
+
+const buildPlan = (params: { amountAtoms: bigint; ownedUtxos: FirmaOwnedUtxo[] }) =>
+  buildFirmaSendPlan({
+    changeOwner: primaryOwner,
+    destination: destinationAddress,
+    ...params
+  })
+
+describe('Firma Alpha HD-aware ALP SEND plan', () => {
+  it('selects only canonical FIRMA, preserves token change and funds the fee with wallet-owned pure XEC', () => {
     const canonical = tokenUtxo({ marker: 'a', atoms: 250n })
     const rmz = tokenUtxo({ marker: 'b', atoms: 999n, tokenId: RMZ_ETOKEN_ID })
     const fakeFirma = tokenUtxo({ marker: 'c', atoms: 999n, tokenId: 'c'.repeat(64) })
@@ -76,11 +129,9 @@ describe('Firma Alpha ALP SEND plan', () => {
     const mintBaton = tokenUtxo({ marker: 'e', atoms: 0n, isMintBaton: true })
     const pureXec = xecUtxo('f', 20_000n)
 
-    const plan = buildFirmaSendPlan({
-      walletAddress,
-      destination: destinationAddress,
+    const plan = buildPlan({
       amountAtoms: 100n,
-      utxos: [rmz, fakeFirma, nft, mintBaton, canonical, pureXec]
+      ownedUtxos: [rmz, fakeFirma, nft, mintBaton, canonical, pureXec].map((utxo) => owned(utxo))
     })
 
     expect(plan.preview.tokenId).toBe(FIRMA_ALPHA.tokenId)
@@ -108,12 +159,99 @@ describe('Firma Alpha ALP SEND plan', () => {
     })
   })
 
-  it('creates a full acceptance send with no FIRMA change output', () => {
-    const plan = buildFirmaSendPlan({
-      walletAddress,
-      destination: destinationAddress,
+  it('prepares 0.0100 FIRMA when the active address has zero but another wallet receive path owns it (case A)', () => {
+    const plan = buildPlan({
       amountAtoms: 100n,
-      utxos: [tokenUtxo({ marker: '1', atoms: 100n }), xecUtxo('2', 20_000n)]
+      ownedUtxos: [
+        owned(xecUtxo('1', 20_000n), primaryOwner),
+        owned(tokenUtxo({ marker: '2', atoms: 100n }), secondaryOwner)
+      ]
+    })
+
+    expect(plan.preview.balanceBeforeAtoms).toBe(100n)
+    expect(plan.preview.balanceAfterAtoms).toBe(0n)
+    expect(plan.preview.tokenInputOutpoints).toEqual([`${'2'.repeat(64)}:0`])
+    expect(plan.tokenInputs[0].owner.hdPath).toBe(secondaryOwner.hdPath)
+  })
+
+  it('consolidates FIRMA split across two wallet HD paths (case B)', () => {
+    const forty = owned(tokenUtxo({ marker: '3', atoms: 40n }), primaryOwner)
+    const sixty = owned(tokenUtxo({ marker: '4', atoms: 60n }), secondaryOwner)
+    const plan = buildPlan({
+      amountAtoms: 100n,
+      ownedUtxos: [forty, sixty, owned(xecUtxo('5', 20_000n), primaryOwner)]
+    })
+
+    expect(plan.preview.balanceBeforeAtoms).toBe(100n)
+    expect(plan.preview.tokenInputOutpoints).toEqual([
+      `${sixty.utxo.outpoint.txid}:0`,
+      `${forty.utxo.outpoint.txid}:0`
+    ])
+    expect(plan.tokenInputs.map(({ owner: inputOwner }) => inputOwner.hdPath)).toEqual([
+      secondaryOwner.hdPath,
+      primaryOwner.hdPath
+    ])
+  })
+
+  it('attaches the signatory resolved for each selected input owner (case D)', () => {
+    const primaryFirma = owned(tokenUtxo({ marker: '5', atoms: 40n }), primaryOwner)
+    const secondaryFirma = owned(tokenUtxo({ marker: '6', atoms: 60n }), secondaryOwner)
+    const feeFuel = owned(xecUtxo('7', 20_000n), primaryOwner)
+    const plan = buildPlan({ amountAtoms: 100n, ownedUtxos: [primaryFirma, secondaryFirma, feeFuel] })
+    const primarySignatory = P2PKHSignatory(testSkA, testPkA, ALL_BIP143)
+    const secondarySignatory = P2PKHSignatory(testSkB, testPkB, ALL_BIP143)
+    const builder = createSignedFirmaSendBuilder(plan, (inputOwner) =>
+      inputOwner.hdPath === primaryOwner.hdPath ? primarySignatory : secondarySignatory
+    )
+
+    expect(builder.inputs.map(({ signatory }) => signatory)).toEqual([
+      secondarySignatory,
+      primarySignatory,
+      primarySignatory
+    ])
+  })
+
+  it('never makes a foreign UTXO eligible without a wallet HD owner (case C)', () => {
+    const walletFirma = owned(tokenUtxo({ marker: '6', atoms: 100n }), secondaryOwner)
+    const foreignFirma = tokenUtxo({ marker: '7', atoms: 1_000_000n })
+    expect(foreignAddress).not.toBe(primaryOwner.address)
+    expect(foreignAddress).not.toBe(secondaryOwner.address)
+
+    expect(() => buildPlan({
+      amountAtoms: 101n,
+      // foreignFirma intentionally cannot enter the typed owned-UTXO set.
+      ownedUtxos: [walletFirma, owned(xecUtxo('8', 20_000n), primaryOwner)]
+    })).toThrow(/FIRMA insuficiente/)
+    expect(foreignFirma.token?.atoms).toBe(1_000_000n)
+  })
+
+  it('returns FIRMA and XEC change to the explicit active receive-0 policy (case E)', () => {
+    const plan = buildPlan({
+      amountAtoms: 100n,
+      ownedUtxos: [
+        owned(tokenUtxo({ marker: '9', atoms: 150n }), secondaryOwner),
+        owned(xecUtxo('a', 20_000n), secondaryOwner)
+      ]
+    })
+    const changeScriptHex = toHex(Script.fromAddress(primaryOwner.address).bytecode)
+    const tokenChange = plan.outputs[2]
+    const xecChange = plan.outputs[3]
+
+    expect(plan.preview.changeAddress).toBe(primaryOwner.address)
+    expect(plan.preview.changeHdPath).toBe(WALLET_DERIVATION_PATH)
+    expect('bytecode' in tokenChange).toBe(false)
+    if (!('bytecode' in tokenChange)) expect(toHex(tokenChange.script.bytecode)).toBe(changeScriptHex)
+    expect('bytecode' in xecChange).toBe(true)
+    if ('bytecode' in xecChange) expect(toHex(xecChange.bytecode)).toBe(changeScriptHex)
+  })
+
+  it('creates a full send with no FIRMA change output', () => {
+    const plan = buildPlan({
+      amountAtoms: 100n,
+      ownedUtxos: [
+        owned(tokenUtxo({ marker: 'b', atoms: 100n })),
+        owned(xecUtxo('c', 20_000n))
+      ]
     })
 
     expect(plan.preview.firmaChangeAtoms).toBe(0n)
@@ -125,27 +263,19 @@ describe('Firma Alpha ALP SEND plan', () => {
   })
 
   it('rejects zero, insufficient FIRMA and missing pure-XEC fee fuel', () => {
-    const firma = tokenUtxo({ marker: '3', atoms: 100n })
-    expect(() => buildFirmaSendPlan({
-      walletAddress,
-      destination: destinationAddress,
+    const firma = owned(tokenUtxo({ marker: 'd', atoms: 100n }))
+    expect(() => buildPlan({
       amountAtoms: 0n,
-      utxos: [firma, xecUtxo('4', 20_000n)]
+      ownedUtxos: [firma, owned(xecUtxo('e', 20_000n))]
     })).toThrow(/mayor a cero/)
 
-    expect(() => buildFirmaSendPlan({
-      walletAddress,
-      destination: destinationAddress,
+    expect(() => buildPlan({
       amountAtoms: 101n,
-      utxos: [firma, xecUtxo('4', 20_000n)]
+      ownedUtxos: [firma, owned(xecUtxo('e', 20_000n))]
     })).toThrow(/FIRMA insuficiente/)
 
-    expect(() => buildFirmaSendPlan({
-      walletAddress,
-      destination: destinationAddress,
-      amountAtoms: 100n,
-      utxos: [firma]
-    })).toThrow(/UTXO XEC puro/)
+    expect(() => buildPlan({ amountAtoms: 100n, ownedUtxos: [firma] }))
+      .toThrow(/UTXO XEC puro/)
   })
 
   it('parses FIRMA amounts exactly to four decimal atoms and rejects excess precision', () => {
@@ -156,36 +286,107 @@ describe('Firma Alpha ALP SEND plan', () => {
 
   it('rejects an invalid eCash destination before building a preview', () => {
     expect(() => buildFirmaSendPlan({
-      walletAddress,
+      changeOwner: primaryOwner,
       destination: 'firma:not-an-address',
       amountAtoms: 100n,
-      utxos: [tokenUtxo({ marker: '9', atoms: 100n }), xecUtxo('a', 20_000n)]
+      ownedUtxos: [
+        owned(tokenUtxo({ marker: 'f', atoms: 100n })),
+        owned(xecUtxo('1', 20_000n))
+      ]
     })).toThrow(/dirección eCash de destino no es válida/)
   })
 })
 
-describe('XolosWalletService FIRMA preview boundary', () => {
+describe('ecash-lib dummy estimate versus real FIRMA signature', () => {
+  it('produces the same contractual inputs, outputs, size, XEC change and fee with test keys', () => {
+    const tokenA = owned(tokenUtxo({ marker: '2', atoms: 40n }), primaryOwner)
+    const tokenB = owned(tokenUtxo({ marker: '3', atoms: 80n }), secondaryOwner)
+    const feeFuel = owned(xecUtxo('4', 20_000n), primaryOwner)
+    const plan = buildPlan({ amountAtoms: 100n, ownedUtxos: [tokenA, tokenB, feeFuel] })
+    const signatories = new Map([
+      [primaryOwner.hdPath, P2PKHSignatory(testSkA, testPkA, ALL_BIP143)],
+      [secondaryOwner.hdPath, P2PKHSignatory(testSkB, testPkB, ALL_BIP143)]
+    ])
+
+    const realTx = createSignedFirmaSendBuilder(plan, (inputOwner) => {
+      const signatory = signatories.get(inputOwner.hdPath)
+      if (!signatory) throw new Error(`Missing test signatory for ${inputOwner.hdPath}`)
+      return signatory
+    }).sign({ feePerKb: FIRMA_SEND_FEE_PER_KB, dustSats: TOKEN_DUST_SATS })
+    const parsed = Tx.fromHex(realTx.toHex())
+    const inputSats = [...plan.tokenInputs, ...plan.xecInputs]
+      .reduce((total, { utxo }) => total + utxo.sats, 0n)
+    const actualFee = inputSats - parsed.outputs.reduce((total, output) => total + output.sats, 0n)
+
+    expect(parsed.serSize()).toBe(plan.estimatedTx.serSize())
+    expect(actualFee).toBe(plan.preview.networkFeeSats)
+    expect(parsed.outputs.map((output) => [output.sats, toHex(output.script.bytecode)]))
+      .toEqual(plan.estimatedTx.outputs.map((output) => [output.sats, toHex(output.script.bytecode)]))
+    expect(realTx.inputs.map(({ prevOut }) => `${String(prevOut.txid)}:${prevOut.outIdx}`))
+      .toEqual(plan.preview.inputOutpoints)
+    expect(parsed.inputs.map(({ prevOut }) => `${toHexRev(prevOut.txid as Uint8Array)}:${prevOut.outIdx}`))
+      .toEqual(plan.preview.inputOutpoints)
+
+    const alp = parseAlp(parseEmppScript(parsed.outputs[0].script)?.[0] as Uint8Array)
+    expect(alp).toEqual({
+      txType: 'SEND',
+      tokenType: FIRMA_ALPHA.tokenType,
+      tokenId: FIRMA_ALPHA.tokenId,
+      sendAtomsArray: [100n, 20n]
+    })
+    expect(toHex(parsed.outputs[1].script.bytecode))
+      .toBe(toHex(Script.fromAddress(destinationAddress).bytecode))
+    expect(toHex(parsed.outputs[2].script.bytecode))
+      .toBe(toHex(Script.fromAddress(primaryOwner.address).bytecode))
+    expect(toHex(parsed.outputs.at(-1)?.script.bytecode ?? new Uint8Array()))
+      .toBe(toHex(Script.fromAddress(primaryOwner.address).bytecode))
+    expect(parsed.outputs.at(-1)?.sats).toBe(
+      inputSats - (TOKEN_DUST_SATS * 2n) - plan.preview.networkFeeSats
+    )
+  })
+})
+
+type FirmaServiceInternals = {
+  getFirmaSpendOwners: () => FirmaInputOwner[]
+  getFirmaChangeOwner: (account: X402WalletAccount) => FirmaInputOwner
+  deriveHdSignatory: (inputOwner: FirmaInputOwner) => WalletSignatory
+}
+
+describe('XolosWalletService FIRMA HD preview boundary', () => {
   const chronik = getChronik()
-  let currentUtxos: ScriptUtxo[]
+  const internals = xolosWalletService as unknown as FirmaServiceInternals
+  let utxosByAddress: Map<string, ScriptUtxo[]>
+  let deriveHdSignatory: ReturnType<typeof vi.spyOn>
 
   beforeEach(() => {
-    currentUtxos = [tokenUtxo({ marker: '5', atoms: 250n }), xecUtxo('6', 20_000n)]
+    utxosByAddress = new Map([
+      [walletAddress, [xecUtxo('5', 20_000n)]],
+      [secondaryAddress, [tokenUtxo({ marker: '6', atoms: 100n })]]
+    ])
     vi.spyOn(chronik, 'token').mockResolvedValue(canonicalTokenInfo())
-    vi.spyOn(chronik, 'address').mockImplementation(() => ({
-      utxos: async () => ({ outputScript: '', utxos: currentUtxos })
+    vi.spyOn(chronik, 'address').mockImplementation((address: string) => ({
+      utxos: async () => ({ outputScript: '', utxos: utxosByAddress.get(address) ?? [] })
     }) as never)
     vi.spyOn(chronik, 'broadcastTx').mockResolvedValue({ txid: '7'.repeat(64) })
     vi.spyOn(xolosWalletService, 'getX402ActiveAccount').mockReturnValue({
       address: walletAddress,
-      publicKey: Buffer.from(DUMMY_KEYPAIR.pk).toString('hex')
+      publicKey: toHex(testPkA)
     })
-    vi.spyOn(xolosWalletService, 'getSignatory').mockReturnValue({
-      address: walletAddress,
-      publicKeyHex: Buffer.from(DUMMY_KEYPAIR.pk).toString('hex'),
-      publicKey: DUMMY_KEYPAIR.pk,
-      signatory: P2PKHSignatory(DUMMY_KEYPAIR.sk, DUMMY_KEYPAIR.pk, ALL_BIP143)
+    vi.spyOn(internals, 'getFirmaSpendOwners').mockReturnValue([primaryOwner, secondaryOwner])
+    vi.spyOn(internals, 'getFirmaChangeOwner').mockReturnValue(primaryOwner)
+    deriveHdSignatory = vi.spyOn(internals, 'deriveHdSignatory').mockImplementation((inputOwner) => {
+      const isPrimary = inputOwner.hdPath === primaryOwner.hdPath
+      const privateKey = isPrimary ? testSkA : testSkB
+      const publicKey = isPrimary ? testPkA : testPkB
+      return {
+        address: inputOwner.address,
+        publicKeyHex: inputOwner.publicKeyHex,
+        publicKey,
+        signatory: P2PKHSignatory(privateKey, publicKey, ALL_BIP143)
+      }
     })
-    vi.spyOn(xolosWalletService, 'withPrivateKey').mockImplementation((handler) => handler(DUMMY_KEYPAIR.sk))
+    vi.spyOn(xolosWalletService, 'getSignatory')
+    vi.spyOn(xolosWalletService, 'withPrivateKey')
     vi.spyOn(xolosWalletService, 'signTxBuilder').mockReturnValue({
       ser: () => new Uint8Array([1, 2, 3])
     } as never)
@@ -196,15 +397,46 @@ describe('XolosWalletService FIRMA preview boundary', () => {
     vi.restoreAllMocks()
   })
 
-  it('does not access any real signing mechanism during preview', async () => {
+  it('prepares spendable HD FIRMA while the active address itself holds zero (case A)', async () => {
     const preview = await xolosWalletService.prepareFirmaSend(destinationAddress, 100n)
 
-    expect(preview.amountAtoms).toBe(100n)
-    expect(chronik.token).toHaveBeenCalledWith(FIRMA_ALPHA.tokenId)
+    expect(preview.balanceBeforeAtoms).toBe(100n)
+    expect(preview.tokenInputOutpoints).toEqual([`${'6'.repeat(64)}:0`])
+    expect(chronik.address).toHaveBeenCalledWith(walletAddress)
+    expect(chronik.address).toHaveBeenCalledWith(secondaryAddress)
+    expect(deriveHdSignatory).not.toHaveBeenCalled()
     expect(xolosWalletService.getSignatory).not.toHaveBeenCalled()
     expect(xolosWalletService.withPrivateKey).not.toHaveBeenCalled()
     expect(xolosWalletService.signTxBuilder).not.toHaveBeenCalled()
     expect(chronik.broadcastTx).not.toHaveBeenCalled()
+  })
+
+  it('selects split FIRMA and assigns every HD input its own signatory only after revalidation (cases B and D)', async () => {
+    utxosByAddress.set(walletAddress, [tokenUtxo({ marker: '8', atoms: 40n }), xecUtxo('9', 20_000n)])
+    utxosByAddress.set(secondaryAddress, [tokenUtxo({ marker: 'a', atoms: 60n })])
+    const preview = await xolosWalletService.prepareFirmaSend(destinationAddress, 100n)
+
+    await expect(xolosWalletService.sendFirma(preview)).resolves.toBe('7'.repeat(64))
+
+    expect(preview.tokenInputOutpoints).toEqual([`${'a'.repeat(64)}:0`, `${'8'.repeat(64)}:0`])
+    expect(deriveHdSignatory).toHaveBeenCalledTimes(2)
+    expect(deriveHdSignatory.mock.calls.map((call: [FirmaInputOwner]) => call[0].hdPath).sort()).toEqual([
+      primaryOwner.hdPath,
+      secondaryOwner.hdPath
+    ].sort())
+    expect(xolosWalletService.getSignatory).not.toHaveBeenCalled()
+    expect(xolosWalletService.signTxBuilder).toHaveBeenCalledOnce()
+    expect(vi.mocked(chronik.address).mock.invocationCallOrder[2])
+      .toBeLessThan(deriveHdSignatory.mock.invocationCallOrder[0])
+  })
+
+  it('never queries or selects a foreign address outside the HD ownership set (case C)', async () => {
+    utxosByAddress.set(foreignAddress, [tokenUtxo({ marker: 'b', atoms: 1_000_000n }), xecUtxo('c', 20_000n)])
+
+    await expect(xolosWalletService.prepareFirmaSend(destinationAddress, 101n))
+      .rejects.toThrow(/FIRMA insuficiente/)
+    expect(chronik.address).not.toHaveBeenCalledWith(foreignAddress)
+    expect(deriveHdSignatory).not.toHaveBeenCalled()
   })
 
   it('rejects ticker-matching metadata when the returned Token ID is not canonical', async () => {
@@ -214,15 +446,16 @@ describe('XolosWalletService FIRMA preview boundary', () => {
 
     await expect(xolosWalletService.prepareFirmaSend(destinationAddress, 100n))
       .rejects.toThrow(/Token ID no coincide/)
-    expect(xolosWalletService.getSignatory).not.toHaveBeenCalled()
+    expect(deriveHdSignatory).not.toHaveBeenCalled()
     expect(xolosWalletService.signTxBuilder).not.toHaveBeenCalled()
   })
 
-  it('aborts before signing when UTXOs changed after preview', async () => {
+  it('aborts before HD key derivation when UTXOs changed after preview', async () => {
     const preview = await xolosWalletService.prepareFirmaSend(destinationAddress, 100n)
-    currentUtxos = [tokenUtxo({ marker: '8', atoms: 250n }), xecUtxo('6', 20_000n)]
+    utxosByAddress.set(secondaryAddress, [tokenUtxo({ marker: 'd', atoms: 100n })])
 
     await expect(xolosWalletService.sendFirma(preview)).rejects.toThrow(/nueva previsualización/)
+    expect(deriveHdSignatory).not.toHaveBeenCalled()
     expect(xolosWalletService.getSignatory).not.toHaveBeenCalled()
     expect(xolosWalletService.withPrivateKey).not.toHaveBeenCalled()
     expect(xolosWalletService.signTxBuilder).not.toHaveBeenCalled()
@@ -234,12 +467,21 @@ describe('XolosWalletService FIRMA preview boundary', () => {
 
     await expect(xolosWalletService.sendFirma(preview)).resolves.toBe('7'.repeat(64))
 
-    expect(xolosWalletService.getSignatory).toHaveBeenCalledOnce()
+    expect(deriveHdSignatory).toHaveBeenCalledTimes(2)
     expect(xolosWalletService.signTxBuilder).toHaveBeenCalledOnce()
     expect(xolosWalletService.withPrivateKey).not.toHaveBeenCalled()
     expect(chronik.broadcastTx).toHaveBeenCalledOnce()
     expect(xolosWalletService.getBalances).toHaveBeenCalledOnce()
-    expect(vi.mocked(chronik.address).mock.invocationCallOrder[1])
-      .toBeLessThan(vi.mocked(xolosWalletService.getSignatory).mock.invocationCallOrder[0])
+    expect(vi.mocked(chronik.address).mock.invocationCallOrder[2])
+      .toBeLessThan(deriveHdSignatory.mock.invocationCallOrder[0])
+  })
+
+  it('includes owner path and token atoms in preview-to-confirm integrity', async () => {
+    const preview = await xolosWalletService.prepareFirmaSend(destinationAddress, 100n)
+    const changedOwner = { ...secondaryOwner, hdPath: `m/44'/899'/0'/1/1`, branch: 'change' as const }
+    vi.mocked(internals.getFirmaSpendOwners).mockReturnValueOnce([primaryOwner, changedOwner])
+
+    await expect(xolosWalletService.sendFirma(preview)).rejects.toThrow(/nueva previsualización/)
+    expect(deriveHdSignatory).not.toHaveBeenCalled()
   })
 })
