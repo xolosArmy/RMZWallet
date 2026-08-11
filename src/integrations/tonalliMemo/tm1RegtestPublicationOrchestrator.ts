@@ -242,6 +242,7 @@ type Tm1ActivePublicationOperation =
   | 'approveAndBroadcast'
   | 'confirm'
   | 'reconcile'
+  | 'reset'
   | null
 
 export interface Tm1RegtestPublicationOrchestrator {
@@ -526,9 +527,10 @@ implements Tm1RegtestPublicationOrchestrator {
 
       let auditedArtifact: RegtestSignedTransaction
       try {
+        const auditArtifact = cloneSignedArtifact(signedReview.signedArtifact)
         auditedArtifact = await this.dependencies.signedArtifactAudit.auditSignedArtifact({
           review: freezePreparedReview(review),
-          signedArtifact: signedReview.signedArtifact
+          signedArtifact: auditArtifact
         })
       } catch (error) {
         throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID', 'SIGNED_ARTIFACT_INVALID', error)
@@ -714,20 +716,25 @@ implements Tm1RegtestPublicationOrchestrator {
   }
 
   reset(): void {
-    if (this.activeOperation !== null) throw new Tm1PublicationError('INVALID_STATE')
-    if (
-      this.state.status !== 'idle' &&
-      this.state.status !== 'reviewReady' &&
-      this.state.status !== 'signedReviewReady' &&
-      this.state.status !== 'rejected' &&
-      this.state.status !== 'aborted' &&
-      this.state.status !== 'expired' &&
-      this.state.status !== 'failed' &&
-      this.state.status !== 'confirmed'
-    ) {
-      throw new Tm1PublicationError('INVALID_STATE')
+    this.beginOperation('reset')
+
+    try {
+      if (
+        this.state.status !== 'idle' &&
+        this.state.status !== 'reviewReady' &&
+        this.state.status !== 'signedReviewReady' &&
+        this.state.status !== 'rejected' &&
+        this.state.status !== 'aborted' &&
+        this.state.status !== 'expired' &&
+        this.state.status !== 'failed' &&
+        this.state.status !== 'confirmed'
+      ) {
+        throw new Tm1PublicationError('INVALID_STATE')
+      }
+      this.transition({ status: 'idle' })
+    } finally {
+      this.endOperation('reset')
     }
-    this.transition({ status: 'idle' })
   }
 
   private beginOperation(operation: Exclude<Tm1ActivePublicationOperation, null>): void {

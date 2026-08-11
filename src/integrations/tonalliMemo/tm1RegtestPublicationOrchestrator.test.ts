@@ -92,6 +92,7 @@ function createHarness() {
   let auditFailure: unknown = null
   let auditMutator: ((artifact: RegtestSignedTransaction) => RegtestSignedTransaction) | null = null
   let auditReturnUnchecked: RegtestSignedTransaction | null = null
+  const auditArtifacts: RegtestSignedTransaction[] = []
   let broadcastFailure: unknown = null
   let broadcastTxidOverride: string | null = null
   let confirmationOverride: Tm1Confirmation | null = null
@@ -159,6 +160,7 @@ function createHarness() {
     signedArtifactAudit: {
       async auditSignedArtifact({ signedArtifact }) {
         calls.audit += 1
+        auditArtifacts.push(signedArtifact)
         if (auditFailure) throw auditFailure
         if (auditDeferred) return auditDeferred.promise
         if (auditReturnUnchecked) return auditReturnUnchecked
@@ -254,6 +256,7 @@ function createHarness() {
     },
     mutateBroadcastArtifact: (fn: (artifact: RegtestSignedTransaction) => void) => { broadcastMutator = fn },
     getLastBroadcastArtifact: () => lastBroadcastArtifact,
+    getAuditArtifacts: () => [...auditArtifacts],
     deferConfirmation: () => {
       confirmationDeferred = createDeferred<Tm1Confirmation>()
       return confirmationDeferred
@@ -966,6 +969,76 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.calls.broadcast).toBe(1)
   })
 
+  test('broadcast re-audit receives a defensive copy and ignores retained mutations during pending transport', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const stateBefore = harness.orchestrator.getState()
+    if (stateBefore.status !== 'signedReviewReady') throw new Error('expected signed review')
+    const originalHex = signedReview.signedArtifact.rawTransactionHex
+    const originalHash = signedReview.signedArtifactHash
+    const broadcast = harness.deferBroadcast()
+
+    const promise = harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.calls.broadcast).toBe(1)
+    const auditArtifacts = harness.getAuditArtifacts()
+    expect(auditArtifacts).toHaveLength(2)
+    const retainedAuditArtifact = auditArtifacts[1]
+    if (retainedAuditArtifact === undefined) throw new Error('expected retained audit artifact')
+    const transportArtifact = harness.getLastBroadcastArtifact()
+    if (transportArtifact === null) throw new Error('expected transport artifact')
+    expect(retainedAuditArtifact).not.toBe(signedReview.signedArtifact)
+    expect(retainedAuditArtifact).not.toBe(stateBefore.signedReview.signedArtifact)
+    expect(retainedAuditArtifact.rawTransactionBytes).not.toBe(signedReview.signedArtifact.rawTransactionBytes)
+    expect(retainedAuditArtifact.rawTransactionBytes).not.toBe(stateBefore.signedReview.signedArtifact.rawTransactionBytes)
+    expect(transportArtifact).not.toBe(retainedAuditArtifact)
+    expect(transportArtifact.rawTransactionBytes).not.toBe(retainedAuditArtifact.rawTransactionBytes)
+
+    retainedAuditArtifact.rawTransactionBytes[0] ^= 0xff
+    broadcast.resolve(Object.freeze({ txid: signedReview.txid, disposition: 'accepted' as const }))
+
+    const receipt = await promise
+    expect(receipt.txid).toBe(signedReview.txid)
+    expect(receipt.deliveryReceipt.txid).toBe(signedReview.txid)
+    expect(harness.calls.broadcast).toBe(1)
+    const submitted = harness.orchestrator.getState()
+    expect(submitted.status).toBe('submitted')
+    if (submitted.status !== 'submitted') throw new Error('expected submitted')
+    expect(submitted.signedReview.txid).toBe(signedReview.txid)
+    expect(submitted.signedReview.signedArtifactHash).toBe(originalHash)
+    expect(toHex(submitted.signedReview.signedArtifact.rawTransactionBytes)).toBe(originalHex)
+    expect(submitted.receipt.txid).toBe(signedReview.txid)
+    expect(toHex(sha256d(submitted.signedReview.signedArtifact.rawTransactionBytes))).toBe(originalHash)
+  })
+
+  test('retained broadcast audit artifact mutations after return cannot affect submitted state', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const originalHex = signedReview.signedArtifact.rawTransactionHex
+    const originalHash = signedReview.signedArtifactHash
+
+    await expect(harness.orchestrator.approveAndBroadcast(signedReview.signedId)).resolves.toMatchObject({
+      txid: signedReview.txid
+    })
+
+    const auditArtifacts = harness.getAuditArtifacts()
+    const retainedAuditArtifact = auditArtifacts[1]
+    if (retainedAuditArtifact === undefined) throw new Error('expected retained audit artifact')
+    retainedAuditArtifact.rawTransactionBytes[0] ^= 0xff
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('submitted')
+    if (state.status !== 'submitted') throw new Error('expected submitted')
+    expect(state.signedReview.txid).toBe(signedReview.txid)
+    expect(state.signedReview.signedArtifactHash).toBe(originalHash)
+    expect(toHex(state.signedReview.signedArtifact.rawTransactionBytes)).toBe(originalHex)
+    expect(state.receipt.txid).toBe(signedReview.txid)
+    expect(state.receipt.deliveryReceipt.txid).toBe(signedReview.txid)
+    expect(harness.calls.broadcast).toBe(1)
+  })
+
   test('returned snapshots are defensively isolated from mutation attempts', async () => {
     const harness = createHarness()
     const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
@@ -1088,6 +1161,87 @@ describe('TM1 regtest publication orchestrator', () => {
       message: 'publication B after reset'
     })).resolves.toMatchObject({ message: 'publication B after reset' })
     expect(harness.calls.attest).toBe(3)
+  })
+
+  test('rejects reentrant prepare from reset idle notification until reset returns', async () => {
+    const harness = createHarness()
+    await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    let reentrantPrepare: Promise<unknown> | null = null
+    const observed: string[] = []
+
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'idle') {
+        observed.push(state.status)
+        reentrantPrepare = harness.orchestrator.prepare({
+          ...DEFAULT_REQUEST,
+          message: 'reentrant publication from reset'
+        })
+      }
+    })
+
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+    expect(harness.orchestrator.getState().status).toBe('idle')
+    expect(observed).toEqual(['idle'])
+    if (reentrantPrepare === null) throw new Error('expected reentrant prepare')
+    await expectCode(reentrantPrepare, 'PUBLICATION_ALREADY_ACTIVE')
+    expect(harness.orchestrator.getState().status).toBe('idle')
+    expect(harness.calls.attest).toBe(1)
+
+    await expect(harness.orchestrator.prepare({
+      ...DEFAULT_REQUEST,
+      message: 'normal publication after reset'
+    })).resolves.toMatchObject({ message: 'normal publication after reset' })
+    expect(harness.calls.attest).toBe(2)
+  })
+
+  test('reset idle subscribers receive the reset snapshot before reentrant attempts can transition', async () => {
+    const harness = createHarness()
+    await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const events: string[] = []
+    let reentrantPrepare: Promise<unknown> | null = null
+
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'idle') return
+      events.push('A:idle')
+      reentrantPrepare = harness.orchestrator.prepare({
+        ...DEFAULT_REQUEST,
+        message: 'subscriber A reentrant prepare'
+      })
+    })
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'idle') return
+      events.push('B:' + state.status)
+    })
+
+    harness.orchestrator.reset()
+
+    expect(events).toEqual(['A:idle', 'B:idle'])
+    if (reentrantPrepare === null) throw new Error('expected reentrant prepare')
+    await expectCode(reentrantPrepare, 'PUBLICATION_ALREADY_ACTIVE')
+    expect(harness.orchestrator.getState().status).toBe('idle')
+    expect(harness.calls.attest).toBe(1)
+  })
+
+  test('subscriber exceptions during reset idle notification do not leak the operation guard', async () => {
+    const harness = createHarness()
+    await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const observed: string[] = []
+
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'idle') throw new Error('idle subscriber failed')
+    })
+    harness.orchestrator.subscribe(state => observed.push(state.status))
+
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+    expect(harness.orchestrator.getState().status).toBe('idle')
+    expect(observed).toContain('idle')
+
+    await expect(harness.orchestrator.prepare({
+      ...DEFAULT_REQUEST,
+      message: 'normal publication after throwing reset subscriber'
+    })).resolves.toMatchObject({ message: 'normal publication after throwing reset subscriber' })
+    expect(harness.orchestrator.getState().status).toBe('reviewReady')
+    expect(harness.calls.attest).toBe(2)
   })
 
   test('clears the active staged operation after exceptions', async () => {
