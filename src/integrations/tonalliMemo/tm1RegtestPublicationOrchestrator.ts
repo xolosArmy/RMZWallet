@@ -19,7 +19,11 @@ import {
   planTm1Draft02Post,
   type Tm1Draft02FundingUtxo
 } from './tm1Draft02Plan'
-import type { RegtestSignedTransaction } from './tm1Draft02RegtestP2pkhSigner'
+import {
+  TM1_REGTEST_SIGNED_TRANSACTION_ARTIFACT_VERSION,
+  TM1_REGTEST_SIGNED_TRANSACTION_FORMAT,
+  type RegtestSignedTransaction
+} from './tm1Draft02RegtestP2pkhSigner'
 import type {
   Tm1RegtestDeliveryReceipt,
   Tm1RegtestNetworkAttestation
@@ -543,6 +547,7 @@ implements Tm1RegtestPublicationOrchestrator {
         signedReview,
         broadcastAuthorizationId
       })
+      assertNotAborted(signal)
       const transportArtifact = cloneSignedArtifact(signedReview.signedArtifact)
 
       try {
@@ -599,19 +604,17 @@ implements Tm1RegtestPublicationOrchestrator {
 
       assertNotAborted(signal)
       this.transition({ status: 'reconciling', signedReview, uncertainty })
-      const confirmation = await this.dependencies.confirmationObserver.confirm({
+      const confirmationResult: unknown = await this.dependencies.confirmationObserver.confirm({
         submissionId: uncertainty.submissionId,
         txid: uncertainty.txid,
         signal
       })
       assertNotAborted(signal)
-      if (
-        confirmation.submissionId !== uncertainty.submissionId ||
-        confirmation.txid !== uncertainty.txid
-      ) {
-        throw new Tm1PublicationError('TXID_MISMATCH')
-      }
-      assertPositiveConfirmations(confirmation)
+      const confirmation = snapshotValidatedConfirmation(
+        confirmationResult,
+        uncertainty.submissionId,
+        uncertainty.txid
+      )
       const receipt = freezeReceipt({
         submissionId: uncertainty.submissionId,
         signedId: uncertainty.signedId,
@@ -619,9 +622,8 @@ implements Tm1RegtestPublicationOrchestrator {
         txid: uncertainty.txid,
         deliveryReceipt: Object.freeze({ txid: uncertainty.txid, disposition: 'accepted' as const })
       })
-      const frozenConfirmation = freezeConfirmation(confirmation)
-      this.transition({ status: 'confirmed', receipt, confirmation: frozenConfirmation })
-      return frozenConfirmation
+      this.transition({ status: 'confirmed', receipt, confirmation })
+      return confirmation
     } catch (error) {
       const state = this.state
       if (state.status !== 'reconciling') {
@@ -652,19 +654,19 @@ implements Tm1RegtestPublicationOrchestrator {
 
       assertNotAborted(signal)
       this.transition({ status: 'confirming', receipt })
-      const confirmation = await this.dependencies.confirmationObserver.confirm({
+      const confirmationResult: unknown = await this.dependencies.confirmationObserver.confirm({
         submissionId,
         txid: receipt.txid,
         signal
       })
       assertNotAborted(signal)
-      if (confirmation.submissionId !== submissionId || confirmation.txid !== receipt.txid) {
-        throw new Tm1PublicationError('TXID_MISMATCH')
-      }
-      assertPositiveConfirmations(confirmation)
-      const frozenConfirmation = freezeConfirmation(confirmation)
-      this.transition({ status: 'confirmed', receipt, confirmation: frozenConfirmation })
-      return frozenConfirmation
+      const confirmation = snapshotValidatedConfirmation(
+        confirmationResult,
+        submissionId,
+        receipt.txid
+      )
+      this.transition({ status: 'confirmed', receipt, confirmation })
+      return confirmation
     } catch (error) {
       const state = this.state
       if (state.status !== 'confirming') {
@@ -890,6 +892,18 @@ function readOptionalString(value: unknown, key: PropertyKey): string | undefine
   return descriptor.value
 }
 
+function readOptionalNumber(value: unknown, key: PropertyKey): number | undefined {
+  if (value === null || typeof value !== 'object') {
+    throw new Error('Invalid external object')
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, key)
+  if (descriptor === undefined) return undefined
+  if (!('value' in descriptor) || (descriptor.value !== undefined && typeof descriptor.value !== 'number')) {
+    throw new Error(`Invalid optional number property: ${String(key)}`)
+  }
+  return descriptor.value
+}
+
 function snapshotNetworkAttestation(value: unknown): Tm1RegtestNetworkAttestation {
   const environment = readRequiredOwnDataProperty(value, 'environment')
   const chainIdentity = readRequiredOwnDataProperty(value, 'chainIdentity')
@@ -922,6 +936,45 @@ function snapshotValidatedDeliveryReceipt(
   if (txid !== expectedTxid) throw new Tm1PublicationError('TXID_MISMATCH')
   if (disposition !== 'accepted') throw new Tm1PublicationError('BROADCAST_FAILED')
   return Object.freeze({ txid, disposition })
+}
+
+function snapshotValidatedConfirmation(
+  value: unknown,
+  expectedSubmissionId: string,
+  expectedTxid: string
+): Tm1Confirmation {
+  const submissionId = readRequiredNonEmptyString(value, 'submissionId')
+  const txid = readRequiredNonEmptyString(value, 'txid')
+  const confirmations = readRequiredOwnDataProperty(value, 'confirmations')
+  const blockHash = readOptionalString(value, 'blockHash')
+  const blockHeight = readOptionalNumber(value, 'blockHeight')
+
+  if (submissionId !== expectedSubmissionId || txid !== expectedTxid) {
+    throw new Tm1PublicationError('TXID_MISMATCH')
+  }
+  if (typeof confirmations !== 'number' || !Number.isSafeInteger(confirmations) || confirmations <= 0) {
+    throw new Tm1PublicationError(
+      'CONFIRMATION_FAILED',
+      'CONFIRMATION_FAILED: confirmations must be a positive safe integer'
+    )
+  }
+  if (blockHash !== undefined && blockHash.length === 0) {
+    throw new Tm1PublicationError('CONFIRMATION_FAILED')
+  }
+  if (
+    blockHeight !== undefined &&
+    (!Number.isSafeInteger(blockHeight) || blockHeight < 0)
+  ) {
+    throw new Tm1PublicationError('CONFIRMATION_FAILED')
+  }
+
+  return Object.freeze({
+    submissionId,
+    txid,
+    confirmations,
+    ...(blockHash === undefined ? {} : { blockHash }),
+    ...(blockHeight === undefined ? {} : { blockHeight })
+  })
 }
 
 function rejectedState(
@@ -978,15 +1031,6 @@ function isBroadcastAuthorizationBound(
 
 function assertNotAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
-}
-
-function assertPositiveConfirmations(confirmation: Tm1Confirmation): void {
-  if (!Number.isSafeInteger(confirmation.confirmations) || confirmation.confirmations <= 0) {
-    throw new Tm1PublicationError(
-      'CONFIRMATION_FAILED',
-      'CONFIRMATION_FAILED: confirmations must be a positive safe integer'
-    )
-  }
 }
 
 function isAbortError(error: unknown): boolean {
@@ -1164,11 +1208,8 @@ function snapshotValidatedSignedArtifact(value: unknown): RegtestSignedTransacti
   const rawTransactionBytes = readRequiredOwnDataProperty(value, 'rawTransactionBytes')
 
   if (
-    typeof format !== 'string' ||
-    format.length === 0 ||
-    typeof artifactVersion !== 'number' ||
-    !Number.isSafeInteger(artifactVersion) ||
-    artifactVersion <= 0 ||
+    format !== TM1_REGTEST_SIGNED_TRANSACTION_FORMAT ||
+    artifactVersion !== TM1_REGTEST_SIGNED_TRANSACTION_ARTIFACT_VERSION ||
     environment !== TM1_DRAFT_02_CANDIDATE_ENVIRONMENT ||
     sighashPolicy !== TM1_DRAFT_02_SIGHASH_POLICY ||
     typeof fixturePublicKeyHex !== 'string' ||

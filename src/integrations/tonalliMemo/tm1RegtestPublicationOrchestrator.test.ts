@@ -103,7 +103,7 @@ function createHarness() {
   const auditArtifacts: RegtestSignedTransaction[] = []
   let broadcastFailure: unknown = null
   let broadcastTxidOverride: string | null = null
-  let confirmationOverride: Tm1Confirmation | null = null
+  let confirmationOverride: unknown = null
   let confirmationFailure: unknown = null
   let confirmationDeferred: Deferred<Tm1Confirmation> | null = null
   let signerDeferred: Deferred<RegtestSignedTransaction> | null = null
@@ -221,13 +221,13 @@ function createHarness() {
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (confirmationFailure) throw confirmationFailure
         if (confirmationDeferred) return confirmationDeferred.promise
-        return confirmationOverride ?? Object.freeze({
+        return (confirmationOverride ?? Object.freeze({
           submissionId,
           txid,
           confirmations: 1,
           blockHash: 'cc'.repeat(32),
           blockHeight: 101
-        })
+        })) as Tm1Confirmation
       }
     },
     clock: {
@@ -258,7 +258,7 @@ function createHarness() {
     failBroadcast: (error: unknown) => { broadcastFailure = error },
     setBroadcastTxid: (txid: string) => { broadcastTxidOverride = txid },
     setBroadcastReceipt: (receipt: unknown) => { broadcastReceiptOverride = receipt },
-    setConfirmation: (confirmation: Tm1Confirmation) => { confirmationOverride = confirmation },
+    setConfirmation: (confirmation: unknown) => { confirmationOverride = confirmation },
     failConfirmation: (error: unknown) => { confirmationFailure = error },
     onSigningAuthorization: (fn: () => void) => { onSigningAuthorization = fn },
     onBroadcastAuthorization: (fn: () => void) => { onBroadcastAuthorization = fn },
@@ -552,6 +552,20 @@ describe('TM1 regtest publication orchestrator', () => {
     }))
 
     await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNED_ARTIFACT_INVALID')
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+  })
+
+  test.each([
+    ['format', Object.freeze({ format: 'unsupported-signed-transaction-format' })],
+    ['artifact version', Object.freeze({ artifactVersion: 2 })]
+  ])('rejects an unsupported signed artifact %s', async (_label, override) => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    harness.returnUncheckedAudit(Object.freeze({ ...validArtifact, ...override }))
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNED_ARTIFACT_INVALID')
+    expect(harness.calls.broadcast).toBe(0)
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
   })
 
@@ -1483,6 +1497,26 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.calls.broadcast).toBe(1)
   })
 
+  test('honors a synchronous subscriber abort before irreversible broadcast dispatch', async () => {
+    const harness = createHarness()
+    const controller = new AbortController()
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'broadcasting') controller.abort()
+    })
+    const signedReview = await prepareAndSign(harness)
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId, controller.signal),
+      'ABORTED'
+    )
+
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'aborted',
+      stage: 'broadcasting'
+    })
+  })
+
   test('subscriber reentrant operations are rejected by guards without breaking invariants', async () => {
     const harness = createHarness()
     const reentrant: Promise<unknown>[] = []
@@ -2128,6 +2162,70 @@ describe('TM1 regtest publication orchestrator', () => {
     }
   })
 
+  test('rejects getter-backed confirmation results without invoking getters in confirm', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    let getterCalls = 0
+    const confirmation: Record<PropertyKey, unknown> = {
+      submissionId: receipt.submissionId,
+      txid: receipt.txid
+    }
+    Object.defineProperty(confirmation, 'confirmations', {
+      enumerable: true,
+      get() {
+        getterCalls += 1
+        return 1
+      }
+    })
+    harness.setConfirmation(confirmation)
+
+    await expectCode(harness.orchestrator.confirm(receipt.submissionId), 'CONFIRMATION_FAILED')
+
+    expect(getterCalls).toBe(0)
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'submitted' })
+  })
+
+  test('reads each proxy-backed confirmation field once before publishing the snapshot', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    const descriptorCalls = new Map<PropertyKey, number>()
+    let dataGetterCalls = 0
+    const target: Tm1Confirmation = {
+      submissionId: receipt.submissionId,
+      txid: receipt.txid,
+      confirmations: 2,
+      blockHash: 'ac'.repeat(32),
+      blockHeight: 108
+    }
+    const confirmation = new Proxy(target, {
+      get(targetValue, key, receiver) {
+        if (key === 'then') return undefined
+        dataGetterCalls += 1
+        return Reflect.get(targetValue, key, receiver)
+      },
+      getOwnPropertyDescriptor(targetValue, key) {
+        descriptorCalls.set(key, (descriptorCalls.get(key) ?? 0) + 1)
+        return Reflect.getOwnPropertyDescriptor(targetValue, key)
+      }
+    })
+    harness.setConfirmation(confirmation)
+
+    await expect(harness.orchestrator.confirm(receipt.submissionId)).resolves.toEqual(target)
+
+    expect(dataGetterCalls).toBe(0)
+    expect(Object.fromEntries(descriptorCalls)).toEqual({
+      submissionId: 1,
+      txid: 1,
+      confirmations: 1,
+      blockHash: 1,
+      blockHeight: 1
+    })
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'confirmed' })
+  })
+
   test('requires positive safe integer confirmations during reconciliation without losing uncertainty', async () => {
     const harness = createHarness()
     const signedReview = await prepareAndSign(harness)
@@ -2151,6 +2249,37 @@ describe('TM1 regtest publication orchestrator', () => {
     if (state.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
     expect(state.uncertainty.txid).toBe(signedReview.txid)
     expect(harness.calls.broadcast).toBe(1)
+  })
+
+  test('rejects getter-backed confirmation results without invoking getters in reconcile', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.failBroadcast(new Error('timeout after dispatch'))
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'BROADCAST_FAILED'
+    )
+    const uncertain = harness.orchestrator.getState()
+    if (uncertain.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    let getterCalls = 0
+    const confirmation: Record<PropertyKey, unknown> = {
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: uncertain.uncertainty.txid
+    }
+    Object.defineProperty(confirmation, 'confirmations', {
+      enumerable: true,
+      get() {
+        getterCalls += 1
+        return 1
+      }
+    })
+    harness.setConfirmation(confirmation)
+
+    await expectCode(harness.orchestrator.reconcile(), 'CONFIRMATION_FAILED')
+
+    expect(getterCalls).toBe(0)
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'broadcastUncertain' })
   })
 
   test('classifies coded operation aborts during reconciliation without losing uncertainty', async () => {
