@@ -469,6 +469,88 @@ describe('TM1 regtest publication orchestrator', () => {
     }
   })
 
+  test('snapshots approved signing authorization before re-attestation awaits', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const mutableDecision = { status: 'approved' as const, authorizationId: 'auth-original' }
+    const attestation = harness.deferAttestation()
+    const observedAuthorizationIds: string[] = []
+    harness.setSigningDecision(mutableDecision)
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'revalidating' || state.status === 'signing') {
+        observedAuthorizationIds.push(state.signingAuthorizationId)
+      }
+      if (state.status === 'signedReviewReady') {
+        observedAuthorizationIds.push(state.signedReview.signingAuthorizationId)
+      }
+    })
+
+    const promise = harness.orchestrator.authorizeAndSign(review.preparedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(observedAuthorizationIds).toEqual(['auth-original'])
+    mutableDecision.authorizationId = 'auth-mutated'
+    attestation.resolve(undefined)
+
+    const signedReview = await promise
+    const state = harness.orchestrator.getState()
+    expect(observedAuthorizationIds).toEqual([
+      'auth-original',
+      'auth-original',
+      'auth-original'
+    ])
+    expect(observedAuthorizationIds).not.toContain('auth-mutated')
+    expect(signedReview.signingAuthorizationId).toBe('auth-original')
+    expect(state.status).toBe('signedReviewReady')
+    if (state.status !== 'signedReviewReady') throw new Error('expected signed review')
+    expect(state.signedReview.signingAuthorizationId).toBe('auth-original')
+  })
+
+  test('keeps signing authorization when provider mutates approved id to undefined', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const mutableDecision = { status: 'approved' as const, authorizationId: 'auth-original' }
+    const attestation = harness.deferAttestation()
+    harness.setSigningDecision(mutableDecision)
+
+    const promise = harness.orchestrator.authorizeAndSign(review.preparedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    ;(mutableDecision as { authorizationId?: string }).authorizationId = undefined
+    attestation.resolve(undefined)
+
+    const signedReview = await promise
+    const state = harness.orchestrator.getState()
+    expect(signedReview.signingAuthorizationId).toBe('auth-original')
+    expect(state.status).toBe('signedReviewReady')
+    if (state.status !== 'signedReviewReady') throw new Error('expected signed review')
+    expect(state.signedReview.signingAuthorizationId).toBe('auth-original')
+  })
+
+  test('keeps signing authorization stable during pending signing and later object reuse', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const mutableDecision = { status: 'approved' as const, authorizationId: 'auth-original' }
+    const signer = harness.deferSigner()
+    harness.setSigningDecision(mutableDecision)
+
+    const promise = harness.orchestrator.authorizeAndSign(review.preparedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.signer).toBe(1)
+    mutableDecision.authorizationId = 'auth-mutated-during-signing'
+    signer.resolve(signTm1Draft02RegtestCandidate({ candidate: review.candidate }))
+
+    const signedReview = await promise
+    expect(signedReview.signingAuthorizationId).toBe('auth-original')
+    mutableDecision.authorizationId = 'auth-reused-after-return'
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('signedReviewReady')
+    if (state.status !== 'signedReviewReady') throw new Error('expected signed review')
+    expect(state.signedReview.signingAuthorizationId).toBe('auth-original')
+  })
+
   test('does not broadcast before independent broadcast authorization', async () => {
     const harness = createHarness()
     const signedReview = await prepareAndSign(harness)
@@ -684,6 +766,77 @@ describe('TM1 regtest publication orchestrator', () => {
 
     await harness.orchestrator.prepare(DEFAULT_REQUEST)
     expect(observed).toEqual(['idle'])
+  })
+
+  test('does not add subscribers created during a transition to the active dispatch', async () => {
+    const harness = createHarness()
+    const attestation = harness.deferAttestation()
+    const events: string[] = []
+    let subscribedDuringTransition = false
+
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'attesting' || subscribedDuringTransition) return
+      events.push('A')
+      subscribedDuringTransition = true
+      harness.orchestrator.subscribe(next => {
+        if (next.status === 'attesting') events.push('B-immediate')
+      })
+      harness.orchestrator.subscribe(next => {
+        if (next.status === 'attesting') events.push('C-immediate')
+      })
+    })
+
+    const promise = harness.orchestrator.prepare(DEFAULT_REQUEST)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(events).toEqual(['A', 'B-immediate', 'C-immediate'])
+    attestation.resolve(undefined)
+    await promise
+    expect(events).toEqual(['A', 'B-immediate', 'C-immediate'])
+  })
+
+  test('notifies transition-start listener snapshot even when a listener unsubscribes another', async () => {
+    const harness = createHarness()
+    const attestation = harness.deferAttestation()
+    const events: string[] = []
+    let unsubscribeB: () => void = () => undefined
+
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'attesting') return
+      events.push('A-attesting')
+      unsubscribeB()
+    })
+    unsubscribeB = harness.orchestrator.subscribe(state => {
+      if (state.status === 'attesting' || state.status === 'preparing') {
+        events.push(`B-${state.status}`)
+      }
+    })
+
+    const promise = harness.orchestrator.prepare(DEFAULT_REQUEST)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(events).toEqual(['A-attesting', 'B-attesting'])
+    attestation.resolve(undefined)
+    await promise
+    expect(events).toEqual(['A-attesting', 'B-attesting'])
+  })
+
+  test('subscriber exceptions still isolate later listeners with transition listener snapshots', async () => {
+    const harness = createHarness()
+    const observed: string[] = []
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'attesting') throw new Error('listener A failed')
+    })
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'attesting') observed.push('B')
+    })
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'attesting') observed.push('C')
+    })
+
+    await harness.orchestrator.prepare(DEFAULT_REQUEST)
+
+    expect(observed).toEqual(['B', 'C'])
   })
 
   test('keeps prepare bounded to preview planning without authorization or transport', async () => {

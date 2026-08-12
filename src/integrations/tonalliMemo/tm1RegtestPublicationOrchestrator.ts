@@ -397,11 +397,13 @@ implements Tm1RegtestPublicationOrchestrator {
         )
       }
 
+      const signingAuthorizationId = decision.authorizationId
+
       assertNotAborted(signal)
       this.transition({
         status: 'revalidating',
         review,
-        signingAuthorizationId: decision.authorizationId
+        signingAuthorizationId
       })
       let freshNetwork: Tm1RegtestNetworkAttestation
       try {
@@ -440,7 +442,7 @@ implements Tm1RegtestPublicationOrchestrator {
       this.transition({
         status: 'signing',
         review,
-        signingAuthorizationId: decision.authorizationId
+        signingAuthorizationId
       })
       let signedArtifact: RegtestSignedTransaction
       try {
@@ -472,7 +474,7 @@ implements Tm1RegtestPublicationOrchestrator {
         feeSats: review.feeSats,
         orderedOutputs: review.orderedOutputs,
         bindingHash: review.bindingHash,
-        signingAuthorizationId: decision.authorizationId
+        signingAuthorizationId
       })
 
       this.transition({ status: 'signedReviewReady', review, signedReview })
@@ -753,7 +755,8 @@ implements Tm1RegtestPublicationOrchestrator {
   private transition(state: Tm1PublicationState): void {
     this.state = cloneState(state)
     // Subscriber failures are isolated from state transitions and later listeners.
-    for (const listener of this.listeners) this.notifyListener(listener, this.getState())
+    const listenersSnapshot = [...this.listeners]
+    for (const listener of listenersSnapshot) this.notifyListener(listener, this.getState())
   }
 
   private notifyListener(
