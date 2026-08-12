@@ -555,13 +555,26 @@ implements Tm1RegtestPublicationOrchestrator {
       })
       const transportArtifact = cloneSignedArtifact(signedReview.signedArtifact)
 
-      let deliveryReceipt: Tm1RegtestDeliveryReceipt
       try {
-        deliveryReceipt = await this.dependencies.deliveryTransport.broadcast(
+        const deliveryReceipt = await this.dependencies.deliveryTransport.broadcast(
           transportArtifact
         )
+        if (deliveryReceipt.txid !== signedReview.txid) {
+          throw new Tm1PublicationError('TXID_MISMATCH')
+        }
+        const receipt = freezeReceipt({
+          submissionId,
+          signedId: signedReview.signedId,
+          preparedId: signedReview.preparedId,
+          txid: signedReview.txid,
+          deliveryReceipt
+        })
+        this.transition({ status: 'submitted', signedReview, receipt })
+        return receipt
       } catch (error) {
-        const publicationError = new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', error)
+        const publicationError = error instanceof Tm1PublicationError
+          ? error
+          : new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', error)
         this.transition({
           status: 'broadcastUncertain',
           signedReview,
@@ -578,33 +591,6 @@ implements Tm1RegtestPublicationOrchestrator {
         })
         throw publicationError
       }
-      if (deliveryReceipt.txid !== signedReview.txid) {
-        const publicationError = new Tm1PublicationError('TXID_MISMATCH')
-        this.transition({
-          status: 'broadcastUncertain',
-          signedReview,
-          uncertainty: freezeUncertainty({
-            submissionId,
-            preparedId: signedReview.preparedId,
-            signedId: signedReview.signedId,
-            txid: signedReview.txid,
-            signedArtifact: signedReview.signedArtifact,
-            signedArtifactHash: signedReview.signedArtifactHash,
-            broadcastAuthorizationId,
-            error: publicationError
-          })
-        })
-        throw publicationError
-      }
-      const receipt = freezeReceipt({
-        submissionId,
-        signedId: signedReview.signedId,
-        preparedId: signedReview.preparedId,
-        txid: signedReview.txid,
-        deliveryReceipt
-      })
-      this.transition({ status: 'submitted', signedReview, receipt })
-      return receipt
     } catch (error) {
       throw this.enterFailureOrAbort(error)
     } finally {

@@ -308,6 +308,23 @@ async function expectCode(promise: Promise<unknown>, code: Tm1PublicationErrorCo
   )
 }
 
+function expectBroadcastUncertainEvidence(
+  harness: Harness,
+  signedReview: Tm1SignedReview
+): Extract<Tm1PublicationState, { status: 'broadcastUncertain' }> {
+  const state = harness.orchestrator.getState()
+  expect(state.status).toBe('broadcastUncertain')
+  if (state.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+  expect(state.uncertainty.preparedId).toBe(signedReview.preparedId)
+  expect(state.uncertainty.signedId).toBe(signedReview.signedId)
+  expect(state.uncertainty.txid).toBe(signedReview.txid)
+  expect(state.uncertainty.signedArtifact.txid).toBe(signedReview.txid)
+  expect(state.uncertainty.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+  expect(state.uncertainty.broadcastAuthorizationId).toBe('broadcast-auth-1')
+  expect(state.signedReview.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+  return state
+}
+
 const MUTATED_LOCKING_SCRIPT_HEX = '76a914111111111111111111111111111111111111111188ac'
 
 function statuses(states: readonly Tm1PublicationState[]): string[] {
@@ -952,12 +969,75 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'broadcastUncertain' })
   })
 
-  test('rejects a delivery txid mismatch', async () => {
+  test('moves txid accessor failures after transport resolution into broadcastUncertain and reconciles without rebroadcast', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.setBroadcastReceipt({
+      get txid(): string {
+        throw new Error('txid accessor failed')
+      },
+      disposition: 'accepted' as const
+    } as Tm1RegtestDeliveryReceipt)
+
+    await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'BROADCAST_FAILED')
+    expect(harness.calls.broadcast).toBe(1)
+    const uncertain = expectBroadcastUncertainEvidence(harness, signedReview)
+
+    harness.setConfirmation(Object.freeze({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: signedReview.txid,
+      confirmations: 1,
+      blockHash: 'dd'.repeat(32),
+      blockHeight: 102
+    }))
+    await expect(harness.orchestrator.reconcile()).resolves.toMatchObject({ txid: signedReview.txid })
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('confirmed')
+  })
+
+  test('moves disposition accessor failures after transport resolution into broadcastUncertain', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.setBroadcastReceipt({
+      txid: signedReview.txid,
+      get disposition(): 'accepted' {
+        throw new Error('disposition accessor failed')
+      }
+    } as Tm1RegtestDeliveryReceipt)
+
+    await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'BROADCAST_FAILED')
+    expect(harness.calls.broadcast).toBe(1)
+    expectBroadcastUncertainEvidence(harness, signedReview)
+  })
+
+  test('moves delivery receipt snapshot failures after transport resolution into broadcastUncertain', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const deliveryReceipt = {
+      txid: signedReview.txid,
+      disposition: 'accepted' as const
+    } as Tm1RegtestDeliveryReceipt & { metadata?: unknown }
+    Object.defineProperty(deliveryReceipt, 'metadata', {
+      enumerable: true,
+      get() {
+        throw new Error('receipt snapshot failed')
+      }
+    })
+    harness.setBroadcastReceipt(deliveryReceipt)
+
+    await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'BROADCAST_FAILED')
+    expect(harness.calls.broadcast).toBe(1)
+    expectBroadcastUncertainEvidence(harness, signedReview)
+  })
+
+  test('rejects a delivery txid mismatch as broadcastUncertain after dispatch', async () => {
     const harness = createHarness()
     const signedReview = await prepareAndSign(harness)
     harness.setBroadcastTxid('00'.repeat(32))
 
     await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'TXID_MISMATCH')
+    expect(harness.calls.broadcast).toBe(1)
+    expectBroadcastUncertainEvidence(harness, signedReview)
   })
 
   test('aborts before signing and invokes no signer', async () => {
