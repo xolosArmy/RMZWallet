@@ -85,7 +85,7 @@ function createHarness() {
   let ids = 0
   let utxos = cloneUtxos(fixtureUtxos())
   let chainIdentity = 'tm1-regtest-chain'
-  let attestationOverride: Tm1RegtestNetworkAttestation | null = null
+  let attestationOverride: unknown = null
   let signingDecision: unknown = Object.freeze({
     status: 'approved',
     authorizationId: 'sign-auth-1'
@@ -112,7 +112,7 @@ function createHarness() {
   let onSigningAuthorization: (() => void) | null = null
   let onBroadcastAuthorization: (() => void) | null = null
   let broadcastDeferred: Deferred<Tm1RegtestDeliveryReceipt> | null = null
-  let broadcastReceiptOverride: Tm1RegtestDeliveryReceipt | null = null
+  let broadcastReceiptOverride: unknown = null
   let broadcastMutator: ((artifact: RegtestSignedTransaction) => void) | null = null
   let lastBroadcastArtifact: RegtestSignedTransaction | null = null
   let attestDeferred: Deferred<void> | null = null
@@ -135,10 +135,10 @@ function createHarness() {
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (attestFailure) throw attestFailure
         if (attestDeferred) await attestDeferred.promise
-        return attestationOverride ?? Object.freeze({
+        return (attestationOverride ?? Object.freeze({
           environment: 'deterministic-regtest-fixture',
           chainIdentity
-        })
+        })) as Tm1RegtestNetworkAttestation
       }
     },
     utxoProvider: {
@@ -208,7 +208,7 @@ function createHarness() {
         broadcastMutator?.(signedArtifact)
         if (broadcastFailure) throw broadcastFailure
         if (broadcastDeferred) return broadcastDeferred.promise
-        if (broadcastReceiptOverride) return broadcastReceiptOverride
+        if (broadcastReceiptOverride) return broadcastReceiptOverride as Tm1RegtestDeliveryReceipt
         return Object.freeze({
           txid: broadcastTxidOverride ?? signedArtifact.txid,
           disposition: 'accepted' as const
@@ -244,7 +244,7 @@ function createHarness() {
     calls,
     setUtxos: (next: readonly Tm1Draft02FreshUtxo[]) => { utxos = cloneUtxos(next) },
     setChainIdentity: (next: string) => { chainIdentity = next },
-    setAttestation: (next: Tm1RegtestNetworkAttestation) => { attestationOverride = next },
+    setAttestation: (next: unknown) => { attestationOverride = next },
     setSigningDecision: (next: unknown) => { signingDecision = next },
     setBroadcastDecision: (next: unknown) => { broadcastDecision = next },
     failBroadcastAuthorization: (error: unknown) => { broadcastAuthorizationFailure = error },
@@ -257,7 +257,7 @@ function createHarness() {
     returnUncheckedAudit: (artifact: unknown) => { auditReturnUnchecked = artifact },
     failBroadcast: (error: unknown) => { broadcastFailure = error },
     setBroadcastTxid: (txid: string) => { broadcastTxidOverride = txid },
-    setBroadcastReceipt: (receipt: Tm1RegtestDeliveryReceipt) => { broadcastReceiptOverride = receipt },
+    setBroadcastReceipt: (receipt: unknown) => { broadcastReceiptOverride = receipt },
     setConfirmation: (confirmation: Tm1Confirmation) => { confirmationOverride = confirmation },
     failConfirmation: (error: unknown) => { confirmationFailure = error },
     onSigningAuthorization: (fn: () => void) => { onSigningAuthorization = fn },
@@ -739,6 +739,39 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(review.network).not.toBe(adapterAttestation)
   })
 
+  test.each([
+    ['a non-regtest environment', { environment: 'production-mainnet', chainIdentity: 'chain-A' }],
+    ['an invalid chain identity', { environment: 'deterministic-regtest-fixture', chainIdentity: ' chain-A ' }]
+  ])('rejects initial attestation with %s before reading UTXOs', async (_label, attestation) => {
+    const harness = createHarness()
+    harness.setAttestation(attestation)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(harness.calls.utxos).toBe(0)
+    expect(harness.calls.signer).toBe(0)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'attesting' })
+  })
+
+  test.each([
+    ['a non-regtest environment', { environment: 'production-mainnet', chainIdentity: 'chain-A' }],
+    ['an invalid chain identity', { environment: 'deterministic-regtest-fixture', chainIdentity: '' }]
+  ])('rejects signing re-attestation with %s before signing', async (_label, attestation) => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.setAttestation(attestation)
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'CANDIDATE_REVALIDATION_FAILED'
+    )
+
+    expect(harness.calls.signer).toBe(0)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'revalidating' })
+  })
+
   test('snapshots the publication request before pending attestation resolves', async () => {
     const harness = createHarness()
     const attestation = harness.deferAttestation()
@@ -1103,6 +1136,20 @@ describe('TM1 regtest publication orchestrator', () => {
     } as Tm1RegtestDeliveryReceipt)
 
     await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'BROADCAST_FAILED')
+    expect(harness.calls.broadcast).toBe(1)
+    expectBroadcastUncertainEvidence(harness, signedReview)
+  })
+
+  test('rejects a non-accepted transport disposition as broadcastUncertain', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.setBroadcastReceipt({
+      txid: signedReview.txid,
+      disposition: 'rejected'
+    })
+
+    await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'BROADCAST_FAILED')
+
     expect(harness.calls.broadcast).toBe(1)
     expectBroadcastUncertainEvidence(harness, signedReview)
   })

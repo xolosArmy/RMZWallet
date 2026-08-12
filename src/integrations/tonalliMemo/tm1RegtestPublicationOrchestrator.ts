@@ -294,7 +294,7 @@ implements Tm1RegtestPublicationOrchestrator {
       this.transition({ status: 'attesting', message: requestSnapshot.message })
       const attestationResult = await this.dependencies.networkAttestation.attest(signal)
       assertNotAborted(signal)
-      const network = freezeNetwork(attestationResult)
+      const network = snapshotNetworkAttestation(attestationResult)
       this.transition({ status: 'preparing', message: requestSnapshot.message, network })
 
       const utxos = await this.dependencies.utxoProvider.readUtxos(signal)
@@ -410,7 +410,9 @@ implements Tm1RegtestPublicationOrchestrator {
       })
       let freshNetwork: Tm1RegtestNetworkAttestation
       try {
-        freshNetwork = await this.dependencies.networkAttestation.attest(signal)
+        const attestationResult = await this.dependencies.networkAttestation.attest(signal)
+        assertNotAborted(signal)
+        freshNetwork = snapshotNetworkAttestation(attestationResult)
       } catch (error) {
         if (isAbortLike(error)) throw error
         throw new Tm1PublicationError(
@@ -419,7 +421,6 @@ implements Tm1RegtestPublicationOrchestrator {
           error
         )
       }
-      assertNotAborted(signal)
       if (
         freshNetwork.environment !== review.network.environment ||
         freshNetwork.chainIdentity !== review.network.chainIdentity
@@ -545,12 +546,13 @@ implements Tm1RegtestPublicationOrchestrator {
       const transportArtifact = cloneSignedArtifact(signedReview.signedArtifact)
 
       try {
-        const deliveryReceipt = await this.dependencies.deliveryTransport.broadcast(
+        const deliveryReceiptResult = await this.dependencies.deliveryTransport.broadcast(
           transportArtifact
         )
-        if (deliveryReceipt.txid !== signedReview.txid) {
-          throw new Tm1PublicationError('TXID_MISMATCH')
-        }
+        const deliveryReceipt = snapshotValidatedDeliveryReceipt(
+          deliveryReceiptResult,
+          signedReview.txid
+        )
         const receipt = freezeReceipt({
           submissionId,
           signedId: signedReview.signedId,
@@ -886,6 +888,40 @@ function readOptionalString(value: unknown, key: PropertyKey): string | undefine
     throw new Error(`Invalid optional string property: ${String(key)}`)
   }
   return descriptor.value
+}
+
+function snapshotNetworkAttestation(value: unknown): Tm1RegtestNetworkAttestation {
+  const environment = readRequiredOwnDataProperty(value, 'environment')
+  const chainIdentity = readRequiredOwnDataProperty(value, 'chainIdentity')
+  if (
+    environment !== TM1_DRAFT_02_CANDIDATE_ENVIRONMENT ||
+    typeof chainIdentity !== 'string' ||
+    chainIdentity.length === 0 ||
+    chainIdentity.trim() !== chainIdentity
+  ) {
+    throw new Error('Invalid regtest network attestation')
+  }
+  return Object.freeze({ environment, chainIdentity })
+}
+
+function snapshotValidatedDeliveryReceipt(
+  value: unknown,
+  expectedTxid: string
+): Tm1RegtestDeliveryReceipt {
+  if (value === null || typeof value !== 'object') {
+    throw new Tm1PublicationError('BROADCAST_FAILED')
+  }
+  // Snapshot the current receipt shape while still inside the post-dispatch
+  // uncertainty boundary. Any hostile accessor therefore preserves evidence.
+  const snapshot = Object.freeze({ ...value }) as Record<PropertyKey, unknown>
+  const txid = snapshot.txid
+  const disposition = snapshot.disposition
+  if (typeof txid !== 'string' || !/^[0-9a-f]{64}$/.test(txid)) {
+    throw new Tm1PublicationError('BROADCAST_FAILED')
+  }
+  if (txid !== expectedTxid) throw new Tm1PublicationError('TXID_MISMATCH')
+  if (disposition !== 'accepted') throw new Tm1PublicationError('BROADCAST_FAILED')
+  return Object.freeze({ txid, disposition })
 }
 
 function rejectedState(
