@@ -289,17 +289,19 @@ implements Tm1RegtestPublicationOrchestrator {
     request: Tm1PublicationRequest,
     signal?: AbortSignal
   ): Promise<Tm1PreparedReview> {
-    const requestSnapshot = freezePublicationRequest(request)
     this.beginOperation('prepare')
 
     try {
+      const requestSnapshot = freezePublicationRequest(request)
       if (this.state.status !== 'idle') throw new Tm1PublicationError('INVALID_STATE')
       assertNotAborted(signal)
       this.transition({ status: 'attesting', message: requestSnapshot.message })
+      assertNotAborted(signal)
       const attestationResult = await this.dependencies.networkAttestation.attest(signal)
       assertNotAborted(signal)
       const network = snapshotNetworkAttestation(attestationResult)
       this.transition({ status: 'preparing', message: requestSnapshot.message, network })
+      assertNotAborted(signal)
 
       const utxos = await this.dependencies.utxoProvider.readUtxos(signal)
       assertNotAborted(signal)
@@ -380,6 +382,7 @@ implements Tm1RegtestPublicationOrchestrator {
 
       assertNotAborted(signal)
       this.transition({ status: 'authorizing', review })
+      assertNotAborted(signal)
       let decision: Tm1PublicationAuthorizationDecision
       try {
         const authorizationResult = await this.dependencies.signingAuthorization.requestSigningAuthorization(
@@ -412,6 +415,7 @@ implements Tm1RegtestPublicationOrchestrator {
         review,
         signingAuthorizationId
       })
+      assertNotAborted(signal)
       let freshNetwork: Tm1RegtestNetworkAttestation
       try {
         const attestationResult = await this.dependencies.networkAttestation.attest(signal)
@@ -452,6 +456,7 @@ implements Tm1RegtestPublicationOrchestrator {
         review,
         signingAuthorizationId
       })
+      assertNotAborted(signal)
       let signedArtifact: RegtestSignedTransaction
       try {
         signedArtifact = await this.dependencies.signer.sign(
@@ -504,6 +509,7 @@ implements Tm1RegtestPublicationOrchestrator {
 
       assertNotAborted(signal)
       this.transition({ status: 'approvingBroadcast', signedReview })
+      assertNotAborted(signal)
       let decision: Tm1BroadcastAuthorizationDecision
       try {
         const authorizationResult = await this.dependencies.broadcastAuthorization.requestBroadcastAuthorization(
@@ -604,6 +610,7 @@ implements Tm1RegtestPublicationOrchestrator {
 
       assertNotAborted(signal)
       this.transition({ status: 'reconciling', signedReview, uncertainty })
+      assertNotAborted(signal)
       const confirmationResult: unknown = await this.dependencies.confirmationObserver.confirm({
         submissionId: uncertainty.submissionId,
         txid: uncertainty.txid,
@@ -654,6 +661,7 @@ implements Tm1RegtestPublicationOrchestrator {
 
       assertNotAborted(signal)
       this.transition({ status: 'confirming', receipt })
+      assertNotAborted(signal)
       const confirmationResult: unknown = await this.dependencies.confirmationObserver.confirm({
         submissionId,
         txid: receipt.txid,

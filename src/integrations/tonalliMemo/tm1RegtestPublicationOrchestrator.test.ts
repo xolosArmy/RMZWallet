@@ -832,6 +832,68 @@ describe('TM1 regtest publication orchestrator', () => {
     ])
   })
 
+  test('acquires the prepare guard before reading reentrant request getters', async () => {
+    const harness = createHarness()
+    let reentrantPrepare: Promise<unknown> | null = null
+    const request = Object.defineProperties({}, {
+      message: {
+        enumerable: true,
+        get() {
+          reentrantPrepare = harness.orchestrator.prepare({
+            ...DEFAULT_REQUEST,
+            message: 'getter-injected publication'
+          })
+          return DEFAULT_REQUEST.message
+        }
+      },
+      activeLockingScriptHex: {
+        enumerable: true,
+        value: DEFAULT_REQUEST.activeLockingScriptHex
+      },
+      maxFeeSats: {
+        enumerable: true,
+        value: DEFAULT_REQUEST.maxFeeSats
+      }
+    }) as Tm1PublicationRequest
+
+    const review = await harness.orchestrator.prepare(request)
+
+    if (reentrantPrepare === null) throw new Error('expected reentrant prepare')
+    await expectCode(reentrantPrepare, 'PUBLICATION_ALREADY_ACTIVE')
+    expect(review.message).toBe(DEFAULT_REQUEST.message)
+    expect(harness.calls.attest).toBe(1)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'reviewReady',
+      review: { preparedId: review.preparedId }
+    })
+  })
+
+  test('releases the prepare guard when request snapshotting fails', async () => {
+    const harness = createHarness()
+    const request = Object.defineProperties({}, {
+      message: {
+        enumerable: true,
+        get() {
+          throw new Error('hostile request getter')
+        }
+      },
+      activeLockingScriptHex: {
+        enumerable: true,
+        value: DEFAULT_REQUEST.activeLockingScriptHex
+      }
+    }) as Tm1PublicationRequest
+
+    await expectCode(harness.orchestrator.prepare(request), 'PREPARATION_FAILED')
+
+    expect(harness.calls.attest).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed' })
+    harness.orchestrator.reset()
+    await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
+      message: DEFAULT_REQUEST.message
+    })
+    expect(harness.calls.attest).toBe(1)
+  })
+
   test('snapshots the publication request before pending UTXO reads resolve', async () => {
     const harness = createHarness()
     const utxoRead = harness.deferUtxos()
@@ -2525,6 +2587,28 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.calls.audit).toBe(0)
     expect(harness.calls.broadcast).toBe(0)
     expect(harness.orchestrator.getState().status).toBe('aborted')
+  })
+
+  test('honors a synchronous signing subscriber abort before invoking the signer', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const controller = new AbortController()
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'signing') controller.abort()
+    })
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId, controller.signal),
+      'ABORTED'
+    )
+
+    expect(harness.calls.signer).toBe(0)
+    expect(harness.calls.audit).toBe(0)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'aborted',
+      stage: 'signing'
+    })
   })
 
   test('aborts after signed artifact audit resolves when auditor ignored the signal', async () => {
