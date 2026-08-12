@@ -291,8 +291,9 @@ implements Tm1RegtestPublicationOrchestrator {
       if (this.state.status !== 'idle') throw new Tm1PublicationError('INVALID_STATE')
       assertNotAborted(signal)
       this.transition({ status: 'attesting', message: request.message })
-      const network = await this.dependencies.networkAttestation.attest(signal)
+      const attestationResult = await this.dependencies.networkAttestation.attest(signal)
       assertNotAborted(signal)
+      const network = freezeNetwork(attestationResult)
       this.transition({ status: 'preparing', message: request.message, network })
 
       const utxos = await this.dependencies.utxoProvider.readUtxos(signal)
@@ -526,6 +527,7 @@ implements Tm1RegtestPublicationOrchestrator {
         this.transition(rejectedState('broadcast', 'BROADCAST_REJECTED'))
         throw new Tm1PublicationError('BROADCAST_REJECTED', 'BROADCAST_REJECTED')
       }
+      const broadcastAuthorizationId = decision.authorizationId
 
       let auditedArtifact: RegtestSignedTransaction
       try {
@@ -548,7 +550,7 @@ implements Tm1RegtestPublicationOrchestrator {
       this.transition({
         status: 'broadcasting',
         signedReview,
-        broadcastAuthorizationId: decision.authorizationId
+        broadcastAuthorizationId
       })
       const transportArtifact = cloneSignedArtifact(signedReview.signedArtifact)
 
@@ -569,7 +571,7 @@ implements Tm1RegtestPublicationOrchestrator {
             txid: signedReview.txid,
             signedArtifact: signedReview.signedArtifact,
             signedArtifactHash: signedReview.signedArtifactHash,
-            broadcastAuthorizationId: decision.authorizationId,
+            broadcastAuthorizationId,
             error: publicationError
           })
         })
@@ -587,13 +589,13 @@ implements Tm1RegtestPublicationOrchestrator {
             txid: signedReview.txid,
             signedArtifact: signedReview.signedArtifact,
             signedArtifactHash: signedReview.signedArtifactHash,
-            broadcastAuthorizationId: decision.authorizationId,
+            broadcastAuthorizationId,
             error: publicationError
           })
         })
         throw publicationError
       }
-      const receipt = Object.freeze({
+      const receipt = freezeReceipt({
         submissionId,
         signedId: signedReview.signedId,
         preparedId: signedReview.preparedId,

@@ -10,7 +10,11 @@ import {
   signTm1Draft02RegtestCandidate,
   type RegtestSignedTransaction
 } from './tm1Draft02RegtestP2pkhSigner'
-import { Tm1InMemoryDeliveryTransport } from './tm1RegtestDeliveryTransport'
+import {
+  Tm1InMemoryDeliveryTransport,
+  type Tm1RegtestDeliveryReceipt,
+  type Tm1RegtestNetworkAttestation
+} from './tm1RegtestDeliveryTransport'
 import {
   Tm1PublicationError,
   Tm1RegtestPublicationOrchestratorImpl,
@@ -78,6 +82,7 @@ function createHarness() {
   let ids = 0
   let utxos = cloneUtxos(fixtureUtxos())
   let chainIdentity = 'tm1-regtest-chain'
+  let attestationOverride: Tm1RegtestNetworkAttestation | null = null
   let signingDecision: Tm1PublicationAuthorizationDecision = Object.freeze({
     status: 'approved',
     authorizationId: 'sign-auth-1'
@@ -100,9 +105,11 @@ function createHarness() {
   let confirmationDeferred: Deferred<Tm1Confirmation> | null = null
   let signerDeferred: Deferred<RegtestSignedTransaction> | null = null
   let auditDeferred: Deferred<RegtestSignedTransaction> | null = null
+  let utxoDeferred: Deferred<readonly Tm1Draft02FreshUtxo[]> | null = null
   let onSigningAuthorization: (() => void) | null = null
   let onBroadcastAuthorization: (() => void) | null = null
-  let broadcastDeferred: Deferred<Readonly<{ txid: string; disposition: 'accepted' }>> | null = null
+  let broadcastDeferred: Deferred<Tm1RegtestDeliveryReceipt> | null = null
+  let broadcastReceiptOverride: Tm1RegtestDeliveryReceipt | null = null
   let broadcastMutator: ((artifact: RegtestSignedTransaction) => void) | null = null
   let lastBroadcastArtifact: RegtestSignedTransaction | null = null
   let attestDeferred: Deferred<void> | null = null
@@ -125,7 +132,7 @@ function createHarness() {
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (attestFailure) throw attestFailure
         if (attestDeferred) await attestDeferred.promise
-        return Object.freeze({
+        return attestationOverride ?? Object.freeze({
           environment: 'deterministic-regtest-fixture',
           chainIdentity
         })
@@ -136,6 +143,7 @@ function createHarness() {
         calls.utxos += 1
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (utxoFailure) throw utxoFailure
+        if (utxoDeferred) return utxoDeferred.promise
         return Object.freeze(cloneUtxos(utxos))
       }
     },
@@ -195,6 +203,7 @@ function createHarness() {
         broadcastMutator?.(signedArtifact)
         if (broadcastFailure) throw broadcastFailure
         if (broadcastDeferred) return broadcastDeferred.promise
+        if (broadcastReceiptOverride) return broadcastReceiptOverride
         return Object.freeze({
           txid: broadcastTxidOverride ?? signedArtifact.txid,
           disposition: 'accepted' as const
@@ -230,6 +239,7 @@ function createHarness() {
     calls,
     setUtxos: (next: readonly Tm1Draft02FreshUtxo[]) => { utxos = cloneUtxos(next) },
     setChainIdentity: (next: string) => { chainIdentity = next },
+    setAttestation: (next: Tm1RegtestNetworkAttestation) => { attestationOverride = next },
     setSigningDecision: (next: Tm1PublicationAuthorizationDecision) => { signingDecision = next },
     setBroadcastDecision: (next: Tm1BroadcastAuthorizationDecision) => { broadcastDecision = next },
     failBroadcastAuthorization: (error: unknown) => { broadcastAuthorizationFailure = error },
@@ -242,12 +252,13 @@ function createHarness() {
     returnUncheckedAudit: (artifact: RegtestSignedTransaction) => { auditReturnUnchecked = artifact },
     failBroadcast: (error: unknown) => { broadcastFailure = error },
     setBroadcastTxid: (txid: string) => { broadcastTxidOverride = txid },
+    setBroadcastReceipt: (receipt: Tm1RegtestDeliveryReceipt) => { broadcastReceiptOverride = receipt },
     setConfirmation: (confirmation: Tm1Confirmation) => { confirmationOverride = confirmation },
     failConfirmation: (error: unknown) => { confirmationFailure = error },
     onSigningAuthorization: (fn: () => void) => { onSigningAuthorization = fn },
     onBroadcastAuthorization: (fn: () => void) => { onBroadcastAuthorization = fn },
     deferBroadcast: () => {
-      broadcastDeferred = createDeferred<Readonly<{ txid: string; disposition: 'accepted' }>>()
+      broadcastDeferred = createDeferred<Tm1RegtestDeliveryReceipt>()
       return broadcastDeferred
     },
     deferBroadcastAuthorization: () => {
@@ -272,6 +283,10 @@ function createHarness() {
     deferAttestation: () => {
       attestDeferred = createDeferred<void>()
       return attestDeferred
+    },
+    deferUtxos: () => {
+      utxoDeferred = createDeferred<readonly Tm1Draft02FreshUtxo[]>()
+      return utxoDeferred
     }
   }
 }
@@ -551,6 +566,81 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(state.signedReview.signingAuthorizationId).toBe('auth-original')
   })
 
+  test('snapshots the initial network attestation before pending UTXO reads', async () => {
+    const harness = createHarness()
+    const adapterAttestation: Tm1RegtestNetworkAttestation = {
+      environment: 'deterministic-regtest-fixture',
+      chainIdentity: 'chain-A'
+    }
+    const utxoRead = harness.deferUtxos()
+    const observedNetworks: Tm1RegtestNetworkAttestation[] = []
+    harness.setAttestation(adapterAttestation)
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'preparing') observedNetworks.push(state.network)
+      if (state.status === 'reviewReady') observedNetworks.push(state.review.network)
+    })
+
+    const promise = harness.orchestrator.prepare(DEFAULT_REQUEST)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(observedNetworks).toHaveLength(1)
+    expect(observedNetworks[0].chainIdentity).toBe('chain-A')
+    ;(adapterAttestation as { chainIdentity: string }).chainIdentity = 'chain-B'
+    utxoRead.resolve(fixtureUtxos())
+
+    const review = await promise
+    const state = harness.orchestrator.getState()
+    expect(review.network.chainIdentity).toBe('chain-A')
+    expect(state.status).toBe('reviewReady')
+    if (state.status !== 'reviewReady') throw new Error('expected review')
+    expect(state.review.network.chainIdentity).toBe('chain-A')
+    expect(observedNetworks.map(network => network.chainIdentity)).toEqual(['chain-A', 'chain-A'])
+    expect(review.network).not.toBe(adapterAttestation)
+    expect(state.review.network).not.toBe(adapterAttestation)
+  })
+
+  test('keeps individual network identity fields stable after the attestation await', async () => {
+    const harness = createHarness()
+    const adapterAttestation: Tm1RegtestNetworkAttestation = {
+      environment: 'deterministic-regtest-fixture',
+      chainIdentity: 'chain-A'
+    }
+    const utxoRead = harness.deferUtxos()
+    harness.setAttestation(adapterAttestation)
+
+    const promise = harness.orchestrator.prepare(DEFAULT_REQUEST)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    ;(adapterAttestation as { environment: string }).environment = 'mutated-environment'
+    ;(adapterAttestation as { chainIdentity: string }).chainIdentity = 'chain-B'
+    utxoRead.resolve(fixtureUtxos())
+
+    const review = await promise
+    expect(review.network).toEqual({
+      environment: 'deterministic-regtest-fixture',
+      chainIdentity: 'chain-A'
+    })
+  })
+
+  test('keeps prepared reviews isolated when the attestation adapter reuses an object', async () => {
+    const harness = createHarness()
+    const adapterAttestation: Tm1RegtestNetworkAttestation = {
+      environment: 'deterministic-regtest-fixture',
+      chainIdentity: 'chain-A'
+    }
+    harness.setAttestation(adapterAttestation)
+
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    ;(adapterAttestation as { chainIdentity: string }).chainIdentity = 'chain-B'
+
+    const state = harness.orchestrator.getState()
+    expect(review.network.chainIdentity).toBe('chain-A')
+    expect(state.status).toBe('reviewReady')
+    if (state.status !== 'reviewReady') throw new Error('expected review')
+    expect(state.review.network.chainIdentity).toBe('chain-A')
+    expect(review.network).not.toBe(adapterAttestation)
+  })
+
   test('does not broadcast before independent broadcast authorization', async () => {
     const harness = createHarness()
     const signedReview = await prepareAndSign(harness)
@@ -618,6 +708,120 @@ describe('TM1 regtest publication orchestrator', () => {
 
   test('aborts when broadcast authorization resolves expired after abort', async () => {
     await expectLateBroadcastAuthorizationAbort('expired')
+  })
+
+  test('snapshots approved broadcast authorization before artifact audit awaits', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const mutableDecision = {
+      status: 'approved' as const,
+      authorizationId: 'broadcast-auth-original',
+      signedId: signedReview.signedId,
+      txid: signedReview.txid,
+      signedArtifactHash: signedReview.signedArtifactHash
+    }
+    const audit = harness.deferAudit()
+    const observedAuthorizationIds: string[] = []
+    harness.setBroadcastDecision(mutableDecision)
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'broadcasting') observedAuthorizationIds.push(state.broadcastAuthorizationId)
+    })
+
+    const promise = harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.audit).toBe(2)
+    mutableDecision.authorizationId = 'broadcast-auth-mutated'
+    audit.resolve(signedReview.signedArtifact)
+
+    const receipt = await promise
+    const state = harness.orchestrator.getState()
+    expect(receipt.txid).toBe(signedReview.txid)
+    expect(state.status).toBe('submitted')
+    expect(observedAuthorizationIds[0]).toBe('broadcast-auth-original')
+    expect(observedAuthorizationIds).not.toContain('broadcast-auth-mutated')
+  })
+
+  test('keeps broadcast authorization when provider mutates approved id to undefined', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const mutableDecision = {
+      status: 'approved' as const,
+      authorizationId: 'broadcast-auth-original',
+      signedId: signedReview.signedId,
+      txid: signedReview.txid,
+      signedArtifactHash: signedReview.signedArtifactHash
+    }
+    const audit = harness.deferAudit()
+    const observedAuthorizationIds: string[] = []
+    harness.setBroadcastDecision(mutableDecision)
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'broadcasting') observedAuthorizationIds.push(state.broadcastAuthorizationId)
+    })
+
+    const promise = harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    ;(mutableDecision as { authorizationId?: string }).authorizationId = undefined
+    audit.resolve(signedReview.signedArtifact)
+
+    await expect(promise).resolves.toMatchObject({ txid: signedReview.txid })
+    expect(observedAuthorizationIds).toEqual(['broadcast-auth-original'])
+  })
+
+  test('keeps original broadcast authorization id in broadcastUncertain after post-dispatch failure', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const mutableDecision = {
+      status: 'approved' as const,
+      authorizationId: 'broadcast-auth-original',
+      signedId: signedReview.signedId,
+      txid: signedReview.txid,
+      signedArtifactHash: signedReview.signedArtifactHash
+    }
+    const broadcast = harness.deferBroadcast()
+    harness.setBroadcastDecision(mutableDecision)
+
+    const promise = harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.broadcast).toBe(1)
+    mutableDecision.authorizationId = 'broadcast-auth-mutated'
+    broadcast.reject(new Error('transport uncertain after dispatch'))
+
+    await expectCode(promise, 'BROADCAST_FAILED')
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('broadcastUncertain')
+    if (state.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    expect(state.uncertainty.broadcastAuthorizationId).toBe('broadcast-auth-original')
+    expect(state.uncertainty.broadcastAuthorizationId).not.toBe('broadcast-auth-mutated')
+  })
+
+  test('keeps broadcast authorization stable when provider reuses the decision object', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const mutableDecision = {
+      status: 'approved' as const,
+      authorizationId: 'broadcast-auth-original',
+      signedId: signedReview.signedId,
+      txid: signedReview.txid,
+      signedArtifactHash: signedReview.signedArtifactHash
+    }
+    const broadcast = harness.deferBroadcast()
+    harness.setBroadcastDecision(mutableDecision)
+
+    const promise = harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    mutableDecision.authorizationId = 'broadcast-auth-reused'
+    broadcast.resolve(Object.freeze({ txid: signedReview.txid, disposition: 'accepted' as const }))
+
+    const receipt = await promise
+    expect(receipt.txid).toBe(signedReview.txid)
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('submitted')
+    if (state.status !== 'submitted') throw new Error('expected submitted')
+    expect(state.receipt.txid).toBe(signedReview.txid)
   })
 
   test('maps delivery transport failures to BROADCAST_FAILED', async () => {
@@ -1190,6 +1394,89 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(state.receipt.txid).toBe(signedReview.txid)
     expect(state.receipt.deliveryReceipt.txid).toBe(signedReview.txid)
     expect(harness.calls.broadcast).toBe(1)
+  })
+
+  test('snapshots delivery receipt before storing and returning it', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const transportReceipt: Tm1RegtestDeliveryReceipt = {
+      txid: signedReview.txid,
+      disposition: 'accepted'
+    }
+    harness.setBroadcastReceipt(transportReceipt)
+
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    const submitted = harness.orchestrator.getState()
+
+    expect(submitted.status).toBe('submitted')
+    if (submitted.status !== 'submitted') throw new Error('expected submitted')
+    expect(receipt.deliveryReceipt).not.toBe(transportReceipt)
+    expect(submitted.receipt.deliveryReceipt).not.toBe(transportReceipt)
+    expect(Object.isFrozen(receipt.deliveryReceipt)).toBe(true)
+    expect(receipt.deliveryReceipt.txid).toBe(signedReview.txid)
+    expect(submitted.receipt.deliveryReceipt.txid).toBe(signedReview.txid)
+
+    ;(transportReceipt as { txid: string }).txid = '00'.repeat(32)
+    ;(transportReceipt as { disposition: 'accepted' }).disposition = 'accepted'
+
+    const afterMutation = harness.orchestrator.getState()
+    expect(receipt.txid).toBe(signedReview.txid)
+    expect(receipt.deliveryReceipt.txid).toBe(signedReview.txid)
+    expect(receipt.deliveryReceipt.disposition).toBe('accepted')
+    expect(afterMutation.status).toBe('submitted')
+    if (afterMutation.status !== 'submitted') throw new Error('expected submitted')
+    expect(afterMutation.receipt.txid).toBe(signedReview.txid)
+    expect(afterMutation.receipt.deliveryReceipt.txid).toBe(signedReview.txid)
+    expect(afterMutation.receipt.deliveryReceipt.disposition).toBe('accepted')
+  })
+
+  test('caller mutation of returned delivery receipt cannot affect submitted state', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    expect(() => {
+      (receipt.deliveryReceipt as { txid: string }).txid = '00'.repeat(32)
+    }).toThrow(TypeError)
+    expect(() => {
+      (receipt as { txid: string }).txid = '11'.repeat(32)
+    }).toThrow(TypeError)
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('submitted')
+    if (state.status !== 'submitted') throw new Error('expected submitted')
+    expect(state.receipt.txid).toBe(signedReview.txid)
+    expect(state.receipt.deliveryReceipt.txid).toBe(signedReview.txid)
+  })
+
+  test('isolates submitted receipt delivery receipts between subscribers', async () => {
+    const harness = createHarness()
+    const listenerReceipts: Tm1RegtestDeliveryReceipt[] = []
+
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'submitted') return
+      listenerReceipts.push(state.receipt.deliveryReceipt)
+      try {
+        ;(state.receipt.deliveryReceipt as { txid: string }).txid = '00'.repeat(32)
+      } catch {
+        // The mutation attempt is the assertion; subscriber exceptions must remain isolated.
+      }
+    })
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'submitted') return
+      listenerReceipts.push(state.receipt.deliveryReceipt)
+    })
+
+    const signedReview = await prepareAndSign(harness)
+    await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    expect(listenerReceipts).toHaveLength(2)
+    expect(listenerReceipts[0]).not.toBe(listenerReceipts[1])
+    expect(listenerReceipts[1].txid).toBe(signedReview.txid)
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('submitted')
+    if (state.status !== 'submitted') throw new Error('expected submitted')
+    expect(state.receipt.deliveryReceipt.txid).toBe(signedReview.txid)
   })
 
   test('returned snapshots are defensively isolated from mutation attempts', async () => {
