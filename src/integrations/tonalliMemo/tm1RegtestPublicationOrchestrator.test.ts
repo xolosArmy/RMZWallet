@@ -32,6 +32,7 @@ import {
 
 const TXID_A = 'aa'.repeat(32)
 const TXID_B = 'bb'.repeat(32)
+const NO_AUDIT_OVERRIDE = Symbol('NO_AUDIT_OVERRIDE')
 const DEFAULT_REQUEST: Tm1PublicationRequest = Object.freeze({
   message: 'TM1 orchestrator regtest publication',
   activeLockingScriptHex: TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
@@ -85,11 +86,11 @@ function createHarness() {
   let utxos = cloneUtxos(fixtureUtxos())
   let chainIdentity = 'tm1-regtest-chain'
   let attestationOverride: Tm1RegtestNetworkAttestation | null = null
-  let signingDecision: Tm1PublicationAuthorizationDecision = Object.freeze({
+  let signingDecision: unknown = Object.freeze({
     status: 'approved',
     authorizationId: 'sign-auth-1'
   })
-  let broadcastDecision: Tm1BroadcastAuthorizationDecision | null = null
+  let broadcastDecision: unknown = null
   let broadcastAuthorizationFailure: unknown = null
   let broadcastAuthorizationDeferred: Deferred<Tm1BroadcastAuthorizationDecision> | null = null
   let signingAuthorizationFailure: unknown = null
@@ -98,7 +99,7 @@ function createHarness() {
   let signerFailure: unknown = null
   let auditFailure: unknown = null
   let auditMutator: ((artifact: RegtestSignedTransaction) => RegtestSignedTransaction) | null = null
-  let auditReturnUnchecked: RegtestSignedTransaction | null = null
+  let auditReturnUnchecked: unknown = NO_AUDIT_OVERRIDE
   const auditArtifacts: RegtestSignedTransaction[] = []
   let broadcastFailure: unknown = null
   let broadcastTxidOverride: string | null = null
@@ -155,7 +156,7 @@ function createHarness() {
         onSigningAuthorization?.()
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (signingAuthorizationFailure) throw signingAuthorizationFailure
-        return signingDecision
+        return signingDecision as Tm1PublicationAuthorizationDecision
       }
     },
     signer: {
@@ -173,7 +174,9 @@ function createHarness() {
         auditArtifacts.push(signedArtifact)
         if (auditFailure) throw auditFailure
         if (auditDeferred) return auditDeferred.promise
-        if (auditReturnUnchecked) return auditReturnUnchecked
+        if (auditReturnUnchecked !== NO_AUDIT_OVERRIDE) {
+          return auditReturnUnchecked as RegtestSignedTransaction
+        }
         const audited = auditMutator ? auditMutator(signedArtifact) : signedArtifact
         await new Tm1InMemoryDeliveryTransport().submit(audited)
         return Object.freeze({
@@ -189,13 +192,13 @@ function createHarness() {
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (broadcastAuthorizationFailure) throw broadcastAuthorizationFailure
         if (broadcastAuthorizationDeferred) return broadcastAuthorizationDeferred.promise
-        return broadcastDecision ?? Object.freeze({
+        return (broadcastDecision ?? Object.freeze({
           status: 'approved' as const,
           authorizationId: 'broadcast-auth-1',
           signedId: signedReview.signedId,
           txid: signedReview.txid,
           signedArtifactHash: signedReview.signedArtifactHash
-        })
+        })) as Tm1BroadcastAuthorizationDecision
       }
     },
     deliveryTransport: {
@@ -242,8 +245,8 @@ function createHarness() {
     setUtxos: (next: readonly Tm1Draft02FreshUtxo[]) => { utxos = cloneUtxos(next) },
     setChainIdentity: (next: string) => { chainIdentity = next },
     setAttestation: (next: Tm1RegtestNetworkAttestation) => { attestationOverride = next },
-    setSigningDecision: (next: Tm1PublicationAuthorizationDecision) => { signingDecision = next },
-    setBroadcastDecision: (next: Tm1BroadcastAuthorizationDecision) => { broadcastDecision = next },
+    setSigningDecision: (next: unknown) => { signingDecision = next },
+    setBroadcastDecision: (next: unknown) => { broadcastDecision = next },
     failBroadcastAuthorization: (error: unknown) => { broadcastAuthorizationFailure = error },
     failSigningAuthorization: (error: unknown) => { signingAuthorizationFailure = error },
     failAttestation: (error: unknown) => { attestFailure = error },
@@ -251,7 +254,7 @@ function createHarness() {
     failSigner: (error: unknown) => { signerFailure = error },
     failAudit: (error: unknown) => { auditFailure = error },
     mutateAudit: (fn: (artifact: RegtestSignedTransaction) => RegtestSignedTransaction) => { auditMutator = fn },
-    returnUncheckedAudit: (artifact: RegtestSignedTransaction) => { auditReturnUnchecked = artifact },
+    returnUncheckedAudit: (artifact: unknown) => { auditReturnUnchecked = artifact },
     failBroadcast: (error: unknown) => { broadcastFailure = error },
     setBroadcastTxid: (txid: string) => { broadcastTxidOverride = txid },
     setBroadcastReceipt: (receipt: Tm1RegtestDeliveryReceipt) => { broadcastReceiptOverride = receipt },
@@ -467,6 +470,19 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.calls.signer).toBe(0)
   })
 
+  test.each([
+    ['an unrecognized status', { status: 'unknown', authorizationId: 'must-not-authorize' }],
+    ['an approved decision without a valid id', { status: 'approved', authorizationId: '' }]
+  ])('rejects malformed signing authorization with %s', async (_label, decision) => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.setSigningDecision(decision)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+    expect(harness.calls.signer).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'authorizing' })
+  })
+
   test('rejects a mutated UTXO after review approval', async () => {
     const harness = createHarness()
     const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
@@ -512,6 +528,44 @@ describe('TM1 regtest publication orchestrator', () => {
 
     await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNED_ARTIFACT_INVALID')
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+  })
+
+  test.each([
+    ['null', null],
+    ['a malformed object', Object.freeze({})]
+  ])('maps primary audit runtime value %s to SIGNED_ARTIFACT_INVALID', async (_label, value) => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.returnUncheckedAudit(value)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNED_ARTIFACT_INVALID')
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+  })
+
+  test('maps primary audit rawTransactionBytes with the wrong runtime type to SIGNED_ARTIFACT_INVALID', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    harness.returnUncheckedAudit(Object.freeze({
+      ...validArtifact,
+      rawTransactionBytes: validArtifact.rawTransactionHex
+    }))
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNED_ARTIFACT_INVALID')
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+  })
+
+  test('accepts a valid runtime audit result and snapshots its bytes', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    harness.returnUncheckedAudit(validArtifact)
+
+    const signedReview = await harness.orchestrator.authorizeAndSign(review.preparedId)
+
+    expect(signedReview.txid).toBe(validArtifact.txid)
+    expect(signedReview.signedArtifact.rawTransactionBytes).not.toBe(validArtifact.rawTransactionBytes)
+    expect(toHex(signedReview.signedArtifact.rawTransactionBytes)).toBe(validArtifact.rawTransactionHex)
   })
 
   test('binds txid and signed bytes into the signed review', async () => {
@@ -798,6 +852,49 @@ describe('TM1 regtest publication orchestrator', () => {
     )
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'expired', stage: 'broadcast' })
     expect(harness.calls.broadcast).toBe(0)
+  })
+
+  test.each([
+    ['an unrecognized status', (signedReview: Tm1SignedReview) => ({
+      status: 'unknown',
+      authorizationId: 'must-not-authorize',
+      signedId: signedReview.signedId,
+      txid: signedReview.txid,
+      signedArtifactHash: signedReview.signedArtifactHash
+    })],
+    ['an approved decision without a valid id', (signedReview: Tm1SignedReview) => ({
+      status: 'approved',
+      authorizationId: '',
+      signedId: signedReview.signedId,
+      txid: signedReview.txid,
+      signedArtifactHash: signedReview.signedArtifactHash
+    })]
+  ])('rejects malformed broadcast authorization with %s', async (_label, makeDecision) => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.setBroadcastDecision(makeDecision(signedReview))
+
+    await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'BROADCAST_FAILED')
+    expect(harness.calls.audit).toBe(1)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'approvingBroadcast' })
+  })
+
+  test.each([
+    ['null', null],
+    ['a malformed object', Object.freeze({})]
+  ])('maps broadcast re-audit runtime value %s to SIGNED_ARTIFACT_INVALID before dispatch', async (_label, value) => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.returnUncheckedAudit(value)
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'approvingBroadcast' })
   })
 
   test('maps broadcast authorization service failures to BROADCAST_FAILED', async () => {
@@ -2510,6 +2607,145 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(state.uncertainty.signedArtifact).not.toBe(signedReview.signedArtifact)
     expect(state.uncertainty.signedArtifact.rawTransactionHex).toBe(signedReview.signedArtifact.rawTransactionHex)
     expect(state.uncertainty.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+  })
+
+  test('clones plain object causes without invoking throwing getters', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    let getterCalls = 0
+    const cause: { code: string; dangerous?: unknown } = { code: 'ORIGINAL' }
+    Object.defineProperty(cause, 'dangerous', {
+      enumerable: true,
+      get() {
+        getterCalls += 1
+        throw new Error('getter must never execute')
+      }
+    })
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const clonedCause = innermostCause(state.error) as Record<PropertyKey, unknown>
+    expect(getterCalls).toBe(0)
+    expect(clonedCause.code).toBe('ORIGINAL')
+    expect(Object.hasOwn(clonedCause, 'dangerous')).toBe(false)
+  })
+
+  test('clones nested causes without invoking nested throwing getters', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    let getterCalls = 0
+    const nested: { value: string; dangerous?: unknown } = { value: 'safe' }
+    Object.defineProperty(nested, 'dangerous', {
+      enumerable: true,
+      get() {
+        getterCalls += 1
+        throw new Error('nested getter must never execute')
+      }
+    })
+    harness.failSigner({ code: 'ORIGINAL', nested })
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const clonedCause = innermostCause(state.error) as { nested: Record<PropertyKey, unknown> }
+    expect(getterCalls).toBe(0)
+    expect(clonedCause.nested.value).toBe('safe')
+    expect(Object.hasOwn(clonedCause.nested, 'dangerous')).toBe(false)
+  })
+
+  test('clones Error causes without invoking an own message accessor', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    let getterCalls = 0
+    const cause = new Error('original') as Error & { code: string }
+    cause.code = 'ORIGINAL'
+    Object.defineProperty(cause, 'message', {
+      configurable: true,
+      get() {
+        getterCalls += 1
+        throw new Error('message getter must never execute')
+      }
+    })
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const clonedCause = innermostCause(state.error) as Error & { code: string }
+    expect(getterCalls).toBe(0)
+    expect(clonedCause).toBeInstanceOf(Error)
+    expect(clonedCause.code).toBe('ORIGINAL')
+  })
+
+  test('clones array causes without invoking index accessors', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    let getterCalls = 0
+    const cause: unknown[] = []
+    Object.defineProperty(cause, '0', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls += 1
+        throw new Error('array getter must never execute')
+      }
+    })
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const clonedCause = innermostCause(state.error) as unknown[]
+    expect(getterCalls).toBe(0)
+    expect(clonedCause).toHaveLength(1)
+    expect(0 in clonedCause).toBe(false)
+  })
+
+  test('keeps hostile post-dispatch rejection reconcilable without invoking its getter or rebroadcasting', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    let getterCalls = 0
+    const cause: { code: string; dangerous?: unknown } = { code: 'ORIGINAL' }
+    Object.defineProperty(cause, 'dangerous', {
+      enumerable: true,
+      get() {
+        getterCalls += 1
+        throw new Error('post-dispatch getter must never execute')
+      }
+    })
+    harness.failBroadcast(cause)
+
+    await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'BROADCAST_FAILED')
+
+    expect(getterCalls).toBe(0)
+    expect(harness.calls.broadcast).toBe(1)
+    const uncertain = expectBroadcastUncertainEvidence(harness, signedReview)
+    expect(innermostCause(uncertain.uncertainty.error)).toMatchObject({ code: 'ORIGINAL' })
+    harness.setConfirmation(Object.freeze({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: signedReview.txid,
+      confirmations: 1,
+      blockHash: 'ef'.repeat(32),
+      blockHeight: 107
+    }))
+
+    await expect(harness.orchestrator.reconcile()).resolves.toMatchObject({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: signedReview.txid
+    })
+    expect(getterCalls).toBe(0)
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('confirmed')
   })
 
   test('clones simple Error causes for failed state snapshots', async () => {

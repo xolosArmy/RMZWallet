@@ -378,15 +378,16 @@ implements Tm1RegtestPublicationOrchestrator {
       this.transition({ status: 'authorizing', review })
       let decision: Tm1PublicationAuthorizationDecision
       try {
-        decision = await this.dependencies.signingAuthorization.requestSigningAuthorization(
+        const authorizationResult = await this.dependencies.signingAuthorization.requestSigningAuthorization(
           freezePreparedReview(review),
           signal
         )
+        assertNotAborted(signal)
+        decision = snapshotSigningAuthorizationDecision(authorizationResult)
       } catch (error) {
         if (isAbortLike(error)) throw error
         throw new Tm1PublicationError('SIGNING_FAILED', 'SIGNING_FAILED', error)
       }
-      assertNotAborted(signal)
       if (decision.status === 'rejected') {
         this.transition(rejectedState('signing', decision.reason))
         throw new Tm1PublicationError('SIGNING_REJECTED', decision.reason ?? 'SIGNING_REJECTED')
@@ -457,22 +458,18 @@ implements Tm1RegtestPublicationOrchestrator {
         throw new Tm1PublicationError('SIGNING_FAILED', 'SIGNING_FAILED', error)
       }
       assertNotAborted(signal)
-      let auditedArtifact: RegtestSignedTransaction
-      try {
-        auditedArtifact = await this.dependencies.signedArtifactAudit.auditSignedArtifact({
-          review: freezePreparedReview(review),
-          signedArtifact
-        })
-      } catch (error) {
-        throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID', 'SIGNED_ARTIFACT_INVALID', error)
-      }
-      assertNotAborted(signal)
+      const audited = await auditSignedArtifact({
+        auditPort: this.dependencies.signedArtifactAudit,
+        review,
+        signedArtifact,
+        signal
+      })
       const signedReview = freezeSignedReview({
         preparedId: review.preparedId,
         signedId: this.clock.createId('signed'),
-        txid: auditedArtifact.txid,
-        signedArtifactHash: hashBytes(auditedArtifact.rawTransactionBytes),
-        signedArtifact: auditedArtifact,
+        txid: audited.artifact.txid,
+        signedArtifactHash: audited.artifactHash,
+        signedArtifact: audited.artifact,
         feeSats: review.feeSats,
         orderedOutputs: review.orderedOutputs,
         bindingHash: review.bindingHash,
@@ -504,15 +501,16 @@ implements Tm1RegtestPublicationOrchestrator {
       this.transition({ status: 'approvingBroadcast', signedReview })
       let decision: Tm1BroadcastAuthorizationDecision
       try {
-        decision = await this.dependencies.broadcastAuthorization.requestBroadcastAuthorization(
+        const authorizationResult = await this.dependencies.broadcastAuthorization.requestBroadcastAuthorization(
           freezeSignedReview(signedReview),
           signal
         )
+        assertNotAborted(signal)
+        decision = snapshotBroadcastAuthorizationDecision(authorizationResult)
       } catch (error) {
         if (isAbortLike(error)) throw error
         throw new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', error)
       }
-      assertNotAborted(signal)
       if (decision.status === 'rejected') {
         this.transition(rejectedState('broadcast', decision.reason))
         throw new Tm1PublicationError('BROADCAST_REJECTED', decision.reason ?? 'BROADCAST_REJECTED')
@@ -530,23 +528,14 @@ implements Tm1RegtestPublicationOrchestrator {
       }
       const broadcastAuthorizationId = decision.authorizationId
 
-      let auditedArtifact: RegtestSignedTransaction
-      try {
-        const auditArtifact = cloneSignedArtifact(signedReview.signedArtifact)
-        auditedArtifact = await this.dependencies.signedArtifactAudit.auditSignedArtifact({
-          review: freezePreparedReview(review),
-          signedArtifact: auditArtifact
-        })
-      } catch (error) {
-        throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID', 'SIGNED_ARTIFACT_INVALID', error)
-      }
-      if (
-        auditedArtifact.txid !== signedReview.txid ||
-        hashBytes(auditedArtifact.rawTransactionBytes) !== signedReview.signedArtifactHash
-      ) {
-        throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID')
-      }
-      assertNotAborted(signal)
+      await auditSignedArtifact({
+        auditPort: this.dependencies.signedArtifactAudit,
+        review,
+        signedArtifact: cloneSignedArtifact(signedReview.signedArtifact),
+        signal,
+        expectedTxid: signedReview.txid,
+        expectedArtifactHash: signedReview.signedArtifactHash
+      })
       const submissionId = this.clock.createId('submission')
       this.transition({
         status: 'broadcasting',
@@ -789,6 +778,116 @@ implements Tm1RegtestPublicationOrchestrator {
   }
 }
 
+type Tm1AuditedArtifactEvidence = Readonly<{
+  artifact: RegtestSignedTransaction
+  artifactHash: string
+}>
+
+async function auditSignedArtifact(input: Readonly<{
+  auditPort: Tm1SignedArtifactAuditPort
+  review: Tm1PreparedReview
+  signedArtifact: RegtestSignedTransaction
+  signal?: AbortSignal
+  expectedTxid?: string
+  expectedArtifactHash?: string
+}>): Promise<Tm1AuditedArtifactEvidence> {
+  try {
+    const auditResult: unknown = await input.auditPort.auditSignedArtifact({
+      review: freezePreparedReview(input.review),
+      signedArtifact: input.signedArtifact
+    })
+    assertNotAborted(input.signal)
+
+    const artifact = snapshotValidatedSignedArtifact(auditResult)
+    const artifactHash = hashBytes(artifact.rawTransactionBytes)
+    if (
+      artifact.inputCount !== input.review.orderedInputs.length ||
+      artifact.feeSats !== input.review.feeSats ||
+      artifact.fixtureLockingScriptHex !== input.review.candidate.authorLockingScriptHex ||
+      (input.expectedTxid !== undefined && artifact.txid !== input.expectedTxid) ||
+      (input.expectedArtifactHash !== undefined && artifactHash !== input.expectedArtifactHash)
+    ) {
+      throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID')
+    }
+
+    return Object.freeze({ artifact, artifactHash })
+  } catch (error) {
+    if (isAbortLike(error)) throw error
+    if (error instanceof Tm1PublicationError && error.code === 'SIGNED_ARTIFACT_INVALID') {
+      throw error
+    }
+    throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID', 'SIGNED_ARTIFACT_INVALID', error)
+  }
+}
+
+function snapshotSigningAuthorizationDecision(value: unknown): Tm1PublicationAuthorizationDecision {
+  const status = readRequiredOwnDataProperty(value, 'status')
+  if (status === 'approved') {
+    return Object.freeze({
+      status,
+      authorizationId: readRequiredNonEmptyString(value, 'authorizationId')
+    })
+  }
+  if (status === 'rejected' || status === 'expired') {
+    const reason = readOptionalString(value, 'reason')
+    return reason === undefined
+      ? Object.freeze({ status })
+      : Object.freeze({ status, reason })
+  }
+  throw new Error('Invalid signing authorization decision')
+}
+
+function snapshotBroadcastAuthorizationDecision(value: unknown): Tm1BroadcastAuthorizationDecision {
+  const status = readRequiredOwnDataProperty(value, 'status')
+  if (status === 'approved') {
+    return Object.freeze({
+      status,
+      authorizationId: readRequiredNonEmptyString(value, 'authorizationId'),
+      signedId: readRequiredNonEmptyString(value, 'signedId'),
+      txid: readRequiredNonEmptyString(value, 'txid'),
+      signedArtifactHash: readRequiredNonEmptyString(value, 'signedArtifactHash')
+    })
+  }
+  if (status === 'rejected' || status === 'expired') {
+    const reason = readOptionalString(value, 'reason')
+    return reason === undefined
+      ? Object.freeze({ status })
+      : Object.freeze({ status, reason })
+  }
+  throw new Error('Invalid broadcast authorization decision')
+}
+
+function readRequiredOwnDataProperty(value: unknown, key: PropertyKey): unknown {
+  if (value === null || typeof value !== 'object') {
+    throw new Error('Invalid external object')
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, key)
+  if (descriptor === undefined || !('value' in descriptor)) {
+    throw new Error(`Missing data property: ${String(key)}`)
+  }
+  return descriptor.value
+}
+
+function readRequiredNonEmptyString(value: unknown, key: PropertyKey): string {
+  const property = readRequiredOwnDataProperty(value, key)
+  if (typeof property !== 'string' || property.trim().length === 0) {
+    throw new Error(`Invalid string property: ${String(key)}`)
+  }
+  return property
+}
+
+function readOptionalString(value: unknown, key: PropertyKey): string | undefined {
+  if (value === null || typeof value !== 'object') {
+    throw new Error('Invalid external object')
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, key)
+  if (descriptor === undefined) return undefined
+  if (!('value' in descriptor) || (descriptor.value !== undefined && typeof descriptor.value !== 'string')) {
+    throw new Error(`Invalid optional string property: ${String(key)}`)
+  }
+  return descriptor.value
+}
+
 function rejectedState(
   stage: 'signing' | 'broadcast',
   reason: string | undefined
@@ -1015,6 +1114,67 @@ function freezeSignedArtifact(artifact: RegtestSignedTransaction): RegtestSigned
   return Object.freeze(cloneSignedArtifact(artifact))
 }
 
+function snapshotValidatedSignedArtifact(value: unknown): RegtestSignedTransaction {
+  const format = readRequiredOwnDataProperty(value, 'format')
+  const artifactVersion = readRequiredOwnDataProperty(value, 'artifactVersion')
+  const environment = readRequiredOwnDataProperty(value, 'environment')
+  const sighashPolicy = readRequiredOwnDataProperty(value, 'sighashPolicy')
+  const fixturePublicKeyHex = readRequiredOwnDataProperty(value, 'fixturePublicKeyHex')
+  const fixtureLockingScriptHex = readRequiredOwnDataProperty(value, 'fixtureLockingScriptHex')
+  const inputCount = readRequiredOwnDataProperty(value, 'inputCount')
+  const feeSats = readRequiredOwnDataProperty(value, 'feeSats')
+  const txid = readRequiredOwnDataProperty(value, 'txid')
+  const rawTransactionHex = readRequiredOwnDataProperty(value, 'rawTransactionHex')
+  const rawTransactionBytes = readRequiredOwnDataProperty(value, 'rawTransactionBytes')
+
+  if (
+    typeof format !== 'string' ||
+    format.length === 0 ||
+    typeof artifactVersion !== 'number' ||
+    !Number.isSafeInteger(artifactVersion) ||
+    artifactVersion <= 0 ||
+    environment !== TM1_DRAFT_02_CANDIDATE_ENVIRONMENT ||
+    sighashPolicy !== TM1_DRAFT_02_SIGHASH_POLICY ||
+    typeof fixturePublicKeyHex !== 'string' ||
+    !/^(02|03)[0-9a-f]{64}$/.test(fixturePublicKeyHex) ||
+    typeof fixtureLockingScriptHex !== 'string' ||
+    fixtureLockingScriptHex.length === 0 ||
+    fixtureLockingScriptHex.length % 2 !== 0 ||
+    !/^[0-9a-f]+$/.test(fixtureLockingScriptHex) ||
+    typeof inputCount !== 'number' ||
+    !Number.isSafeInteger(inputCount) ||
+    inputCount <= 0 ||
+    typeof feeSats !== 'bigint' ||
+    feeSats < 0n ||
+    typeof txid !== 'string' ||
+    !/^[0-9a-f]{64}$/.test(txid) ||
+    typeof rawTransactionHex !== 'string' ||
+    rawTransactionHex.length === 0 ||
+    rawTransactionHex.length % 2 !== 0 ||
+    !/^[0-9a-f]+$/.test(rawTransactionHex) ||
+    !(rawTransactionBytes instanceof Uint8Array) ||
+    rawTransactionBytes.length === 0
+  ) {
+    throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID')
+  }
+
+  const snapshot = Object.freeze({
+    format,
+    artifactVersion,
+    environment,
+    sighashPolicy,
+    fixturePublicKeyHex,
+    fixtureLockingScriptHex,
+    inputCount,
+    feeSats,
+    txid,
+    rawTransactionHex,
+    rawTransactionBytes: new Uint8Array(rawTransactionBytes)
+  }) as RegtestSignedTransaction
+  assertSignedArtifactCoherent(snapshot)
+  return snapshot
+}
+
 function cloneSignedArtifact(artifact: RegtestSignedTransaction): RegtestSignedTransaction {
   assertSignedArtifactCoherent(artifact)
   return {
@@ -1048,52 +1208,81 @@ function clonePublicationError(error: Tm1PublicationError): Tm1PublicationError 
 
 function cloneErrorCause(cause: unknown, seen: WeakMap<object, unknown> = new WeakMap()): unknown {
   if (cause === null || typeof cause !== 'object') return cause
-  if (cause instanceof Tm1PublicationError) return clonePublicationError(cause)
-  if (cause instanceof Error) {
-    const existing = seen.get(cause)
-    if (existing !== undefined) return existing
-    const clone = new Error(cause.message)
-    seen.set(cause, clone)
-    clone.name = cause.name
-    for (const key of Reflect.ownKeys(cause)) {
-      if (key === 'name' || key === 'message' || key === 'stack') continue
-      const descriptor = Object.getOwnPropertyDescriptor(cause, key)
-      if (descriptor === undefined || !('value' in descriptor)) continue
-      Object.defineProperty(clone, key, {
+
+  try {
+    if (cause instanceof Tm1PublicationError) return clonePublicationError(cause)
+    if (cause instanceof Error) {
+      const existing = seen.get(cause)
+      if (existing !== undefined) return existing
+      const clone = new Error()
+      seen.set(cause, clone)
+      cloneDataProperties(cause, clone, seen, key => key !== 'stack')
+      return clone
+    }
+    if (cause instanceof Uint8Array) return new Uint8Array(cause)
+    if (Array.isArray(cause)) {
+      const existing = seen.get(cause)
+      if (existing !== undefined) return existing
+      const clone: unknown[] = []
+      seen.set(cause, clone)
+      cloneDataProperties(cause, clone, seen, key => key !== 'length')
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(cause, 'length')
+      if (lengthDescriptor !== undefined && 'value' in lengthDescriptor) {
+        Object.defineProperty(clone, 'length', lengthDescriptor)
+      }
+      return clone
+    }
+    if (isPlainObject(cause)) {
+      const existing = seen.get(cause)
+      if (existing !== undefined) return existing
+      const clone: Record<PropertyKey, unknown> = {}
+      seen.set(cause, clone)
+      cloneDataProperties(cause, clone, seen)
+      return clone
+    }
+  } catch {
+    return unknownObjectCause()
+  }
+
+  return unknownObjectCause()
+}
+
+function cloneDataProperties(
+  source: object,
+  target: object,
+  seen: WeakMap<object, unknown>,
+  include: (key: PropertyKey) => boolean = () => true
+): void {
+  for (const key of Reflect.ownKeys(source)) {
+    if (!include(key)) continue
+    const descriptor = Object.getOwnPropertyDescriptor(source, key)
+    // Accessors from external values are intentionally omitted and never invoked.
+    if (descriptor === undefined || !('value' in descriptor)) continue
+    try {
+      Object.defineProperty(target, key, {
         ...descriptor,
         value: cloneErrorCause(descriptor.value, seen)
       })
+    } catch {
+      // A hostile descriptor must not make publication error construction throw.
     }
-    return clone
   }
-  if (cause instanceof Uint8Array) return new Uint8Array(cause)
-  if (Array.isArray(cause)) {
-    const existing = seen.get(cause)
-    if (existing !== undefined) return existing
-    const clone: unknown[] = []
-    seen.set(cause, clone)
-    for (const item of cause) clone.push(cloneErrorCause(item, seen))
-    return clone
-  }
-  if (isPlainObject(cause)) {
-    const existing = seen.get(cause)
-    if (existing !== undefined) return existing
-    const clone: Record<PropertyKey, unknown> = {}
-    seen.set(cause, clone)
-    for (const key of Reflect.ownKeys(cause)) {
-      clone[key] = cloneErrorCause((cause as Record<PropertyKey, unknown>)[key], seen)
-    }
-    return clone
-  }
+}
+
+function unknownObjectCause(): Readonly<{ name: 'UnknownObject'; description: string }> {
   return Object.freeze({
-    name: cause.constructor?.name ?? 'UnknownObject',
-    description: String(cause)
+    name: 'UnknownObject',
+    description: 'External object could not be cloned safely'
   })
 }
 
 function isPlainObject(value: object): value is Record<PropertyKey, unknown> {
-  const prototype = Object.getPrototypeOf(value)
-  return prototype === Object.prototype || prototype === null
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
+  } catch {
+    return false
+  }
 }
 
 function freezeReceipt(receipt: Tm1SubmissionReceipt): Tm1SubmissionReceipt {
