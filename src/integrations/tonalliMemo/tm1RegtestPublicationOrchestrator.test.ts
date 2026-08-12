@@ -61,6 +61,68 @@ function createDeferred<T>(): Deferred<T> {
   return Object.freeze({ promise, resolve: resolveValue, reject: rejectValue })
 }
 
+function mutateSignedArtifactTransaction(
+  artifact: RegtestSignedTransaction,
+  mutate: (transaction: Tx) => void
+): RegtestSignedTransaction {
+  const transaction = Tx.fromHex(artifact.rawTransactionHex)
+  mutate(transaction)
+  const rawTransactionBytes = transaction.ser()
+  return Object.freeze({
+    ...artifact,
+    inputCount: transaction.inputs.length,
+    txid: transaction.txid(),
+    rawTransactionHex: toHex(rawTransactionBytes),
+    rawTransactionBytes: new Uint8Array(rawTransactionBytes)
+  })
+}
+
+function appendTrailingByte(artifact: RegtestSignedTransaction): RegtestSignedTransaction {
+  const rawTransactionBytes = new Uint8Array(artifact.rawTransactionBytes.length + 1)
+  rawTransactionBytes.set(artifact.rawTransactionBytes)
+  rawTransactionBytes[rawTransactionBytes.length - 1] = 0
+  return Object.freeze({
+    ...artifact,
+    rawTransactionHex: toHex(rawTransactionBytes),
+    rawTransactionBytes
+  })
+}
+
+const CANDIDATE_TRANSACTION_MUTATIONS: ReadonlyArray<readonly [
+  string,
+  (transaction: Tx) => void
+]> = [
+  ['version', transaction => { transaction.version += 1 }],
+  ['locktime', transaction => { transaction.locktime += 1 }],
+  ['input outpoint', transaction => {
+    const input = transaction.inputs[0]
+    if (!input) throw new Error('expected an input')
+    input.prevOut.outIdx += 1
+  }],
+  ['input sequence', transaction => {
+    const input = transaction.inputs[0]
+    if (!input) throw new Error('expected an input')
+    input.sequence = 0xfffffffe
+  }],
+  ['output value', transaction => {
+    const output = transaction.outputs[1]
+    if (!output) throw new Error('expected a change output')
+    output.sats -= 1n
+  }],
+  ['output locking script', transaction => {
+    const opReturn = transaction.outputs[0]
+    const change = transaction.outputs[1]
+    if (!opReturn || !change) throw new Error('expected two outputs')
+    change.script = opReturn.script.copy()
+  }],
+  ['output ordering', transaction => {
+    const first = transaction.outputs[0]
+    const second = transaction.outputs[1]
+    if (!first || !second) throw new Error('expected two outputs')
+    transaction.outputs = [second, first]
+  }]
+]
+
 function fixtureUtxos(): Tm1Draft02FreshUtxo[] {
   return [
     {
@@ -635,6 +697,84 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(toHex(signedReview.signedArtifact.rawTransactionBytes)).toBe(validArtifact.rawTransactionHex)
   })
 
+  test.each(CANDIDATE_TRANSACTION_MUTATIONS)(
+    'rejects a signed transaction with a candidate %s mismatch during primary audit',
+    async (_label, mutate) => {
+      const harness = createHarness()
+      const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+      const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+      harness.returnUncheckedAudit(mutateSignedArtifactTransaction(validArtifact, mutate))
+
+      await expectCode(
+        harness.orchestrator.authorizeAndSign(review.preparedId),
+        'SIGNED_ARTIFACT_INVALID'
+      )
+
+      expect(harness.calls.broadcast).toBe(0)
+      expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+    }
+  )
+
+  test('rejects a signed transaction with permuted multi-input ordering', async () => {
+    const harness = createHarness()
+    harness.setUtxos(fixtureUtxos().map(utxo => ({ ...utxo, sats: 700n })))
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    expect(review.candidate.inputs).toHaveLength(2)
+    const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    const reorderedArtifact = mutateSignedArtifactTransaction(validArtifact, transaction => {
+      const first = transaction.inputs[0]
+      const second = transaction.inputs[1]
+      if (!first || !second) throw new Error('expected two inputs')
+      transaction.inputs = [second, first]
+    })
+    harness.returnUncheckedAudit(reorderedArtifact)
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(harness.calls.broadcast).toBe(0)
+  })
+
+  test('rejects a non-canonical signed transaction with a trailing byte during primary audit', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    harness.returnUncheckedAudit(appendTrailingByte(validArtifact))
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+  })
+
+  test('accepts the exact prepared candidate through signed review and submission', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const signedReview = await harness.orchestrator.authorizeAndSign(review.preparedId)
+
+    expect(harness.orchestrator.getState().status).toBe('signedReviewReady')
+    expect(toHex(signedReview.signedArtifact.rawTransactionBytes)).toBe(
+      signedReview.signedArtifact.rawTransactionHex
+    )
+    expect(Tx.fromHex(signedReview.signedArtifact.rawTransactionHex).txid()).toBe(
+      signedReview.txid
+    )
+    expect(signedReview.signedArtifactHash).toBe(
+      toHex(sha256d(signedReview.signedArtifact.rawTransactionBytes))
+    )
+
+    await expect(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    ).resolves.toMatchObject({ txid: signedReview.txid })
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('submitted')
+  })
+
   test('binds txid and signed bytes into the signed review', async () => {
     const harness = createHarness()
     const signedReview = await prepareAndSign(harness)
@@ -921,31 +1061,44 @@ describe('TM1 regtest publication orchestrator', () => {
     })
   })
 
-  test('releases the prepare guard when request snapshotting fails', async () => {
+  test.each(['message', 'activeLockingScriptHex', 'maxFeeSats'] as const)(
+    'records the idle stage and releases the prepare guard when request.%s snapshotting fails',
+    async property => {
     const harness = createHarness()
-    const request = Object.defineProperties({}, {
-      message: {
-        enumerable: true,
-        get() {
-          throw new Error('hostile request getter')
-        }
-      },
-      activeLockingScriptHex: {
-        enumerable: true,
-        value: DEFAULT_REQUEST.activeLockingScriptHex
+    let getterCalls = 0
+    const request = { ...DEFAULT_REQUEST }
+    Object.defineProperty(request, property, {
+      enumerable: true,
+      get() {
+        getterCalls += 1
+        throw new Error(`hostile ${property} getter`)
       }
-    }) as Tm1PublicationRequest
+    })
 
     await expectCode(harness.orchestrator.prepare(request), 'PREPARATION_FAILED')
 
-    expect(harness.calls.attest).toBe(0)
-    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed' })
+    expect(getterCalls).toBe(1)
+    expect(harness.calls).toEqual({
+      attest: 0,
+      utxos: 0,
+      signingAuthorization: 0,
+      signer: 0,
+      audit: 0,
+      broadcastAuthorization: 0,
+      broadcast: 0,
+      confirm: 0
+    })
+    const state = harness.orchestrator.getState()
+    expect(state).toMatchObject({ status: 'failed', stage: 'idle' })
+    expect('review' in state).toBe(false)
+    expect('signedReview' in state).toBe(false)
     harness.orchestrator.reset()
     await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
       message: DEFAULT_REQUEST.message
     })
     expect(harness.calls.attest).toBe(1)
-  })
+    }
+  )
 
   test('does not read request getters or replace an existing prepared review', async () => {
     const harness = createHarness()
@@ -1126,6 +1279,47 @@ describe('TM1 regtest publication orchestrator', () => {
       ...signedReview.signedArtifact,
       fixturePublicKeyHex: WRONG_VALID_COMPRESSED_PUBLIC_KEY_HEX
     }))
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast'
+    })
+    expect(harness.orchestrator.getState().status).not.toBe('broadcastUncertain')
+  })
+
+  test('rejects a different candidate during broadcast re-audit before dispatch', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.returnUncheckedAudit(mutateSignedArtifactTransaction(
+      signedReview.signedArtifact,
+      transaction => { transaction.locktime += 1 }
+    ))
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast'
+    })
+    expect(harness.orchestrator.getState().status).not.toBe('broadcastUncertain')
+  })
+
+  test('rejects trailing bytes during broadcast re-audit before dispatch', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.returnUncheckedAudit(appendTrailingByte(signedReview.signedArtifact))
 
     await expectCode(
       harness.orchestrator.approveAndBroadcast(signedReview.signedId),
