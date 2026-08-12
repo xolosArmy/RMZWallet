@@ -351,6 +351,22 @@ function innermostCause(error: Tm1PublicationError): unknown {
   return cause
 }
 
+function publicationErrorCycle(
+  error: Tm1PublicationError
+): readonly Tm1PublicationError[] {
+  const seen = new Map<Tm1PublicationError, number>()
+  const path: Tm1PublicationError[] = []
+  let current: unknown = error
+  while (current instanceof Tm1PublicationError) {
+    const cycleStart = seen.get(current)
+    if (cycleStart !== undefined) return path.slice(cycleStart)
+    seen.set(current, path.length)
+    path.push(current)
+    current = current.cause
+  }
+  return []
+}
+
 function observedPrepareMessage(state: Tm1PublicationState): string {
   if (state.status === 'attesting' || state.status === 'preparing') return state.message
   if (state.status === 'reviewReady') return state.review.message
@@ -892,6 +908,66 @@ describe('TM1 regtest publication orchestrator', () => {
       message: DEFAULT_REQUEST.message
     })
     expect(harness.calls.attest).toBe(1)
+  })
+
+  test('does not read request getters or replace an existing prepared review', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const stateBeforeInvalidCall = harness.orchestrator.getState()
+    let getterCalls = 0
+    const hostileRequest = Object.defineProperties({}, {
+      message: {
+        enumerable: true,
+        get() {
+          getterCalls += 1
+          throw new Error('request getter must not run outside idle')
+        }
+      },
+      activeLockingScriptHex: {
+        enumerable: true,
+        value: DEFAULT_REQUEST.activeLockingScriptHex
+      }
+    }) as Tm1PublicationRequest
+
+    await expectCode(harness.orchestrator.prepare(hostileRequest), 'INVALID_STATE')
+
+    expect(getterCalls).toBe(0)
+    expect(harness.calls.attest).toBe(1)
+    expect(harness.orchestrator.getState()).toEqual(stateBeforeInvalidCall)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'reviewReady',
+      review: { preparedId: review.preparedId }
+    })
+  })
+
+  test('does not read request getters or replace an existing signed review', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const stateBeforeInvalidCall = harness.orchestrator.getState()
+    let getterCalls = 0
+    const hostileRequest = Object.defineProperties({}, {
+      message: {
+        enumerable: true,
+        get() {
+          getterCalls += 1
+          throw new Error('request getter must not run outside idle')
+        }
+      },
+      activeLockingScriptHex: {
+        enumerable: true,
+        value: DEFAULT_REQUEST.activeLockingScriptHex
+      }
+    }) as Tm1PublicationRequest
+
+    await expectCode(harness.orchestrator.prepare(hostileRequest), 'INVALID_STATE')
+
+    expect(getterCalls).toBe(0)
+    expect(harness.calls.attest).toBe(2)
+    expect(harness.orchestrator.getState()).toEqual(stateBeforeInvalidCall)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'signedReviewReady',
+      signedReview: { signedId: signedReview.signedId }
+    })
   })
 
   test('snapshots the publication request before pending UTXO reads resolve', async () => {
@@ -3168,6 +3244,129 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(clonedCause.reason).toBe('original')
     expect(clonedCause.self).toBe(clonedCause)
     expect(clonedCause).not.toBe(cause)
+  })
+
+  test('clones a self-referential publication error with diagnostics and no recursion', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause = new Tm1PublicationError('SIGNING_FAILED', 'self-referential failure') as
+      Tm1PublicationError & { metadata: { nested: { reason: string } } }
+    cause.metadata = { nested: { reason: 'original' } }
+    Object.defineProperty(cause, 'cause', { value: cause })
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+    cause.metadata.nested.reason = 'mutated'
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const cycle = publicationErrorCycle(state.error)
+    expect(cycle).toHaveLength(1)
+    expect(cycle[0]).not.toBe(cause)
+    expect((cycle[0] as Tm1PublicationError & {
+      metadata: { nested: { reason: string } }
+    }).metadata).toEqual({ nested: { reason: 'original' } })
+  })
+
+  test('clones a two-node publication error cycle', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const errorA = new Tm1PublicationError('SIGNING_FAILED', 'cycle A')
+    const errorB = new Tm1PublicationError('CANDIDATE_REVALIDATION_FAILED', 'cycle B')
+    Object.defineProperty(errorA, 'cause', { value: errorB })
+    Object.defineProperty(errorB, 'cause', { value: errorA })
+    harness.failSigner(errorA)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const cycle = publicationErrorCycle(state.error)
+    expect(cycle).toHaveLength(2)
+    expect(cycle.map(error => error.message)).toEqual(['cycle A', 'cycle B'])
+    expect(cycle).not.toContain(errorA)
+    expect(cycle).not.toContain(errorB)
+  })
+
+  test('clones a publication error embedded in a circular plain object', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const publicationError = new Tm1PublicationError('SIGNING_FAILED', 'embedded failure')
+    const cause: { self?: unknown; publicationError: Tm1PublicationError } = {
+      publicationError
+    }
+    cause.self = cause
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const clonedCause = innermostCause(state.error) as typeof cause
+    expect(clonedCause).not.toBe(cause)
+    expect(clonedCause.self).toBe(clonedCause)
+    expect(clonedCause.publicationError).toBeInstanceOf(Tm1PublicationError)
+    expect(clonedCause.publicationError).not.toBe(publicationError)
+    expect(clonedCause.publicationError.message).toBe('embedded failure')
+  })
+
+  test('clones a plain object to publication error back-edge without sharing references', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause: { publicationError?: Tm1PublicationError; label: string } = {
+      label: 'root'
+    }
+    const publicationError = new Tm1PublicationError('SIGNING_FAILED', 'back-edge failure')
+    cause.publicationError = publicationError
+    Object.defineProperty(publicationError, 'cause', { value: cause })
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const clonedCause = innermostCause(state.error) as Required<typeof cause>
+    expect(clonedCause).not.toBe(cause)
+    expect(clonedCause.publicationError).not.toBe(publicationError)
+    expect(clonedCause.publicationError.cause).toBe(clonedCause)
+  })
+
+  test('keeps a cyclic publication rejection reconcilable without rebroadcasting', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const cause = new Tm1PublicationError('BROADCAST_FAILED', 'cyclic transport failure')
+    Object.defineProperty(cause, 'cause', { value: cause })
+    harness.failBroadcast(cause)
+
+    await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'BROADCAST_FAILED')
+
+    expect(harness.calls.broadcast).toBe(1)
+    const uncertain = expectBroadcastUncertainEvidence(harness, signedReview)
+    expect(publicationErrorCycle(uncertain.uncertainty.error)).toHaveLength(1)
+    expect(uncertain.uncertainty.txid).toBe(signedReview.txid)
+    expect(uncertain.uncertainty.broadcastAuthorizationId).toBe('broadcast-auth-1')
+    expect(uncertain.uncertainty.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+    expect(uncertain.uncertainty.signedArtifact.rawTransactionHex).toBe(
+      signedReview.signedArtifact.rawTransactionHex
+    )
+    harness.setConfirmation(Object.freeze({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: signedReview.txid,
+      confirmations: 1,
+      blockHash: 'fa'.repeat(32),
+      blockHeight: 108
+    }))
+
+    await expect(harness.orchestrator.reconcile()).resolves.toMatchObject({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: signedReview.txid
+    })
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('confirmed')
   })
 
   test('isolates broadcast uncertainty errors and preserves reconciliation metadata', async () => {

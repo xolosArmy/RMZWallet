@@ -292,8 +292,8 @@ implements Tm1RegtestPublicationOrchestrator {
     this.beginOperation('prepare')
 
     try {
-      const requestSnapshot = freezePublicationRequest(request)
       if (this.state.status !== 'idle') throw new Tm1PublicationError('INVALID_STATE')
+      const requestSnapshot = freezePublicationRequest(request)
       assertNotAborted(signal)
       this.transition({ status: 'attesting', message: requestSnapshot.message })
       assertNotAborted(signal)
@@ -1281,13 +1281,16 @@ function freezeUncertainty(uncertainty: Tm1BroadcastUncertainty): Tm1BroadcastUn
   })
 }
 
-function clonePublicationError(error: Tm1PublicationError): Tm1PublicationError {
-  const clone = new Tm1PublicationError(
-    error.code,
-    error.message,
-    cloneErrorCause(error.cause)
-  )
-  clone.name = error.name
+function clonePublicationError(
+  error: Tm1PublicationError,
+  seen: WeakMap<object, unknown> = new WeakMap()
+): Tm1PublicationError {
+  const existing = seen.get(error)
+  if (existing instanceof Tm1PublicationError) return existing
+
+  const clone = new Tm1PublicationError(error.code, error.message)
+  seen.set(error, clone)
+  cloneDataProperties(error, clone, seen, key => key !== 'stack')
   return clone
 }
 
@@ -1295,7 +1298,7 @@ function cloneErrorCause(cause: unknown, seen: WeakMap<object, unknown> = new We
   if (cause === null || typeof cause !== 'object') return cause
 
   try {
-    if (cause instanceof Tm1PublicationError) return clonePublicationError(cause)
+    if (cause instanceof Tm1PublicationError) return clonePublicationError(cause, seen)
     if (cause instanceof Error) {
       const existing = seen.get(cause)
       if (existing !== undefined) return existing
