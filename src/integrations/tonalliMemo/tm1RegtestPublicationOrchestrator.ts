@@ -1064,8 +1064,20 @@ function cloneErrorCause(cause: unknown, seen: WeakMap<object, unknown> = new We
   if (cause === null || typeof cause !== 'object') return cause
   if (cause instanceof Tm1PublicationError) return clonePublicationError(cause)
   if (cause instanceof Error) {
+    const existing = seen.get(cause)
+    if (existing !== undefined) return existing
     const clone = new Error(cause.message)
+    seen.set(cause, clone)
     clone.name = cause.name
+    for (const key of Reflect.ownKeys(cause)) {
+      if (key === 'name' || key === 'message' || key === 'stack') continue
+      const descriptor = Object.getOwnPropertyDescriptor(cause, key)
+      if (descriptor === undefined || !('value' in descriptor)) continue
+      Object.defineProperty(clone, key, {
+        ...descriptor,
+        value: cloneErrorCause(descriptor.value, seen)
+      })
+    }
     return clone
   }
   if (cause instanceof Uint8Array) return new Uint8Array(cause)

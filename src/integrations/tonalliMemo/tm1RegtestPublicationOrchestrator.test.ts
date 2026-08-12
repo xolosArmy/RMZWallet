@@ -13,6 +13,7 @@ import {
 } from './tm1Draft02RegtestP2pkhSigner'
 import {
   Tm1InMemoryDeliveryTransport,
+  Tm1RegtestDeliveryTransportError,
   type Tm1RegtestDeliveryReceipt,
   type Tm1RegtestNetworkAttestation
 } from './tm1RegtestDeliveryTransport'
@@ -2279,6 +2280,175 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(listenerAErrors[0]).not.toBe(listenerBErrors[0])
     expect(listenerBErrors[0].code).toBe('SIGNING_FAILED')
     expect(listenerBErrors[0].message).toBe('SIGNING_FAILED')
+  })
+
+  test('preserves coded Error diagnostics for failed state snapshots', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const originalCause = new Tm1RegtestDeliveryTransportError(
+      'DUPLICATE_SUBMISSION'
+    ) as Tm1RegtestDeliveryTransportError & { metadata: { retryable: boolean; nested: { reason: string } } }
+    originalCause.metadata = { retryable: false, nested: { reason: 'original' } }
+    harness.failSigner(originalCause)
+    let thrown: Tm1PublicationError | null = null
+
+    await harness.orchestrator.authorizeAndSign(review.preparedId).catch(error => { thrown = error })
+    if (thrown === null) throw new Error('expected thrown error')
+    const thrownCause = innermostCause(thrown) as Error & { code: string; metadata: { nested: { reason: string } } }
+    expect(thrownCause).not.toBe(originalCause)
+    expect(thrownCause.name).toBe('Tm1RegtestDeliveryTransportError')
+    expect(thrownCause.message).toBe('DUPLICATE_SUBMISSION')
+    expect(thrownCause.code).toBe('DUPLICATE_SUBMISSION')
+    expect(thrownCause.metadata.nested.reason).toBe('original')
+
+    ;(originalCause as { code: string }).code = 'MUTATED'
+    originalCause.metadata.nested.reason = 'mutated'
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const stateCause = innermostCause(state.error) as Error & { code: string; metadata: { nested: { reason: string } } }
+    expect(stateCause).not.toBe(originalCause)
+    expect(stateCause).not.toBe(thrownCause)
+    expect(stateCause.name).toBe('Tm1RegtestDeliveryTransportError')
+    expect(stateCause.message).toBe('DUPLICATE_SUBMISSION')
+    expect(stateCause.code).toBe('DUPLICATE_SUBMISSION')
+    expect(stateCause.metadata.nested.reason).toBe('original')
+  })
+
+  test('clones mutable Error diagnostic properties and isolates caller mutations', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause = new Error('failure') as Error & {
+      code: string
+      metadata: { retryable: boolean; nested: { reason: string } }
+    }
+    cause.code = 'ORIGINAL'
+    cause.metadata = { retryable: false, nested: { reason: 'original' } }
+    harness.failSigner(cause)
+    let thrown: Tm1PublicationError | null = null
+
+    await harness.orchestrator.authorizeAndSign(review.preparedId).catch(error => { thrown = error })
+    if (thrown === null) throw new Error('expected thrown error')
+    cause.metadata.nested.reason = 'mutated'
+    const thrownCause = innermostCause(thrown) as Error & {
+      code: string
+      metadata: { retryable: boolean; nested: { reason: string } }
+    }
+    thrownCause.code = 'CALLER_MUTATED'
+    thrownCause.metadata.nested.reason = 'caller-mutated'
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const stateCause = innermostCause(state.error) as Error & {
+      code: string
+      metadata: { retryable: boolean; nested: { reason: string } }
+    }
+    expect(stateCause).not.toBe(cause)
+    expect(stateCause).not.toBe(thrownCause)
+    expect(stateCause.code).toBe('ORIGINAL')
+    expect(stateCause.metadata).toEqual({ retryable: false, nested: { reason: 'original' } })
+    expect(stateCause.metadata).not.toBe(cause.metadata)
+    expect(stateCause.metadata).not.toBe(thrownCause.metadata)
+  })
+
+  test('failed state subscribers receive isolated coded Error diagnostics', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause = new Error('failure') as Error & {
+      code: string
+      metadata: { retryable: boolean; nested: { reason: string } }
+    }
+    cause.code = 'ORIGINAL'
+    cause.metadata = { retryable: false, nested: { reason: 'original' } }
+    const listenerACauses: unknown[] = []
+    const listenerBCauses: unknown[] = []
+    harness.failSigner(cause)
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'failed') return
+      const snapshotCause = innermostCause(state.error) as Error & {
+        code: string
+        metadata: { nested: { reason: string } }
+      }
+      listenerACauses.push(snapshotCause)
+      snapshotCause.code = 'LISTENER_MUTATED'
+      snapshotCause.metadata.nested.reason = 'listener-mutated'
+    })
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'failed') return
+      listenerBCauses.push(innermostCause(state.error))
+    })
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+    expect(listenerACauses).toHaveLength(1)
+    expect(listenerBCauses).toHaveLength(1)
+    expect(listenerACauses[0]).not.toBe(listenerBCauses[0])
+    expect(listenerBCauses[0]).toMatchObject({
+      name: 'Error',
+      message: 'failure',
+      code: 'ORIGINAL',
+      metadata: { retryable: false, nested: { reason: 'original' } }
+    })
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    expect(innermostCause(state.error)).toMatchObject({
+      code: 'ORIGINAL',
+      metadata: { retryable: false, nested: { reason: 'original' } }
+    })
+  })
+
+  test('broadcastUncertain preserves coded Error diagnostics and signed evidence', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const cause = new Tm1RegtestDeliveryTransportError(
+      'INVALID_ARTIFACT_ENVIRONMENT'
+    ) as Tm1RegtestDeliveryTransportError & { metadata: { retryable: boolean; nested: { reason: string } } }
+    cause.metadata = { retryable: false, nested: { reason: 'original' } }
+    harness.failBroadcast(cause)
+    let thrown: Tm1PublicationError | null = null
+
+    await harness.orchestrator.approveAndBroadcast(signedReview.signedId).catch(error => { thrown = error })
+    if (thrown === null) throw new Error('expected broadcast error')
+    cause.metadata.nested.reason = 'mutated'
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('broadcastUncertain')
+    if (state.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    const uncertaintyCause = innermostCause(state.uncertainty.error) as Error & {
+      code: string
+      metadata: { retryable: boolean; nested: { reason: string } }
+    }
+    expect(uncertaintyCause).not.toBe(cause)
+    expect(uncertaintyCause.name).toBe('Tm1RegtestDeliveryTransportError')
+    expect(uncertaintyCause.message).toBe('INVALID_ARTIFACT_ENVIRONMENT')
+    expect(uncertaintyCause.code).toBe('INVALID_ARTIFACT_ENVIRONMENT')
+    expect(uncertaintyCause.metadata).toEqual({ retryable: false, nested: { reason: 'original' } })
+    expect(state.uncertainty.broadcastAuthorizationId).toBe('broadcast-auth-1')
+    expect(state.uncertainty.txid).toBe(signedReview.txid)
+    expect(state.uncertainty.signedArtifact).not.toBe(signedReview.signedArtifact)
+    expect(state.uncertainty.signedArtifact.rawTransactionHex).toBe(signedReview.signedArtifact.rawTransactionHex)
+    expect(state.uncertainty.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+  })
+
+  test('clones simple Error causes for failed state snapshots', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause = new Error('simple failure')
+    cause.name = 'SimpleFailure'
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const stateCause = innermostCause(state.error) as Error
+    expect(stateCause).toBeInstanceOf(Error)
+    expect(stateCause).not.toBe(cause)
+    expect(stateCause.name).toBe('SimpleFailure')
+    expect(stateCause.message).toBe('simple failure')
   })
 
   test('clones mutable plain object causes for failed state snapshots', async () => {
