@@ -54,7 +54,7 @@ export class Tm1PublicationError extends Error {
     super(message)
     this.name = 'Tm1PublicationError'
     this.code = code
-    this.cause = cause
+    this.cause = cloneErrorCause(cause)
   }
 }
 
@@ -285,34 +285,35 @@ implements Tm1RegtestPublicationOrchestrator {
     request: Tm1PublicationRequest,
     signal?: AbortSignal
   ): Promise<Tm1PreparedReview> {
+    const requestSnapshot = freezePublicationRequest(request)
     this.beginOperation('prepare')
 
     try {
       if (this.state.status !== 'idle') throw new Tm1PublicationError('INVALID_STATE')
       assertNotAborted(signal)
-      this.transition({ status: 'attesting', message: request.message })
+      this.transition({ status: 'attesting', message: requestSnapshot.message })
       const attestationResult = await this.dependencies.networkAttestation.attest(signal)
       assertNotAborted(signal)
       const network = freezeNetwork(attestationResult)
-      this.transition({ status: 'preparing', message: request.message, network })
+      this.transition({ status: 'preparing', message: requestSnapshot.message, network })
 
       const utxos = await this.dependencies.utxoProvider.readUtxos(signal)
       assertNotAborted(signal)
       const preview = encodeTm1Draft02Post({
-        eventData: request.message,
+        eventData: requestSnapshot.message,
         authorInputIndex: TM1_DRAFT_02_STANDARD_AUTHOR_INPUT_INDEX
       })
       const plan = planTm1Draft02Post({
         preview,
         utxos,
-        activeLockingScriptHex: request.activeLockingScriptHex
+        activeLockingScriptHex: requestSnapshot.activeLockingScriptHex
       })
       const candidate = createTm1Draft02Candidate({
         environment: TM1_DRAFT_02_CANDIDATE_ENVIRONMENT,
         transactionVersion: TM1_DRAFT_02_TX_VERSION,
         locktime: TM1_DRAFT_02_LOCKTIME,
         authorInputIndex: TM1_DRAFT_02_AUTHOR_INPUT_INDEX,
-        authorLockingScriptHex: request.activeLockingScriptHex,
+        authorLockingScriptHex: requestSnapshot.activeLockingScriptHex,
         inputs: plan.inputs.map(input => ({
           txid: input.txid,
           outIdx: input.outIdx,
@@ -325,7 +326,7 @@ implements Tm1RegtestPublicationOrchestrator {
           scriptHex: output.scriptHex
         })),
         dustSats: BigInt(XEC_DUST_SATS),
-        maxFeeSats: request.maxFeeSats ?? DEFAULT_MAX_FEE_SATS,
+        maxFeeSats: requestSnapshot.maxFeeSats ?? DEFAULT_MAX_FEE_SATS,
         sighashPolicy: TM1_DRAFT_02_SIGHASH_POLICY
       })
       const effectiveContent = encodeTm1Draft02CandidateEffectiveContent(candidate)
@@ -820,6 +821,14 @@ function expiredState(
     : Object.freeze({ status: 'expired', stage, reason })
 }
 
+function freezePublicationRequest(request: Tm1PublicationRequest): Tm1PublicationRequest {
+  return Object.freeze({
+    message: request.message,
+    activeLockingScriptHex: request.activeLockingScriptHex,
+    maxFeeSats: request.maxFeeSats
+  })
+}
+
 function assertCandidateStillValid(
   review: Tm1PreparedReview,
   freshUtxos: readonly Tm1Draft02FreshUtxo[]
@@ -1051,14 +1060,42 @@ function clonePublicationError(error: Tm1PublicationError): Tm1PublicationError 
   return clone
 }
 
-function cloneErrorCause(cause: unknown): unknown {
+function cloneErrorCause(cause: unknown, seen: WeakMap<object, unknown> = new WeakMap()): unknown {
+  if (cause === null || typeof cause !== 'object') return cause
   if (cause instanceof Tm1PublicationError) return clonePublicationError(cause)
   if (cause instanceof Error) {
     const clone = new Error(cause.message)
     clone.name = cause.name
     return clone
   }
-  return cause
+  if (cause instanceof Uint8Array) return new Uint8Array(cause)
+  if (Array.isArray(cause)) {
+    const existing = seen.get(cause)
+    if (existing !== undefined) return existing
+    const clone: unknown[] = []
+    seen.set(cause, clone)
+    for (const item of cause) clone.push(cloneErrorCause(item, seen))
+    return clone
+  }
+  if (isPlainObject(cause)) {
+    const existing = seen.get(cause)
+    if (existing !== undefined) return existing
+    const clone: Record<PropertyKey, unknown> = {}
+    seen.set(cause, clone)
+    for (const key of Reflect.ownKeys(cause)) {
+      clone[key] = cloneErrorCause((cause as Record<PropertyKey, unknown>)[key], seen)
+    }
+    return clone
+  }
+  return Object.freeze({
+    name: cause.constructor?.name ?? 'UnknownObject',
+    description: String(cause)
+  })
+}
+
+function isPlainObject(value: object): value is Record<PropertyKey, unknown> {
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
 }
 
 function freezeReceipt(receipt: Tm1SubmissionReceipt): Tm1SubmissionReceipt {

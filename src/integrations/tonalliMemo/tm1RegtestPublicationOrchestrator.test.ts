@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import { Tx, sha256d, toHex } from 'ecash-lib'
 import { XEC_DUST_SATS } from '../../config/xecFees'
+import { encodeTm1Draft02Post } from './tm1Draft02'
 import {
   encodeTm1Draft02CandidateEffectiveContent,
   type Tm1Draft02FreshUtxo
@@ -306,8 +307,33 @@ async function expectCode(promise: Promise<unknown>, code: Tm1PublicationErrorCo
   )
 }
 
+const MUTATED_LOCKING_SCRIPT_HEX = '76a914111111111111111111111111111111111111111188ac'
+
 function statuses(states: readonly Tm1PublicationState[]): string[] {
   return states.map(state => state.status)
+}
+
+function mutatePublicationRequest(request: Tm1PublicationRequest): void {
+  const mutable = request as {
+    message: string
+    activeLockingScriptHex: string
+    maxFeeSats?: bigint
+  }
+  mutable.message = 'message-mutated'
+  mutable.activeLockingScriptHex = MUTATED_LOCKING_SCRIPT_HEX
+  mutable.maxFeeSats = 999_999n
+}
+
+function innermostCause(error: Tm1PublicationError): unknown {
+  let cause = error.cause
+  while (cause instanceof Tm1PublicationError) cause = cause.cause
+  return cause
+}
+
+function observedPrepareMessage(state: Tm1PublicationState): string {
+  if (state.status === 'attesting' || state.status === 'preparing') return state.message
+  if (state.status === 'reviewReady') return state.review.message
+  throw new Error(`unexpected prepare state: ${state.status}`)
 }
 
 async function expectLateBroadcastAuthorizationAbort(
@@ -639,6 +665,98 @@ describe('TM1 regtest publication orchestrator', () => {
     if (state.status !== 'reviewReady') throw new Error('expected review')
     expect(state.review.network.chainIdentity).toBe('chain-A')
     expect(review.network).not.toBe(adapterAttestation)
+  })
+
+  test('snapshots the publication request before pending attestation resolves', async () => {
+    const harness = createHarness()
+    const attestation = harness.deferAttestation()
+    const request: Tm1PublicationRequest = {
+      message: 'message-original',
+      activeLockingScriptHex: TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
+      maxFeeSats: 10_000n
+    }
+    const observed: Tm1PublicationState[] = []
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'attesting' || state.status === 'preparing' || state.status === 'reviewReady') {
+        observed.push(state)
+      }
+    })
+
+    const promise = harness.orchestrator.prepare(request)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    mutatePublicationRequest(request)
+    attestation.resolve(undefined)
+
+    const review = await promise
+    const state = harness.orchestrator.getState()
+    expect(review.message).toBe('message-original')
+    expect(review.candidate.authorLockingScriptHex).toBe(TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX)
+    expect(review.candidate.feePolicy.maxFeeSats).toBe(10_000n)
+    expect(review.orderedOutputs[0].scriptHex).toBe(encodeTm1Draft02Post({
+      eventData: 'message-original',
+      authorInputIndex: 0
+    }).scriptHex)
+    expect(review.orderedOutputs[0].scriptHex).not.toBe(encodeTm1Draft02Post({
+      eventData: 'message-mutated',
+      authorInputIndex: 0
+    }).scriptHex)
+    expect(state.status).toBe('reviewReady')
+    if (state.status !== 'reviewReady') throw new Error('expected review')
+    expect(state.review.message).toBe('message-original')
+    expect(state.review.candidate.authorLockingScriptHex).toBe(TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX)
+    expect(observed.map(item => item.status)).toEqual(['attesting', 'preparing', 'reviewReady'])
+    expect(observed.map(observedPrepareMessage)).toEqual([
+      'message-original',
+      'message-original',
+      'message-original'
+    ])
+  })
+
+  test('snapshots the publication request before pending UTXO reads resolve', async () => {
+    const harness = createHarness()
+    const utxoRead = harness.deferUtxos()
+    const request: Tm1PublicationRequest = {
+      message: 'message-original',
+      activeLockingScriptHex: TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
+      maxFeeSats: 10_000n
+    }
+    const observed: Tm1PublicationState[] = []
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'attesting' || state.status === 'preparing' || state.status === 'reviewReady') {
+        observed.push(state)
+      }
+    })
+
+    const promise = harness.orchestrator.prepare(request)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(observed.map(item => item.status)).toEqual(['attesting', 'preparing'])
+    mutatePublicationRequest(request)
+    utxoRead.resolve(fixtureUtxos())
+
+    const review = await promise
+    const state = harness.orchestrator.getState()
+    expect(review.message).toBe('message-original')
+    expect(review.candidate.authorLockingScriptHex).toBe(TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX)
+    expect(review.candidate.feePolicy.maxFeeSats).toBe(10_000n)
+    expect(review.orderedOutputs[0].scriptHex).toBe(encodeTm1Draft02Post({
+      eventData: 'message-original',
+      authorInputIndex: 0
+    }).scriptHex)
+    expect(review.orderedOutputs[0].scriptHex).not.toBe(encodeTm1Draft02Post({
+      eventData: 'message-mutated',
+      authorInputIndex: 0
+    }).scriptHex)
+    expect(state.status).toBe('reviewReady')
+    if (state.status !== 'reviewReady') throw new Error('expected review')
+    expect(state.review.message).toBe('message-original')
+    expect(state.review.candidate.authorLockingScriptHex).toBe(TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX)
+    expect(observed.map(observedPrepareMessage)).toEqual([
+      'message-original',
+      'message-original',
+      'message-original'
+    ])
   })
 
   test('does not broadcast before independent broadcast authorization', async () => {
@@ -2161,6 +2279,149 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(listenerAErrors[0]).not.toBe(listenerBErrors[0])
     expect(listenerBErrors[0].code).toBe('SIGNING_FAILED')
     expect(listenerBErrors[0].message).toBe('SIGNING_FAILED')
+  })
+
+  test('clones mutable plain object causes for failed state snapshots', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause = { reason: 'original', nested: { value: 1 } }
+    const subscriberCauses: unknown[] = []
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'failed') subscriberCauses.push(innermostCause(state.error))
+    })
+    harness.failSigner(cause)
+    let thrown: Tm1PublicationError | null = null
+
+    await harness.orchestrator.authorizeAndSign(review.preparedId).catch(error => { thrown = error })
+    if (thrown === null) throw new Error('expected thrown error')
+    cause.reason = 'mutated'
+    cause.nested.value = 999
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    expect(innermostCause(thrown)).toEqual({ reason: 'original', nested: { value: 1 } })
+    expect(innermostCause(state.error)).toEqual({ reason: 'original', nested: { value: 1 } })
+    expect(subscriberCauses).toHaveLength(1)
+    expect(subscriberCauses[0]).toEqual({ reason: 'original', nested: { value: 1 } })
+    expect(innermostCause(state.error)).not.toBe(cause)
+  })
+
+  test('clones mutable array causes for failed state snapshots', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause: unknown[] = ['original', { value: 1 }]
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+    cause[0] = 'mutated'
+    ;(cause[1] as { value: number }).value = 999
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    expect(innermostCause(state.error)).toEqual(['original', { value: 1 }])
+    expect(innermostCause(state.error)).not.toBe(cause)
+  })
+
+  test('clones mutable Uint8Array causes for failed state snapshots', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause = new Uint8Array([1, 2, 3])
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+    cause[0] = 255
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    expect(Array.from(innermostCause(state.error) as Uint8Array)).toEqual([1, 2, 3])
+    expect(innermostCause(state.error)).not.toBe(cause)
+  })
+
+  test('caller mutation of thrown mutable cause cannot affect future getState snapshots', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause = { reason: 'original', nested: { value: 1 } }
+    harness.failSigner(cause)
+    let thrown: Tm1PublicationError | null = null
+
+    await harness.orchestrator.authorizeAndSign(review.preparedId).catch(error => { thrown = error })
+    if (thrown === null) throw new Error('expected thrown error')
+    ;(innermostCause(thrown) as { nested: { value: number } }).nested.value = 999
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    expect(innermostCause(state.error)).toEqual({ reason: 'original', nested: { value: 1 } })
+  })
+
+  test('failed state subscribers receive isolated mutable cause snapshots', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause = { reason: 'original', nested: { value: 1 } }
+    const listenerACauses: unknown[] = []
+    const listenerBCauses: unknown[] = []
+    harness.failSigner(cause)
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'failed') return
+      const snapshotCause = innermostCause(state.error)
+      listenerACauses.push(snapshotCause)
+      ;(snapshotCause as { nested: { value: number } }).nested.value = 999
+    })
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'failed') return
+      listenerBCauses.push(innermostCause(state.error))
+    })
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+    expect(listenerACauses).toHaveLength(1)
+    expect(listenerBCauses).toHaveLength(1)
+    expect(listenerACauses[0]).not.toBe(listenerBCauses[0])
+    expect(listenerBCauses[0]).toEqual({ reason: 'original', nested: { value: 1 } })
+  })
+
+  test('broadcastUncertain clones mutable plain object causes and preserves signed evidence', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const cause = { reason: 'original', nested: { value: 1 } }
+    harness.failBroadcast(cause)
+    let thrown: Tm1PublicationError | null = null
+
+    await harness.orchestrator.approveAndBroadcast(signedReview.signedId).catch(error => { thrown = error })
+    if (thrown === null) throw new Error('expected broadcast error')
+    cause.reason = 'mutated'
+    cause.nested.value = 999
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('broadcastUncertain')
+    if (state.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    expect(innermostCause(thrown)).toEqual({ reason: 'original', nested: { value: 1 } })
+    expect(innermostCause(state.uncertainty.error)).toEqual({ reason: 'original', nested: { value: 1 } })
+    expect(state.uncertainty.broadcastAuthorizationId).toBe('broadcast-auth-1')
+    expect(state.uncertainty.txid).toBe(signedReview.txid)
+    expect(state.uncertainty.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+    expect(state.uncertainty.signedArtifact.rawTransactionHex).toBe(signedReview.signedArtifact.rawTransactionHex)
+  })
+
+  test('clones circular plain object causes without stack overflow', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause: { reason: string; self?: unknown } = { reason: 'original' }
+    cause.self = cause
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+    cause.reason = 'mutated'
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const clonedCause = innermostCause(state.error) as { reason: string; self?: unknown }
+    expect(clonedCause.reason).toBe('original')
+    expect(clonedCause.self).toBe(clonedCause)
+    expect(clonedCause).not.toBe(cause)
   })
 
   test('isolates broadcast uncertainty errors and preserves reconciliation metadata', async () => {
