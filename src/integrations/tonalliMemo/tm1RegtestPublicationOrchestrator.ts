@@ -20,6 +20,7 @@ import {
   type Tm1Draft02FundingUtxo
 } from './tm1Draft02Plan'
 import {
+  TM1_REGTEST_FIXTURE_PUBLIC_KEY_HEX,
   TM1_REGTEST_SIGNED_TRANSACTION_ARTIFACT_VERSION,
   TM1_REGTEST_SIGNED_TRANSACTION_FORMAT,
   type RegtestSignedTransaction
@@ -1222,6 +1223,7 @@ function snapshotValidatedSignedArtifact(value: unknown): RegtestSignedTransacti
     sighashPolicy !== TM1_DRAFT_02_SIGHASH_POLICY ||
     typeof fixturePublicKeyHex !== 'string' ||
     !/^(02|03)[0-9a-f]{64}$/.test(fixturePublicKeyHex) ||
+    fixturePublicKeyHex !== TM1_REGTEST_FIXTURE_PUBLIC_KEY_HEX ||
     typeof fixtureLockingScriptHex !== 'string' ||
     fixtureLockingScriptHex.length === 0 ||
     fixtureLockingScriptHex.length % 2 !== 0 ||

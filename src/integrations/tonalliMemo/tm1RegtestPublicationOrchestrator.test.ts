@@ -8,6 +8,7 @@ import {
 } from './tm1Draft02Candidate'
 import {
   TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
+  TM1_REGTEST_FIXTURE_PUBLIC_KEY_HEX,
   signTm1Draft02RegtestCandidate,
   type RegtestSignedTransaction
 } from './tm1Draft02RegtestP2pkhSigner'
@@ -32,6 +33,8 @@ import {
 
 const TXID_A = 'aa'.repeat(32)
 const TXID_B = 'bb'.repeat(32)
+const WRONG_VALID_COMPRESSED_PUBLIC_KEY_HEX =
+  `03${TM1_REGTEST_FIXTURE_PUBLIC_KEY_HEX.slice(2)}`
 const NO_AUDIT_OVERRIDE = Symbol('NO_AUDIT_OVERRIDE')
 const DEFAULT_REQUEST: Tm1PublicationRequest = Object.freeze({
   message: 'TM1 orchestrator regtest publication',
@@ -571,6 +574,37 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
   })
 
+  test('rejects a syntactically valid non-fixture public key during the primary audit', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    harness.returnUncheckedAudit(Object.freeze({
+      ...validArtifact,
+      fixturePublicKeyHex: WRONG_VALID_COMPRESSED_PUBLIC_KEY_HEX
+    }))
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNED_ARTIFACT_INVALID')
+
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+    expect(harness.orchestrator.getState().status).not.toBe('signedReviewReady')
+  })
+
+  test('keeps rejecting a malformed fixture public key during the primary audit', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    harness.returnUncheckedAudit(Object.freeze({
+      ...validArtifact,
+      fixturePublicKeyHex: '04-not-a-compressed-public-key'
+    }))
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNED_ARTIFACT_INVALID')
+
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+  })
+
   test.each([
     ['format', Object.freeze({ format: 'unsupported-signed-transaction-format' })],
     ['artifact version', Object.freeze({ artifactVersion: 2 })]
@@ -594,6 +628,9 @@ describe('TM1 regtest publication orchestrator', () => {
     const signedReview = await harness.orchestrator.authorizeAndSign(review.preparedId)
 
     expect(signedReview.txid).toBe(validArtifact.txid)
+    expect(signedReview.signedArtifact.fixturePublicKeyHex).toBe(
+      TM1_REGTEST_FIXTURE_PUBLIC_KEY_HEX
+    )
     expect(signedReview.signedArtifact.rawTransactionBytes).not.toBe(validArtifact.rawTransactionBytes)
     expect(toHex(signedReview.signedArtifact.rawTransactionBytes)).toBe(validArtifact.rawTransactionHex)
   })
@@ -1080,6 +1117,28 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.calls.audit).toBe(2)
     expect(harness.calls.broadcast).toBe(0)
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'approvingBroadcast' })
+  })
+
+  test('rejects a syntactically valid non-fixture public key during broadcast re-audit before dispatch', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.returnUncheckedAudit(Object.freeze({
+      ...signedReview.signedArtifact,
+      fixturePublicKeyHex: WRONG_VALID_COMPRESSED_PUBLIC_KEY_HEX
+    }))
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast'
+    })
+    expect(harness.orchestrator.getState().status).not.toBe('broadcastUncertain')
   })
 
   test('maps broadcast authorization service failures to BROADCAST_FAILED', async () => {
