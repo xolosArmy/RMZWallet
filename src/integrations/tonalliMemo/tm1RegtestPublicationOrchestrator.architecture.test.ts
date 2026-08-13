@@ -31,6 +31,27 @@ describe('TM1 regtest publication orchestrator architectural boundaries', () => 
     expect(runtime).not.toMatch(/new ChronikClient|new UniversalAuthorizationCore|xolosWalletService/)
   })
 
+  test('snapshots every dependency binding instead of retaining the caller container', () => {
+    const runtime = source('./tm1RegtestPublicationOrchestrator.ts')
+
+    expect(runtime).toContain('private readonly dependencies: Tm1RegtestPublicationDependencyBindings')
+    expect(runtime).toContain('this.dependencies = Object.freeze({')
+    expect(runtime).not.toContain('this.dependencies = dependencies')
+    for (const binding of [
+      'networkAttestation',
+      'utxoProvider',
+      'signingAuthorization',
+      'signer',
+      'signedArtifactAudit',
+      'broadcastAuthorization',
+      'deliveryTransport',
+      'confirmationObserver'
+    ]) {
+      expect(runtime).toContain(`${binding}: dependencies.${binding}`)
+    }
+    expect(runtime).toContain('const clock = dependencies.clock ?? monotonicClock()')
+  })
+
   test('is not mounted in application routes, preview UI, authorization registry, or CLI harness runtime', () => {
     const symbol = 'Tm1RegtestPublicationOrchestrator'
     const app = source('../../App.tsx')

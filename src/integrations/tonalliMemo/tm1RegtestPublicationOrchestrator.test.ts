@@ -46,6 +46,11 @@ const DEFAULT_REQUEST: Tm1PublicationRequest = Object.freeze({
 
 type Harness = ReturnType<typeof createHarness>
 
+type MutableTm1RegtestPublicationDependencies = {
+  -readonly [Key in keyof Tm1RegtestPublicationDependencies]:
+  Tm1RegtestPublicationDependencies[Key]
+}
+
 type Deferred<T> = Readonly<{
   promise: Promise<T>
   resolve: (value: T) => void
@@ -231,6 +236,7 @@ function createHarness() {
     status: 'approved',
     authorizationId: 'sign-auth-1'
   })
+  let signingAuthorizationDeferred: Deferred<Tm1PublicationAuthorizationDecision> | null = null
   let broadcastDecision: unknown = null
   let broadcastAuthorizationFailure: unknown = null
   let broadcastAuthorizationDeferred: Deferred<Tm1BroadcastAuthorizationDecision> | null = null
@@ -269,7 +275,7 @@ function createHarness() {
     confirm: 0
   }
 
-  const dependencies: Tm1RegtestPublicationDependencies = {
+  const dependencies: MutableTm1RegtestPublicationDependencies = {
     networkAttestation: {
       async attest(signal?: AbortSignal) {
         calls.attest += 1
@@ -297,6 +303,7 @@ function createHarness() {
         onSigningAuthorization?.()
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (signingAuthorizationFailure) throw signingAuthorizationFailure
+        if (signingAuthorizationDeferred) return signingAuthorizationDeferred.promise
         return signingDecision as Tm1PublicationAuthorizationDecision
       }
     },
@@ -382,6 +389,7 @@ function createHarness() {
   const orchestrator = new Tm1RegtestPublicationOrchestratorImpl(dependencies)
   return {
     orchestrator,
+    dependencies,
     calls,
     setUtxos: (next: readonly Tm1Draft02FreshUtxo[]) => { utxos = cloneUtxos(next) },
     setChainIdentity: (next: string) => { chainIdentity = next },
@@ -410,6 +418,10 @@ function createHarness() {
     deferBroadcastAuthorization: () => {
       broadcastAuthorizationDeferred = createDeferred<Tm1BroadcastAuthorizationDecision>()
       return broadcastAuthorizationDeferred
+    },
+    deferSigningAuthorization: () => {
+      signingAuthorizationDeferred = createDeferred<Tm1PublicationAuthorizationDecision>()
+      return signingAuthorizationDeferred
     },
     mutateBroadcastArtifact: (fn: (artifact: RegtestSignedTransaction) => void) => { broadcastMutator = fn },
     getLastBroadcastArtifact: () => lastBroadcastArtifact,
@@ -566,6 +578,206 @@ describe('TM1 regtest publication orchestrator', () => {
       broadcast: 1,
       confirm: 1
     })
+  })
+
+  test('snapshots the original delivery transport immediately at construction', async () => {
+    const harness = createHarness()
+    let replacementCalls = 0
+    harness.dependencies.deliveryTransport = {
+      async broadcast(signedArtifact) {
+        replacementCalls += 1
+        return Object.freeze({ txid: signedArtifact.txid, disposition: 'accepted' as const })
+      }
+    }
+
+    const signedReview = await prepareAndSign(harness)
+    await expect(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    ).resolves.toMatchObject({ txid: signedReview.txid })
+
+    expect(harness.calls.broadcast).toBe(1)
+    expect(replacementCalls).toBe(0)
+  })
+
+  test('keeps the construction-time transport while broadcast authorization is pending', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const authorization = harness.deferBroadcastAuthorization()
+    const observedAuthorizationIds: string[] = []
+    let replacementCalls = 0
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'broadcasting') {
+        observedAuthorizationIds.push(state.broadcastAuthorizationId)
+      }
+    })
+
+    const promise = harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.broadcastAuthorization).toBe(1)
+    harness.dependencies.deliveryTransport = {
+      async broadcast(signedArtifact) {
+        replacementCalls += 1
+        return Object.freeze({ txid: signedArtifact.txid, disposition: 'accepted' as const })
+      }
+    }
+    authorization.resolve(Object.freeze({
+      status: 'approved',
+      authorizationId: 'broadcast-auth-snapshotted',
+      signedId: signedReview.signedId,
+      txid: signedReview.txid,
+      signedArtifactHash: signedReview.signedArtifactHash
+    }))
+
+    const receipt = await promise
+    const state = harness.orchestrator.getState()
+    expect(receipt.txid).toBe(signedReview.txid)
+    expect(receipt.deliveryReceipt.txid).toBe(signedReview.txid)
+    expect(harness.getLastBroadcastArtifact()?.txid).toBe(signedReview.txid)
+    expect(observedAuthorizationIds).toEqual(['broadcast-auth-snapshotted'])
+    expect(state.status).toBe('submitted')
+    if (state.status !== 'submitted') throw new Error('expected submitted')
+    expect(state.signedReview.txid).toBe(signedReview.txid)
+    expect(state.signedReview.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+    expect(harness.calls.broadcast).toBe(1)
+    expect(replacementCalls).toBe(0)
+  })
+
+  test('keeps the construction-time transport while broadcast re-audit is pending', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const audit = harness.deferAudit()
+    let replacementCalls = 0
+
+    const promise = harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.audit).toBe(2)
+    harness.dependencies.deliveryTransport = {
+      async broadcast(signedArtifact) {
+        replacementCalls += 1
+        return Object.freeze({ txid: signedArtifact.txid, disposition: 'accepted' as const })
+      }
+    }
+    audit.resolve(signedReview.signedArtifact)
+
+    await expect(promise).resolves.toMatchObject({ txid: signedReview.txid })
+    expect(harness.calls.broadcast).toBe(1)
+    expect(replacementCalls).toBe(0)
+    expect(harness.orchestrator.getState().status).toBe('submitted')
+  })
+
+  test('keeps the construction-time signer while signing authorization is pending', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const authorization = harness.deferSigningAuthorization()
+    let replacementCalls = 0
+
+    const promise = harness.orchestrator.authorizeAndSign(review.preparedId)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.signingAuthorization).toBe(1)
+    harness.dependencies.signer = {
+      async sign(currentReview, signal) {
+        replacementCalls += 1
+        return signTm1Draft02RegtestCandidate({ candidate: currentReview.candidate, signal })
+      }
+    }
+    authorization.resolve(Object.freeze({
+      status: 'approved',
+      authorizationId: 'sign-auth-snapshotted'
+    }))
+
+    await expect(promise).resolves.toMatchObject({ preparedId: review.preparedId })
+    expect(harness.calls.signer).toBe(1)
+    expect(replacementCalls).toBe(0)
+    expect(harness.orchestrator.getState().status).toBe('signedReviewReady')
+  })
+
+  test('keeps the construction-time signed artifact audit after container mutation', async () => {
+    const harness = createHarness()
+    let replacementCalls = 0
+    harness.dependencies.signedArtifactAudit = {
+      async auditSignedArtifact({ signedArtifact }) {
+        replacementCalls += 1
+        return signedArtifact
+      }
+    }
+
+    await prepareAndSign(harness)
+
+    expect(harness.calls.audit).toBe(1)
+    expect(replacementCalls).toBe(0)
+  })
+
+  test('keeps the construction-time confirmation observer after submission', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    let replacementCalls = 0
+    harness.dependencies.confirmationObserver = {
+      async confirm({ submissionId, txid }) {
+        replacementCalls += 1
+        return Object.freeze({ submissionId, txid, confirmations: 1 })
+      }
+    }
+
+    await expect(harness.orchestrator.confirm(receipt.submissionId)).resolves.toMatchObject({
+      submissionId: receipt.submissionId,
+      txid: receipt.txid,
+      confirmations: 1
+    })
+
+    expect(harness.calls.confirm).toBe(1)
+    expect(replacementCalls).toBe(0)
+  })
+
+  test('keeps construction-time network and UTXO ports for prepare and revalidation', async () => {
+    const harness = createHarness()
+    let replacementAttestCalls = 0
+    let replacementUtxoCalls = 0
+    harness.dependencies.networkAttestation = {
+      async attest() {
+        replacementAttestCalls += 1
+        return Object.freeze({
+          environment: 'deterministic-regtest-fixture',
+          chainIdentity: 'replacement-chain'
+        })
+      }
+    }
+    harness.dependencies.utxoProvider = {
+      async readUtxos() {
+        replacementUtxoCalls += 1
+        return Object.freeze(cloneUtxos(fixtureUtxos()))
+      }
+    }
+
+    await prepareAndSign(harness)
+
+    expect(harness.calls.attest).toBe(2)
+    expect(harness.calls.utxos).toBe(2)
+    expect(replacementAttestCalls).toBe(0)
+    expect(replacementUtxoCalls).toBe(0)
+  })
+
+  test('keeps the construction-time clock for every staged identifier', async () => {
+    const harness = createHarness()
+    let replacementCalls = 0
+    harness.dependencies.clock = {
+      createId(prefix) {
+        replacementCalls += 1
+        return `replacement-${prefix}`
+      }
+    }
+
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const signedReview = await harness.orchestrator.authorizeAndSign(review.preparedId)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    expect(review.preparedId).toBe('prepared-1')
+    expect(signedReview.signedId).toBe('signed-2')
+    expect(receipt.submissionId).toBe('submission-3')
+    expect(replacementCalls).toBe(0)
   })
 
   test('emits the exact non-terminal state sequence for the happy path', async () => {

@@ -194,6 +194,10 @@ export type Tm1RegtestPublicationDependencies = Readonly<{
   clock?: Tm1PublicationClock
 }>
 
+type Tm1RegtestPublicationDependencyBindings = Readonly<
+  Required<Tm1RegtestPublicationDependencies>
+>
+
 export interface Tm1NetworkAttestationPort {
   attest(signal?: AbortSignal): Promise<Tm1RegtestNetworkAttestation>
 }
@@ -265,15 +269,26 @@ export interface Tm1RegtestPublicationOrchestrator {
 
 export class Tm1RegtestPublicationOrchestratorImpl
 implements Tm1RegtestPublicationOrchestrator {
-  private readonly dependencies: Tm1RegtestPublicationDependencies
+  private readonly dependencies: Tm1RegtestPublicationDependencyBindings
   private readonly clock: Tm1PublicationClock
   private readonly listeners = new Set<(state: Tm1PublicationState) => void>()
   private state: Tm1PublicationState = Object.freeze({ status: 'idle' })
   private activeOperation: Tm1ActivePublicationOperation = null
 
   constructor(dependencies: Tm1RegtestPublicationDependencies) {
-    this.dependencies = dependencies
-    this.clock = dependencies.clock ?? monotonicClock()
+    const clock = dependencies.clock ?? monotonicClock()
+    this.dependencies = Object.freeze({
+      networkAttestation: dependencies.networkAttestation,
+      utxoProvider: dependencies.utxoProvider,
+      signingAuthorization: dependencies.signingAuthorization,
+      signer: dependencies.signer,
+      signedArtifactAudit: dependencies.signedArtifactAudit,
+      broadcastAuthorization: dependencies.broadcastAuthorization,
+      deliveryTransport: dependencies.deliveryTransport,
+      confirmationObserver: dependencies.confirmationObserver,
+      clock
+    })
+    this.clock = clock
   }
 
   getState(): Tm1PublicationState {
