@@ -1,4 +1,4 @@
-import { Tx, sha256d, toHex, toHexRev } from 'ecash-lib'
+import { Tx, sha256d, toHex } from 'ecash-lib'
 import { XEC_DUST_SATS } from '../../config/xecFees'
 import { encodeTm1Draft02Post } from './tm1Draft02'
 import {
@@ -20,9 +20,11 @@ import {
   type Tm1Draft02FundingUtxo
 } from './tm1Draft02Plan'
 import {
+  TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
   TM1_REGTEST_FIXTURE_PUBLIC_KEY_HEX,
   TM1_REGTEST_SIGNED_TRANSACTION_ARTIFACT_VERSION,
   TM1_REGTEST_SIGNED_TRANSACTION_FORMAT,
+  auditTm1Draft02RegtestSignedTransaction,
   type RegtestSignedTransaction
 } from './tm1Draft02RegtestP2pkhSigner'
 import type {
@@ -812,7 +814,10 @@ async function auditSignedArtifact(input: Readonly<{
     assertNotAborted(input.signal)
 
     const { artifact, transaction } = snapshotValidatedSignedArtifact(auditResult)
-    assertSignedTransactionMatchesCandidate(transaction, input.review.candidate)
+    auditTm1Draft02RegtestSignedTransaction({
+      candidate: input.review.candidate,
+      signedTransaction: transaction
+    })
     const artifactHash = hashBytes(artifact.rawTransactionBytes)
     if (
       artifact.inputCount !== input.review.orderedInputs.length ||
@@ -1231,6 +1236,7 @@ function snapshotValidatedSignedArtifact(value: unknown): Readonly<{
     fixtureLockingScriptHex.length === 0 ||
     fixtureLockingScriptHex.length % 2 !== 0 ||
     !/^[0-9a-f]+$/.test(fixtureLockingScriptHex) ||
+    fixtureLockingScriptHex !== TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX ||
     typeof inputCount !== 'number' ||
     !Number.isSafeInteger(inputCount) ||
     inputCount <= 0 ||
@@ -1417,49 +1423,6 @@ function assertSignedArtifactCoherent(artifact: RegtestSignedTransaction): Tx {
     throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID')
   }
   return transaction
-}
-
-function assertSignedTransactionMatchesCandidate(
-  transaction: Tx,
-  candidate: Tm1Draft02Candidate
-): void {
-  if (
-    transaction.version !== candidate.transactionVersion ||
-    transaction.locktime !== candidate.locktime ||
-    transaction.inputs.length !== candidate.inputs.length ||
-    transaction.outputs.length !== candidate.outputs.length
-  ) {
-    throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID')
-  }
-
-  transaction.inputs.forEach((signedInput, index) => {
-    const expected = candidate.inputs[index]
-    const txid = typeof signedInput.prevOut.txid === 'string'
-      ? signedInput.prevOut.txid.toLowerCase()
-      : toHexRev(signedInput.prevOut.txid)
-    if (
-      !expected ||
-      txid !== expected.txid ||
-      signedInput.prevOut.outIdx !== expected.outIdx ||
-      signedInput.sequence !== expected.sequence
-    ) {
-      throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID')
-    }
-  })
-
-  transaction.outputs.forEach((signedOutput, index) => {
-    const expected = candidate.outputs[index]
-    if (
-      !expected ||
-      signedOutput.sats !== expected.sats ||
-      signedOutput.script.toHex() !== expected.scriptHex
-    ) {
-      throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID')
-    }
-  })
-
-  // scriptSig is deliberately excluded because signing must add unlocking data.
-  // signData contains prevout metadata and is not serialized into the transaction.
 }
 
 function monotonicClock(): Tm1PublicationClock {

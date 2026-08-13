@@ -10,7 +10,8 @@ import {
   isPushOp,
   sha256d,
   shaRmd160,
-  toHex
+  toHex,
+  toHexRev
 } from 'ecash-lib'
 import {
   TM1_DRAFT_02_AUTHOR_INPUT_INDEX,
@@ -155,7 +156,7 @@ export function signTm1Draft02RegtestCandidate(input: Readonly<{
     }))
   }).sign({ ecc })
 
-  auditSignedTransaction(candidate, signedTransaction, publicKey, ecc)
+  auditTm1Draft02RegtestSignedTransaction({ candidate, signedTransaction })
   assertNotAborted(input.signal)
 
   const rawTransactionBytes = signedTransaction.ser()
@@ -174,12 +175,29 @@ export function signTm1Draft02RegtestCandidate(input: Readonly<{
   })
 }
 
-function auditSignedTransaction(
-  candidate: Tm1Draft02Candidate,
-  signedTransaction: Tx,
-  publicKey: Uint8Array,
-  ecc: Ecc
-): void {
+export function auditTm1Draft02RegtestSignedTransaction(input: Readonly<{
+  candidate: Tm1Draft02Candidate
+  signedTransaction: Tx
+}>): void {
+  const { candidate, signedTransaction } = input
+  if (
+    candidate.environment !== TM1_DRAFT_02_CANDIDATE_ENVIRONMENT ||
+    candidate.sighashPolicy !== TM1_DRAFT_02_SIGHASH_POLICY
+  ) {
+    fail('SIGNED_TRANSACTION_MISMATCH')
+  }
+  if (candidate.inputs.some(
+    candidateInput => candidateInput.lockingScriptHex !== TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX
+  )) {
+    fail('INPUT_NOT_OWNED_BY_FIXTURE_KEY')
+  }
+  if (
+    candidate.authorInputIndex !== TM1_DRAFT_02_AUTHOR_INPUT_INDEX ||
+    candidate.authorLockingScriptHex !== TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX ||
+    candidate.outputs[1]?.scriptHex !== TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX
+  ) {
+    fail('AUTHOR_IDENTITY_MISMATCH')
+  }
   if (
     signedTransaction.version !== candidate.transactionVersion ||
     signedTransaction.locktime !== candidate.locktime ||
@@ -191,10 +209,12 @@ function auditSignedTransaction(
 
   signedTransaction.inputs.forEach((signedInput, index) => {
     const expected = candidate.inputs[index]
+    const txid = typeof signedInput.prevOut.txid === 'string'
+      ? signedInput.prevOut.txid.toLowerCase()
+      : toHexRev(signedInput.prevOut.txid)
     if (
       !expected ||
-      typeof signedInput.prevOut.txid !== 'string' ||
-      signedInput.prevOut.txid.toLowerCase() !== expected.txid ||
+      txid !== expected.txid ||
       signedInput.prevOut.outIdx !== expected.outIdx ||
       signedInput.sequence !== expected.sequence
     ) {
@@ -213,29 +233,31 @@ function auditSignedTransaction(
     }
   })
 
-  const unsigned = UnsignedTx.fromTx(signedTransaction)
-  signedTransaction.inputs.forEach((signedInput, index) => {
-    const operations = signedInput.script?.ops()
-    const signaturePush = operations?.next()
-    const publicKeyPush = operations?.next()
-    if (
-      !operations ||
-      !isPushOp(signaturePush) ||
-      !isPushOp(publicKeyPush) ||
-      operations.next() !== undefined ||
-      signaturePush.data.length !== SCHNORR_SIGNATURE_BYTES + 1 ||
-      publicKeyPush.data.length !== publicKey.length ||
-      !bytesEqual(publicKeyPush.data, publicKey) ||
-      signaturePush.data[SCHNORR_SIGNATURE_BYTES] !== (ALL_BIP143.toInt() & 0xff)
-    ) {
-      fail('INVALID_P2PKH_SCRIPTSIG')
-    }
+  const verificationTransaction = new Tx({
+    version: signedTransaction.version,
+    locktime: signedTransaction.locktime,
+    inputs: signedTransaction.inputs.map((signedInput, index) => ({
+      prevOut: signedInput.prevOut,
+      script: signedInput.script,
+      sequence: signedInput.sequence,
+      signData: {
+        sats: candidate.inputs[index].sats,
+        outputScript: new Script(fromHex(candidate.inputs[index].lockingScriptHex))
+      }
+    })),
+    outputs: signedTransaction.outputs
+  })
+  const unsigned = UnsignedTx.fromTx(verificationTransaction)
+  const publicKey = fromHex(TM1_REGTEST_FIXTURE_PUBLIC_KEY_HEX)
+  const ecc = new Ecc()
+  verificationTransaction.inputs.forEach((signedInput, index) => {
+    const signature = readFixtureP2pkhSignature(signedInput.script, publicKey)
 
     const preimage = unsigned.inputAt(index).sigHashPreimage(ALL_BIP143)
     const sighash = sha256d(preimage.bytes)
     try {
       ecc.schnorrVerify(
-        signaturePush.data.slice(0, SCHNORR_SIGNATURE_BYTES),
+        signature.slice(0, SCHNORR_SIGNATURE_BYTES),
         sighash,
         publicKey
       )
@@ -243,6 +265,35 @@ function auditSignedTransaction(
       fail('INVALID_P2PKH_SIGNATURE')
     }
   })
+}
+
+function readFixtureP2pkhSignature(
+  script: Script | undefined,
+  expectedPublicKey: Uint8Array
+): Uint8Array {
+  try {
+    const operations = script?.ops()
+    const signaturePush = operations?.next()
+    const publicKeyPush = operations?.next()
+    if (
+      !operations ||
+      !isPushOp(signaturePush) ||
+      !isPushOp(publicKeyPush) ||
+      operations.next() !== undefined ||
+      signaturePush.opcode !== SCHNORR_SIGNATURE_BYTES + 1 ||
+      signaturePush.data.length !== SCHNORR_SIGNATURE_BYTES + 1 ||
+      publicKeyPush.opcode !== expectedPublicKey.length ||
+      publicKeyPush.data.length !== expectedPublicKey.length ||
+      !bytesEqual(publicKeyPush.data, expectedPublicKey) ||
+      signaturePush.data[SCHNORR_SIGNATURE_BYTES] !== (ALL_BIP143.toInt() & 0xff)
+    ) {
+      fail('INVALID_P2PKH_SCRIPTSIG')
+    }
+    return signaturePush.data
+  } catch (error) {
+    if (error instanceof Tm1Draft02RegtestSignerError) throw error
+    fail('INVALID_P2PKH_SCRIPTSIG')
+  }
 }
 
 function decodeCompressedRegtestWif(wif: string): Uint8Array {

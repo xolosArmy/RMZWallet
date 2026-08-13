@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { Tx, sha256d, toHex } from 'ecash-lib'
+import { Script, Tx, fromHex, isPushOp, sha256d, toHex } from 'ecash-lib'
 import { XEC_DUST_SATS } from '../../config/xecFees'
 import { encodeTm1Draft02Post } from './tm1Draft02'
 import {
@@ -35,6 +35,8 @@ const TXID_A = 'aa'.repeat(32)
 const TXID_B = 'bb'.repeat(32)
 const WRONG_VALID_COMPRESSED_PUBLIC_KEY_HEX =
   `03${TM1_REGTEST_FIXTURE_PUBLIC_KEY_HEX.slice(2)}`
+const NON_FIXTURE_P2PKH_LOCKING_SCRIPT_HEX =
+  '76a914111111111111111111111111111111111111111188ac'
 const NO_AUDIT_OVERRIDE = Symbol('NO_AUDIT_OVERRIDE')
 const DEFAULT_REQUEST: Tm1PublicationRequest = Object.freeze({
   message: 'TM1 orchestrator regtest publication',
@@ -76,6 +78,80 @@ function mutateSignedArtifactTransaction(
     rawTransactionBytes: new Uint8Array(rawTransactionBytes)
   })
 }
+
+type P2pkhUnlocking = Readonly<{
+  signature: Uint8Array
+  publicKey: Uint8Array
+}>
+
+function mutateSignedArtifactP2pkhUnlocking(
+  artifact: RegtestSignedTransaction,
+  inputIndex: number,
+  mutate: (unlocking: P2pkhUnlocking) => P2pkhUnlocking
+): RegtestSignedTransaction {
+  return mutateSignedArtifactTransaction(artifact, transaction => {
+    const transactionInput = transaction.inputs[inputIndex]
+    if (!transactionInput) throw new Error(`expected input ${inputIndex}`)
+    const operations = transactionInput.script?.ops()
+    const signaturePush = operations?.next()
+    const publicKeyPush = operations?.next()
+    if (
+      !operations ||
+      !isPushOp(signaturePush) ||
+      !isPushOp(publicKeyPush) ||
+      operations.next() !== undefined
+    ) {
+      throw new Error('expected signer-produced P2PKH unlocking script')
+    }
+    const unlocking = mutate(Object.freeze({
+      signature: new Uint8Array(signaturePush.data),
+      publicKey: new Uint8Array(publicKeyPush.data)
+    }))
+    transactionInput.script = Script.p2pkhSpend(unlocking.publicKey, unlocking.signature)
+  })
+}
+
+const INVALID_UNLOCKING_MUTATIONS: ReadonlyArray<readonly [
+  string,
+  (artifact: RegtestSignedTransaction) => RegtestSignedTransaction
+]> = [
+  ['an empty scriptSig', artifact => mutateSignedArtifactTransaction(artifact, transaction => {
+    const input = transaction.inputs[0]
+    if (!input) throw new Error('expected an input')
+    input.script = new Script()
+  })],
+  ['a scriptSig with a trailing push', artifact => mutateSignedArtifactTransaction(artifact, transaction => {
+    const input = transaction.inputs[0]
+    if (!input?.script) throw new Error('expected an unlocking script')
+    input.script = new Script(new Uint8Array([...input.script.bytecode, 0]))
+  })],
+  ['the wrong compressed public key', artifact => mutateSignedArtifactP2pkhUnlocking(
+    artifact,
+    0,
+    unlocking => Object.freeze({
+      ...unlocking,
+      publicKey: fromHex(WRONG_VALID_COMPRESSED_PUBLIC_KEY_HEX)
+    })
+  )],
+  ['a corrupted Schnorr signature', artifact => mutateSignedArtifactP2pkhUnlocking(
+    artifact,
+    0,
+    unlocking => {
+      const signature = new Uint8Array(unlocking.signature)
+      signature[0] = (signature[0] ?? 0) ^ 1
+      return Object.freeze({ ...unlocking, signature })
+    }
+  )],
+  ['the wrong sighash type', artifact => mutateSignedArtifactP2pkhUnlocking(
+    artifact,
+    0,
+    unlocking => {
+      const signature = new Uint8Array(unlocking.signature)
+      signature[signature.length - 1] = 0x01
+      return Object.freeze({ ...unlocking, signature })
+    }
+  )]
+]
 
 function appendTrailingByte(artifact: RegtestSignedTransaction): RegtestSignedTransaction {
   const rawTransactionBytes = new Uint8Array(artifact.rawTransactionBytes.length + 1)
@@ -393,8 +469,6 @@ function expectBroadcastUncertainEvidence(
   return state
 }
 
-const MUTATED_LOCKING_SCRIPT_HEX = '76a914111111111111111111111111111111111111111188ac'
-
 function statuses(states: readonly Tm1PublicationState[]): string[] {
   return states.map(state => state.status)
 }
@@ -406,7 +480,7 @@ function mutatePublicationRequest(request: Tm1PublicationRequest): void {
     maxFeeSats?: bigint
   }
   mutable.message = 'message-mutated'
-  mutable.activeLockingScriptHex = MUTATED_LOCKING_SCRIPT_HEX
+  mutable.activeLockingScriptHex = NON_FIXTURE_P2PKH_LOCKING_SCRIPT_HEX
   mutable.maxFeeSats = 999_999n
 }
 
@@ -668,6 +742,44 @@ describe('TM1 regtest publication orchestrator', () => {
   })
 
   test.each([
+    ['a syntactically valid non-fixture P2PKH locking script', NON_FIXTURE_P2PKH_LOCKING_SCRIPT_HEX],
+    ['a malformed locking script', 'not-a-locking-script']
+  ])('rejects %s during the primary audit', async (_label, fixtureLockingScriptHex) => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    harness.returnUncheckedAudit(Object.freeze({
+      ...validArtifact,
+      fixtureLockingScriptHex
+    }))
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNED_ARTIFACT_INVALID')
+
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+    expect(harness.orchestrator.getState().status).not.toBe('signedReviewReady')
+  })
+
+  test.each(INVALID_UNLOCKING_MUTATIONS)(
+    'rejects signer output with %s during the primary audit',
+    async (_label, mutate) => {
+      const harness = createHarness()
+      const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+      const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+      harness.returnUncheckedAudit(mutate(validArtifact))
+
+      await expectCode(
+        harness.orchestrator.authorizeAndSign(review.preparedId),
+        'SIGNED_ARTIFACT_INVALID'
+      )
+
+      expect(harness.calls.broadcast).toBe(0)
+      expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+      expect(harness.orchestrator.getState().status).not.toBe('signedReviewReady')
+    }
+  )
+
+  test.each([
     ['format', Object.freeze({ format: 'unsupported-signed-transaction-format' })],
     ['artifact version', Object.freeze({ artifactVersion: 2 })]
   ])('rejects an unsupported signed artifact %s', async (_label, override) => {
@@ -692,6 +804,9 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(signedReview.txid).toBe(validArtifact.txid)
     expect(signedReview.signedArtifact.fixturePublicKeyHex).toBe(
       TM1_REGTEST_FIXTURE_PUBLIC_KEY_HEX
+    )
+    expect(signedReview.signedArtifact.fixtureLockingScriptHex).toBe(
+      TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX
     )
     expect(signedReview.signedArtifact.rawTransactionBytes).not.toBe(validArtifact.rawTransactionBytes)
     expect(toHex(signedReview.signedArtifact.rawTransactionBytes)).toBe(validArtifact.rawTransactionHex)
@@ -735,6 +850,31 @@ describe('TM1 regtest publication orchestrator', () => {
     )
 
     expect(harness.calls.broadcast).toBe(0)
+  })
+
+  test('rejects a multi-input artifact when only one Schnorr signature is corrupted', async () => {
+    const harness = createHarness()
+    harness.setUtxos(fixtureUtxos().map(utxo => ({ ...utxo, sats: 700n })))
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    expect(review.candidate.inputs).toHaveLength(2)
+    const validArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    harness.returnUncheckedAudit(mutateSignedArtifactP2pkhUnlocking(
+      validArtifact,
+      1,
+      unlocking => {
+        const signature = new Uint8Array(unlocking.signature)
+        signature[0] = (signature[0] ?? 0) ^ 1
+        return Object.freeze({ ...unlocking, signature })
+      }
+    ))
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
   })
 
   test('rejects a non-canonical signed transaction with a trailing byte during primary audit', async () => {
@@ -1279,6 +1419,81 @@ describe('TM1 regtest publication orchestrator', () => {
       ...signedReview.signedArtifact,
       fixturePublicKeyHex: WRONG_VALID_COMPRESSED_PUBLIC_KEY_HEX
     }))
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast'
+    })
+    expect(harness.orchestrator.getState().status).not.toBe('broadcastUncertain')
+  })
+
+  test('rejects a non-fixture P2PKH locking script during broadcast re-audit before dispatch', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.returnUncheckedAudit(Object.freeze({
+      ...signedReview.signedArtifact,
+      fixtureLockingScriptHex: NON_FIXTURE_P2PKH_LOCKING_SCRIPT_HEX
+    }))
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast'
+    })
+    expect(harness.orchestrator.getState().status).not.toBe('broadcastUncertain')
+  })
+
+  test('rejects an empty scriptSig during broadcast re-audit before dispatch', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.returnUncheckedAudit(mutateSignedArtifactTransaction(
+      signedReview.signedArtifact,
+      transaction => {
+        const input = transaction.inputs[0]
+        if (!input) throw new Error('expected an input')
+        input.script = new Script()
+      }
+    ))
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast'
+    })
+    expect(harness.orchestrator.getState().status).not.toBe('broadcastUncertain')
+  })
+
+  test('rejects a cryptographically invalid signature during broadcast re-audit before dispatch', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.returnUncheckedAudit(mutateSignedArtifactP2pkhUnlocking(
+      signedReview.signedArtifact,
+      0,
+      unlocking => {
+        const signature = new Uint8Array(unlocking.signature)
+        signature[0] = (signature[0] ?? 0) ^ 1
+        return Object.freeze({ ...unlocking, signature })
+      }
+    ))
 
     await expectCode(
       harness.orchestrator.approveAndBroadcast(signedReview.signedId),
