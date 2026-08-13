@@ -68,6 +68,33 @@ function createDeferred<T>(): Deferred<T> {
   return Object.freeze({ promise, resolve: resolveValue, reject: rejectValue })
 }
 
+function awaitCooperativeAudit<T>(
+  deferred: Deferred<T>,
+  signal?: AbortSignal
+): Promise<T> {
+  if (signal?.aborted) return Promise.reject(new Tm1PublicationError('ABORTED'))
+  if (signal === undefined) return deferred.promise
+
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', onAbort)
+    const onAbort = () => {
+      cleanup()
+      reject(new Tm1PublicationError('ABORTED'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    deferred.promise.then(
+      value => {
+        cleanup()
+        resolve(value)
+      },
+      error => {
+        cleanup()
+        reject(error)
+      }
+    )
+  })
+}
+
 function mutateSignedArtifactTransaction(
   artifact: RegtestSignedTransaction,
   mutate: (transaction: Tx) => void
@@ -255,6 +282,8 @@ function createHarness() {
   let confirmationDeferred: Deferred<Tm1Confirmation> | null = null
   let signerDeferred: Deferred<RegtestSignedTransaction> | null = null
   let auditDeferred: Deferred<RegtestSignedTransaction> | null = null
+  let cooperativeAudit = false
+  const auditSignals: Array<AbortSignal | undefined> = []
   let utxoDeferred: Deferred<readonly Tm1Draft02FreshUtxo[]> | null = null
   let onSigningAuthorization: (() => void) | null = null
   let onBroadcastAuthorization: (() => void) | null = null
@@ -317,11 +346,21 @@ function createHarness() {
       }
     },
     signedArtifactAudit: {
-      async auditSignedArtifact({ signedArtifact }) {
+      async auditSignedArtifact({ signedArtifact, signal }) {
+        auditSignals.push(signal)
+        if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         calls.audit += 1
         auditArtifacts.push(signedArtifact)
         if (auditFailure) throw auditFailure
-        if (auditDeferred) return auditDeferred.promise
+        if (auditDeferred) {
+          const deferred = auditDeferred
+          if (cooperativeAudit) {
+            auditDeferred = null
+            cooperativeAudit = false
+            return awaitCooperativeAudit(deferred, signal)
+          }
+          return deferred.promise
+        }
         if (auditReturnUnchecked !== NO_AUDIT_OVERRIDE) {
           return auditReturnUnchecked as RegtestSignedTransaction
         }
@@ -426,6 +465,7 @@ function createHarness() {
     mutateBroadcastArtifact: (fn: (artifact: RegtestSignedTransaction) => void) => { broadcastMutator = fn },
     getLastBroadcastArtifact: () => lastBroadcastArtifact,
     getAuditArtifacts: () => [...auditArtifacts],
+    getAuditSignals: () => [...auditSignals],
     deferConfirmation: () => {
       confirmationDeferred = createDeferred<Tm1Confirmation>()
       return confirmationDeferred
@@ -436,6 +476,11 @@ function createHarness() {
     },
     deferAudit: () => {
       auditDeferred = createDeferred<RegtestSignedTransaction>()
+      return auditDeferred
+    },
+    deferCooperativeAudit: () => {
+      auditDeferred = createDeferred<RegtestSignedTransaction>()
+      cooperativeAudit = true
       return auditDeferred
     },
     deferAttestation: () => {
@@ -778,6 +823,108 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(signedReview.signedId).toBe('signed-2')
     expect(receipt.submissionId).toBe('submission-3')
     expect(replacementCalls).toBe(0)
+  })
+
+  test('forwards the exact operation signal to the primary signed-artifact audit', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const controller = new AbortController()
+
+    await expect(
+      harness.orchestrator.authorizeAndSign(review.preparedId, controller.signal)
+    ).resolves.toMatchObject({ preparedId: review.preparedId })
+
+    expect(harness.getAuditSignals()).toEqual([controller.signal])
+    expect(harness.orchestrator.getState().status).toBe('signedReviewReady')
+  })
+
+  test('cooperatively aborts a pending primary audit and releases the active operation', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.deferCooperativeAudit()
+    const controller = new AbortController()
+
+    const promise = harness.orchestrator.authorizeAndSign(review.preparedId, controller.signal)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.audit).toBe(1)
+    expect(harness.getAuditSignals()).toEqual([controller.signal])
+    controller.abort()
+
+    await expectCode(promise, 'ABORTED')
+    expect(harness.orchestrator.getState().status).toBe('aborted')
+    expect(harness.orchestrator.getState().status).not.toBe('signedReviewReady')
+
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+    const retryReview = await harness.orchestrator.prepare({
+      ...DEFAULT_REQUEST,
+      message: 'retry after primary audit abort'
+    })
+    await expect(
+      harness.orchestrator.authorizeAndSign(retryReview.preparedId)
+    ).resolves.toMatchObject({ preparedId: retryReview.preparedId })
+    expect(harness.orchestrator.getState().status).toBe('signedReviewReady')
+  })
+
+  test('forwards the exact operation signal to the broadcast re-audit', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const controller = new AbortController()
+
+    await expect(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId, controller.signal)
+    ).resolves.toMatchObject({ txid: signedReview.txid })
+
+    expect(harness.getAuditSignals()).toEqual([undefined, controller.signal])
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('submitted')
+  })
+
+  test('cooperatively aborts broadcast re-audit before dispatch and releases the operation', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.deferCooperativeAudit()
+    const controller = new AbortController()
+
+    const promise = harness.orchestrator.approveAndBroadcast(
+      signedReview.signedId,
+      controller.signal
+    )
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.getAuditSignals()).toEqual([undefined, controller.signal])
+    controller.abort()
+
+    await expectCode(promise, 'ABORTED')
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState().status).toBe('aborted')
+    expect(harness.orchestrator.getState().status).not.toBe('broadcastUncertain')
+
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+    await expect(harness.orchestrator.prepare({
+      ...DEFAULT_REQUEST,
+      message: 'new operation after re-audit abort'
+    })).resolves.toMatchObject({ message: 'new operation after re-audit abort' })
+  })
+
+  test('a cooperative audit performs no relevant work for an already-aborted signal', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const signedArtifact = signTm1Draft02RegtestCandidate({ candidate: review.candidate })
+    const controller = new AbortController()
+    controller.abort()
+
+    await expectCode(harness.dependencies.signedArtifactAudit.auditSignedArtifact({
+      review,
+      signedArtifact,
+      signal: controller.signal
+    }), 'ABORTED')
+
+    expect(harness.getAuditSignals()).toEqual([controller.signal])
+    expect(harness.calls.audit).toBe(0)
+    expect(harness.getAuditArtifacts()).toHaveLength(0)
   })
 
   test('emits the exact non-terminal state sequence for the happy path', async () => {
@@ -3926,6 +4073,73 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(clonedCause).not.toBe(cause)
   })
 
+  test.each(['code', 'message', 'name', 'cause'] as const)(
+    'never invokes a poisoned publication error %s accessor while cloning',
+    async poisonedKey => {
+      const harness = createHarness()
+      const signedReview = await prepareAndSign(harness)
+      const transportError = new Tm1PublicationError(
+        'BROADCAST_FAILED',
+        'safe transport failure',
+        { diagnostic: 'safe cause' }
+      )
+      let getterCalls = 0
+      Object.defineProperty(transportError, poisonedKey, {
+        configurable: true,
+        get() {
+          getterCalls += 1
+          throw new Error(`poisoned ${poisonedKey} getter`)
+        }
+      })
+      harness.failBroadcast(transportError)
+
+      await harness.orchestrator.approveAndBroadcast(signedReview.signedId).then(
+        () => { throw new Error('expected broadcast rejection') },
+        () => undefined
+      )
+
+      expect(getterCalls).toBe(0)
+      expect(harness.calls.broadcast).toBe(1)
+      const uncertain = expectBroadcastUncertainEvidence(harness, signedReview)
+      expect(uncertain.uncertainty.error.code).toBe('BROADCAST_FAILED')
+      expect(uncertain.uncertainty.error.name).toBe('Tm1PublicationError')
+      expect(uncertain.uncertainty.error.message).toBe(
+        poisonedKey === 'message' ? 'BROADCAST_FAILED' : 'safe transport failure'
+      )
+      if (poisonedKey === 'cause') {
+        expect(uncertain.uncertainty.error.cause).toBeUndefined()
+      } else {
+        expect(uncertain.uncertainty.error.cause).toEqual({ diagnostic: 'safe cause' })
+      }
+    }
+  )
+
+  test('preserves safe normal publication error metadata in an isolated clone', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const transportError = new Tm1PublicationError(
+      'BROADCAST_FAILED',
+      'normal publication failure',
+      { diagnostic: { attempt: 1 } }
+    )
+    harness.failBroadcast(transportError)
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'BROADCAST_FAILED'
+    )
+
+    const uncertain = expectBroadcastUncertainEvidence(harness, signedReview)
+    const cloned = uncertain.uncertainty.error
+    expect(cloned).toBeInstanceOf(Tm1PublicationError)
+    expect(cloned).not.toBe(transportError)
+    expect(cloned.name).toBe(transportError.name)
+    expect(cloned.message).toBe(transportError.message)
+    expect(cloned.code).toBe(transportError.code)
+    expect(cloned.cause).toEqual(transportError.cause)
+    expect(cloned.cause).not.toBe(transportError.cause)
+  })
+
   test('clones a self-referential publication error with diagnostics and no recursion', async () => {
     const harness = createHarness()
     const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
@@ -4045,6 +4259,60 @@ describe('TM1 regtest publication orchestrator', () => {
       submissionId: uncertain.uncertainty.submissionId,
       txid: signedReview.txid
     })
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('confirmed')
+  })
+
+  test('keeps a post-dispatch poisoned publication error reconcilable without accessors or rebroadcast', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const transportError = new Tm1PublicationError(
+      'BROADCAST_FAILED',
+      'must never be read directly',
+      { diagnostic: 'must never be read directly' }
+    )
+    let getterCalls = 0
+    for (const key of ['code', 'message', 'name', 'cause'] as const) {
+      Object.defineProperty(transportError, key, {
+        configurable: true,
+        get() {
+          getterCalls += 1
+          throw new Error(`poisoned ${key} getter`)
+        }
+      })
+    }
+    harness.failBroadcast(transportError)
+
+    await harness.orchestrator.approveAndBroadcast(signedReview.signedId).then(
+      () => { throw new Error('expected broadcast rejection') },
+      () => undefined
+    )
+
+    expect(getterCalls).toBe(0)
+    expect(harness.calls.broadcast).toBe(1)
+    const uncertain = expectBroadcastUncertainEvidence(harness, signedReview)
+    expect(uncertain.uncertainty.error === transportError).toBe(false)
+    expect(uncertain.uncertainty.error.code).toBe('BROADCAST_FAILED')
+    expect(uncertain.uncertainty.error.message).toBe('BROADCAST_FAILED')
+    expect(uncertain.uncertainty.error.name).toBe('Tm1PublicationError')
+    expect(uncertain.uncertainty.error.cause).toBeUndefined()
+    expect(uncertain.uncertainty.txid).toBe(signedReview.txid)
+    expect(uncertain.uncertainty.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+    expect(uncertain.uncertainty.broadcastAuthorizationId).toBe('broadcast-auth-1')
+    expect(uncertain.signedReview.txid).toBe(signedReview.txid)
+    harness.setConfirmation(Object.freeze({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: signedReview.txid,
+      confirmations: 1,
+      blockHash: 'fb'.repeat(32),
+      blockHeight: 109
+    }))
+
+    await expect(harness.orchestrator.reconcile()).resolves.toMatchObject({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: signedReview.txid
+    })
+    expect(getterCalls).toBe(0)
     expect(harness.calls.broadcast).toBe(1)
     expect(harness.orchestrator.getState().status).toBe('confirmed')
   })

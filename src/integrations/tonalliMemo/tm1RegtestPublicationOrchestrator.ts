@@ -221,6 +221,7 @@ export interface Tm1SignedArtifactAuditPort {
   auditSignedArtifact(input: Readonly<{
     review: Tm1PreparedReview
     signedArtifact: RegtestSignedTransaction
+    signal?: AbortSignal
   }>): Promise<RegtestSignedTransaction>
 }
 
@@ -822,9 +823,11 @@ async function auditSignedArtifact(input: Readonly<{
   expectedArtifactHash?: string
 }>): Promise<Tm1AuditedArtifactEvidence> {
   try {
+    assertNotAborted(input.signal)
     const auditResult: unknown = await input.auditPort.auditSignedArtifact({
       review: freezePreparedReview(input.review),
-      signedArtifact: input.signedArtifact
+      signedArtifact: input.signedArtifact,
+      signal: input.signal
     })
     assertNotAborted(input.signal)
 
@@ -1314,10 +1317,79 @@ function clonePublicationError(
   const existing = seen.get(error)
   if (existing instanceof Tm1PublicationError) return existing
 
-  const clone = new Tm1PublicationError(error.code, error.message)
+  const codeDescriptor = safeOwnDataDescriptor(error, 'code')
+  const code = isTm1PublicationErrorCode(codeDescriptor?.value)
+    ? codeDescriptor.value
+    : 'BROADCAST_FAILED'
+  const messageDescriptor = safeOwnDataDescriptor(error, 'message')
+  const message = typeof messageDescriptor?.value === 'string'
+    ? messageDescriptor.value
+    : code
+  const nameDescriptor = safeOwnDataDescriptor(error, 'name')
+  const name = typeof nameDescriptor?.value === 'string' && nameDescriptor.value.length > 0
+    ? nameDescriptor.value
+    : 'Tm1PublicationError'
+
+  const clone = new Tm1PublicationError(code, message)
   seen.set(error, clone)
-  cloneDataProperties(error, clone, seen, key => key !== 'stack')
+  clone.name = name
+
+  const causeDescriptor = safeOwnDataDescriptor(error, 'cause')
+  if (causeDescriptor !== undefined) {
+    try {
+      Object.defineProperty(clone, 'cause', {
+        ...causeDescriptor,
+        value: cloneErrorCause(causeDescriptor.value, seen)
+      })
+    } catch {
+      // The constructor's undefined cause is a safe fallback.
+    }
+  }
+  cloneDataProperties(error, clone, seen, key =>
+    key !== 'stack' &&
+    key !== 'name' &&
+    key !== 'message' &&
+    key !== 'code' &&
+    key !== 'cause'
+  )
   return clone
+}
+
+function safeOwnDataDescriptor(
+  value: object,
+  key: PropertyKey
+): PropertyDescriptor | undefined {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return descriptor !== undefined && 'value' in descriptor ? descriptor : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function isTm1PublicationErrorCode(value: unknown): value is Tm1PublicationErrorCode {
+  switch (value) {
+    case 'INVALID_STATE':
+    case 'PUBLICATION_ALREADY_ACTIVE':
+    case 'STALE_PREPARED_REVIEW':
+    case 'STALE_SIGNED_REVIEW':
+    case 'STALE_SUBMISSION':
+    case 'PREPARATION_FAILED':
+    case 'SIGNING_REJECTED':
+    case 'SIGNING_AUTHORIZATION_EXPIRED':
+    case 'CANDIDATE_REVALIDATION_FAILED':
+    case 'SIGNING_FAILED':
+    case 'SIGNED_ARTIFACT_INVALID':
+    case 'BROADCAST_REJECTED':
+    case 'BROADCAST_AUTHORIZATION_EXPIRED':
+    case 'BROADCAST_FAILED':
+    case 'TXID_MISMATCH':
+    case 'CONFIRMATION_FAILED':
+    case 'ABORTED':
+      return true
+    default:
+      return false
+  }
 }
 
 function cloneErrorCause(cause: unknown, seen: WeakMap<object, unknown> = new WeakMap()): unknown {
@@ -1367,9 +1439,15 @@ function cloneDataProperties(
   seen: WeakMap<object, unknown>,
   include: (key: PropertyKey) => boolean = () => true
 ): void {
-  for (const key of Reflect.ownKeys(source)) {
+  let keys: PropertyKey[]
+  try {
+    keys = Reflect.ownKeys(source)
+  } catch {
+    return
+  }
+  for (const key of keys) {
     if (!include(key)) continue
-    const descriptor = Object.getOwnPropertyDescriptor(source, key)
+    const descriptor = safeOwnDataDescriptor(source, key)
     // Accessors from external values are intentionally omitted and never invoked.
     if (descriptor === undefined || !('value' in descriptor)) continue
     try {
