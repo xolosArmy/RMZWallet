@@ -1,8 +1,9 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import { normalizeFirmaBid, proxyFirmaBid } from './firmaBidProxy'
 
 const PROXY_URL = 'https://tonalli.example/api/firma-bid'
-const UPSTREAM_URL = 'https://firmaprotocol.com/api/bid'
+const UPSTREAM_URL = 'https://stakedxec.com/api/bid'
 
 const request = (method = 'GET') => new Request(`${PROXY_URL}?url=https://attacker.example/bid`, {
   method,
@@ -56,7 +57,7 @@ describe('Firma bid server-side proxy', () => {
     const fetchImpl = vi.fn<typeof fetch>(async () => upstreamResponse(
       JSON.stringify({ bid: '7000.00' }),
       { status: 200, headers: { 'Content-Type': 'application/json' } },
-      'https://firmaprotocol.com/api/current-bid',
+      'https://stakedxec.com/api/current-bid',
       true
     ))
 
@@ -166,6 +167,19 @@ describe('Firma bid server-side proxy', () => {
     expect(response.status).toBe(405)
     expect(response.headers.get('allow')).toBe('GET')
     expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('keeps both upstream URLs out of browser code and the current URL singular in the server proxy', () => {
+    const browserSources = [
+      readFileSync(new URL('../src/config/firmaAlpha.ts', import.meta.url), 'utf8'),
+      readFileSync(new URL('../src/services/firmaAlphaExchange.ts', import.meta.url), 'utf8')
+    ].join('\n')
+    const serverSource = readFileSync(new URL('./firmaBidProxy.ts', import.meta.url), 'utf8')
+
+    expect(browserSources).not.toContain('firmaprotocol.com/api/bid')
+    expect(browserSources).not.toContain('stakedxec.com/api/bid')
+    expect(serverSource).not.toContain('firmaprotocol.com/api/bid')
+    expect(serverSource.match(/https:\/\/stakedxec\.com\/api\/bid/g)).toHaveLength(1)
   })
 })
 

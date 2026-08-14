@@ -1,5 +1,5 @@
 const FIRMA_BID_TIMEOUT_MS = 15_000
-const FIRMA_BID_UPSTREAM_URL = 'https://firmaprotocol.com/api/bid'
+const FIRMA_BID_UPSTREAM_URL = 'https://stakedxec.com/api/bid'
 const FIRMA_BID_UPSTREAM_ORIGIN = new URL(FIRMA_BID_UPSTREAM_URL).origin
 
 type JsonRecord = Record<string, unknown>
