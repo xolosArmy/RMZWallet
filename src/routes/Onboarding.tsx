@@ -122,12 +122,14 @@ function DerivationProfileChoice({
   if (detection.kind !== 'choice-required') return null
   return (
     <div className="card" role="group" aria-label="Elegir perfil de derivación">
-      <h2>Actividad encontrada en dos perfiles</h2>
+      <h2>Actividad encontrada en varios perfiles</h2>
       <p className="muted">
-        Encontramos actividad en dos perfiles asociados a esta seed. Elige cuál quieres abrir.
+        Encontramos actividad en varios engines asociados a esta seed. Elige cuál quieres abrir.
         Tonalli no combinará sus UTXOs.
       </p>
-      {DERIVATION_PROFILE_IDS.map(profileId => {
+      {DERIVATION_PROFILE_IDS.filter(
+        profileId => detection.profiles[profileId].hasActivity
+      ).map(profileId => {
         const profile = getDerivationProfile(profileId)
         const activity = detection.profiles[profileId]
         return (
