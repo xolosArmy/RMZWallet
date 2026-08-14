@@ -6,9 +6,11 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 import { WalletContext } from '../context/walletContext'
 import type { WalletContextValue } from '../context/walletContext'
 import {
+  ECASH_STANDARD_899_PROFILE_ID,
   ECASH_STANDARD_PROFILE_ID,
   TONALLI_LEGACY_PROFILE_ID
 } from '../services/derivationProfiles'
+import type { DerivationProfileId } from '../services/derivationProfiles'
 import type { DerivationProfileActivity } from '../services/dualDerivationDiscovery'
 import { ImportWallet, UnlockWallet } from './Onboarding'
 
@@ -16,11 +18,12 @@ const PUBLIC_TEST_MNEMONIC =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
 
 const activity = (
-  profileId: typeof TONALLI_LEGACY_PROFILE_ID | typeof ECASH_STANDARD_PROFILE_ID,
-  xecSats: bigint
+  profileId: DerivationProfileId,
+  xecSats: bigint,
+  hasActivity = true
 ): DerivationProfileActivity => Object.freeze({
   profileId,
-  hasActivity: true,
+  hasActivity,
   xecSats,
   tokenUtxoCount: 1,
   activeAddressCount: 1,
@@ -30,9 +33,10 @@ const activity = (
 
 const dualDetection = Object.freeze({
   kind: 'choice-required' as const,
-  reason: 'dual-activity' as const,
+  reason: 'multi-activity' as const,
   profiles: Object.freeze({
     [TONALLI_LEGACY_PROFILE_ID]: activity(TONALLI_LEGACY_PROFILE_ID, 100n),
+    [ECASH_STANDARD_899_PROFILE_ID]: activity(ECASH_STANDARD_899_PROFILE_ID, 0n, false),
     [ECASH_STANDARD_PROFILE_ID]: activity(ECASH_STANDARD_PROFILE_ID, 200n)
   })
 })
@@ -101,7 +105,7 @@ describe('dual-profile restore resolution UI', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Restaurar wallet' }))
 
-    expect(await screen.findByText('Actividad encontrada en dos perfiles')).toBeTruthy()
+    expect(await screen.findByText('Actividad encontrada en varios perfiles')).toBeTruthy()
     expect(screen.getByText(/Tonalli no combinará sus UTXOs/)).toBeTruthy()
     expect(restoreWallet).toHaveBeenCalledTimes(1)
     expect(restoreWallet).toHaveBeenNthCalledWith(1, PUBLIC_TEST_MNEMONIC)
@@ -142,7 +146,7 @@ describe('dual-profile restore resolution UI', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Desbloquear' }))
 
-    expect(await screen.findByText('Actividad encontrada en dos perfiles')).toBeTruthy()
+    expect(await screen.findByText('Actividad encontrada en varios perfiles')).toBeTruthy()
     expect(loadExistingWallet).toHaveBeenNthCalledWith(1, '123456')
 
     fireEvent.click(screen.getByRole('button', { name: 'Abrir eCash / Cashtab' }))

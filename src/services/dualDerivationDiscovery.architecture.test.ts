@@ -5,22 +5,26 @@ const source = (relativePath: string) =>
   readFileSync(new URL(relativePath, import.meta.url), 'utf8')
 
 describe('dual derivation discovery security boundary', () => {
-  test('discovery derives account xpubs once and has no seed, signing or broadcast primitive', () => {
+  test('discovery derives one public account state per engine and has no signing or broadcast primitive', () => {
     const discovery = source('./dualDerivationDiscovery.ts')
     const derivation = source('./derivationProfiles.ts')
+    const legacy = source('./legacy899Compatibility.ts')
 
     expect(discovery).not.toContain('mnemonicToSeed')
     expect(discovery).not.toMatch(/getSignatory\s*\(/)
     expect(discovery).not.toMatch(/signTxBuilder\s*\(/)
     expect(discovery).not.toMatch(/broadcastTx\s*\(/)
     const publicBoundary = derivation.slice(
-      derivation.indexOf('export function deriveAccountXpub'),
-      derivation.indexOf('/** Reconstruct a watch-only account node')
+      derivation.indexOf('export function deriveAccountPublicState'),
+      derivation.indexOf('/** @deprecated Prefer deriveAccountPublicState')
     )
     expect(publicBoundary.match(/mnemonicToSeed\s*\(/g)).toHaveLength(1)
     expect(discovery).not.toContain('deriveSigningMetadata')
     expect(derivation).toContain('seckey: undefined')
     expect(derivation).toContain('node.seckey() !== undefined')
+    expect(legacy).toContain('deriveLegacy899AccountPublicState')
+    expect(legacy).toContain('seed.fill(0)')
+    expect(legacy).toContain('privateKey.fill(0)')
   })
 
   test('wallet scans use the public derivation boundary and reserve private derivation for signing', () => {
@@ -34,9 +38,9 @@ describe('dual derivation discovery security boundary', () => {
       service.lastIndexOf('\n}')
     )
 
-    expect(ownerBoundary).toContain('deriveWatchOnlyMetadata(')
+    expect(ownerBoundary).toContain('derivePublicMetadata(')
     expect(ownerBoundary).not.toContain('deriveFromMnemonic(')
-    expect(rescanBoundary).toContain('deriveWatchOnlyMetadata(')
+    expect(rescanBoundary).toContain('derivePublicMetadata(')
     expect(rescanBoundary).not.toContain('deriveFromMnemonic(')
   })
 

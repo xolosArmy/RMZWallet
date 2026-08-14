@@ -39,9 +39,9 @@ import {
   DERIVATION_PROFILE_STORAGE_KEY,
   ECASH_STANDARD_PROFILE_ID,
   TONALLI_LEGACY_PROFILE_ID,
-  deriveAccountXpub,
+  deriveAccountPublicState,
+  derivePublicMetadata,
   deriveSigningMetadata,
-  deriveWatchOnlyMetadata,
   getDerivationPath,
   getDerivationProfile,
   isDerivationProfileId,
@@ -49,7 +49,7 @@ import {
   serializeStoredDerivationProfileMetadata
 } from './derivationProfiles'
 import type {
-  AccountXpub,
+  AccountPublicState,
   DerivationProfile,
   DerivationProfileId,
   SigningDerivationMetadata
@@ -330,7 +330,7 @@ export class XolosWalletService {
   private scanPromiseGapLimit: number | null = null
   private hdAddressCache: FirmaInputOwner[] = []
   private activeProfileId: DerivationProfileId = DEFAULT_NEW_WALLET_PROFILE_ID
-  private activeAccountXpub: AccountXpub | null = null
+  private activeAccountState: AccountPublicState | null = null
   private rmzDecimals: number | null = null
   private rmzDecimalsPromise: Promise<number> | null = null
   private pendingAliasReservationExcludedTxids: string[] = []
@@ -363,7 +363,7 @@ export class XolosWalletService {
     this.scanPromise = null
     this.scanPromiseGapLimit = null
     this.hdAddressCache = []
-    this.activeAccountXpub = null
+    this.activeAccountState = null
     return this.wallet
   }
 
@@ -450,7 +450,7 @@ export class XolosWalletService {
     const wallet = this.wallet as MinimalXecWallet
     await wallet.walletInfoPromise
     this.decryptedMnemonic = mnemonic
-    this.activeAccountXpub = deriveAccountXpub(mnemonic, profileId)
+    this.activeAccountState = deriveAccountPublicState(mnemonic, profileId)
     this.bindMinimalWalletToCanonicalProfile(mnemonic)
     await wallet.initialize()
     this.isReady = true
@@ -628,7 +628,7 @@ export class XolosWalletService {
     const wallet = this.wallet as MinimalXecWallet
     await wallet.walletInfoPromise
     this.decryptedMnemonic = mnemonic
-    this.activeAccountXpub = deriveAccountXpub(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
+    this.activeAccountState = deriveAccountPublicState(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
     this.bindMinimalWalletToCanonicalProfile(mnemonic)
     await wallet.initialize()
     this.isReady = true
@@ -663,13 +663,19 @@ export class XolosWalletService {
       return Object.freeze({
         status: 'choice-required',
         detection,
-        notice: 'Encontramos actividad en dos perfiles asociados a esta seed. Elige cuál quieres abrir.'
+        notice: 'Encontramos actividad en varios engines asociados a esta seed. Elige cuál quieres abrir.'
       })
     }
 
     const resolvedProfileId = selectedProfileId ?? detection.selectedProfileId
     if (!isDerivationProfileId(resolvedProfileId)) {
       throw new Error('No se pudo resolver un perfil de derivación válido.')
+    }
+    if (
+      detection.kind === 'choice-required' &&
+      !detection.profiles[resolvedProfileId].hasActivity
+    ) {
+      throw new Error('El perfil solicitado no contiene actividad detectada para esta seed.')
     }
     if (
       detection.kind === 'selected' &&
@@ -683,7 +689,9 @@ export class XolosWalletService {
       ? detection.reason === 'empty'
         ? 'No se encontró actividad previa. Se utilizará el perfil compatible con eCash/Cashtab.'
         : 'Se encontró una wallet compatible con eCash/Cashtab.'
-      : 'Se encontró una wallet Tonalli existente.'
+      : resolvedProfileId === TONALLI_LEGACY_PROFILE_ID
+        ? 'Se encontró una wallet Tonalli con derivación criptográfica histórica.'
+        : 'Se encontró una wallet de la ventana transitoria eCash Standard 899.'
 
     return Object.freeze({
       status: 'restored',
@@ -723,7 +731,7 @@ export class XolosWalletService {
       return Object.freeze({
         status: 'choice-required',
         detection,
-        notice: 'Falta metadata del perfil y hay actividad en ambos perfiles. Elige cuál abrir.'
+        notice: 'Falta metadata del engine y hay actividad en varios candidatos. Elige cuál abrir.'
       })
     }
 
@@ -736,7 +744,9 @@ export class XolosWalletService {
         ? 'Wallet histórica sin actividad: se conservó el perfil Tonalli Legacy.'
         : resolvedProfileId === ECASH_STANDARD_PROFILE_ID
           ? 'Se recuperó y guardó el perfil eCash/Cashtab detectado.'
-          : 'Se recuperó y guardó el perfil Tonalli Legacy detectado.'
+          : resolvedProfileId === TONALLI_LEGACY_PROFILE_ID
+            ? 'Se recuperó y guardó el engine criptográfico Tonalli Legacy histórico.'
+            : 'Se recuperó y guardó el perfil transitorio eCash Standard 899.'
     })
   }
 
@@ -783,7 +793,7 @@ export class XolosWalletService {
     this.scanPromiseGapLimit = null
     this.hdAddressCache = []
     this.activeProfileId = DEFAULT_NEW_WALLET_PROFILE_ID
-    this.activeAccountXpub = null
+    this.activeAccountState = null
     this.rmzDecimals = null
     this.rmzDecimalsPromise = null
   }
@@ -807,15 +817,15 @@ export class XolosWalletService {
     return mnemonic
   }
 
-  private getAccountXpubOrThrow(): AccountXpub {
-    if (!this.activeAccountXpub) {
-      throw new Error('No hay un account xpub disponible para derivación watch-only.')
+  private getAccountStateOrThrow(): AccountPublicState {
+    if (!this.activeAccountState) {
+      throw new Error('No hay un estado público de cuenta disponible para derivación.')
     }
-    return this.activeAccountXpub
+    return this.activeAccountState
   }
 
   private deriveHdOwner(branch: FirmaInputOwner['branch'], index: number): FirmaInputOwner {
-    const derived = deriveWatchOnlyMetadata(this.getAccountXpubOrThrow(), branch, index)
+    const derived = derivePublicMetadata(this.getAccountStateOrThrow(), branch, index)
     return Object.freeze({
       profileId: this.activeProfileId,
       account: 0,
@@ -1391,7 +1401,7 @@ export class XolosWalletService {
   }
 
   getPublicKeyHex(): string | null {
-    if (!this.wallet || !this.isReady || !this.activeAccountXpub) return null
+    if (!this.wallet || !this.isReady || !this.activeAccountState) return null
     return this.getCanonicalReceiveOwner().publicKeyHex
   }
 
@@ -1412,12 +1422,12 @@ export class XolosWalletService {
   }
 
   getAddress(): string | null {
-    if (!this.wallet || !this.isReady || !this.activeAccountXpub) return null
+    if (!this.wallet || !this.isReady || !this.activeAccountState) return null
     return this.getCanonicalReceiveOwner().address
   }
 
   getX402ActiveAccount(): X402WalletAccount | null {
-    if (!this.wallet || !this.isReady || !this.decryptedMnemonic || !this.activeAccountXpub) {
+    if (!this.wallet || !this.isReady || !this.decryptedMnemonic || !this.activeAccountState) {
       return null
     }
 
@@ -1446,7 +1456,7 @@ export class XolosWalletService {
   }
 
   getSignatory(): WalletSignatory {
-    if (!this.decryptedMnemonic || !this.activeAccountXpub) {
+    if (!this.decryptedMnemonic || !this.activeAccountState) {
       throw new Error('WALLET_LOCKED')
     }
     return this.deriveHdSignatory(this.getCanonicalReceiveOwner())
@@ -1457,7 +1467,7 @@ export class XolosWalletService {
   }
 
   withPrivateKey<T>(handler: (privateKey: Uint8Array) => T): T {
-    if (!this.decryptedMnemonic || !this.activeAccountXpub) {
+    if (!this.decryptedMnemonic || !this.activeAccountState) {
       throw new Error('WALLET_LOCKED')
     }
     const derived = this.deriveSigningMetadataForOwner(this.getCanonicalReceiveOwner())
@@ -1654,7 +1664,7 @@ export class XolosWalletService {
     maxAddresses?: number
   ): Promise<ScanCache> {
     const now = Date.now()
-    const accountXpub = this.getAccountXpubOrThrow()
+    const accountState = this.getAccountStateOrThrow()
     const receive: string[] = []
     const change: string[] = []
     const owners: FirmaInputOwner[] = []
@@ -1668,8 +1678,8 @@ export class XolosWalletService {
     let index = startIndex
 
     const scanIndex = async (currentIndex: number) => {
-      const receiveDerived = deriveWatchOnlyMetadata(accountXpub, 'receive', currentIndex)
-      const changeDerived = deriveWatchOnlyMetadata(accountXpub, 'change', currentIndex)
+      const receiveDerived = derivePublicMetadata(accountState, 'receive', currentIndex)
+      const changeDerived = derivePublicMetadata(accountState, 'change', currentIndex)
       const receiveOwner: FirmaInputOwner = {
         profileId: this.activeProfileId,
         account: 0,

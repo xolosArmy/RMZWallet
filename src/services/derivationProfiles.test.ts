@@ -2,12 +2,15 @@ import { Address, HdNode, mnemonicToSeed, shaRmd160, toHex } from 'ecash-lib'
 import { describe, expect, test } from 'vitest'
 import {
   DEFAULT_NEW_WALLET_PROFILE_ID,
+  ECASH_LIB_DERIVATION_ENGINE,
+  ECASH_STANDARD_899_PROFILE_ID,
   ECASH_STANDARD_PROFILE_ID,
+  TONALLI_LEGACY_DERIVATION_ENGINE,
   TONALLI_LEGACY_PROFILE_ID,
-  accountXpubToWatchOnlyNode,
-  deriveAccountXpub,
+  accountPublicStateToWatchOnlyNode,
+  deriveAccountPublicState,
+  derivePublicMetadata,
   deriveSigningMetadata,
-  deriveWatchOnlyMetadata,
   getDerivationPath,
   parseStoredDerivationProfileMetadata,
   serializeStoredDerivationProfileMetadata
@@ -17,33 +20,58 @@ import {
 const PUBLIC_TEST_MNEMONIC =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
 
-describe('Tonalli dual BIP44 derivation profiles', () => {
-  test('derives deterministic and distinct receive-0 identities for 899 and 1899', () => {
-    const legacyXpub = deriveAccountXpub(PUBLIC_TEST_MNEMONIC, TONALLI_LEGACY_PROFILE_ID)
-    const standardXpub = deriveAccountXpub(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID)
-    const legacy = deriveWatchOnlyMetadata(legacyXpub, 'receive', 0)
-    const standard = deriveWatchOnlyMetadata(standardXpub, 'receive', 0)
+const HISTORICAL_899_ADDRESS = 'ecash:qr03uhyuv0cen3atackpru04watjlllxtu6aqnedrp'
+const HISTORICAL_899_PUBLIC_KEY =
+  '024bf38c8532f655cc1de47083a4ab9dc35378897fce16b2c9de0df522812ed3c6'
+const STANDARD_899_ADDRESS = 'ecash:qpluxjhhlxfjwsymf9nmctvsdrwzwygadsh2pq0ang'
+const CASHTAB_1899_ADDRESS = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
 
-    expect(legacy.hdPath).toBe("m/44'/899'/0'/0/0")
-    expect(legacy.address).toBe('ecash:qpluxjhhlxfjwsymf9nmctvsdrwzwygadsh2pq0ang')
-    expect(legacy.publicKeyHex).toBe(
-      '03602543a67787c0778df0153e879b33eb16e3759ae63dbed6e9bd3704bfe7a236'
+describe('Tonalli derivation profiles and engines', () => {
+  test('keeps historical 899, standard 899 and Cashtab 1899 cryptographically distinct', () => {
+    const historical = derivePublicMetadata(
+      deriveAccountPublicState(PUBLIC_TEST_MNEMONIC, TONALLI_LEGACY_PROFILE_ID),
+      'receive',
+      0
     )
-    expect(standard.hdPath).toBe("m/44'/1899'/0'/0/0")
-    expect(standard.address).toBe('ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg')
-    expect(standard.publicKeyHex).toBe(
-      '03ee1364cd7af3a9ffbbbd886388776a6f92a7b8dd986f6a8578885e4b856f7bfb'
+    const standard899 = derivePublicMetadata(
+      deriveAccountPublicState(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_899_PROFILE_ID),
+      'receive',
+      0
     )
-    expect(standard.hash160Hex).toBe('dc224140d18053b1c27da53d73fca6f44fc87449')
-    expect(legacy.address).not.toBe(standard.address)
-    expect(deriveWatchOnlyMetadata(standardXpub, 'receive', 0)).toEqual(standard)
+    const standard1899 = derivePublicMetadata(
+      deriveAccountPublicState(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID),
+      'receive',
+      0
+    )
+
+    expect(historical).toMatchObject({
+      engine: TONALLI_LEGACY_DERIVATION_ENGINE,
+      hdPath: "m/44'/899'/0'/0/0",
+      address: HISTORICAL_899_ADDRESS,
+      publicKeyHex: HISTORICAL_899_PUBLIC_KEY
+    })
+    expect(standard899).toMatchObject({
+      engine: ECASH_LIB_DERIVATION_ENGINE,
+      hdPath: "m/44'/899'/0'/0/0",
+      address: STANDARD_899_ADDRESS,
+      publicKeyHex: '03602543a67787c0778df0153e879b33eb16e3759ae63dbed6e9bd3704bfe7a236'
+    })
+    expect(standard1899).toMatchObject({
+      engine: ECASH_LIB_DERIVATION_ENGINE,
+      hdPath: "m/44'/1899'/0'/0/0",
+      address: CASHTAB_1899_ADDRESS,
+      publicKeyHex: '03ee1364cd7af3a9ffbbbd886388776a6f92a7b8dd986f6a8578885e4b856f7bfb',
+      hash160Hex: 'dc224140d18053b1c27da53d73fca6f44fc87449'
+    })
+    expect(historical.address).not.toBe(standard899.address)
+    expect(new Set([historical.address, standard899.address, standard1899.address]).size).toBe(3)
   })
 
-  test('matches the current Cashtab 1899 fixture including its test-only secret derivation', () => {
+  test('matches the public Cashtab 1899 fixture including test-only secret derivation', () => {
     const node = HdNode.fromSeed(mnemonicToSeed(PUBLIC_TEST_MNEMONIC, ''))
       .derivePath("m/44'/1899'/0'/0/0")
-    const standard = deriveWatchOnlyMetadata(
-      deriveAccountXpub(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID),
+    const standard = derivePublicMetadata(
+      deriveAccountPublicState(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID),
       'receive',
       0
     )
@@ -52,36 +80,55 @@ describe('Tonalli dual BIP44 derivation profiles', () => {
     expect(toHex(node.seckey()!)).toBe(
       '97f2d7fa9745baa45fc1b53be3ecead6c000265cc5115aa4ae4d1f452057eb0c'
     )
-    expect(standard.address).toBe('ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg')
+    expect(standard.address).toBe(CASHTAB_1899_ADDRESS)
   })
 
-  test('re-enters private derivation only for the exact requested signing path', () => {
-    const watchOnly = deriveWatchOnlyMetadata(
-      deriveAccountXpub(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID),
-      'receive',
-      7
-    )
-    const signing = deriveSigningMetadata(
-      PUBLIC_TEST_MNEMONIC,
-      ECASH_STANDARD_PROFILE_ID,
-      'receive',
-      7
-    )
-
-    expect(signing.hdPath).toBe("m/44'/1899'/0'/0/7")
-    expect(signing.address).toBe(watchOnly.address)
-    expect(signing.publicKeyHex).toBe(watchOnly.publicKeyHex)
-    expect(signing.privateKey).toHaveLength(32)
-    expect(signing.address).not.toBe(
-      deriveWatchOnlyMetadata(
-        deriveAccountXpub(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID),
+  test('derives each signing key with the engine and exact path that produced its owner', () => {
+    for (const profileId of [
+      TONALLI_LEGACY_PROFILE_ID,
+      ECASH_STANDARD_899_PROFILE_ID,
+      ECASH_STANDARD_PROFILE_ID
+    ] as const) {
+      const owner = derivePublicMetadata(
+        deriveAccountPublicState(PUBLIC_TEST_MNEMONIC, profileId),
         'receive',
-        0
-      ).address
-    )
+        7
+      )
+      const signing = deriveSigningMetadata(PUBLIC_TEST_MNEMONIC, profileId, 'receive', 7)
+
+      expect(signing.hdPath).toBe(owner.hdPath)
+      expect(signing.engine).toBe(owner.engine)
+      expect(signing.address).toBe(owner.address)
+      expect(signing.publicKeyHex).toBe(owner.publicKeyHex)
+      expect(signing.privateKey).toHaveLength(32)
+    }
   })
 
-  test('derives receive and change within the selected profile', () => {
+  test('derives standard receive/change from strictly watch-only account tuples', () => {
+    for (const profileId of [ECASH_STANDARD_899_PROFILE_ID, ECASH_STANDARD_PROFILE_ID] as const) {
+      const account = deriveAccountPublicState(PUBLIC_TEST_MNEMONIC, profileId)
+      const watchOnly = accountPublicStateToWatchOnlyNode(account)
+      expect(watchOnly.seckey()).toBeUndefined()
+      expect(watchOnly.derive(0).derive(7).seckey()).toBeUndefined()
+    }
+
+    expect(() => accountPublicStateToWatchOnlyNode(
+      deriveAccountPublicState(PUBLIC_TEST_MNEMONIC, TONALLI_LEGACY_PROFILE_ID)
+    )).toThrow(/no es un xpub BIP32/)
+  })
+
+  test('rejects an account tuple whose declared profile and engine do not match', () => {
+    const standard899 = deriveAccountPublicState(
+      PUBLIC_TEST_MNEMONIC,
+      ECASH_STANDARD_899_PROFILE_ID
+    )
+    expect(() => derivePublicMetadata({
+      ...standard899,
+      profileId: TONALLI_LEGACY_PROFILE_ID
+    }, 'receive', 0)).toThrow(/perfil y engine declarados/)
+  })
+
+  test('keeps canonical Cashtab change derivation unchanged', () => {
     expect(getDerivationPath(TONALLI_LEGACY_PROFILE_ID, 'change', 7))
       .toBe("m/44'/899'/0'/1/7")
     expect(getDerivationPath(ECASH_STANDARD_PROFILE_ID, 'change', 0))
@@ -89,8 +136,8 @@ describe('Tonalli dual BIP44 derivation profiles', () => {
 
     const cashtabChangeNode = HdNode.fromSeed(mnemonicToSeed(PUBLIC_TEST_MNEMONIC, ''))
       .derivePath("m/44'/1899'/0'/1/0")
-    const tonalliChange = deriveWatchOnlyMetadata(
-      deriveAccountXpub(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID),
+    const tonalliChange = derivePublicMetadata(
+      deriveAccountPublicState(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID),
       'change',
       0
     )
@@ -98,44 +145,24 @@ describe('Tonalli dual BIP44 derivation profiles', () => {
     expect(tonalliChange.address).toBe(
       Address.p2pkh(shaRmd160(cashtabChangeNode.pubkey())).toString()
     )
-
-    const legacyXpub = deriveAccountXpub(PUBLIC_TEST_MNEMONIC, TONALLI_LEGACY_PROFILE_ID)
-    for (const branch of ['receive', 'change'] as const) {
-      const branchIndex = branch === 'receive' ? 0 : 1
-      const previousFullPathNode = HdNode.fromSeed(mnemonicToSeed(PUBLIC_TEST_MNEMONIC, ''))
-        .derivePath(`m/44'/899'/0'/${branchIndex}/4`)
-      const watchOnly = deriveWatchOnlyMetadata(legacyXpub, branch, 4)
-      expect(watchOnly.publicKeyHex).toBe(toHex(previousFullPathNode.pubkey()))
-      expect(watchOnly.address).toBe(
-        Address.p2pkh(shaRmd160(previousFullPathNode.pubkey())).toString()
-      )
-    }
   })
 
-  test('reconstructs account and child nodes as strictly watch-only', () => {
-    const accountXpub = deriveAccountXpub(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID)
-    const accountNode = accountXpubToWatchOnlyNode(accountXpub)
-
-    expect(accountNode.seckey()).toBeUndefined()
-    expect(accountNode.derive(0).derive(7).seckey()).toBeUndefined()
-    expect(deriveWatchOnlyMetadata(accountXpub, 'receive', 7).hdPath)
-      .toBe("m/44'/1899'/0'/0/7")
-  })
-
-  test('serializes an explicitly recovered legacy profile deterministically', () => {
-    const legacyXpub = deriveAccountXpub(PUBLIC_TEST_MNEMONIC, TONALLI_LEGACY_PROFILE_ID)
-    const addressBeforeMigration = deriveWatchOnlyMetadata(legacyXpub, 'receive', 0).address
-    expect(deriveWatchOnlyMetadata(legacyXpub, 'receive', 0).address).toBe(addressBeforeMigration)
-    expect(addressBeforeMigration).toBe('ecash:qpluxjhhlxfjwsymf9nmctvsdrwzwygadsh2pq0ang')
-
+  test('persists engine-versioned metadata and rejects ambiguous version 1 metadata', () => {
     const serialized = serializeStoredDerivationProfileMetadata(TONALLI_LEGACY_PROFILE_ID)
     expect(parseStoredDerivationProfileMetadata(serialized)).toEqual({
-      version: 1,
-      derivationProfile: TONALLI_LEGACY_PROFILE_ID
+      version: 2,
+      derivationProfile: TONALLI_LEGACY_PROFILE_ID,
+      engine: TONALLI_LEGACY_DERIVATION_ENGINE
     })
+    expect(parseStoredDerivationProfileMetadata(
+      '{"version":1,"derivationProfile":"tonalli-legacy-899"}'
+    )).toBeNull()
+    expect(parseStoredDerivationProfileMetadata(
+      '{"version":2,"derivationProfile":"tonalli-legacy-899","engine":"ecash-lib-bip32"}'
+    )).toBeNull()
   })
 
-  test('defaults a new wallet without stored state to the interoperable profile', () => {
+  test('defaults new wallets to interoperable 1899', () => {
     expect(DEFAULT_NEW_WALLET_PROFILE_ID).toBe(ECASH_STANDARD_PROFILE_ID)
   })
 })

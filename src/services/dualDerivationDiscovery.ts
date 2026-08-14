@@ -1,13 +1,14 @@
 import type { ScriptUtxo } from 'chronik-client'
 import {
   DERIVATION_PROFILE_IDS,
+  ECASH_STANDARD_899_PROFILE_ID,
   ECASH_STANDARD_PROFILE_ID,
   TONALLI_LEGACY_PROFILE_ID,
-  deriveAccountXpub,
-  deriveWatchOnlyMetadata
+  deriveAccountPublicState,
+  derivePublicMetadata
 } from './derivationProfiles'
 import type {
-  AccountXpub,
+  AccountPublicState,
   DerivationProfileId,
   PublicDerivationMetadata
 } from './derivationProfiles'
@@ -37,19 +38,24 @@ export type DerivationProfileActivity = Readonly<{
 
 export type DerivationDiscovery = Readonly<{
   kind: 'selected' | 'choice-required'
-  reason: 'only-legacy' | 'only-standard' | 'empty' | 'dual-activity'
+  reason:
+    | 'only-historical-899'
+    | 'only-standard-899'
+    | 'only-standard-1899'
+    | 'empty'
+    | 'multi-activity'
   selectedProfileId?: DerivationProfileId
   profiles: Readonly<Record<DerivationProfileId, DerivationProfileActivity>>
 }>
 
 export type DerivationDiscoveryDependencies = Readonly<{
   readAddress(address: string): Promise<AddressDiscoverySnapshot>
-  deriveAccountXpub?: (
+  deriveAccountPublicState?: (
     mnemonic: string,
     profileId: DerivationProfileId
-  ) => AccountXpub
-  deriveWatchOnly?: (
-    accountXpub: AccountXpub,
+  ) => AccountPublicState
+  derivePublic?: (
+    account: AccountPublicState,
     branch: PublicDerivationMetadata['branch'],
     index: number
   ) => PublicDerivationMetadata
@@ -88,7 +94,7 @@ export function summarizeTokenUtxos(utxos: readonly ScriptUtxo[]): readonly Disc
 }
 
 export async function scanDerivationProfile(
-  accountXpub: AccountXpub,
+  account: AccountPublicState,
   gapLimit: number,
   dependencies: DerivationDiscoveryDependencies
 ): Promise<DerivationProfileActivity> {
@@ -96,7 +102,7 @@ export async function scanDerivationProfile(
     throw new Error('El gap limit de autodetección debe ser un entero positivo.')
   }
 
-  const derive = dependencies.deriveWatchOnly ?? deriveWatchOnlyMetadata
+  const derive = dependencies.derivePublic ?? derivePublicMetadata
   const snapshots: Array<Readonly<{
     metadata: PublicDerivationMetadata
     snapshot: AddressDiscoverySnapshot
@@ -109,8 +115,8 @@ export async function scanDerivationProfile(
   // history/UTXOs. Both branches are queried concurrently.
   while (consecutiveUnused < gapLimit) {
     const metadata = [
-      derive(accountXpub, 'receive', index),
-      derive(accountXpub, 'change', index)
+      derive(account, 'receive', index),
+      derive(account, 'change', index)
     ] as const
     const pair = await Promise.all(metadata.map(async entry => Object.freeze({
       metadata: entry,
@@ -130,7 +136,7 @@ export async function scanDerivationProfile(
   ).length
 
   return Object.freeze({
-    profileId: accountXpub.profileId,
+    profileId: account.profileId,
     hasActivity: activeAddressCount > 0,
     xecSats: allUtxos.reduce((total, utxo) => total + utxo.sats, 0n),
     tokenUtxoCount: tokens.reduce((total, token) => total + token.utxoCount, 0),
@@ -141,30 +147,41 @@ export async function scanDerivationProfile(
 }
 
 export function selectDerivationProfile(
-  legacy: DerivationProfileActivity,
-  standard: DerivationProfileActivity
+  activities: readonly DerivationProfileActivity[]
 ): DerivationDiscovery {
+  const historical899 = activities.find(
+    activity => activity.profileId === TONALLI_LEGACY_PROFILE_ID
+  )
+  const standard899 = activities.find(
+    activity => activity.profileId === ECASH_STANDARD_899_PROFILE_ID
+  )
+  const standard1899 = activities.find(
+    activity => activity.profileId === ECASH_STANDARD_PROFILE_ID
+  )
+  if (!historical899 || !standard899 || !standard1899) {
+    throw new Error('No se pudieron evaluar los tres engines de derivación.')
+  }
   const profiles = Object.freeze({
-    [TONALLI_LEGACY_PROFILE_ID]: legacy,
-    [ECASH_STANDARD_PROFILE_ID]: standard
+    [TONALLI_LEGACY_PROFILE_ID]: historical899,
+    [ECASH_STANDARD_899_PROFILE_ID]: standard899,
+    [ECASH_STANDARD_PROFILE_ID]: standard1899
   })
 
-  if (legacy.hasActivity && standard.hasActivity) {
-    return Object.freeze({ kind: 'choice-required', reason: 'dual-activity', profiles })
+  const active = activities.filter(activity => activity.hasActivity)
+  if (active.length > 1) {
+    return Object.freeze({ kind: 'choice-required', reason: 'multi-activity', profiles })
   }
-  if (legacy.hasActivity) {
+  if (active.length === 1) {
+    const selectedProfileId = active[0].profileId
+    const reason = selectedProfileId === TONALLI_LEGACY_PROFILE_ID
+      ? 'only-historical-899'
+      : selectedProfileId === ECASH_STANDARD_899_PROFILE_ID
+        ? 'only-standard-899'
+        : 'only-standard-1899'
     return Object.freeze({
       kind: 'selected',
-      reason: 'only-legacy',
-      selectedProfileId: TONALLI_LEGACY_PROFILE_ID,
-      profiles
-    })
-  }
-  if (standard.hasActivity) {
-    return Object.freeze({
-      kind: 'selected',
-      reason: 'only-standard',
-      selectedProfileId: ECASH_STANDARD_PROFILE_ID,
+      reason,
+      selectedProfileId,
       profiles
     })
   }
@@ -179,7 +196,7 @@ export function selectDerivationProfile(
 /**
  * Resolve an encrypted wallet whose profile metadata is absent or invalid.
  * A truly empty historical wallet keeps Tonalli's legacy fallback; a detected
- * profile (or explicit dual-activity choice) is authoritative.
+ * profile (or explicit multi-engine choice) is authoritative.
  */
 export function resolveProfileForMissingMetadata(
   detection: DerivationDiscovery,
@@ -189,6 +206,9 @@ export function resolveProfileForMissingMetadata(
     if (selectedProfileId === undefined) return undefined
     if (!DERIVATION_PROFILE_IDS.includes(selectedProfileId)) {
       throw new Error('El perfil solicitado para recuperación no es válido.')
+    }
+    if (!detection.profiles[selectedProfileId].hasActivity) {
+      throw new Error('El perfil solicitado no contiene actividad detectada.')
     }
     return selectedProfileId
   }
@@ -205,17 +225,14 @@ export async function discoverDerivationProfile(
   gapLimit: number,
   dependencies: DerivationDiscoveryDependencies
 ): Promise<DerivationDiscovery> {
-  const deriveAccount = dependencies.deriveAccountXpub ?? deriveAccountXpub
-  const accountXpubs = DERIVATION_PROFILE_IDS.map(profileId =>
+  const deriveAccount = dependencies.deriveAccountPublicState ?? deriveAccountPublicState
+  const accounts = DERIVATION_PROFILE_IDS.map(profileId =>
     deriveAccount(mnemonic, profileId)
   )
   const results = await Promise.all(
-    accountXpubs.map(accountXpub =>
-      scanDerivationProfile(accountXpub, gapLimit, dependencies)
+    accounts.map(account =>
+      scanDerivationProfile(account, gapLimit, dependencies)
     )
   )
-  const legacy = results.find(result => result.profileId === TONALLI_LEGACY_PROFILE_ID)
-  const standard = results.find(result => result.profileId === ECASH_STANDARD_PROFILE_ID)
-  if (!legacy || !standard) throw new Error('No se pudieron evaluar ambos perfiles de derivación.')
-  return selectDerivationProfile(legacy, standard)
+  return selectDerivationProfile(results)
 }
