@@ -63,6 +63,11 @@ export type PublicDerivationMetadata = Readonly<{
   hash160Hex: string
 }>
 
+/** Private material derived only at an explicit signing boundary. */
+export type SigningDerivationMetadata = PublicDerivationMetadata & Readonly<{
+  privateKey: Uint8Array
+}>
+
 /**
  * The public half of a hardened BIP44 account node. ecash-lib currently does
  * not expose xpub serialization helpers, so this is the exact extended-public
@@ -196,4 +201,40 @@ export function deriveWatchOnlyMetadata(
     publicKeyHex: toHex(publicKey),
     hash160Hex: toHex(hash160)
   })
+}
+
+/**
+ * Re-enter the private boundary for one exact input path. Callers must invoke
+ * this only after any preview/fresh-state checks have completed.
+ */
+export function deriveSigningMetadata(
+  mnemonic: string,
+  profileId: DerivationProfileId,
+  branch: DerivationBranch,
+  index: number
+): SigningDerivationMetadata {
+  const hdPath = getDerivationPath(profileId, branch, index)
+  const seed = mnemonicToSeed(mnemonic.trim(), '')
+  try {
+    const node = HdNode.fromSeed(seed).derivePath(hdPath)
+    const privateKey = node.seckey()
+    if (privateKey === undefined) {
+      throw new Error('La ruta de firma no produjo una llave privada.')
+    }
+    const publicKey = node.pubkey()
+    const hash160 = shaRmd160(publicKey)
+    return {
+      profileId,
+      account: getDerivationProfile(profileId).account,
+      branch,
+      index,
+      hdPath,
+      address: Address.p2pkh(hash160).toString(),
+      publicKeyHex: toHex(publicKey),
+      hash160Hex: toHex(hash160),
+      privateKey
+    }
+  } finally {
+    seed.fill(0)
+  }
 }

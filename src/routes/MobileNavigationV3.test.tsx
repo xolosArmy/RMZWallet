@@ -25,6 +25,8 @@ vi.mock('../context/useWallet', () => ({
       rmzDecimals: 0,
       xecFormatted: '1200',
       xec: 120000n,
+      tokenUtxoSats: 546n,
+      tokenUtxoXecFormatted: '5.46',
       firmaAtoms: 0n,
       firmaFormatted: walletState.firmaFormatted,
       firmaDecimals: 4
@@ -234,7 +236,8 @@ describe('Tonalli mobile navigation v3', () => {
     expect(html).toContain('href="/receive"')
     expect(html).toContain('href="/scan"')
     expect(html).toContain('eToken Xolos RMZ')
-    expect(html).toContain('eCash (XEC) para comisiones')
+    expect(html).toContain('XEC libre para comisiones')
+    expect(html).toContain('Sats asociados a token UTXOs: 546 sats (5.46 XEC)')
     expect(html).toContain('Activos compatibles')
     expect(html).toContain('Firma Alpha')
     expect(html).toContain('0.0000 FIRMA')
@@ -258,7 +261,7 @@ describe('Tonalli mobile navigation v3', () => {
 
     expect(html).toContain('12.3456 FIRMA')
     expect(html.indexOf('eToken Xolos RMZ')).toBeLessThan(html.indexOf('Activos compatibles'))
-    expect(html.indexOf('eCash (XEC) para comisiones')).toBeLessThan(html.indexOf('Activos compatibles'))
+    expect(html.indexOf('XEC libre para comisiones')).toBeLessThan(html.indexOf('Activos compatibles'))
     walletState.firmaFormatted = '0.0000'
   })
 

@@ -71,6 +71,16 @@ fresh-state revalidation. FIRMA input ownership includes the profile, account,
 branch, index, full path, address and public key; mixed-profile plans are
 rejected before a signatory is requested.
 
+`minimal-xec-wallet@2.0.2` is not an identity authority. Its internal child-key
+calculation assigns the left HMAC half directly instead of applying the BIP32
+`(IL + kparent) mod n` scalar addition, so it does not reproduce BIP32/Cashtab
+for the same nominal 1899 path and the public fixture below. Tonalli therefore
+never uses `walletInfo.xecAddress`,
+`walletInfo.publicKey` or `walletInfo.privateKey` for the active identity,
+WalletConnect, x402, dApps, FIRMA change or canonical signing. Those boundaries
+use the profile registry and `ecash-lib`; the external wallet object remains a
+legacy transport/utility dependency only.
+
 ## Cashtab interoperability test
 
 The test suite uses the public, burned BIP39 vector
@@ -93,7 +103,9 @@ Primary references, pinned during implementation:
 
 ## Firma Wallet status
 
-This work prepares the 1899 path and generic asset discovery, but it does not
-claim verified Firma Wallet compatibility. That requires a later, independent
-manual test controlled entirely by the user. Work must never request, receive,
-copy or store that real seed.
+A user-controlled manual discovery test confirmed that the same Firma Wallet
+mnemonic restored in Cashtab and Tonalli selects 1899 and discovers the same
+FIRMA balance and UTXO sats. The mnemonic was never disclosed to this project.
+Signing and broadcast remain a separate manual verification after this
+identity-boundary correction; work must never request, receive, copy or store
+that real seed.
