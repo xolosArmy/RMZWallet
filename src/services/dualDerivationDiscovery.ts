@@ -3,9 +3,11 @@ import {
   DERIVATION_PROFILE_IDS,
   ECASH_STANDARD_PROFILE_ID,
   TONALLI_LEGACY_PROFILE_ID,
-  derivePublicMetadata
+  deriveAccountXpub,
+  deriveWatchOnlyMetadata
 } from './derivationProfiles'
 import type {
+  AccountXpub,
   DerivationProfileId,
   PublicDerivationMetadata
 } from './derivationProfiles'
@@ -42,9 +44,12 @@ export type DerivationDiscovery = Readonly<{
 
 export type DerivationDiscoveryDependencies = Readonly<{
   readAddress(address: string): Promise<AddressDiscoverySnapshot>
-  derivePublic?: (
+  deriveAccountXpub?: (
     mnemonic: string,
-    profileId: DerivationProfileId,
+    profileId: DerivationProfileId
+  ) => AccountXpub
+  deriveWatchOnly?: (
+    accountXpub: AccountXpub,
     branch: PublicDerivationMetadata['branch'],
     index: number
   ) => PublicDerivationMetadata
@@ -83,8 +88,7 @@ export function summarizeTokenUtxos(utxos: readonly ScriptUtxo[]): readonly Disc
 }
 
 export async function scanDerivationProfile(
-  mnemonic: string,
-  profileId: DerivationProfileId,
+  accountXpub: AccountXpub,
   gapLimit: number,
   dependencies: DerivationDiscoveryDependencies
 ): Promise<DerivationProfileActivity> {
@@ -92,7 +96,7 @@ export async function scanDerivationProfile(
     throw new Error('El gap limit de autodetección debe ser un entero positivo.')
   }
 
-  const derive = dependencies.derivePublic ?? derivePublicMetadata
+  const derive = dependencies.deriveWatchOnly ?? deriveWatchOnlyMetadata
   const snapshots: Array<Readonly<{
     metadata: PublicDerivationMetadata
     snapshot: AddressDiscoverySnapshot
@@ -105,8 +109,8 @@ export async function scanDerivationProfile(
   // history/UTXOs. Both branches are queried concurrently.
   while (consecutiveUnused < gapLimit) {
     const metadata = [
-      derive(mnemonic, profileId, 'receive', index),
-      derive(mnemonic, profileId, 'change', index)
+      derive(accountXpub, 'receive', index),
+      derive(accountXpub, 'change', index)
     ] as const
     const pair = await Promise.all(metadata.map(async entry => Object.freeze({
       metadata: entry,
@@ -126,7 +130,7 @@ export async function scanDerivationProfile(
   ).length
 
   return Object.freeze({
-    profileId,
+    profileId: accountXpub.profileId,
     hasActivity: activeAddressCount > 0,
     xecSats: allUtxos.reduce((total, utxo) => total + utxo.sats, 0n),
     tokenUtxoCount: tokens.reduce((total, token) => total + token.utxoCount, 0),
@@ -172,14 +176,42 @@ export function selectDerivationProfile(
   })
 }
 
+/**
+ * Resolve an encrypted wallet whose profile metadata is absent or invalid.
+ * A truly empty historical wallet keeps Tonalli's legacy fallback; a detected
+ * profile (or explicit dual-activity choice) is authoritative.
+ */
+export function resolveProfileForMissingMetadata(
+  detection: DerivationDiscovery,
+  selectedProfileId?: DerivationProfileId
+): DerivationProfileId | undefined {
+  if (detection.kind === 'choice-required') {
+    if (selectedProfileId === undefined) return undefined
+    if (!DERIVATION_PROFILE_IDS.includes(selectedProfileId)) {
+      throw new Error('El perfil solicitado para recuperación no es válido.')
+    }
+    return selectedProfileId
+  }
+
+  if (selectedProfileId !== undefined && selectedProfileId !== detection.selectedProfileId) {
+    throw new Error('El perfil solicitado no coincide con la actividad detectada.')
+  }
+  if (detection.reason === 'empty') return TONALLI_LEGACY_PROFILE_ID
+  return detection.selectedProfileId
+}
+
 export async function discoverDerivationProfile(
   mnemonic: string,
   gapLimit: number,
   dependencies: DerivationDiscoveryDependencies
 ): Promise<DerivationDiscovery> {
+  const deriveAccount = dependencies.deriveAccountXpub ?? deriveAccountXpub
+  const accountXpubs = DERIVATION_PROFILE_IDS.map(profileId =>
+    deriveAccount(mnemonic, profileId)
+  )
   const results = await Promise.all(
-    DERIVATION_PROFILE_IDS.map(profileId =>
-      scanDerivationProfile(mnemonic, profileId, gapLimit, dependencies)
+    accountXpubs.map(accountXpub =>
+      scanDerivationProfile(accountXpub, gapLimit, dependencies)
     )
   )
   const legacy = results.find(result => result.profileId === TONALLI_LEGACY_PROFILE_ID)

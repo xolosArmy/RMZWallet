@@ -1,4 +1,4 @@
-import { Address, HdNode, mnemonicToSeed, shaRmd160, toHex } from 'ecash-lib'
+import { Address, HdNode, fromHex, mnemonicToSeed, shaRmd160, toHex } from 'ecash-lib'
 
 export const TONALLI_LEGACY_PROFILE_ID = 'tonalli-legacy-899' as const
 export const ECASH_STANDARD_PROFILE_ID = 'ecash-standard-1899' as const
@@ -44,18 +44,12 @@ export const DERIVATION_PROFILE_IDS = Object.freeze([
 ] as const)
 
 export const DEFAULT_NEW_WALLET_PROFILE_ID = ECASH_STANDARD_PROFILE_ID
-export const LEGACY_WALLET_MIGRATION_PROFILE_ID = TONALLI_LEGACY_PROFILE_ID
 export const DERIVATION_PROFILE_STORAGE_KEY = 'xoloswallet_derivation_profile_v1'
 export const DERIVATION_PROFILE_STORAGE_VERSION = 1 as const
 
 export type StoredDerivationProfileMetadata = Readonly<{
   version: typeof DERIVATION_PROFILE_STORAGE_VERSION
   derivationProfile: DerivationProfileId
-}>
-
-export type StoredDerivationProfileResolution = Readonly<{
-  metadata: StoredDerivationProfileMetadata
-  migrated: boolean
 }>
 
 export type PublicDerivationMetadata = Readonly<{
@@ -67,6 +61,22 @@ export type PublicDerivationMetadata = Readonly<{
   address: string
   publicKeyHex: string
   hash160Hex: string
+}>
+
+/**
+ * The public half of a hardened BIP44 account node. ecash-lib currently does
+ * not expose xpub serialization helpers, so this is the exact extended-public
+ * tuple required to reconstruct the same watch-only HdNode without a seckey.
+ */
+export type AccountXpub = Readonly<{
+  profileId: DerivationProfileId
+  account: 0
+  basePath: string
+  publicKeyHex: string
+  chainCodeHex: string
+  depth: number
+  index: number
+  parentFingerprint: number
 }>
 
 export function isDerivationProfileId(value: unknown): value is DerivationProfileId {
@@ -122,41 +132,63 @@ export function parseStoredDerivationProfileMetadata(
   }
 }
 
-export function resolveStoredDerivationProfile(
-  raw: string | null | undefined,
-  hasStoredLegacyWallet: boolean
-): StoredDerivationProfileResolution {
-  const parsed = parseStoredDerivationProfileMetadata(raw)
-  if (parsed) return Object.freeze({ metadata: parsed, migrated: false })
+/**
+ * Cross the private derivation boundary once for a profile and retain only the
+ * hardened account node's public material. The seed buffer is wiped before
+ * this function returns; root/account private-capable nodes remain local.
+ */
+export function deriveAccountXpub(
+  mnemonic: string,
+  profileId: DerivationProfileId
+): AccountXpub {
+  const profile = getDerivationProfile(profileId)
+  const seed = mnemonicToSeed(mnemonic.trim(), '')
+  try {
+    const accountNode = HdNode.fromSeed(seed).derivePath(profile.basePath)
+    return Object.freeze({
+      profileId,
+      account: profile.account,
+      basePath: profile.basePath,
+      publicKeyHex: toHex(accountNode.pubkey()),
+      chainCodeHex: toHex(accountNode.chainCode()),
+      depth: accountNode.depth(),
+      index: accountNode.index(),
+      parentFingerprint: accountNode.parentFingerprint()
+    })
+  } finally {
+    seed.fill(0)
+  }
+}
 
-  const profileId = hasStoredLegacyWallet
-    ? LEGACY_WALLET_MIGRATION_PROFILE_ID
-    : DEFAULT_NEW_WALLET_PROFILE_ID
-  return Object.freeze({
-    metadata: createStoredDerivationProfileMetadata(profileId),
-    migrated: hasStoredLegacyWallet
+/** Reconstruct a watch-only account node from the public account snapshot. */
+export function accountXpubToWatchOnlyNode(accountXpub: AccountXpub): HdNode {
+  return new HdNode({
+    seckey: undefined,
+    pubkey: fromHex(accountXpub.publicKeyHex),
+    chainCode: fromHex(accountXpub.chainCodeHex),
+    depth: accountXpub.depth,
+    index: accountXpub.index,
+    parentFingerprint: accountXpub.parentFingerprint
   })
 }
 
-/**
- * Derive only the public metadata required for discovery and previews.
- * The hardened BIP44 path is evaluated from the mnemonic, but this boundary
- * never extracts or returns a secret key or signatory.
- */
-export function derivePublicMetadata(
-  mnemonic: string,
-  profileId: DerivationProfileId,
+/** Derive discovery/preview metadata exclusively from a watch-only account. */
+export function deriveWatchOnlyMetadata(
+  accountXpub: AccountXpub,
   branch: DerivationBranch,
   index: number
 ): PublicDerivationMetadata {
-  const hdPath = getDerivationPath(profileId, branch, index)
-  const root = HdNode.fromSeed(mnemonicToSeed(mnemonic.trim(), ''))
-  const node = root.derivePath(hdPath)
+  const hdPath = getDerivationPath(accountXpub.profileId, branch, index)
+  const branchIndex = branch === 'receive' ? 0 : 1
+  const node = accountXpubToWatchOnlyNode(accountXpub).derive(branchIndex).derive(index)
+  if (node.seckey() !== undefined) {
+    throw new Error('La derivación pública produjo inesperadamente una llave privada.')
+  }
   const publicKey = node.pubkey()
   const hash160 = shaRmd160(publicKey)
   return Object.freeze({
-    profileId,
-    account: 0,
+    profileId: accountXpub.profileId,
+    account: accountXpub.account,
     branch,
     index,
     hdPath,

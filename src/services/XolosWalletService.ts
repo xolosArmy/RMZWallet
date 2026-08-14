@@ -37,16 +37,22 @@ import {
   DERIVATION_PROFILE_STORAGE_KEY,
   ECASH_STANDARD_PROFILE_ID,
   TONALLI_LEGACY_PROFILE_ID,
-  derivePublicMetadata,
+  deriveAccountXpub,
+  deriveWatchOnlyMetadata,
   getDerivationPath,
   getDerivationProfile,
   isDerivationProfileId,
-  resolveStoredDerivationProfile,
+  parseStoredDerivationProfileMetadata,
   serializeStoredDerivationProfileMetadata
 } from './derivationProfiles'
-import type { DerivationProfile, DerivationProfileId } from './derivationProfiles'
+import type {
+  AccountXpub,
+  DerivationProfile,
+  DerivationProfileId
+} from './derivationProfiles'
 import {
   discoverDerivationProfile,
+  resolveProfileForMissingMetadata,
   summarizeTokenUtxos
 } from './dualDerivationDiscovery'
 import type {
@@ -175,6 +181,13 @@ export type WalletRestoreResult = Readonly<{
   notice: string
 }>
 
+export type WalletLoadResult = Readonly<{
+  status: 'loaded' | 'choice-required'
+  detection?: DerivationDiscovery
+  selectedProfileId?: DerivationProfileId
+  notice: string
+}>
+
 export interface WalletKeyInfo {
   mnemonic: string | null
   xecAddress: string | null
@@ -278,6 +291,7 @@ export class XolosWalletService {
   private scanPromiseGapLimit: number | null = null
   private hdAddressCache: FirmaInputOwner[] = []
   private activeProfileId: DerivationProfileId = DEFAULT_NEW_WALLET_PROFILE_ID
+  private activeAccountXpub: AccountXpub | null = null
   private rmzDecimals: number | null = null
   private rmzDecimalsPromise: Promise<number> | null = null
   private pendingAliasReservationExcludedTxids: string[] = []
@@ -285,10 +299,9 @@ export class XolosWalletService {
   private constructor() {
     this.encryptedMnemonic = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_MNEMONIC) : null
     if (typeof window !== 'undefined') {
-      this.activeProfileId = resolveStoredDerivationProfile(
-        localStorage.getItem(DERIVATION_PROFILE_STORAGE_KEY),
-        Boolean(this.encryptedMnemonic)
-      ).metadata.derivationProfile
+      this.activeProfileId = parseStoredDerivationProfileMetadata(
+        localStorage.getItem(DERIVATION_PROFILE_STORAGE_KEY)
+      )?.derivationProfile ?? DEFAULT_NEW_WALLET_PROFILE_ID
     }
   }
 
@@ -311,6 +324,7 @@ export class XolosWalletService {
     this.scanPromise = null
     this.scanPromiseGapLimit = null
     this.hdAddressCache = []
+    this.activeAccountXpub = null
     return this.wallet
   }
 
@@ -333,6 +347,7 @@ export class XolosWalletService {
     await wallet.initialize()
     this.isReady = true
     this.decryptedMnemonic = mnemonic
+    this.activeAccountXpub = deriveAccountXpub(mnemonic, profileId)
     this.scanCache = null
     this.scanPromise = null
     this.scanPromiseGapLimit = null
@@ -508,6 +523,9 @@ export class XolosWalletService {
     await wallet.initialize()
     this.isReady = true
     this.decryptedMnemonic = walletInfo?.mnemonic || null
+    this.activeAccountXpub = this.decryptedMnemonic
+      ? deriveAccountXpub(this.decryptedMnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
+      : null
     this.encryptedMnemonic = null
     this.scanCache = null
     this.scanPromise = null
@@ -569,7 +587,10 @@ export class XolosWalletService {
     })
   }
 
-  async loadFromStorage(password: string): Promise<void> {
+  async loadFromStorage(
+    password: string,
+    selectedProfileId?: DerivationProfileId
+  ): Promise<WalletLoadResult> {
     if (!this.encryptedMnemonic) {
       throw new Error('No existe una semilla cifrada en este dispositivo.')
     }
@@ -578,11 +599,39 @@ export class XolosWalletService {
       localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
       this.encryptedMnemonic = migratedCipherText
     }
-    const resolution = resolveStoredDerivationProfile(
-      typeof window === 'undefined' ? null : localStorage.getItem(DERIVATION_PROFILE_STORAGE_KEY),
-      true
+    const storedMetadata = parseStoredDerivationProfileMetadata(
+      typeof window === 'undefined' ? null : localStorage.getItem(DERIVATION_PROFILE_STORAGE_KEY)
     )
-    await this.activateMnemonic(plainText, resolution.metadata.derivationProfile, true)
+    if (storedMetadata) {
+      await this.activateMnemonic(plainText, storedMetadata.derivationProfile)
+      return Object.freeze({
+        status: 'loaded',
+        selectedProfileId: storedMetadata.derivationProfile,
+        notice: 'Se cargó el perfil de derivación guardado.'
+      })
+    }
+
+    const detection = await this.detectDerivationProfiles(plainText)
+    const resolvedProfileId = resolveProfileForMissingMetadata(detection, selectedProfileId)
+    if (resolvedProfileId === undefined) {
+      return Object.freeze({
+        status: 'choice-required',
+        detection,
+        notice: 'Falta metadata del perfil y hay actividad en ambos perfiles. Elige cuál abrir.'
+      })
+    }
+
+    await this.activateMnemonic(plainText, resolvedProfileId, true)
+    return Object.freeze({
+      status: 'loaded',
+      detection,
+      selectedProfileId: resolvedProfileId,
+      notice: detection.reason === 'empty'
+        ? 'Wallet histórica sin actividad: se conservó el perfil Tonalli Legacy.'
+        : resolvedProfileId === ECASH_STANDARD_PROFILE_ID
+          ? 'Se recuperó y guardó el perfil eCash/Cashtab detectado.'
+          : 'Se recuperó y guardó el perfil Tonalli Legacy detectado.'
+    })
   }
 
   async unlockEncryptedWallet(password: string): Promise<void> {
@@ -628,6 +677,7 @@ export class XolosWalletService {
     this.scanPromiseGapLimit = null
     this.hdAddressCache = []
     this.activeProfileId = DEFAULT_NEW_WALLET_PROFILE_ID
+    this.activeAccountXpub = null
     this.rmzDecimals = null
     this.rmzDecimalsPromise = null
   }
@@ -651,6 +701,13 @@ export class XolosWalletService {
     return mnemonic
   }
 
+  private getAccountXpubOrThrow(): AccountXpub {
+    if (!this.activeAccountXpub) {
+      throw new Error('No hay un account xpub disponible para derivación watch-only.')
+    }
+    return this.activeAccountXpub
+  }
+
   private getKeyDerivation() {
     const wallet = this.getWallet() as MinimalXecWallet & {
       keyDerivation?: {
@@ -669,8 +726,7 @@ export class XolosWalletService {
   }
 
   private deriveHdOwner(branch: FirmaInputOwner['branch'], index: number): FirmaInputOwner {
-    const mnemonic = this.getMnemonicOrThrow()
-    const derived = derivePublicMetadata(mnemonic, this.activeProfileId, branch, index)
+    const derived = deriveWatchOnlyMetadata(this.getAccountXpubOrThrow(), branch, index)
     return {
       profileId: this.activeProfileId,
       account: 0,
@@ -1522,7 +1578,7 @@ export class XolosWalletService {
     maxAddresses?: number
   ): Promise<ScanCache> {
     const now = Date.now()
-    const mnemonic = this.getMnemonicOrThrow()
+    const accountXpub = this.getAccountXpubOrThrow()
     const receive: string[] = []
     const change: string[] = []
     const owners: FirmaInputOwner[] = []
@@ -1535,18 +1591,8 @@ export class XolosWalletService {
     let index = startIndex
 
     const scanIndex = async (currentIndex: number) => {
-      const receiveDerived = derivePublicMetadata(
-        mnemonic,
-        this.activeProfileId,
-        'receive',
-        currentIndex
-      )
-      const changeDerived = derivePublicMetadata(
-        mnemonic,
-        this.activeProfileId,
-        'change',
-        currentIndex
-      )
+      const receiveDerived = deriveWatchOnlyMetadata(accountXpub, 'receive', currentIndex)
+      const changeDerived = deriveWatchOnlyMetadata(accountXpub, 'change', currentIndex)
       const receiveOwner: FirmaInputOwner = {
         profileId: this.activeProfileId,
         account: 0,

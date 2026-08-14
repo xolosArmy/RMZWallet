@@ -3,10 +3,13 @@ import { describe, expect, test, vi } from 'vitest'
 import {
   ECASH_STANDARD_PROFILE_ID,
   TONALLI_LEGACY_PROFILE_ID,
-  derivePublicMetadata
+  deriveAccountXpub,
+  deriveWatchOnlyMetadata,
+  parseStoredDerivationProfileMetadata
 } from './derivationProfiles'
 import {
   discoverDerivationProfile,
+  resolveProfileForMissingMetadata,
   scanDerivationProfile,
   summarizeTokenUtxos
 } from './dualDerivationDiscovery'
@@ -41,18 +44,10 @@ function discoveryReader(entries: Readonly<Record<string, {
 }
 
 describe('dual derivation discovery', () => {
-  const legacyAddress = derivePublicMetadata(
-    PUBLIC_TEST_MNEMONIC,
-    TONALLI_LEGACY_PROFILE_ID,
-    'receive',
-    0
-  ).address
-  const standardAddress = derivePublicMetadata(
-    PUBLIC_TEST_MNEMONIC,
-    ECASH_STANDARD_PROFILE_ID,
-    'receive',
-    0
-  ).address
+  const legacyXpub = deriveAccountXpub(PUBLIC_TEST_MNEMONIC, TONALLI_LEGACY_PROFILE_ID)
+  const standardXpub = deriveAccountXpub(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID)
+  const legacyAddress = deriveWatchOnlyMetadata(legacyXpub, 'receive', 0).address
+  const standardAddress = deriveWatchOnlyMetadata(standardXpub, 'receive', 0).address
 
   test('selects legacy when only 899 has activity', async () => {
     const result = await discoverDerivationProfile(PUBLIC_TEST_MNEMONIC, 2, {
@@ -115,40 +110,88 @@ describe('dual derivation discovery', () => {
     expect(result.selectedProfileId).toBeUndefined()
   })
 
-  test('derives public metadata and scans both branches without signing hooks', async () => {
-    const derivePublic = vi.fn(derivePublicMetadata)
+  test('derives one account xpub per profile and scans all indices watch-only', async () => {
+    const deriveAccount = vi.fn(deriveAccountXpub)
+    const deriveWatchOnly = vi.fn(deriveWatchOnlyMetadata)
     const readAddress = discoveryReader({})
-    const result = await scanDerivationProfile(
+    const result = await discoverDerivationProfile(
       PUBLIC_TEST_MNEMONIC,
-      ECASH_STANDARD_PROFILE_ID,
       3,
-      { derivePublic, readAddress }
+      { deriveAccountXpub: deriveAccount, deriveWatchOnly, readAddress }
     )
 
-    expect(result.scannedAddressCount).toBe(6)
-    expect(derivePublic).toHaveBeenCalledTimes(6)
-    expect(derivePublic.mock.calls.map(call => call[2])).toEqual([
+    expect(result.profiles[ECASH_STANDARD_PROFILE_ID].scannedAddressCount).toBe(6)
+    expect(deriveAccount).toHaveBeenCalledTimes(2)
+    expect(deriveAccount.mock.calls.map(call => call[1])).toEqual([
+      TONALLI_LEGACY_PROFILE_ID,
+      ECASH_STANDARD_PROFILE_ID
+    ])
+    expect(deriveWatchOnly).toHaveBeenCalledTimes(12)
+    expect(deriveWatchOnly.mock.calls.slice(6).map(call => call[1])).toEqual([
       'receive', 'change', 'receive', 'change', 'receive', 'change'
     ])
-    expect(readAddress).toHaveBeenCalledTimes(6)
+    expect(readAddress).toHaveBeenCalledTimes(12)
   })
 
   test('resets the full gap after late activity like the existing HD scanner', async () => {
-    const lateAddress = derivePublicMetadata(
-      PUBLIC_TEST_MNEMONIC,
-      TONALLI_LEGACY_PROFILE_ID,
-      'change',
-      2
-    ).address
+    const lateAddress = deriveWatchOnlyMetadata(legacyXpub, 'change', 2).address
     const result = await scanDerivationProfile(
-      PUBLIC_TEST_MNEMONIC,
-      TONALLI_LEGACY_PROFILE_ID,
+      legacyXpub,
       3,
       { readAddress: discoveryReader({ [lateAddress]: { hasHistory: true } }) }
     )
 
     expect(result.activeAddressCount).toBe(1)
     expect(result.scannedAddressCount).toBe(12)
+  })
+
+  test('recovers a legacy encrypted wallet with missing metadata from 899 activity', async () => {
+    const onlyLegacy = await discoverDerivationProfile(PUBLIC_TEST_MNEMONIC, 1, {
+      readAddress: discoveryReader({ [legacyAddress]: { hasHistory: true } })
+    })
+
+    expect(parseStoredDerivationProfileMetadata(null)).toBeNull()
+    expect(resolveProfileForMissingMetadata(onlyLegacy)).toBe(TONALLI_LEGACY_PROFILE_ID)
+  })
+
+  test('recovers a modern 1899 wallet whose metadata was removed', async () => {
+    const onlyStandard = await discoverDerivationProfile(PUBLIC_TEST_MNEMONIC, 1, {
+      readAddress: discoveryReader({ [standardAddress]: { hasHistory: true } })
+    })
+
+    expect(parseStoredDerivationProfileMetadata(null)).toBeNull()
+    expect(resolveProfileForMissingMetadata(onlyStandard)).toBe(ECASH_STANDARD_PROFILE_ID)
+  })
+
+  test('recovers 1899 activity after rejecting corrupt stored metadata', async () => {
+    const onlyStandard = await discoverDerivationProfile(PUBLIC_TEST_MNEMONIC, 1, {
+      readAddress: discoveryReader({ [standardAddress]: { hasHistory: true } })
+    })
+
+    expect(parseStoredDerivationProfileMetadata('{"version":1,"derivationProfile":"poison"}'))
+      .toBeNull()
+    expect(resolveProfileForMissingMetadata(onlyStandard)).toBe(ECASH_STANDARD_PROFILE_ID)
+  })
+
+  test('keeps the legacy 899 fallback for a completely empty historical wallet', async () => {
+    const empty = await discoverDerivationProfile(PUBLIC_TEST_MNEMONIC, 1, {
+      readAddress: discoveryReader({})
+    })
+
+    expect(resolveProfileForMissingMetadata(empty)).toBe(TONALLI_LEGACY_PROFILE_ID)
+  })
+
+  test('requires explicit profile selection when missing metadata has dual activity', async () => {
+    const dual = await discoverDerivationProfile(PUBLIC_TEST_MNEMONIC, 1, {
+      readAddress: discoveryReader({
+        [legacyAddress]: { hasHistory: true },
+        [standardAddress]: { hasHistory: true }
+      })
+    })
+
+    expect(resolveProfileForMissingMetadata(dual)).toBeUndefined()
+    expect(resolveProfileForMissingMetadata(dual, ECASH_STANDARD_PROFILE_ID))
+      .toBe(ECASH_STANDARD_PROFILE_ID)
   })
 
   test('aggregates token UTXOs by canonical token identity', () => {

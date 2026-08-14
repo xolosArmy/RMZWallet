@@ -5,6 +5,7 @@ import type {
   AliasRegistrationRawTxDebug,
   AliasReservedUtxo,
   WalletBalance,
+  WalletLoadResult,
   WalletRescanOptions,
   WalletRestoreResult
 } from '../services/XolosWalletService'
@@ -24,7 +25,10 @@ export interface WalletContextValue {
     mnemonic: string,
     selectedProfileId?: DerivationProfileId
   ) => Promise<WalletRestoreResult>
-  loadExistingWallet: (password: string) => Promise<void>
+  loadExistingWallet: (
+    password: string,
+    selectedProfileId?: DerivationProfileId
+  ) => Promise<WalletLoadResult>
   encryptAndStore: (password: string) => Promise<void>
   refreshBalances: () => Promise<void>
   rescanWallet: (options?: WalletRescanOptions) => Promise<void>

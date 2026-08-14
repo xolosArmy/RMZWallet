@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
-import { describe, expect, test, vi } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { WalletContext } from '../context/walletContext'
 import type { WalletContextValue } from '../context/walletContext'
 import {
@@ -10,7 +10,7 @@ import {
   TONALLI_LEGACY_PROFILE_ID
 } from '../services/derivationProfiles'
 import type { DerivationProfileActivity } from '../services/dualDerivationDiscovery'
-import { ImportWallet } from './Onboarding'
+import { ImportWallet, UnlockWallet } from './Onboarding'
 
 const PUBLIC_TEST_MNEMONIC =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
@@ -37,7 +37,10 @@ const dualDetection = Object.freeze({
   })
 })
 
-function walletValue(restoreWallet: WalletContextValue['restoreWallet']): WalletContextValue {
+function walletValue(
+  restoreWallet: WalletContextValue['restoreWallet'],
+  loadExistingWallet: WalletContextValue['loadExistingWallet'] = vi.fn()
+): WalletContextValue {
   return {
     address: null,
     balance: null,
@@ -47,7 +50,7 @@ function walletValue(restoreWallet: WalletContextValue['restoreWallet']): Wallet
     backupVerified: false,
     createNewWallet: vi.fn(),
     restoreWallet,
-    loadExistingWallet: vi.fn(),
+    loadExistingWallet,
     encryptAndStore: vi.fn(),
     refreshBalances: vi.fn(),
     rescanWallet: vi.fn(),
@@ -66,6 +69,8 @@ function walletValue(restoreWallet: WalletContextValue['restoreWallet']): Wallet
 }
 
 describe('dual-profile restore resolution UI', () => {
+  afterEach(cleanup)
+
   test('requires and forwards an explicit profile choice when both profiles are active', async () => {
     const restoreWallet = vi.fn<WalletContextValue['restoreWallet']>()
       .mockResolvedValueOnce({
@@ -106,6 +111,45 @@ describe('dual-profile restore resolution UI', () => {
     expect(restoreWallet).toHaveBeenNthCalledWith(
       2,
       PUBLIC_TEST_MNEMONIC,
+      ECASH_STANDARD_PROFILE_ID
+    )
+  })
+
+  test('requires an explicit profile when encrypted-wallet recovery detects dual activity', async () => {
+    const loadExistingWallet = vi.fn<WalletContextValue['loadExistingWallet']>()
+      .mockResolvedValueOnce({
+        status: 'choice-required',
+        detection: dualDetection,
+        notice: 'Elige un perfil.'
+      })
+      .mockResolvedValueOnce({
+        status: 'loaded',
+        detection: dualDetection,
+        selectedProfileId: ECASH_STANDARD_PROFILE_ID,
+        notice: 'Perfil recuperado.'
+      })
+
+    render(
+      <MemoryRouter initialEntries={['/onboarding/unlock']}>
+        <WalletContext.Provider value={walletValue(vi.fn(), loadExistingWallet)}>
+          <UnlockWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+
+    fireEvent.change(screen.getByLabelText('Password/PIN'), {
+      target: { value: '123456' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Desbloquear' }))
+
+    expect(await screen.findByText('Actividad encontrada en dos perfiles')).toBeTruthy()
+    expect(loadExistingWallet).toHaveBeenNthCalledWith(1, '123456')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Abrir eCash / Cashtab' }))
+    await waitFor(() => expect(loadExistingWallet).toHaveBeenCalledTimes(2))
+    expect(loadExistingWallet).toHaveBeenNthCalledWith(
+      2,
+      '123456',
       ECASH_STANDARD_PROFILE_ID
     )
   })

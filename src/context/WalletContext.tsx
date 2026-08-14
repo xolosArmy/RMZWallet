@@ -267,14 +267,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   }, [syncAddressAndBalance])
 
   const loadExistingWallet = useCallback(
-    async (password: string) => {
+    async (password: string, selectedProfileId?: DerivationProfileId) => {
       setLoading(true)
       setError(null)
       try {
-        await xolosWalletService.loadFromStorage(password)
+        const result = await xolosWalletService.loadFromStorage(password, selectedProfileId)
+        if (result.status === 'choice-required') return result
         await syncAddressAndBalance()
         setInitialized(true)
         setBackupVerifiedState(localStorage.getItem(BACKUP_KEY) === 'true')
+        return result
       } catch (err) {
         const message = (err as Error).message || 'No se pudo cargar la billetera guardada.'
         setError(message)

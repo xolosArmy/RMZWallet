@@ -110,6 +110,48 @@ function RouteError({ message }: { message?: string | null }) {
   )
 }
 
+function DerivationProfileChoice({
+  detection,
+  loading,
+  onChoose
+}: {
+  detection: DerivationDiscovery
+  loading: boolean
+  onChoose(profileId: DerivationProfileId): void
+}) {
+  if (detection.kind !== 'choice-required') return null
+  return (
+    <div className="card" role="group" aria-label="Elegir perfil de derivación">
+      <h2>Actividad encontrada en dos perfiles</h2>
+      <p className="muted">
+        Encontramos actividad en dos perfiles asociados a esta seed. Elige cuál quieres abrir.
+        Tonalli no combinará sus UTXOs.
+      </p>
+      {DERIVATION_PROFILE_IDS.map(profileId => {
+        const profile = getDerivationProfile(profileId)
+        const activity = detection.profiles[profileId]
+        return (
+          <div key={profileId} className="card">
+            <strong>{profile.label} ({profile.coinType})</strong>
+            <p className="muted">
+              {formatSatsAsXec(activity.xecSats)} XEC · {activity.tokenUtxoCount} token UTXOs ·{' '}
+              {activity.activeAddressCount} direcciones con actividad
+            </p>
+            <button
+              className="cta outline"
+              type="button"
+              disabled={loading}
+              onClick={() => onChoose(profileId)}
+            >
+              Abrir {profile.label}
+            </button>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 export function CreateWallet() {
   const navigate = useNavigate()
   const { createNewWallet, loading, error } = useWallet()
@@ -169,6 +211,32 @@ export function UnlockWallet() {
   const { loadExistingWallet, backupVerified, getMnemonic, loading, error } = useWallet()
   const [passwordExisting, setPasswordExisting] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
+  const [profileChoice, setProfileChoice] = useState<DerivationDiscovery | null>(null)
+
+  const finishLoadedWallet = () => {
+    if (backupVerified) {
+      navigate('/')
+      return
+    }
+    const mnemonic = getMnemonic()
+    if (!mnemonic) {
+      throw new Error('No se pudo recuperar la seed para el respaldo.')
+    }
+    navigate('/backup', { state: { password: passwordExisting, mnemonic } })
+  }
+
+  const continueWithProfile = async (profileId: DerivationProfileId) => {
+    try {
+      setLocalError(null)
+      const result = await loadExistingWallet(passwordExisting, profileId)
+      if (result.status !== 'loaded') {
+        throw new Error('No se pudo fijar el perfil de derivación elegido.')
+      }
+      finishLoadedWallet()
+    } catch (err) {
+      setLocalError((err as Error).message)
+    }
+  }
 
   const handleExisting = async (e: FormEvent) => {
     e.preventDefault()
@@ -180,16 +248,12 @@ export function UnlockWallet() {
     }
 
     try {
-      await loadExistingWallet(passwordExisting)
-      if (backupVerified) {
-        navigate('/')
+      const result = await loadExistingWallet(passwordExisting)
+      if (result.status === 'choice-required' && result.detection) {
+        setProfileChoice(result.detection)
         return
       }
-      const mnemonic = getMnemonic()
-      if (!mnemonic) {
-        throw new Error('No se pudo recuperar la seed para el respaldo.')
-      }
-      navigate('/backup', { state: { password: passwordExisting, mnemonic } })
+      finishLoadedWallet()
     } catch (err) {
       setLocalError((err as Error).message)
     }
@@ -203,6 +267,13 @@ export function UnlockWallet() {
           <p className="card-kicker">Wallet local</p>
           <h1 id="unlock-wallet-title" className="section-title">Desbloquear wallet</h1>
           <p className="muted">Ingresa el password o PIN con el que cifraste la wallet en este dispositivo.</p>
+          {profileChoice && (
+            <DerivationProfileChoice
+              detection={profileChoice}
+              loading={loading}
+              onChoose={(profileId) => void continueWithProfile(profileId)}
+            />
+          )}
           <label htmlFor="existing-password">Password/PIN</label>
           <input
             id="existing-password"
@@ -298,35 +369,12 @@ export function ImportWallet() {
             dominio oficial.
           </p>
           <p className="warning">Nunca compartas tu frase de recuperación con soporte, terceros o sitios externos.</p>
-          {profileChoice?.kind === 'choice-required' && (
-            <div className="card" role="group" aria-label="Elegir perfil de derivación">
-              <h2>Actividad encontrada en dos perfiles</h2>
-              <p className="muted">
-                Encontramos actividad en dos perfiles asociados a esta seed. Elige cuál quieres abrir.
-                Tonalli no combinará sus UTXOs.
-              </p>
-              {DERIVATION_PROFILE_IDS.map(profileId => {
-                const profile = getDerivationProfile(profileId)
-                const activity = profileChoice.profiles[profileId]
-                return (
-                  <div key={profileId} className="card">
-                    <strong>{profile.label} ({profile.coinType})</strong>
-                    <p className="muted">
-                      {formatSatsAsXec(activity.xecSats)} XEC · {activity.tokenUtxoCount} token UTXOs ·{' '}
-                      {activity.activeAddressCount} direcciones con actividad
-                    </p>
-                    <button
-                      className="cta outline"
-                      type="button"
-                      disabled={loading}
-                      onClick={() => void continueWithProfile(profileId)}
-                    >
-                      Abrir {profile.label}
-                    </button>
-                  </div>
-                )
-              })}
-            </div>
+          {profileChoice && (
+            <DerivationProfileChoice
+              detection={profileChoice}
+              loading={loading}
+              onChoose={(profileId) => void continueWithProfile(profileId)}
+            />
           )}
           <label htmlFor="seed-phrase">Frase seed</label>
           <textarea
