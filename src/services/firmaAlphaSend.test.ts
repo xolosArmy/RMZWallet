@@ -22,6 +22,12 @@ import { getChronik } from './ChronikClient'
 import type { WalletSignatory, X402WalletAccount } from './XolosWalletService'
 import { WALLET_DERIVATION_PATH, xolosWalletService } from './XolosWalletService'
 import {
+  ECASH_STANDARD_PROFILE_ID,
+  TONALLI_LEGACY_PROFILE_ID,
+  getDerivationPath
+} from './derivationProfiles'
+import type { DerivationProfileId } from './derivationProfiles'
+import {
   FIRMA_SEND_FEE_PER_KB,
   buildFirmaSendPlan,
   createSignedFirmaSendBuilder
@@ -47,15 +53,19 @@ const owner = (params: {
   publicKey?: Uint8Array
   branch?: 'receive' | 'change'
   index?: number
+  profileId?: DerivationProfileId
 } = {}): FirmaInputOwner => {
   const branch = params.branch ?? 'receive'
   const index = params.index ?? 0
+  const profileId = params.profileId ?? TONALLI_LEGACY_PROFILE_ID
   return {
+    profileId,
+    account: 0,
     address: params.address ?? walletAddress,
     publicKeyHex: toHex(params.publicKey ?? testPkA),
     branch,
     index,
-    hdPath: `m/44'/899'/0'/${branch === 'receive' ? 0 : 1}/${index}`
+    hdPath: getDerivationPath(profileId, branch, index)
   }
 }
 
@@ -121,6 +131,56 @@ const buildPlan = (params: { amountAtoms: bigint; ownedUtxos: FirmaOwnedUtxo[] }
   })
 
 describe('Firma Alpha HD-aware ALP SEND plan', () => {
+  it('builds the same safe FIRMA plan for an eCash-standard 1899 owner', () => {
+    const standardOwner = owner({ profileId: ECASH_STANDARD_PROFILE_ID })
+    const plan = buildFirmaSendPlan({
+      changeOwner: standardOwner,
+      destination: destinationAddress,
+      amountAtoms: 100n,
+      ownedUtxos: [
+        owned(tokenUtxo({ marker: '0', atoms: 100n }), standardOwner),
+        owned(xecUtxo('1', 20_000n), standardOwner)
+      ]
+    })
+
+    expect(plan.changeOwner.profileId).toBe(ECASH_STANDARD_PROFILE_ID)
+    expect(plan.preview.changeHdPath).toBe("m/44'/1899'/0'/0/0")
+    expect(plan.preview.tokenInputOutpoints).toHaveLength(1)
+  })
+
+  it('rejects cross-profile ownership before any signatory can be requested', () => {
+    const standardOwner = owner({ profileId: ECASH_STANDARD_PROFILE_ID })
+    const signatoryResolver = vi.fn()
+
+    expect(() => buildFirmaSendPlan({
+      changeOwner: standardOwner,
+      destination: destinationAddress,
+      amountAtoms: 100n,
+      ownedUtxos: [
+        owned(tokenUtxo({ marker: '0', atoms: 100n }), primaryOwner),
+        owned(xecUtxo('1', 20_000n), standardOwner)
+      ]
+    })).toThrow(/perfiles de derivación distintos/)
+    expect(signatoryResolver).not.toHaveBeenCalled()
+  })
+
+  it('rejects an owner whose full path belongs to a different profile', () => {
+    const mismatchedOwner: FirmaInputOwner = {
+      ...owner({ profileId: ECASH_STANDARD_PROFILE_ID }),
+      hdPath: getDerivationPath(TONALLI_LEGACY_PROFILE_ID, 'receive', 0)
+    }
+
+    expect(() => buildFirmaSendPlan({
+      changeOwner: mismatchedOwner,
+      destination: destinationAddress,
+      amountAtoms: 100n,
+      ownedUtxos: [
+        owned(tokenUtxo({ marker: '0', atoms: 100n }), mismatchedOwner),
+        owned(xecUtxo('1', 20_000n), mismatchedOwner)
+      ]
+    })).toThrow(/metadata HD propietaria/)
+  })
+
   it('selects only canonical FIRMA, preserves token change and funds the fee with wallet-owned pure XEC', () => {
     const canonical = tokenUtxo({ marker: 'a', atoms: 250n })
     const rmz = tokenUtxo({ marker: 'b', atoms: 999n, tokenId: RMZ_ETOKEN_ID })

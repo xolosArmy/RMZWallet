@@ -5,6 +5,7 @@ import { useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { WalletBalance } from '../services/XolosWalletService'
 import type { FirmaSendPreview } from '../services/firmaAlphaSend'
+import { TONALLI_LEGACY_PROFILE_ID } from '../services/derivationProfiles'
 import { WalletProvider } from './WalletContext'
 import { useWallet } from './useWallet'
 
@@ -79,7 +80,11 @@ describe('WalletContext FIRMA operations', () => {
   beforeEach(() => {
     localStorage.clear()
     localStorage.setItem('xoloswallet_backup_verified', 'true')
-    serviceMocks.loadFromStorage.mockReset().mockResolvedValue(undefined)
+    serviceMocks.loadFromStorage.mockReset().mockResolvedValue({
+      status: 'loaded',
+      selectedProfileId: TONALLI_LEGACY_PROFILE_ID,
+      notice: 'loaded'
+    })
     serviceMocks.getAddress.mockReset().mockReturnValue(destination)
     serviceMocks.getBalances.mockReset()
       .mockResolvedValueOnce(balance(100n, '0.0100'))

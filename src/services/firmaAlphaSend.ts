@@ -17,12 +17,19 @@ import type { Signatory, Tx, TxBuilderInput, TxBuilderOutput } from 'ecash-lib'
 import { FIRMA_ALPHA } from '../config/firmaAlpha'
 import { TOKEN_DUST_SATS } from '../dex/agoraPhase1'
 import { formatTokenAmount } from '../utils/tokenFormat'
+import {
+  getDerivationPath,
+  isDerivationProfileId
+} from './derivationProfiles'
+import type { DerivationProfileId } from './derivationProfiles'
 
 export const FIRMA_SEND_FEE_PER_KB = 1200n
 
 export type FirmaHdBranch = 'receive' | 'change'
 
 export type FirmaInputOwner = Readonly<{
+  profileId: DerivationProfileId
+  account: 0
   address: string
   hdPath: string
   branch: FirmaHdBranch
@@ -78,7 +85,14 @@ const compareOutpoints = (a: FirmaOwnedUtxo, b: FirmaOwnedUtxo) =>
   outpointKey(a).localeCompare(outpointKey(b))
 
 const ownerScript = (owner: FirmaInputOwner): Script => {
-  if (!owner.hdPath.trim() || owner.index < 0 || !Number.isInteger(owner.index)) {
+  if (
+    !isDerivationProfileId(owner.profileId) ||
+    owner.account !== 0 ||
+    !owner.hdPath.trim() ||
+    owner.index < 0 ||
+    !Number.isInteger(owner.index) ||
+    owner.hdPath !== getDerivationPath(owner.profileId, owner.branch, owner.index)
+  ) {
     throw new Error('La metadata HD propietaria de un input FIRMA no es válida.')
   }
   if (!/^(02|03)[0-9a-fA-F]{64}$/.test(owner.publicKeyHex)) {
@@ -170,6 +184,8 @@ const inputCommitment = ({ utxo, owner }: FirmaOwnedUtxo) => {
     outpointKey({ utxo, owner }),
     utxo.sats,
     owner.address,
+    owner.profileId,
+    owner.account,
     owner.hdPath,
     owner.branch,
     owner.index,
@@ -193,6 +209,8 @@ const fingerprint = (params: {
     FIRMA_ALPHA.tokenType.toString(),
     toHex(params.destinationScript.bytecode),
     params.changeOwner.address,
+    params.changeOwner.profileId,
+    params.changeOwner.account,
     params.changeOwner.hdPath,
     params.changeOwner.publicKeyHex.toLowerCase(),
     params.amountAtoms.toString(),
@@ -208,6 +226,11 @@ export function buildFirmaSendPlan(params: BuildFirmaSendPlanParams): FirmaSendP
   }
 
   const changeScript = ownerScript(params.changeOwner)
+  if (params.ownedUtxos.some(({ owner }) =>
+    owner.profileId !== params.changeOwner.profileId || owner.account !== params.changeOwner.account
+  )) {
+    throw new Error('No se pueden combinar inputs FIRMA de perfiles de derivación distintos.')
+  }
   let destinationScript: Script
   try {
     destinationScript = Script.fromAddress(params.destination.trim())

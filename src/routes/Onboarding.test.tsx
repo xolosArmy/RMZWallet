@@ -53,7 +53,7 @@ describe('Tonalli onboarding routes', () => {
     expect(html).toContain('Tus llaves. Tu dinero. Tu Tonalli.')
     expect(html).toContain('Crear nueva wallet')
     expect(html).toContain('Desbloquear wallet')
-    expect(html).toContain('Importar desde seed')
+    expect(html).toContain('Restaurar wallet existente')
     expect(html).toContain('Explorar en modo lectura')
     expect(html).toContain('href="/onboarding/create"')
     expect(html).toContain('href="/onboarding/unlock"')
@@ -69,13 +69,14 @@ describe('Tonalli onboarding routes', () => {
     const html = renderRoute(<CreateWallet />)
 
     expect(html).toContain('Crear wallet nueva')
+    expect(html).toContain('Compatible con eCash / Cashtab · BIP44 1899')
     expect(html).toContain('Generar seed')
     expect(html).toContain('id="new-password"')
     expect(html).toContain('autoComplete="new-password"')
     expect(html).toContain('href="/onboarding"')
     expect(html).not.toContain('id="existing-password"')
     expect(html).not.toContain('id="seed-phrase"')
-    expect(html).not.toContain('Importar wallet')
+    expect(html).not.toContain('Restaurar wallet')
   })
 
   test('/onboarding/unlock shows only the unlock form', () => {
@@ -94,13 +95,13 @@ describe('Tonalli onboarding routes', () => {
   test('/onboarding/import shows only the seed form', () => {
     const html = renderRoute(<ImportWallet />)
 
-    expect(html).toContain('Importar desde seed')
+    expect(html).toContain('Restaurar wallet existente')
     expect(html).toContain('id="seed-phrase"')
     expect(html).toContain('autoCapitalize="off"')
     expect(html).toContain('autoComplete="off"')
     expect(html).toContain('autoCorrect="off"')
     expect(html).toContain('spellCheck="false"')
-    expect(html).toContain('Importar wallet')
+    expect(html).toContain('Restaurar wallet')
     expect(html).toContain('id="import-password"')
     expect(html).toContain('autoComplete="new-password"')
     expect(html).toContain('href="/onboarding"')

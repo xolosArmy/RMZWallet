@@ -1,0 +1,80 @@
+import { readFileSync } from 'node:fs'
+import { describe, expect, test } from 'vitest'
+
+const source = (relativePath: string) =>
+  readFileSync(new URL(relativePath, import.meta.url), 'utf8')
+
+describe('dual derivation discovery security boundary', () => {
+  test('discovery derives account xpubs once and has no seed, signing or broadcast primitive', () => {
+    const discovery = source('./dualDerivationDiscovery.ts')
+    const derivation = source('./derivationProfiles.ts')
+
+    expect(discovery).not.toContain('mnemonicToSeed')
+    expect(discovery).not.toMatch(/getSignatory\s*\(/)
+    expect(discovery).not.toMatch(/signTxBuilder\s*\(/)
+    expect(discovery).not.toMatch(/broadcastTx\s*\(/)
+    expect(derivation.match(/mnemonicToSeed\s*\(/g)).toHaveLength(1)
+    expect(derivation).toContain('seckey: undefined')
+    expect(derivation).toContain('node.seckey() !== undefined')
+  })
+
+  test('wallet scans use the public derivation boundary and reserve private derivation for signing', () => {
+    const service = source('./XolosWalletService.ts')
+    const ownerBoundary = service.slice(
+      service.indexOf('private deriveHdOwner'),
+      service.indexOf('private rememberHdOwners')
+    )
+    const rescanBoundary = service.slice(
+      service.indexOf('private async scanAddressesForRescan'),
+      service.lastIndexOf('\n}')
+    )
+
+    expect(ownerBoundary).toContain('deriveWatchOnlyMetadata(')
+    expect(ownerBoundary).not.toContain('deriveFromMnemonic(')
+    expect(rescanBoundary).toContain('deriveWatchOnlyMetadata(')
+    expect(rescanBoundary).not.toContain('deriveFromMnemonic(')
+  })
+
+  test('FIRMA derives signatories only after fresh-state plan revalidation', () => {
+    const service = source('./XolosWalletService.ts')
+    const sendBoundary = service.slice(
+      service.indexOf('async sendFirma'),
+      service.indexOf('async sendToken')
+    )
+
+    expect(sendBoundary.indexOf('await this.buildFirmaSendPlan(')).toBeGreaterThanOrEqual(0)
+    expect(sendBoundary.indexOf('planFingerprint')).toBeGreaterThan(
+      sendBoundary.indexOf('await this.buildFirmaSendPlan(')
+    )
+    expect(sendBoundary.indexOf('this.deriveHdSignatory(')).toBeGreaterThan(
+      sendBoundary.indexOf('planFingerprint')
+    )
+  })
+
+  test('missing stored metadata is detected read-only before profile persistence', () => {
+    const service = source('./XolosWalletService.ts')
+    const loadBoundary = service.slice(
+      service.indexOf('async loadFromStorage'),
+      service.indexOf('async unlockEncryptedWallet')
+    )
+
+    expect(loadBoundary).toContain('parseStoredDerivationProfileMetadata(')
+    expect(loadBoundary).toContain('await this.detectDerivationProfiles(plainText)')
+    expect(loadBoundary).toContain('resolveProfileForMissingMetadata(')
+    expect(loadBoundary).toContain('await this.activateMnemonic(plainText, resolvedProfileId, true)')
+    expect(loadBoundary).not.toContain('deriveHdSignatory(')
+    expect(loadBoundary).not.toContain('broadcastTx(')
+  })
+
+  test('runtime consumers do not embed either BIP44 profile path', () => {
+    const consumers = [
+      source('./XolosWalletService.ts'),
+      source('./firmaAlphaSend.ts'),
+      source('../routes/Onboarding.tsx'),
+      source('../routes/Settings.tsx')
+    ].join('\n')
+
+    expect(consumers).not.toContain("m/44'/899'")
+    expect(consumers).not.toContain("m/44'/1899'")
+  })
+})

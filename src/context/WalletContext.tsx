@@ -8,6 +8,7 @@ import { computeNetworkFeeSats, MIN_NETWORK_FEE_SATS, TONALLI_SERVICE_FEE_SATS, 
 import { parseTokenAmount } from '../utils/tokenFormat'
 import { FIRMA_ALPHA } from '../config/firmaAlpha'
 import type { FirmaSendPreview } from '../services/firmaAlphaSend'
+import type { DerivationProfileId } from '../services/derivationProfiles'
 import { WalletContext } from './walletContext'
 import { WALLET_REFRESH_EVENT, type WalletRefreshDetail } from '../utils/walletRefresh'
 
@@ -242,15 +243,20 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
   }, [syncAddressAndBalance])
 
-  const restoreWallet = useCallback(async (mnemonic: string) => {
+  const restoreWallet = useCallback(async (
+    mnemonic: string,
+    selectedProfileId?: DerivationProfileId
+  ) => {
     setLoading(true)
     setError(null)
     try {
-      await xolosWalletService.restoreFromMnemonic(mnemonic)
+      const result = await xolosWalletService.restoreFromMnemonic(mnemonic, selectedProfileId)
+      if (result.status === 'choice-required') return result
       await syncAddressAndBalance()
       setInitialized(true)
       setBackupVerifiedState(false)
       localStorage.setItem(BACKUP_KEY, 'false')
+      return result
     } catch (err) {
       const message = (err as Error).message || 'No se pudo restaurar la billetera.'
       setError(message)
@@ -261,14 +267,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   }, [syncAddressAndBalance])
 
   const loadExistingWallet = useCallback(
-    async (password: string) => {
+    async (password: string, selectedProfileId?: DerivationProfileId) => {
       setLoading(true)
       setError(null)
       try {
-        await xolosWalletService.loadFromStorage(password)
+        const result = await xolosWalletService.loadFromStorage(password, selectedProfileId)
+        if (result.status === 'choice-required') return result
         await syncAddressAndBalance()
         setInitialized(true)
         setBackupVerifiedState(localStorage.getItem(BACKUP_KEY) === 'true')
+        return result
       } catch (err) {
         const message = (err as Error).message || 'No se pudo cargar la billetera guardada.'
         setError(message)
