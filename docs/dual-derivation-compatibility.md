@@ -1,9 +1,11 @@
 # Dual derivation compatibility
 
 Tonalli Wallet historically derives its primary eCash identity at
-`m/44'/899'/0'/0/0`. Existing encrypted wallets without derivation metadata
-must continue to use that path, because changing the coin type would produce a
-different key, address and UTXO set.
+`m/44'/899'/0'/0/0`. A historical encrypted wallet without valid derivation
+metadata keeps that path only when read-only autodetection finds no activity
+under either supported profile. When activity exists, the detected profile is
+authoritative because changing the coin type would produce a different key,
+address and UTXO set.
 
 This change adds an explicit interoperable profile at
 `m/44'/1899'/0'/0/0`. Coin type 1899 is the current eCash/Cashtab convention:
@@ -18,9 +20,18 @@ Cashtab's current `appConfig.derivationPath` is 1899 and `ecash-lib` publishes
 | eCash / Cashtab | `m/44'/1899'/0'/0/i` | `m/44'/1899'/0'/1/i` | Default for newly created wallets and empty imported seeds |
 
 The profile registry in `src/services/derivationProfiles.ts` is the single
-source of truth. Stored profile metadata is versioned. Missing or malformed
-metadata attached to an existing encrypted wallet resolves to Tonalli Legacy;
-the migration is idempotent and does not alter the encrypted mnemonic.
+source of truth. Stored profile metadata is versioned. Valid metadata selects
+the stored profile directly. Missing or malformed metadata on an encrypted
+wallet triggers read-only autodetection across both profiles after decryption:
+
+- activity only on 899 recovers and persists Tonalli Legacy;
+- activity only on 1899 recovers and persists eCash / Cashtab;
+- activity on both requires an explicit profile choice before persistence;
+- no activity on either profile preserves the historical Tonalli Legacy 899
+  fallback.
+
+This recovery does not alter the encrypted mnemonic and does not sign or
+broadcast.
 
 ## Restore and autodetection
 
@@ -38,12 +49,27 @@ are read-only and do not enable arbitrary token sends.
 
 ## Security boundary
 
-Discovery derives and retains only path, address, public key and hash160
-metadata. It does not extract secret keys, create signatories, construct signed
-transactions or broadcast. Signing remains after confirmation and fresh-state
-revalidation. FIRMA input ownership includes the profile, account, branch,
-index, full path, address and public key; mixed-profile plans are rejected
-before a signatory is requested.
+For each profile, the mnemonic crosses the private derivation boundary exactly
+once to derive its hardened account node: `m/44'/899'/0'` or
+`m/44'/1899'/0'`. Production retains only the account's extended-public tuple:
+
+- public key;
+- chain code;
+- depth;
+- index;
+- parent fingerprint.
+
+The temporary seed buffer is wiped before the account-public extraction
+returns. Discovery, balance scanning, preview metadata and HD owner discovery
+reconstruct watch-only nodes from that tuple with `seckey: undefined`, then
+derive only the non-hardened receive and change branches `/0/i` and `/1/i`.
+
+Discovery does not create signatories, construct signed transactions or
+broadcast. Full private derivation from the mnemonic and complete input path
+occurs again only at the signing boundary, after user confirmation and
+fresh-state revalidation. FIRMA input ownership includes the profile, account,
+branch, index, full path, address and public key; mixed-profile plans are
+rejected before a signatory is requested.
 
 ## Cashtab interoperability test
 
