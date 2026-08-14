@@ -19,7 +19,7 @@ import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { TOKEN_DUST_SATS } from '../dex/agoraPhase1'
 import { parseTokenAmount } from '../utils/tokenFormat'
 import { getChronik } from './ChronikClient'
-import type { WalletSignatory, X402WalletAccount } from './XolosWalletService'
+import type { WalletSignatory } from './XolosWalletService'
 import { WALLET_DERIVATION_PATH, xolosWalletService } from './XolosWalletService'
 import {
   ECASH_STANDARD_PROFILE_ID,
@@ -408,7 +408,7 @@ describe('ecash-lib dummy estimate versus real FIRMA signature', () => {
 
 type FirmaServiceInternals = {
   getFirmaSpendOwners: () => FirmaInputOwner[]
-  getFirmaChangeOwner: (account: X402WalletAccount) => FirmaInputOwner
+  getFirmaChangeOwner: () => FirmaInputOwner
   deriveHdSignatory: (inputOwner: FirmaInputOwner) => WalletSignatory
 }
 

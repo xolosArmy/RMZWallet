@@ -1,4 +1,6 @@
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
+import { generateMnemonic } from '@scure/bip39'
+import { wordlist } from '@scure/bip39/wordlists/english.js'
 import { ALL_BIP143, P2PKHSignatory, Script, TxBuilder, fromHex, signMsg, toHex } from 'ecash-lib'
 import { AgoraOneshotAdSignatory } from 'ecash-agora'
 import type { ScriptUtxo } from 'chronik-client'
@@ -38,6 +40,7 @@ import {
   ECASH_STANDARD_PROFILE_ID,
   TONALLI_LEGACY_PROFILE_ID,
   deriveAccountXpub,
+  deriveSigningMetadata,
   deriveWatchOnlyMetadata,
   getDerivationPath,
   getDerivationProfile,
@@ -48,7 +51,8 @@ import {
 import type {
   AccountXpub,
   DerivationProfile,
-  DerivationProfileId
+  DerivationProfileId,
+  SigningDerivationMetadata
 } from './derivationProfiles'
 import {
   discoverDerivationProfile,
@@ -91,6 +95,10 @@ const SCAN_CACHE_TTL_MS = 30000
 const CHRONIK_CONCURRENCY_LIMIT = 4
 const ALIAS_CHRONIK_VERIFY_ATTEMPTS = 20
 const ALIAS_CHRONIK_VERIFY_DELAY_MS = 3000
+// Burned BIP39 vector. MinimalXECWallet is instantiated only as a utility;
+// the user's mnemonic is bound later to Tonalli's canonical derivation port.
+const MINIMAL_WALLET_UTILITY_MNEMONIC =
+  'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
 
 export const DEFAULT_GAP_LIMIT = 20
 export const EXTENDED_GAP_LIMIT = 100
@@ -158,7 +166,9 @@ const runWithConcurrency = async <T, R>(
 }
 
 export interface WalletBalance {
-  xec: bigint // satoshis
+  xec: bigint // pure, spendable XEC satoshis
+  tokenUtxoSats: bigint
+  tokenUtxoXecFormatted: string
   rmzAtoms: bigint
   rmzFormatted: string
   rmzDecimals: number
@@ -167,6 +177,16 @@ export interface WalletBalance {
   firmaDecimals: number
   xecFormatted: string // XEC con 2 decimales
 }
+
+export const partitionWalletSats = (utxos: readonly ScriptUtxo[]) =>
+  Object.freeze(utxos.reduce(
+    (totals, utxo) => {
+      if (utxo.token) totals.tokenUtxoSats += utxo.sats
+      else totals.spendableXecSats += utxo.sats
+      return totals
+    },
+    { spendableXecSats: 0n, tokenUtxoSats: 0n }
+  ))
 
 export type WalletRescanOptions = {
   gapLimit?: number
@@ -276,6 +296,25 @@ type AliasTxPlan = {
 
 export type AliasReservedUtxo = ScriptUtxo
 
+type CanonicalMnemonicDeriver = {
+  deriveFromMnemonic: (mnemonic: string, hdPath?: string) => {
+    address: string
+    publicKey: string
+    privateKey: string
+  }
+}
+
+type MinimalWalletCompatibilitySurface = MinimalXecWallet & {
+  walletInfo?: WalletInfo & { hdPath?: string }
+  keyDerivation?: CanonicalMnemonicDeriver
+  sendXecLib?: { keyDerivation?: CanonicalMnemonicDeriver }
+  opReturn?: { keyDerivation?: CanonicalMnemonicDeriver }
+  hybridTokens?: {
+    slpHandler?: { keyDerivation?: CanonicalMnemonicDeriver }
+    alpHandler?: { keyDerivation?: CanonicalMnemonicDeriver }
+  }
+}
+
 const INDEPENDENT_ALIAS_UTXO_ERROR =
   'Not enough independent XEC UTXOs. Send a small amount of XEC to yourself, wait for it to appear, and try again.'
 const RMZ_CHANGE_ALIAS_ABORT_ERROR = 'Alias transaction attempted to spend RMZ fee change output. Aborting.'
@@ -312,10 +351,10 @@ export class XolosWalletService {
     return XolosWalletService.instance
   }
 
-  private buildWallet(mnemonic: string | undefined, profileId: DerivationProfileId) {
+  private buildWallet(profileId: DerivationProfileId) {
     this.activeProfileId = profileId
     this.isReady = false
-    this.wallet = new MinimalXECWalletResolved(mnemonic, {
+    this.wallet = new MinimalXECWalletResolved(MINIMAL_WALLET_UTILITY_MNEMONIC, {
       hdPath: getDerivationPath(profileId, 'receive', 0),
       chronikUrls: CHRONIK_ENDPOINTS,
       enableDonations: false
@@ -326,6 +365,72 @@ export class XolosWalletService {
     this.hdAddressCache = []
     this.activeAccountXpub = null
     return this.wallet
+  }
+
+  private bindMinimalWalletToCanonicalProfile(mnemonic: string): void {
+    const wallet = this.getWalletForBinding()
+    const profileId = this.activeProfileId
+    const canonicalOwner = this.deriveHdOwner('receive', 0)
+    const expectedMnemonic = mnemonic.trim()
+    const deriveFromMnemonic = (candidateMnemonic: string, hdPath = canonicalOwner.hdPath) => {
+      if (candidateMnemonic.trim() !== expectedMnemonic) {
+        throw new Error('La seed solicitada no corresponde a la wallet activa.')
+      }
+      const pathPrefix = `${getDerivationProfile(profileId).basePath}/`
+      if (!hdPath.startsWith(pathPrefix)) {
+        throw new Error('La ruta solicitada no pertenece al perfil activo.')
+      }
+      const pathParts = hdPath.slice(pathPrefix.length).split('/')
+      const branch = pathParts[0] === '0'
+        ? 'receive'
+        : pathParts[0] === '1'
+          ? 'change'
+          : null
+      const index = Number(pathParts[1])
+      if (
+        pathParts.length !== 2 ||
+        branch === null ||
+        !Number.isSafeInteger(index) ||
+        index < 0 ||
+        getDerivationPath(profileId, branch, index) !== hdPath
+      ) {
+        throw new Error('La ruta solicitada no es una ruta receive/change canónica.')
+      }
+      const derived = deriveSigningMetadata(expectedMnemonic, profileId, branch, index)
+      return {
+        address: derived.address,
+        publicKey: derived.publicKeyHex,
+        privateKey: toHex(derived.privateKey)
+      }
+    }
+    if (!wallet.walletInfo) {
+      throw new Error('MinimalXECWallet no expuso walletInfo para enlazar la identidad canónica.')
+    }
+    Object.assign(wallet.walletInfo, {
+      mnemonic: expectedMnemonic,
+      xecAddress: canonicalOwner.address,
+      publicKey: canonicalOwner.publicKeyHex,
+      privateKey: undefined,
+      hdPath: canonicalOwner.hdPath
+    })
+    const derivationPorts = [
+      wallet.keyDerivation,
+      wallet.sendXecLib?.keyDerivation,
+      wallet.opReturn?.keyDerivation,
+      wallet.hybridTokens?.slpHandler?.keyDerivation,
+      wallet.hybridTokens?.alpHandler?.keyDerivation
+    ]
+    if (derivationPorts.some((port) => port === undefined)) {
+      throw new Error('MinimalXECWallet no expuso todos sus puertos internos de derivación.')
+    }
+    for (const port of derivationPorts) {
+      (port as CanonicalMnemonicDeriver).deriveFromMnemonic = deriveFromMnemonic
+    }
+  }
+
+  private getWalletForBinding(): MinimalWalletCompatibilitySurface {
+    if (!this.wallet) throw new Error('La billetera no está disponible para enlazar su identidad.')
+    return this.wallet as MinimalWalletCompatibilitySurface
   }
 
   private persistActiveProfile(): void {
@@ -341,13 +446,14 @@ export class XolosWalletService {
     profileId: DerivationProfileId,
     persistProfile = false
   ): Promise<void> {
-    this.buildWallet(mnemonic, profileId)
+    this.buildWallet(profileId)
     const wallet = this.wallet as MinimalXecWallet
     await wallet.walletInfoPromise
-    await wallet.initialize()
-    this.isReady = true
     this.decryptedMnemonic = mnemonic
     this.activeAccountXpub = deriveAccountXpub(mnemonic, profileId)
+    this.bindMinimalWalletToCanonicalProfile(mnemonic)
+    await wallet.initialize()
+    this.isReady = true
     this.scanCache = null
     this.scanPromise = null
     this.scanPromiseGapLimit = null
@@ -517,15 +623,15 @@ export class XolosWalletService {
   }
 
   async createNewWallet(): Promise<string> {
-    this.buildWallet(undefined, DEFAULT_NEW_WALLET_PROFILE_ID)
+    const mnemonic = generateMnemonic(wordlist, 128)
+    this.buildWallet(DEFAULT_NEW_WALLET_PROFILE_ID)
     const wallet = this.wallet as MinimalXecWallet
-    const walletInfo: WalletInfo = await wallet.walletInfoPromise
+    await wallet.walletInfoPromise
+    this.decryptedMnemonic = mnemonic
+    this.activeAccountXpub = deriveAccountXpub(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
+    this.bindMinimalWalletToCanonicalProfile(mnemonic)
     await wallet.initialize()
     this.isReady = true
-    this.decryptedMnemonic = walletInfo?.mnemonic || null
-    this.activeAccountXpub = this.decryptedMnemonic
-      ? deriveAccountXpub(this.decryptedMnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
-      : null
     this.encryptedMnemonic = null
     this.scanCache = null
     this.scanPromise = null
@@ -708,26 +814,9 @@ export class XolosWalletService {
     return this.activeAccountXpub
   }
 
-  private getKeyDerivation() {
-    const wallet = this.getWallet() as MinimalXecWallet & {
-      keyDerivation?: {
-        deriveFromMnemonic: (mnemonic: string, hdPath?: string) => {
-          address: string
-          publicKey: string
-          privateKey: string
-        }
-      }
-    }
-    const keyDerivation = wallet.keyDerivation
-    if (!keyDerivation || typeof keyDerivation.deriveFromMnemonic !== 'function') {
-      throw new Error('No se encontró el derivador de llaves de la billetera.')
-    }
-    return keyDerivation
-  }
-
   private deriveHdOwner(branch: FirmaInputOwner['branch'], index: number): FirmaInputOwner {
     const derived = deriveWatchOnlyMetadata(this.getAccountXpubOrThrow(), branch, index)
-    return {
+    return Object.freeze({
       profileId: this.activeProfileId,
       account: 0,
       address: derived.address,
@@ -735,7 +824,20 @@ export class XolosWalletService {
       branch,
       index,
       publicKeyHex: derived.publicKeyHex
+    })
+  }
+
+  private getCanonicalReceiveOwner(): FirmaInputOwner {
+    this.ensureReady()
+    const owner = this.deriveHdOwner('receive', 0)
+    if (
+      owner.profileId !== this.activeProfileId ||
+      owner.account !== 0 ||
+      owner.hdPath !== getWalletReceivePath(0, this.activeProfileId)
+    ) {
+      throw new Error('La identidad pública canónica receive/0 no corresponde al perfil activo.')
     }
+    return owner
   }
 
   private rememberHdOwners(owners: FirmaInputOwner[]): void {
@@ -810,7 +912,8 @@ export class XolosWalletService {
         this.fetchAddressScan(owner.address)
       )
 
-      let totalSats = 0n
+      let spendableXecSats = 0n
+      let tokenUtxoSats = 0n
       let totalRmzAtoms = 0n
       let totalFirmaAtoms = 0n
       const discoveredUtxos: ScriptUtxo[] = []
@@ -818,7 +921,8 @@ export class XolosWalletService {
       for (const scan of scans) {
         for (const utxo of scan.utxos) {
           discoveredUtxos.push(utxo)
-          totalSats += utxo.sats
+          if (utxo.token) tokenUtxoSats += utxo.sats
+          else spendableXecSats += utxo.sats
           if (utxo.token && utxo.token.tokenId === RMZ_ETOKEN_ID && !utxo.token.isMintBaton) {
             totalRmzAtoms += utxo.token.atoms
           }
@@ -837,16 +941,17 @@ export class XolosWalletService {
         this.getRmzDecimals(),
         this.getFirmaAlphaDecimals()
       ])
-      const xec = totalSats
       const balances: WalletBalance = {
-        xec,
+        xec: spendableXecSats,
+        tokenUtxoSats,
+        tokenUtxoXecFormatted: this.formatXecFromSats(tokenUtxoSats),
         rmzAtoms: totalRmzAtoms,
         rmzFormatted: formatTokenAmount(totalRmzAtoms, rmzDecimals),
         rmzDecimals,
         firmaAtoms: totalFirmaAtoms,
         firmaFormatted: formatTokenAmount(totalFirmaAtoms, firmaDecimals),
         firmaDecimals,
-        xecFormatted: this.formatXecFromSats(totalSats)
+        xecFormatted: this.formatXecFromSats(spendableXecSats)
       }
 
       const cache: ScanCache = {
@@ -885,9 +990,7 @@ export class XolosWalletService {
       return cache.balances
     } catch {
       const fallbackAddress = this.getAddress()
-      const [xecBalance, rmzBalanceObj, firmaUtxos] = await Promise.all([
-        wallet.getXecBalance(),
-        wallet.getETokenBalance({ tokenId: RMZ_ETOKEN_ID }),
+      const [fallbackUtxos] = await Promise.all([
         fallbackAddress
           ? getChronik().address(fallbackAddress).utxos().then((response) => response.utxos).catch(() => [])
           : Promise.resolve([] as ScriptUtxo[])
@@ -897,19 +1000,13 @@ export class XolosWalletService {
         this.getRmzDecimals(),
         this.getFirmaAlphaDecimals()
       ])
-      const parseBalanceAtoms = (
-        balanceObj: Awaited<ReturnType<MinimalXecWallet['getETokenBalance']>>,
-        decimals: number
-      ) => {
-        const displayValue = typeof balanceObj === 'number' ? balanceObj : balanceObj.balance?.display || 0
-        const raw = displayValue.toString()
-        if (/e/i.test(raw)) {
-          return parseTokenAmount(displayValue.toFixed(decimals), decimals)
-        }
-        return parseTokenAmount(raw, decimals)
-      }
-      const rmzAtoms = parseBalanceAtoms(rmzBalanceObj, rmzDecimals)
-      const firmaAtoms = firmaUtxos.reduce((total, utxo) => {
+      const rmzAtoms = fallbackUtxos.reduce((total, utxo) => {
+        const token = utxo.token
+        return token?.tokenId === RMZ_ETOKEN_ID && !token.isMintBaton
+          ? total + token.atoms
+          : total
+      }, 0n)
+      const firmaAtoms = fallbackUtxos.reduce((total, utxo) => {
         const token = utxo.token
         return token?.tokenId === FIRMA_ALPHA.tokenId &&
           token.tokenType.protocol === FIRMA_ALPHA.protocol &&
@@ -918,18 +1015,19 @@ export class XolosWalletService {
           ? total + token.atoms
           : total
       }, 0n)
-
-      const xecInSats = BigInt(Math.round((xecBalance || 0) * 100))
+      const { spendableXecSats, tokenUtxoSats } = partitionWalletSats(fallbackUtxos)
 
       return {
-        xec: xecInSats,
+        xec: spendableXecSats,
+        tokenUtxoSats,
+        tokenUtxoXecFormatted: this.formatXecFromSats(tokenUtxoSats),
         rmzAtoms,
         rmzFormatted: formatTokenAmount(rmzAtoms, rmzDecimals),
         rmzDecimals,
         firmaAtoms,
         firmaFormatted: formatTokenAmount(firmaAtoms, firmaDecimals),
         firmaDecimals,
-        xecFormatted: this.formatXecFromSats(xecInSats)
+        xecFormatted: this.formatXecFromSats(spendableXecSats)
       }
     }
   }
@@ -979,19 +1077,8 @@ export class XolosWalletService {
     return owners
   }
 
-  private getFirmaChangeOwner(account: X402WalletAccount): FirmaInputOwner {
-    const activeReceivePath = getWalletReceivePath(0, this.activeProfileId)
-    const owner = this.hdAddressCache.find((candidate) =>
-      candidate.profileId === this.activeProfileId && candidate.hdPath === activeReceivePath
-    )
-    if (
-      !owner ||
-      owner.address !== account.address ||
-      owner.publicKeyHex !== account.publicKey.toLowerCase()
-    ) {
-      throw new Error('La dirección activa no coincide con la ruta HD de cambio de la wallet.')
-    }
-    return owner
+  private getFirmaChangeOwner(): FirmaInputOwner {
+    return this.getCanonicalReceiveOwner()
   }
 
   private async refreshFirmaOwnedUtxos(owners: FirmaInputOwner[]): Promise<FirmaOwnedUtxo[]> {
@@ -1003,7 +1090,7 @@ export class XolosWalletService {
     return snapshots.flat()
   }
 
-  private deriveHdSignatory(owner: FirmaInputOwner): WalletSignatory {
+  private deriveSigningMetadataForOwner(owner: FirmaInputOwner): SigningDerivationMetadata {
     if (owner.profileId !== this.activeProfileId || owner.account !== 0) {
       throw new Error('El perfil HD del input FIRMA no coincide con la wallet activa.')
     }
@@ -1014,16 +1101,23 @@ export class XolosWalletService {
       throw new Error('La ruta HD del input FIRMA no coincide con su rama e índice.')
     }
 
-    const derived = this.getKeyDerivation().deriveFromMnemonic(this.getMnemonicOrThrow(), owner.hdPath)
-    const publicKeyHex = derived.publicKey.toLowerCase()
+    const derived = deriveSigningMetadata(
+      this.getMnemonicOrThrow(),
+      owner.profileId,
+      owner.branch,
+      owner.index
+    )
+    const publicKeyHex = derived.publicKeyHex.toLowerCase()
     if (derived.address !== owner.address || publicKeyHex !== owner.publicKeyHex.toLowerCase()) {
       throw new Error(`La clave derivada no corresponde al input FIRMA de ${owner.hdPath}.`)
     }
-    if (!/^[0-9a-fA-F]{64}$/.test(derived.privateKey)) {
-      throw new Error(`No se pudo derivar el signatory FIRMA de ${owner.hdPath}.`)
-    }
+    return derived
+  }
 
-    const privateKey = fromHex(derived.privateKey)
+  private deriveHdSignatory(owner: FirmaInputOwner): WalletSignatory {
+    const derived = this.deriveSigningMetadataForOwner(owner)
+    const publicKeyHex = derived.publicKeyHex.toLowerCase()
+    const privateKey = derived.privateKey
     const publicKey = fromHex(publicKeyHex)
     return {
       address: owner.address,
@@ -1036,8 +1130,7 @@ export class XolosWalletService {
   private async buildFirmaSendPlan(destination: string, amountAtoms: bigint): Promise<{
     plan: FirmaSendPlan
   }> {
-    const account = this.getX402ActiveAccount()
-    if (!account) {
+    if (!this.getX402ActiveAccount()) {
       throw new Error('Desbloquea la wallet antes de preparar un envío FIRMA.')
     }
 
@@ -1048,7 +1141,7 @@ export class XolosWalletService {
       this.refreshFirmaOwnedUtxos(owners)
     ])
     assertFirmaAlphaTokenInfo(tokenInfo)
-    const changeOwner = this.getFirmaChangeOwner(account)
+    const changeOwner = this.getFirmaChangeOwner()
     return {
       plan: buildFirmaSendPlan({
         changeOwner,
@@ -1298,7 +1391,8 @@ export class XolosWalletService {
   }
 
   getPublicKeyHex(): string | null {
-    return this.wallet?.walletInfo?.publicKey || null
+    if (!this.wallet || !this.isReady || !this.activeAccountXpub) return null
+    return this.getCanonicalReceiveOwner().publicKeyHex
   }
 
   getActiveDerivationProfile(): DerivationProfile {
@@ -1318,74 +1412,56 @@ export class XolosWalletService {
   }
 
   getAddress(): string | null {
-    return this.wallet?.walletInfo?.xecAddress || null
+    if (!this.wallet || !this.isReady || !this.activeAccountXpub) return null
+    return this.getCanonicalReceiveOwner().address
   }
 
   getX402ActiveAccount(): X402WalletAccount | null {
-    if (!this.wallet || !this.isReady || !this.decryptedMnemonic) {
+    if (!this.wallet || !this.isReady || !this.decryptedMnemonic || !this.activeAccountXpub) {
       return null
     }
 
-    const address = this.wallet.walletInfo?.xecAddress
-    const publicKey = this.wallet.walletInfo?.publicKey
-    if (!address || !publicKey || !/^(02|03)[0-9a-fA-F]{64}$/.test(publicKey)) {
+    const owner = this.getCanonicalReceiveOwner()
+    if (!/^(02|03)[0-9a-f]{64}$/.test(owner.publicKeyHex)) {
       return null
     }
 
-    return { address, publicKey }
+    return { address: owner.address, publicKey: owner.publicKeyHex }
   }
 
   async signX402AuthorizationMessage(message: string): Promise<X402AuthorizationSignature> {
     const account = this.getX402ActiveAccount()
-    const privateKeyHex = this.wallet?.walletInfo?.privateKey
-    if (!account || !privateKeyHex) {
+    if (!account) {
       throw new Error('X402_WALLET_UNAVAILABLE')
     }
 
     try {
-      return {
-        signature: signMsg(message, fromHex(privateKeyHex)),
+      return this.withPrivateKey((privateKey) => ({
+        signature: signMsg(message, privateKey),
         publicKey: account.publicKey
-      }
+      }))
     } catch {
       throw new Error('X402_AUTHORIZATION_SIGNING_FAILED')
     }
   }
 
   getSignatory(): WalletSignatory {
-    const privateKeyHex = this.wallet?.walletInfo?.privateKey || null
-    const publicKeyHex = this.wallet?.walletInfo?.publicKey || null
-    const address = this.wallet?.walletInfo?.xecAddress || null
-
-    if (!privateKeyHex || !publicKeyHex || !address) {
+    if (!this.decryptedMnemonic || !this.activeAccountXpub) {
       throw new Error('WALLET_LOCKED')
     }
-
-    const privateKey = fromHex(privateKeyHex)
-    const publicKey = fromHex(publicKeyHex)
-
-    return {
-      address,
-      publicKeyHex,
-      publicKey,
-      signatory: P2PKHSignatory(privateKey, publicKey, ALL_BIP143)
-    }
+    return this.deriveHdSignatory(this.getCanonicalReceiveOwner())
   }
 
   getAgoraOneshotAdSignatory(): unknown {
-    const privateKeyHex = this.wallet?.walletInfo?.privateKey || null
-    if (!privateKeyHex) {
-      throw new Error('WALLET_LOCKED')
-    }
-    return AgoraOneshotAdSignatory(fromHex(privateKeyHex))
+    return this.withPrivateKey((privateKey) => AgoraOneshotAdSignatory(privateKey))
   }
 
   withPrivateKey<T>(handler: (privateKey: Uint8Array) => T): T {
-    const privateKeyHex = this.wallet?.walletInfo?.privateKey || null
-    if (!privateKeyHex) {
+    if (!this.decryptedMnemonic || !this.activeAccountXpub) {
       throw new Error('WALLET_LOCKED')
     }
-    return handler(fromHex(privateKeyHex))
+    const derived = this.deriveSigningMetadataForOwner(this.getCanonicalReceiveOwner())
+    return handler(derived.privateKey)
   }
 
   signTxBuilder(builder: TxBuilder, options?: { feePerKb?: bigint; dustSats?: bigint }) {
@@ -1582,7 +1658,8 @@ export class XolosWalletService {
     const receive: string[] = []
     const change: string[] = []
     const owners: FirmaInputOwner[] = []
-    let totalSats = 0n
+    let spendableXecSats = 0n
+    let tokenUtxoSats = 0n
     let totalRmzAtoms = 0n
     let totalFirmaAtoms = 0n
     const discoveredUtxos: ScriptUtxo[] = []
@@ -1645,7 +1722,8 @@ export class XolosWalletService {
           }
           for (const utxo of addressScan.utxos) {
             discoveredUtxos.push(utxo)
-            totalSats += utxo.sats
+            if (utxo.token) tokenUtxoSats += utxo.sats
+            else spendableXecSats += utxo.sats
             if (utxo.token && utxo.token.tokenId === RMZ_ETOKEN_ID && !utxo.token.isMintBaton) {
               totalRmzAtoms += utxo.token.atoms
             }
@@ -1685,14 +1763,16 @@ export class XolosWalletService {
       this.getFirmaAlphaDecimals()
     ])
     const balances: WalletBalance = {
-      xec: totalSats,
+      xec: spendableXecSats,
+      tokenUtxoSats,
+      tokenUtxoXecFormatted: this.formatXecFromSats(tokenUtxoSats),
       rmzAtoms: totalRmzAtoms,
       rmzFormatted: formatTokenAmount(totalRmzAtoms, rmzDecimals),
       rmzDecimals,
       firmaAtoms: totalFirmaAtoms,
       firmaFormatted: formatTokenAmount(totalFirmaAtoms, firmaDecimals),
       firmaDecimals,
-      xecFormatted: this.formatXecFromSats(totalSats)
+      xecFormatted: this.formatXecFromSats(spendableXecSats)
     }
 
     this.rememberHdOwners(owners)

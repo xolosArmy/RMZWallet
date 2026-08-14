@@ -330,7 +330,7 @@ test('session_request con offerId faltante responde -32602', async () => {
 
 test('approveSession fuerza namespace ecash con ecash:1 y signAndBroadcastTransaction', async () => {
   const originalGetAddress = xolosWalletService.getAddress
-  xolosWalletService.getAddress = () => 'ecash:qqtestaddress'
+  xolosWalletService.getAddress = () => 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
 
   let approvedPayload:
     | {
@@ -370,7 +370,10 @@ test('approveSession fuerza namespace ecash con ecash:1 y signAndBroadcastTransa
       chains: ['ecash:1', 'ecash:mainnet'],
       methods: ['ecash_signAndBroadcastTransaction', 'ecash_signAndBroadcast', 'ecash_getAddresses', 'ecash_signMessage'],
       events: ['accountsChanged'],
-      accounts: ['ecash:1:qqtestaddress', 'ecash:mainnet:qqtestaddress']
+      accounts: [
+        'ecash:1:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg',
+        'ecash:mainnet:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
+      ]
     }
   })
 
@@ -1972,9 +1975,9 @@ test('preview tardío de otra solicitud no actualiza ni desbloquea la solicitud 
   }
 })
 
-test('ecash_getAddresses conserva la respuesta de la cuenta activa', async () => {
+test('ecash_getAddresses publica exactamente el receive/0 canónico 1899', async () => {
   const originalGetAddress = xolosWalletService.getAddress
-  xolosWalletService.getAddress = () => 'ecash:qactive'
+  xolosWalletService.getAddress = () => 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
 
   try {
     const { responses, sessionRequest } = buildWalletHarness()
@@ -1991,7 +1994,9 @@ test('ecash_getAddresses conserva la respuesta de la cuenta activa', async () =>
     })
 
     assert.equal(responses.length, 1)
-    assert.deepEqual(responses[0].response.result, ['ecash:qactive'])
+    assert.deepEqual(responses[0].response.result, [
+      'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
+    ])
   } finally {
     xolosWalletService.getAddress = originalGetAddress
   }

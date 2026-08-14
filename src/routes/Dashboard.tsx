@@ -370,9 +370,12 @@ function Dashboard() {
           </div>
         </div>
         <div className="card">
-          <p className="muted">eCash (XEC) para comisiones</p>
+          <p className="muted">XEC libre para comisiones</p>
           <h3 className="metric-value" style={{ marginTop: 4 }}>{balance ? `${balance.xecFormatted} XEC` : 'Cargando...'}</h3>
-          <p className="muted">({balance ? `${balance.xec.toString()} sats` : 'sats...'})</p>
+          <p className="muted">({balance ? `${balance.xec.toString()} sats spendable` : 'sats...'})</p>
+          <p className="muted">
+            Sats asociados a token UTXOs: {balance ? `${balance.tokenUtxoSats.toString()} sats (${balance.tokenUtxoXecFormatted} XEC)` : 'cargando...'}
+          </p>
         </div>
       </div>
 

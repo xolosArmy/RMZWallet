@@ -42,6 +42,8 @@ const preview: FirmaSendPreview = {
 const balance = (firmaAtoms: bigint, firmaFormatted: string): WalletBalance => ({
   xec: 20_000n,
   xecFormatted: '200.00',
+  tokenUtxoSats: 546n,
+  tokenUtxoXecFormatted: '5.46',
   rmzAtoms: 42n,
   rmzFormatted: '42',
   rmzDecimals: 0,

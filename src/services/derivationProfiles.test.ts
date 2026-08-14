@@ -6,6 +6,7 @@ import {
   TONALLI_LEGACY_PROFILE_ID,
   accountXpubToWatchOnlyNode,
   deriveAccountXpub,
+  deriveSigningMetadata,
   deriveWatchOnlyMetadata,
   getDerivationPath,
   parseStoredDerivationProfileMetadata,
@@ -52,6 +53,32 @@ describe('Tonalli dual BIP44 derivation profiles', () => {
       '97f2d7fa9745baa45fc1b53be3ecead6c000265cc5115aa4ae4d1f452057eb0c'
     )
     expect(standard.address).toBe('ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg')
+  })
+
+  test('re-enters private derivation only for the exact requested signing path', () => {
+    const watchOnly = deriveWatchOnlyMetadata(
+      deriveAccountXpub(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID),
+      'receive',
+      7
+    )
+    const signing = deriveSigningMetadata(
+      PUBLIC_TEST_MNEMONIC,
+      ECASH_STANDARD_PROFILE_ID,
+      'receive',
+      7
+    )
+
+    expect(signing.hdPath).toBe("m/44'/1899'/0'/0/7")
+    expect(signing.address).toBe(watchOnly.address)
+    expect(signing.publicKeyHex).toBe(watchOnly.publicKeyHex)
+    expect(signing.privateKey).toHaveLength(32)
+    expect(signing.address).not.toBe(
+      deriveWatchOnlyMetadata(
+        deriveAccountXpub(PUBLIC_TEST_MNEMONIC, ECASH_STANDARD_PROFILE_ID),
+        'receive',
+        0
+      ).address
+    )
   })
 
   test('derives receive and change within the selected profile', () => {
