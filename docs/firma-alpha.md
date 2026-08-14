@@ -66,17 +66,19 @@ La publicación bloquea FIRMA en el covenant Agora; no garantiza que exista un c
 
 “Redimir” mantiene el mecanismo oficial on-chain de Firma:
 
-- obtiene el bid vigente desde `https://firmaprotocol.com/api/bid`;
+- obtiene el bid vigente mediante el endpoint same-origin `GET /api/firma-bid` de Tonalli;
 - consulta el saldo XEC de la dirección oficial de redención;
 - exige un mínimo de `0.01 FIRMA`;
 - crea una oferta Agora por el monto completo, ajustada estrictamente por debajo del bid cuando la granularidad del covenant lo exige;
 - impide publicar si la hot wallet no cubre la redención inmediata.
 
-El endpoint se verificó el 10 de agosto de 2026 contra dos fuentes actuales: el sitio oficial `firmaprotocol.com` y el código vigente de Cashtab en Bitcoin ABC usan `https://firmaprotocol.com/api/bid`. La consulta directa respondió HTTP 200, `Content-Type: application/json`, CORS abierto y un objeto de la forma `{"bid":147306.27}`. Cashtab registra ese campo como precio de compra en XEC y lo convierte a nanosatoshis por token; Tonalli lo interpreta como **XEC por 1 FIRMA** y lo convierte a satoshis sin coma flotante financiera. HTTP no exitoso, JSON inválido, ausencia de `bid` o precio no positivo abortan la operación con error explícito.
+La función Edge de Vercel llama server-to-server exclusivamente a `https://stakedxec.com/api/bid`, el upstream vigente de redención que usa la implementación actual de Cashtab. El bundle del navegador no conserva ni consulta esa URL. La función sigue redirects, pero exige que la respuesta final permanezca en el origen autorizado, sea HTTP 2xx y tenga `Content-Type` JSON. Sólo acepta un `bid` decimal positivo representable en satoshis, devuelve `{"bid":"…"}` y marca toda respuesta `Cache-Control: no-store, max-age=0`. No recibe estado de la wallet, no reenvía cookies o autorización y no permite elegir otro upstream.
+
+Tonalli interpreta el `bid` como **XEC por 1 FIRMA** y lo convierte a satoshis sin coma flotante financiera. Timeout, HTTP no exitoso, redirect a otro origen, respuesta HTML, JSON inválido, ausencia de `bid` o precio no positivo abortan la operación. No existe precio fijo, cacheado, sintético ni derivado de Agora como fallback.
 
 `https://firma.cash/api/bid` no es un endpoint alternativo válido: actualmente redirige a `www.firma.cash`, una marca distinta, y termina en HTTP 404. No existe fallback silencioso.
 
-En la confirmación de una redención, antes de materializar la llave, Tonalli vuelve a consultar el bid y la capacidad del sweeper, reconstruye el plan con los UTXOs actuales y comprueba que el P2SH seleccionado siga libre. Si el bid cambió, la capacidad ya no supera `askedSats`, cambiaron los inputs o apareció un covenant idéntico, la ejecución aborta y exige un preview nuevo.
+En la confirmación de una redención, antes de materializar la llave, Tonalli vuelve a consultar `/api/firma-bid` y la capacidad del sweeper, reconstruye el plan con los UTXOs actuales y comprueba que el P2SH seleccionado siga libre. Si el bid cambió, la capacidad ya no supera `askedSats`, cambiaron los inputs o apareció un covenant idéntico, la ejecución aborta y exige un preview nuevo.
 
 El resultado no es un retiro fiat: es una oferta FIRMA por XEC que el sweeper oficial puede aceptar on-chain. Tonalli Wallet no custodia fondos, no envía llaves o seed y no promete tiempo de ejecución fuera de la confirmación de red.
 

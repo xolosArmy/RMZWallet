@@ -262,12 +262,66 @@ describe('Firma Alpha security boundaries', () => {
       display: '147306.27',
       satsPerFirma: 14_730_627n
     })
+    expect(fetch).toHaveBeenLastCalledWith('/api/firma-bid', {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      cache: 'no-store'
+    })
+    expect(vi.mocked(fetch).mock.calls.flatMap(([url]) => String(url)))
+      .not.toContain('firmaprotocol.com')
 
     vi.mocked(fetch).mockResolvedValueOnce(new Response('{}', { status: 200 }))
-    await expect(fetchFirmaBidPrice()).rejects.toThrow(/campo bid/)
+    await expect(fetchFirmaBidPrice()).rejects.toThrow('Firma devolvió un precio de redención inválido.')
 
-    vi.mocked(fetch).mockResolvedValueOnce(new Response('unavailable', { status: 503 }))
-    await expect(fetchFirmaBidPrice()).rejects.toThrow(/HTTP 503/)
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(
+      JSON.stringify({ code: 'FIRMA_BID_UPSTREAM_UNAVAILABLE' }),
+      { status: 502, headers: { 'Content-Type': 'application/json' } }
+    ))
+    await expect(fetchFirmaBidPrice()).rejects.toThrow(
+      'El oráculo de redención de Firma no está disponible temporalmente.'
+    )
+  })
+
+  it('maps proxy timeout and invalid-payload responses to stable user-facing errors', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(
+      JSON.stringify({ code: 'FIRMA_BID_TIMEOUT' }),
+      { status: 504, headers: { 'Content-Type': 'application/json' } }
+    ))
+    await expect(fetchFirmaBidPrice()).rejects.toThrow(
+      'El oráculo de redención de Firma no respondió a tiempo.'
+    )
+
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(
+      JSON.stringify({ code: 'FIRMA_BID_INVALID_PAYLOAD' }),
+      { status: 502, headers: { 'Content-Type': 'application/json' } }
+    ))
+    await expect(fetchFirmaBidPrice()).rejects.toThrow(
+      'Firma devolvió un precio de redención inválido.'
+    )
+  })
+
+  it('does not derive signatories or broadcast when the bid proxy fails during preview', async () => {
+    vi.mocked(fetch).mockRejectedValueOnce(new TypeError('NetworkError when attempting to fetch resource.'))
+
+    await expect(prepareFirmaSale({ amount: '1', mode: 'redeem' })).rejects.toThrow(
+      'El oráculo de redención de Firma no está disponible temporalmente.'
+    )
+    expect(xolosWalletService.getSignatory).not.toHaveBeenCalled()
+    expect(xolosWalletService.signTxBuilder).not.toHaveBeenCalled()
+    expect(chronik.broadcastTx).not.toHaveBeenCalled()
+  })
+
+  it('does not derive signatories or broadcast when the bid proxy fails during fresh-state revalidation', async () => {
+    const preview = await prepareFirmaSale({ amount: '1', mode: 'redeem' })
+    vi.mocked(fetch).mockRejectedValueOnce(new TypeError('proxy unavailable'))
+
+    await expect(executeFirmaSale(preview)).rejects.toThrow(
+      'El oráculo de redención de Firma no está disponible temporalmente.'
+    )
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(xolosWalletService.getSignatory).not.toHaveBeenCalled()
+    expect(xolosWalletService.signTxBuilder).not.toHaveBeenCalled()
+    expect(chronik.broadcastTx).not.toHaveBeenCalled()
   })
 
   it('aborts redemption confirmation when the bid changed', async () => {
@@ -275,8 +329,10 @@ describe('Firma Alpha security boundaries', () => {
     currentBid = 7_001
 
     await expect(executeFirmaSale(preview)).rejects.toThrow(/bid FIRMA cambió/)
+    expect(fetch).toHaveBeenCalledTimes(2)
     expect(xolosWalletService.getSignatory).not.toHaveBeenCalled()
     expect(xolosWalletService.signTxBuilder).not.toHaveBeenCalled()
+    expect(chronik.broadcastTx).not.toHaveBeenCalled()
   })
 
   it('aborts redemption confirmation when sweeper capacity no longer covers askedSats', async () => {
@@ -307,5 +363,6 @@ describe('Firma Alpha security boundaries', () => {
     expect(xolosWalletService.getSignatory).toHaveBeenCalledOnce()
     expect(xolosWalletService.signTxBuilder).toHaveBeenCalledOnce()
     expect(chronik.broadcastTx).toHaveBeenCalledOnce()
+    expect(fetch).toHaveBeenCalledTimes(2)
   })
 })
