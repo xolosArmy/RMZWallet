@@ -11,7 +11,6 @@ export type VerifiedDexAsset = Readonly<{
   genesisAuthPubkeyHex: string
   officialLiquidityPubkeyHex?: string
   redeemAddress: string
-  bidApiUrl: string
 }>
 
 /**
@@ -30,8 +29,7 @@ export const FIRMA_ALPHA: VerifiedDexAsset = Object.freeze({
   tokenType: 0,
   decimals: 4,
   genesisAuthPubkeyHex: '03fba49912622cf8bb5b3729b1b5da3e72c6b57d369c8647f6cc7c6cbed510d105',
-  redeemAddress: 'ecash:qr8hdk8rxjc5nj6f450eth3nnslxa8k4gysrtyfxc5',
-  bidApiUrl: 'https://firmaprotocol.com/api/bid'
+  redeemAddress: 'ecash:qr8hdk8rxjc5nj6f450eth3nnslxa8k4gysrtyfxc5'
 })
 
 export const FIRMA_ALPHA_TOKEN_ID = FIRMA_ALPHA.tokenId

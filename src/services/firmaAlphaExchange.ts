@@ -40,6 +40,11 @@ const OUTPUT_SIZE = 34
 const TX_OVERHEAD = 10
 const REDEEM_PRICE_STEP_NANOSATS_PER_ATOM = 500_000_000n
 const MAX_REDEEM_PRICE_ADJUSTMENTS = 25
+const FIRMA_BID_PROXY_URL = '/api/firma-bid'
+
+const FIRMA_BID_TIMEOUT_MESSAGE = 'El oráculo de redención de Firma no respondió a tiempo.'
+const FIRMA_BID_UNAVAILABLE_MESSAGE = 'El oráculo de redención de Firma no está disponible temporalmente.'
+const FIRMA_BID_INVALID_MESSAGE = 'Firma devolvió un precio de redención inválido.'
 
 type FirmaPartialOffer = AgoraOffer & {
   variant: { type: 'PARTIAL'; params: AgoraPartial }
@@ -598,19 +603,53 @@ const actualPriceXecPerFirma = (askedSats: bigint, offeredAtoms: bigint): string
 }
 
 export async function fetchFirmaBidPrice(): Promise<{ display: string; satsPerFirma: bigint }> {
-  const response = await fetch(FIRMA_ALPHA.bidApiUrl, { headers: { Accept: 'application/json' } })
-  if (!response.ok) throw new Error(`Firma bid API respondió HTTP ${response.status}.`)
-  const body = await response.json() as unknown
+  let response: Response
+  try {
+    response = await fetch(FIRMA_BID_PROXY_URL, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      cache: 'no-store'
+    })
+  } catch {
+    throw new Error(FIRMA_BID_UNAVAILABLE_MESSAGE)
+  }
+
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch {
+    if (!response.ok) throw new Error(FIRMA_BID_UNAVAILABLE_MESSAGE)
+    throw new Error(FIRMA_BID_INVALID_MESSAGE)
+  }
+
+  if (!response.ok) {
+    const code = body && typeof body === 'object' && 'code' in body
+      ? (body as { code?: unknown }).code
+      : undefined
+    if (response.status === 504 || code === 'FIRMA_BID_TIMEOUT') {
+      throw new Error(FIRMA_BID_TIMEOUT_MESSAGE)
+    }
+    if (code === 'FIRMA_BID_INVALID_PAYLOAD') {
+      throw new Error(FIRMA_BID_INVALID_MESSAGE)
+    }
+    throw new Error(FIRMA_BID_UNAVAILABLE_MESSAGE)
+  }
+
   if (!body || typeof body !== 'object' || !('bid' in body)) {
-    throw new Error('Firma bid API no devolvió el campo bid esperado.')
+    throw new Error(FIRMA_BID_INVALID_MESSAGE)
   }
   const rawBid = (body as { bid?: unknown }).bid
   if ((typeof rawBid !== 'string' && typeof rawBid !== 'number') || String(rawBid).trim() === '') {
-    throw new Error('Firma bid API devolvió un precio inválido.')
+    throw new Error(FIRMA_BID_INVALID_MESSAGE)
   }
-  const display = String(rawBid)
-  const satsPerFirma = parseXecToSats(display)
-  if (satsPerFirma <= 0n) throw new Error('Firma bid API devolvió un precio inválido.')
+  const display = String(rawBid).trim()
+  let satsPerFirma: bigint
+  try {
+    satsPerFirma = parseXecToSats(display)
+  } catch {
+    throw new Error(FIRMA_BID_INVALID_MESSAGE)
+  }
+  if (satsPerFirma <= 0n) throw new Error(FIRMA_BID_INVALID_MESSAGE)
   return { display: formatSatsToXec(satsPerFirma), satsPerFirma }
 }
 
