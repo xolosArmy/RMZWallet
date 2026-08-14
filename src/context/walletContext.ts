@@ -5,8 +5,10 @@ import type {
   AliasRegistrationRawTxDebug,
   AliasReservedUtxo,
   WalletBalance,
-  WalletRescanOptions
+  WalletRescanOptions,
+  WalletRestoreResult
 } from '../services/XolosWalletService'
+import type { DerivationProfileId } from '../services/derivationProfiles'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import type { FirmaSendPreview } from '../services/firmaAlphaSend'
 
@@ -18,7 +20,10 @@ export interface WalletContextValue {
   initialized: boolean
   backupVerified: boolean
   createNewWallet: () => Promise<string>
-  restoreWallet: (mnemonic: string) => Promise<void>
+  restoreWallet: (
+    mnemonic: string,
+    selectedProfileId?: DerivationProfileId
+  ) => Promise<WalletRestoreResult>
   loadExistingWallet: (password: string) => Promise<void>
   encryptAndStore: (password: string) => Promise<void>
   refreshBalances: () => Promise<void>

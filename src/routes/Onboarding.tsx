@@ -5,6 +5,15 @@ import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { useResumePendingTonalliRequest } from '../hooks/useResumePendingTonalliRequest'
 import { validateLocalPassword, validateSeedPhraseWordCount } from './onboardingValidation'
+import {
+  DERIVATION_PROFILE_IDS,
+  getDerivationProfile
+} from '../services/derivationProfiles'
+import type { DerivationProfileId } from '../services/derivationProfiles'
+import type { DerivationDiscovery } from '../services/dualDerivationDiscovery'
+
+const formatSatsAsXec = (sats: bigint) =>
+  `${sats / 100n}.${(sats % 100n).toString().padStart(2, '0')}`
 
 function OnboardingShell({ children, className = '' }: { children: ReactNode; className?: string }) {
   const { backupVerified, initialized } = useWallet()
@@ -36,7 +45,7 @@ export function OnboardingHome() {
     },
     {
       eyebrow: 'Recuperar acceso',
-      title: 'Importar desde seed',
+      title: 'Restaurar wallet existente',
       description: 'Restaura acceso con una frase de 12 o 24 palabras.',
       to: '/onboarding/import',
       variant: 'outline'
@@ -132,6 +141,7 @@ export function CreateWallet() {
           <p className="card-kicker">Nueva wallet</p>
           <h1 id="create-wallet-title" className="section-title">Crear wallet nueva</h1>
           <p className="muted">La frase de recuperación se genera localmente y nunca sale de tu dispositivo.</p>
+          <p className="muted">Compatible con eCash / Cashtab · BIP44 1899</p>
           <p className="warning">Tonalli Wallet no custodia ni puede recuperar tu frase de recuperación.</p>
           <label htmlFor="new-password">Password/PIN local</label>
           <input
@@ -220,6 +230,27 @@ export function ImportWallet() {
   const [seedPhrase, setSeedPhrase] = useState('')
   const [passwordImport, setPasswordImport] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
+  const [profileChoice, setProfileChoice] = useState<DerivationDiscovery | null>(null)
+
+  const continueWithProfile = async (profileId: DerivationProfileId) => {
+    try {
+      setLocalError(null)
+      const phrase = seedPhrase.trim()
+      const result = await restoreWallet(phrase, profileId)
+      if (result.status !== 'restored') {
+        throw new Error('No se pudo fijar el perfil de derivación elegido.')
+      }
+      navigate('/backup', {
+        state: {
+          password: passwordImport,
+          mnemonic: phrase,
+          restoreNotice: result.notice
+        }
+      })
+    } catch (err) {
+      setLocalError((err as Error).message)
+    }
+  }
 
   const handleImport = async (e: FormEvent) => {
     e.preventDefault()
@@ -238,8 +269,18 @@ export function ImportWallet() {
     }
 
     try {
-      await restoreWallet(phrase)
-      navigate('/backup', { state: { password: passwordImport, mnemonic: phrase } })
+      const result = await restoreWallet(phrase)
+      if (result.status === 'choice-required') {
+        setProfileChoice(result.detection)
+        return
+      }
+      navigate('/backup', {
+        state: {
+          password: passwordImport,
+          mnemonic: phrase,
+          restoreNotice: result.notice
+        }
+      })
     } catch (err) {
       setLocalError((err as Error).message)
     }
@@ -251,12 +292,42 @@ export function ImportWallet() {
         <BackToOnboarding />
         <form className="card onboarding-form" onSubmit={handleImport}>
           <p className="card-kicker">Recuperar acceso</p>
-          <h1 id="import-wallet-title" className="section-title">Importar desde seed</h1>
+          <h1 id="import-wallet-title" className="section-title">Restaurar wallet existente</h1>
           <p className="muted">
             Introduce tu frase de 12 o 24 palabras únicamente dentro de Tonalli Wallet y verifica que estás usando el
             dominio oficial.
           </p>
           <p className="warning">Nunca compartas tu frase de recuperación con soporte, terceros o sitios externos.</p>
+          {profileChoice?.kind === 'choice-required' && (
+            <div className="card" role="group" aria-label="Elegir perfil de derivación">
+              <h2>Actividad encontrada en dos perfiles</h2>
+              <p className="muted">
+                Encontramos actividad en dos perfiles asociados a esta seed. Elige cuál quieres abrir.
+                Tonalli no combinará sus UTXOs.
+              </p>
+              {DERIVATION_PROFILE_IDS.map(profileId => {
+                const profile = getDerivationProfile(profileId)
+                const activity = profileChoice.profiles[profileId]
+                return (
+                  <div key={profileId} className="card">
+                    <strong>{profile.label} ({profile.coinType})</strong>
+                    <p className="muted">
+                      {formatSatsAsXec(activity.xecSats)} XEC · {activity.tokenUtxoCount} token UTXOs ·{' '}
+                      {activity.activeAddressCount} direcciones con actividad
+                    </p>
+                    <button
+                      className="cta outline"
+                      type="button"
+                      disabled={loading}
+                      onClick={() => void continueWithProfile(profileId)}
+                    >
+                      Abrir {profile.label}
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
           <label htmlFor="seed-phrase">Frase seed</label>
           <textarea
             id="seed-phrase"
@@ -281,7 +352,7 @@ export function ImportWallet() {
           />
           <div className="actions">
             <button className="cta primary" type="submit" disabled={loading}>
-              Importar wallet
+              Restaurar wallet
             </button>
           </div>
           <RouteError message={localError || error} />

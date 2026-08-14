@@ -8,6 +8,7 @@ import TopBar from '../components/TopBar'
 interface BackupState {
   password: string
   mnemonic: string
+  restoreNotice?: string
 }
 
 function BackupSeed() {
@@ -77,6 +78,7 @@ function BackupSeed() {
       </header>
 
       <div className="card">
+        {backupState.restoreNotice && <p className="success">{backupState.restoreNotice}</p>}
         <p className="muted">
           Escribe estas 12 palabras en orden. La seed solo vive en tu memoria y se cifra con tu password local.
         </p>

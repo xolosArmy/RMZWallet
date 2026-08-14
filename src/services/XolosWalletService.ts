@@ -32,6 +32,27 @@ import type {
   FirmaSendPlan,
   FirmaSendPreview
 } from './firmaAlphaSend'
+import {
+  DEFAULT_NEW_WALLET_PROFILE_ID,
+  DERIVATION_PROFILE_STORAGE_KEY,
+  ECASH_STANDARD_PROFILE_ID,
+  TONALLI_LEGACY_PROFILE_ID,
+  derivePublicMetadata,
+  getDerivationPath,
+  getDerivationProfile,
+  isDerivationProfileId,
+  resolveStoredDerivationProfile,
+  serializeStoredDerivationProfileMetadata
+} from './derivationProfiles'
+import type { DerivationProfile, DerivationProfileId } from './derivationProfiles'
+import {
+  discoverDerivationProfile,
+  summarizeTokenUtxos
+} from './dualDerivationDiscovery'
+import type {
+  DerivationDiscovery,
+  DiscoveredTokenAsset
+} from './dualDerivationDiscovery'
 
 // The package ships a UMD/CJS build without an ES default export; grab whatever
 // is available (named export, default from CJS transform, or browser global).
@@ -58,7 +79,6 @@ const CHRONIK_ENDPOINTS = [
   'https://chronik.e.cash',
   'https://chronik.xolosarmy.xyz'
 ]
-const DERIVATION_PATH = "m/44'/899'/0'/0/0"
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
 const STORAGE_KEY_GAP_LIMIT = 'xoloswallet_gap_limit'
 const SCAN_CACHE_TTL_MS = 30000
@@ -76,12 +96,14 @@ type AddressScan = {
 }
 
 type ScanCache = {
+  profileId: DerivationProfileId
   gapLimit: number
   updatedAt: number
   receive: string[]
   change: string[]
   owners: FirmaInputOwner[]
   balances: WalletBalance
+  tokenAssets: readonly DiscoveredTokenAsset[]
 }
 
 const parseGapLimit = (value: string | null | undefined) => {
@@ -97,23 +119,17 @@ const delay = (ms: number) => new Promise((resolve) => {
   globalThis.setTimeout(resolve, ms)
 })
 
-const resolveBasePath = (path: string) => {
-  const segments = path.split('/')
-  if (segments.length < 3) return path
-  return segments.slice(0, -2).join('/')
-}
+export const WALLET_DERIVATION_PATH = getDerivationPath(TONALLI_LEGACY_PROFILE_ID, 'receive', 0)
 
-export const WALLET_DERIVATION_PATH = DERIVATION_PATH
+export const getWalletReceivePath = (
+  index: number,
+  profileId: DerivationProfileId = TONALLI_LEGACY_PROFILE_ID
+) => getDerivationPath(profileId, 'receive', index)
 
-export const getWalletReceivePath = (index: number) => {
-  const basePath = resolveBasePath(DERIVATION_PATH)
-  return `${basePath}/0/${index}`
-}
-
-export const getWalletChangePath = (index: number) => {
-  const basePath = resolveBasePath(DERIVATION_PATH)
-  return `${basePath}/1/${index}`
-}
+export const getWalletChangePath = (
+  index: number,
+  profileId: DerivationProfileId = TONALLI_LEGACY_PROFILE_ID
+) => getDerivationPath(profileId, 'change', index)
 
 const runWithConcurrency = async <T, R>(
   items: T[],
@@ -151,6 +167,13 @@ export type WalletRescanOptions = {
   startIndex?: number
   maxAddresses?: number
 }
+
+export type WalletRestoreResult = Readonly<{
+  status: 'restored' | 'choice-required'
+  detection: DerivationDiscovery
+  selectedProfileId?: DerivationProfileId
+  notice: string
+}>
 
 export interface WalletKeyInfo {
   mnemonic: string | null
@@ -254,12 +277,19 @@ export class XolosWalletService {
   private scanPromise: Promise<ScanCache> | null = null
   private scanPromiseGapLimit: number | null = null
   private hdAddressCache: FirmaInputOwner[] = []
+  private activeProfileId: DerivationProfileId = DEFAULT_NEW_WALLET_PROFILE_ID
   private rmzDecimals: number | null = null
   private rmzDecimalsPromise: Promise<number> | null = null
   private pendingAliasReservationExcludedTxids: string[] = []
 
   private constructor() {
     this.encryptedMnemonic = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_MNEMONIC) : null
+    if (typeof window !== 'undefined') {
+      this.activeProfileId = resolveStoredDerivationProfile(
+        localStorage.getItem(DERIVATION_PROFILE_STORAGE_KEY),
+        Boolean(this.encryptedMnemonic)
+      ).metadata.derivationProfile
+    }
   }
 
   static getInstance(): XolosWalletService {
@@ -269,9 +299,11 @@ export class XolosWalletService {
     return XolosWalletService.instance
   }
 
-  private buildWallet(mnemonic?: string) {
+  private buildWallet(mnemonic: string | undefined, profileId: DerivationProfileId) {
+    this.activeProfileId = profileId
+    this.isReady = false
     this.wallet = new MinimalXECWalletResolved(mnemonic, {
-      hdPath: DERIVATION_PATH,
+      hdPath: getDerivationPath(profileId, 'receive', 0),
       chronikUrls: CHRONIK_ENDPOINTS,
       enableDonations: false
     })
@@ -280,6 +312,32 @@ export class XolosWalletService {
     this.scanPromiseGapLimit = null
     this.hdAddressCache = []
     return this.wallet
+  }
+
+  private persistActiveProfile(): void {
+    if (typeof window === 'undefined') return
+    localStorage.setItem(
+      DERIVATION_PROFILE_STORAGE_KEY,
+      serializeStoredDerivationProfileMetadata(this.activeProfileId)
+    )
+  }
+
+  private async activateMnemonic(
+    mnemonic: string,
+    profileId: DerivationProfileId,
+    persistProfile = false
+  ): Promise<void> {
+    this.buildWallet(mnemonic, profileId)
+    const wallet = this.wallet as MinimalXecWallet
+    await wallet.walletInfoPromise
+    await wallet.initialize()
+    this.isReady = true
+    this.decryptedMnemonic = mnemonic
+    this.scanCache = null
+    this.scanPromise = null
+    this.scanPromiseGapLimit = null
+    this.ensureHdAddressCache(this.getEffectiveGapLimit())
+    if (persistProfile) this.persistActiveProfile()
   }
 
   private ensureReady() {
@@ -444,7 +502,7 @@ export class XolosWalletService {
   }
 
   async createNewWallet(): Promise<string> {
-    this.buildWallet()
+    this.buildWallet(undefined, DEFAULT_NEW_WALLET_PROFILE_ID)
     const wallet = this.wallet as MinimalXecWallet
     const walletInfo: WalletInfo = await wallet.walletInfoPromise
     await wallet.initialize()
@@ -458,20 +516,57 @@ export class XolosWalletService {
     return this.decryptedMnemonic || ''
   }
 
-  async restoreFromMnemonic(mnemonic: string): Promise<void> {
+  async detectDerivationProfiles(mnemonic: string): Promise<DerivationDiscovery> {
     if (!mnemonic || mnemonic.trim().split(' ').length < 12) {
       throw new Error('La frase semilla es inválida.')
     }
-    this.buildWallet(mnemonic.trim())
-    const wallet = this.wallet as MinimalXecWallet
-    await wallet.walletInfoPromise
-    await wallet.initialize()
-    this.isReady = true
-    this.decryptedMnemonic = mnemonic.trim()
-    this.scanCache = null
-    this.scanPromise = null
-    this.scanPromiseGapLimit = null
-    this.ensureHdAddressCache(this.getEffectiveGapLimit())
+    return discoverDerivationProfile(mnemonic.trim(), this.getEffectiveGapLimit(), {
+      readAddress: async address => {
+        const scan = await this.fetchAddressScan(address)
+        return Object.freeze({ utxos: scan.utxos, hasHistory: scan.hasHistory })
+      }
+    })
+  }
+
+  async restoreFromMnemonic(
+    mnemonic: string,
+    selectedProfileId?: DerivationProfileId
+  ): Promise<WalletRestoreResult> {
+    const normalizedMnemonic = mnemonic.trim()
+    const detection = await this.detectDerivationProfiles(normalizedMnemonic)
+
+    if (detection.kind === 'choice-required' && selectedProfileId === undefined) {
+      return Object.freeze({
+        status: 'choice-required',
+        detection,
+        notice: 'Encontramos actividad en dos perfiles asociados a esta seed. Elige cuál quieres abrir.'
+      })
+    }
+
+    const resolvedProfileId = selectedProfileId ?? detection.selectedProfileId
+    if (!isDerivationProfileId(resolvedProfileId)) {
+      throw new Error('No se pudo resolver un perfil de derivación válido.')
+    }
+    if (
+      detection.kind === 'selected' &&
+      detection.selectedProfileId !== resolvedProfileId
+    ) {
+      throw new Error('El perfil solicitado no coincide con la actividad detectada para esta seed.')
+    }
+
+    await this.activateMnemonic(normalizedMnemonic, resolvedProfileId)
+    const notice = resolvedProfileId === ECASH_STANDARD_PROFILE_ID
+      ? detection.reason === 'empty'
+        ? 'No se encontró actividad previa. Se utilizará el perfil compatible con eCash/Cashtab.'
+        : 'Se encontró una wallet compatible con eCash/Cashtab.'
+      : 'Se encontró una wallet Tonalli existente.'
+
+    return Object.freeze({
+      status: 'restored',
+      detection,
+      selectedProfileId: resolvedProfileId,
+      notice
+    })
   }
 
   async loadFromStorage(password: string): Promise<void> {
@@ -483,11 +578,11 @@ export class XolosWalletService {
       localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
       this.encryptedMnemonic = migratedCipherText
     }
-    await this.restoreFromMnemonic(plainText)
-    this.decryptedMnemonic = plainText
-    this.scanCache = null
-    this.scanPromise = null
-    this.scanPromiseGapLimit = null
+    const resolution = resolveStoredDerivationProfile(
+      typeof window === 'undefined' ? null : localStorage.getItem(DERIVATION_PROFILE_STORAGE_KEY),
+      true
+    )
+    await this.activateMnemonic(plainText, resolution.metadata.derivationProfile, true)
   }
 
   async unlockEncryptedWallet(password: string): Promise<void> {
@@ -518,10 +613,12 @@ export class XolosWalletService {
     const cipherText = await encryptWithPassword(mnemonic, password)
     localStorage.setItem(STORAGE_KEY_MNEMONIC, cipherText)
     this.encryptedMnemonic = cipherText
+    this.persistActiveProfile()
   }
 
   clearStoredWallet(): void {
     localStorage.removeItem(STORAGE_KEY_MNEMONIC)
+    localStorage.removeItem(DERIVATION_PROFILE_STORAGE_KEY)
     this.encryptedMnemonic = null
     this.decryptedMnemonic = null
     this.wallet = null
@@ -530,6 +627,7 @@ export class XolosWalletService {
     this.scanPromise = null
     this.scanPromiseGapLimit = null
     this.hdAddressCache = []
+    this.activeProfileId = DEFAULT_NEW_WALLET_PROFILE_ID
     this.rmzDecimals = null
     this.rmzDecimalsPromise = null
   }
@@ -572,18 +670,15 @@ export class XolosWalletService {
 
   private deriveHdOwner(branch: FirmaInputOwner['branch'], index: number): FirmaInputOwner {
     const mnemonic = this.getMnemonicOrThrow()
-    const keyDerivation = this.getKeyDerivation()
-    const hdPath = branch === 'receive' ? getWalletReceivePath(index) : getWalletChangePath(index)
-    const derived = keyDerivation.deriveFromMnemonic(mnemonic, hdPath)
-    if (!derived.address || !/^(02|03)[0-9a-fA-F]{64}$/.test(derived.publicKey)) {
-      throw new Error(`No se pudo derivar la metadata pública HD para ${hdPath}.`)
-    }
+    const derived = derivePublicMetadata(mnemonic, this.activeProfileId, branch, index)
     return {
+      profileId: this.activeProfileId,
+      account: 0,
       address: derived.address,
-      hdPath,
+      hdPath: derived.hdPath,
       branch,
       index,
-      publicKeyHex: derived.publicKey.toLowerCase()
+      publicKeyHex: derived.publicKeyHex
     }
   }
 
@@ -603,8 +698,8 @@ export class XolosWalletService {
     const derived: FirmaInputOwner[] = []
 
     for (let index = 0; index < gapLimit; index += 1) {
-      const receivePath = getWalletReceivePath(index)
-      const changePath = getWalletChangePath(index)
+      const receivePath = getWalletReceivePath(index, this.activeProfileId)
+      const changePath = getWalletChangePath(index, this.activeProfileId)
       if (!cachedPaths.has(receivePath)) derived.push(this.deriveHdOwner('receive', index))
       if (!cachedPaths.has(changePath)) derived.push(this.deriveHdOwner('change', index))
     }
@@ -638,7 +733,11 @@ export class XolosWalletService {
 
   private async scanAddresses(gapLimit: number, forceRefresh: boolean): Promise<ScanCache> {
     const now = Date.now()
-    if (!forceRefresh && this.scanCache && this.scanCache.gapLimit >= gapLimit) {
+    if (
+      !forceRefresh &&
+      this.scanCache?.profileId === this.activeProfileId &&
+      this.scanCache.gapLimit >= gapLimit
+    ) {
       if (now - this.scanCache.updatedAt < SCAN_CACHE_TTL_MS) {
         return this.scanCache
       }
@@ -658,9 +757,11 @@ export class XolosWalletService {
       let totalSats = 0n
       let totalRmzAtoms = 0n
       let totalFirmaAtoms = 0n
+      const discoveredUtxos: ScriptUtxo[] = []
 
       for (const scan of scans) {
         for (const utxo of scan.utxos) {
+          discoveredUtxos.push(utxo)
           totalSats += utxo.sats
           if (utxo.token && utxo.token.tokenId === RMZ_ETOKEN_ID && !utxo.token.isMintBaton) {
             totalRmzAtoms += utxo.token.atoms
@@ -693,12 +794,14 @@ export class XolosWalletService {
       }
 
       const cache: ScanCache = {
+        profileId: this.activeProfileId,
         gapLimit,
         updatedAt: Date.now(),
         receive,
         change,
         owners,
-        balances
+        balances,
+        tokenAssets: summarizeTokenUtxos(discoveredUtxos)
       }
 
       this.scanCache = cache
@@ -821,7 +924,10 @@ export class XolosWalletService {
   }
 
   private getFirmaChangeOwner(account: X402WalletAccount): FirmaInputOwner {
-    const owner = this.hdAddressCache.find((candidate) => candidate.hdPath === DERIVATION_PATH)
+    const activeReceivePath = getWalletReceivePath(0, this.activeProfileId)
+    const owner = this.hdAddressCache.find((candidate) =>
+      candidate.profileId === this.activeProfileId && candidate.hdPath === activeReceivePath
+    )
     if (
       !owner ||
       owner.address !== account.address ||
@@ -842,9 +948,12 @@ export class XolosWalletService {
   }
 
   private deriveHdSignatory(owner: FirmaInputOwner): WalletSignatory {
+    if (owner.profileId !== this.activeProfileId || owner.account !== 0) {
+      throw new Error('El perfil HD del input FIRMA no coincide con la wallet activa.')
+    }
     const expectedPath = owner.branch === 'receive'
-      ? getWalletReceivePath(owner.index)
-      : getWalletChangePath(owner.index)
+      ? getWalletReceivePath(owner.index, owner.profileId)
+      : getWalletChangePath(owner.index, owner.profileId)
     if (owner.hdPath !== expectedPath) {
       throw new Error('La ruta HD del input FIRMA no coincide con su rama e índice.')
     }
@@ -1136,6 +1245,22 @@ export class XolosWalletService {
     return this.wallet?.walletInfo?.publicKey || null
   }
 
+  getActiveDerivationProfile(): DerivationProfile {
+    return getDerivationProfile(this.activeProfileId)
+  }
+
+  getActiveDerivationProfileId(): DerivationProfileId {
+    return this.activeProfileId
+  }
+
+  getOtherDetectedTokenAssets(): readonly DiscoveredTokenAsset[] {
+    return Object.freeze(
+      (this.scanCache?.tokenAssets ?? []).filter(asset =>
+        asset.tokenId !== RMZ_ETOKEN_ID && asset.tokenId !== FIRMA_ALPHA.tokenId
+      )
+    )
+  }
+
   getAddress(): string | null {
     return this.wallet?.walletInfo?.xecAddress || null
   }
@@ -1398,36 +1523,47 @@ export class XolosWalletService {
   ): Promise<ScanCache> {
     const now = Date.now()
     const mnemonic = this.getMnemonicOrThrow()
-    const keyDerivation = this.getKeyDerivation()
-    const basePath = resolveBasePath(DERIVATION_PATH)
     const receive: string[] = []
     const change: string[] = []
     const owners: FirmaInputOwner[] = []
     let totalSats = 0n
     let totalRmzAtoms = 0n
     let totalFirmaAtoms = 0n
+    const discoveredUtxos: ScriptUtxo[] = []
     let consecutiveUnused = 0
     let scannedCount = 0
     let index = startIndex
 
     const scanIndex = async (currentIndex: number) => {
-      const receivePath = `${basePath}/0/${currentIndex}`
-      const changePath = `${basePath}/1/${currentIndex}`
-      const receiveDerived = keyDerivation.deriveFromMnemonic(mnemonic, receivePath)
-      const changeDerived = keyDerivation.deriveFromMnemonic(mnemonic, changePath)
+      const receiveDerived = derivePublicMetadata(
+        mnemonic,
+        this.activeProfileId,
+        'receive',
+        currentIndex
+      )
+      const changeDerived = derivePublicMetadata(
+        mnemonic,
+        this.activeProfileId,
+        'change',
+        currentIndex
+      )
       const receiveOwner: FirmaInputOwner = {
+        profileId: this.activeProfileId,
+        account: 0,
         address: receiveDerived.address,
-        hdPath: receivePath,
+        hdPath: receiveDerived.hdPath,
         branch: 'receive',
         index: currentIndex,
-        publicKeyHex: receiveDerived.publicKey.toLowerCase()
+        publicKeyHex: receiveDerived.publicKeyHex
       }
       const changeOwner: FirmaInputOwner = {
+        profileId: this.activeProfileId,
+        account: 0,
         address: changeDerived.address,
-        hdPath: changePath,
+        hdPath: changeDerived.hdPath,
         branch: 'change',
         index: currentIndex,
-        publicKeyHex: changeDerived.publicKey.toLowerCase()
+        publicKeyHex: changeDerived.publicKeyHex
       }
       const [receiveScan, changeScan] = await Promise.all([
         this.fetchAddressScan(receiveOwner.address),
@@ -1462,6 +1598,7 @@ export class XolosWalletService {
             hasActivity = true
           }
           for (const utxo of addressScan.utxos) {
+            discoveredUtxos.push(utxo)
             totalSats += utxo.sats
             if (utxo.token && utxo.token.tokenId === RMZ_ETOKEN_ID && !utxo.token.isMintBaton) {
               totalRmzAtoms += utxo.token.atoms
@@ -1515,12 +1652,14 @@ export class XolosWalletService {
     this.rememberHdOwners(owners)
 
     const cache: ScanCache = {
+      profileId: this.activeProfileId,
       gapLimit,
       updatedAt: now,
       receive,
       change,
       owners,
-      balances
+      balances,
+      tokenAssets: summarizeTokenUtxos(discoveredUtxos)
     }
 
     this.scanCache = cache
