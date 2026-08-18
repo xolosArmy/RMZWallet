@@ -284,6 +284,7 @@ export class Tm1RegtestPublicationOrchestratorImpl
 implements Tm1RegtestPublicationOrchestrator {
   private readonly dependencies: Tm1RegtestPublicationDependencyBindings
   private readonly clock: Tm1PublicationClock
+  private readonly issuedPublicationIds = new Set<string>()
   private readonly listeners = new Set<(state: Tm1PublicationState) => void>()
   private state: Tm1PublicationState = Object.freeze({ status: 'idle' })
   private activeOperation: Tm1ActivePublicationOperation = null
@@ -374,6 +375,7 @@ implements Tm1RegtestPublicationOrchestrator {
       const effectiveContent = encodeTm1Draft02CandidateEffectiveContent(candidate)
       const preparedId = createValidatedPublicationId(
         this.clock,
+        this.issuedPublicationIds,
         'prepared',
         'PREPARATION_FAILED'
       )
@@ -515,6 +517,7 @@ implements Tm1RegtestPublicationOrchestrator {
       })
       const signedId = createValidatedPublicationId(
         this.clock,
+        this.issuedPublicationIds,
         'signed',
         'SIGNING_FAILED'
       )
@@ -594,6 +597,7 @@ implements Tm1RegtestPublicationOrchestrator {
       assertNotAborted(signal)
       const submissionId = createValidatedPublicationId(
         this.clock,
+        this.issuedPublicationIds,
         'submission',
         'BROADCAST_FAILED'
       )
@@ -1208,15 +1212,20 @@ function expiredState(
 }
 
 function freezePublicationRequest(request: Tm1PublicationRequest): Tm1PublicationRequest {
-  return Object.freeze({
-    message: request.message,
-    activeLockingScriptHex: request.activeLockingScriptHex,
-    maxFeeSats: request.maxFeeSats
-  })
+  try {
+    return Object.freeze({
+      message: request.message,
+      activeLockingScriptHex: request.activeLockingScriptHex,
+      maxFeeSats: request.maxFeeSats
+    })
+  } catch (rawRequestError) {
+    throw trapSafePublicationError('PREPARATION_FAILED', rawRequestError)
+  }
 }
 
 function createValidatedPublicationId(
   clock: Tm1PublicationClock,
+  issuedPublicationIds: Set<string>,
   prefix: Parameters<Tm1PublicationClock['createId']>[0],
   failureCode: 'PREPARATION_FAILED' | 'SIGNING_FAILED' | 'BROADCAST_FAILED'
 ): string {
@@ -1225,6 +1234,10 @@ function createValidatedPublicationId(
     if (typeof generatedId !== 'string' || generatedId.trim().length === 0) {
       throw new Error(`Invalid generated ${prefix} ID`)
     }
+    if (issuedPublicationIds.has(generatedId)) {
+      throw new Error(`Duplicate generated ${prefix} ID`)
+    }
+    issuedPublicationIds.add(generatedId)
     return generatedId
   } catch (externalOrValidationError) {
     throw trapSafePublicationError(failureCode, externalOrValidationError)

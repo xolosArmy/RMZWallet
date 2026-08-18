@@ -1078,6 +1078,138 @@ describe('TM1 regtest publication orchestrator', () => {
     })
   })
 
+  test('rejects a same-cycle cross-kind duplicate generated ID', async () => {
+    const harness = createHarness()
+    harness.setGeneratedId('prepared', 'same-id')
+    harness.setGeneratedId('signed', 'same-id')
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'SIGNING_FAILED'
+    )
+
+    expect(review.preparedId).toBe('same-id')
+    expect(harness.getGeneratedIdCalls()).toEqual({
+      prepared: 1,
+      signed: 1,
+      submission: 0
+    })
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'signing'
+    })
+    expect(harness.calls.broadcast).toBe(0)
+  })
+
+  test('burns a prepared ID for the orchestrator lifetime and blocks stale reuse after reset', async () => {
+    const harness = createHarness()
+    harness.setGeneratedId('prepared', 'prepared-stale-action')
+    const firstReview = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    expect(firstReview.preparedId).toBe('prepared-stale-action')
+    harness.orchestrator.reset()
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(harness.getGeneratedIdCalls().prepared).toBe(2)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'preparing'
+    })
+    expect('review' in harness.orchestrator.getState()).toBe(false)
+
+    harness.orchestrator.reset()
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+    expect(harness.getGeneratedIdCalls().prepared).toBe(3)
+  })
+
+  test('rejects reuse of a signed ID across publication cycles', async () => {
+    const harness = createHarness()
+    harness.setGeneratedId('signed', 'signed-across-cycles')
+    const firstSignedReview = await prepareAndSign(harness)
+    expect(firstSignedReview.signedId).toBe('signed-across-cycles')
+    harness.orchestrator.reset()
+    const secondReview = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(secondReview.preparedId),
+      'SIGNING_FAILED'
+    )
+
+    expect(harness.getGeneratedIdCalls().signed).toBe(2)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'signing'
+    })
+  })
+
+  test('rejects reuse of a submission ID across confirmed publication cycles before rebroadcast', async () => {
+    const harness = createHarness()
+    harness.setGeneratedId('submission', 'submission-across-cycles')
+    const firstSignedReview = await prepareAndSign(harness)
+    const firstReceipt = await harness.orchestrator.approveAndBroadcast(firstSignedReview.signedId)
+    await harness.orchestrator.confirm(firstReceipt.submissionId)
+    expect(harness.calls.broadcast).toBe(1)
+    harness.orchestrator.reset()
+    const secondSignedReview = await prepareAndSign(harness)
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(secondSignedReview.signedId),
+      'BROADCAST_FAILED'
+    )
+
+    expect(harness.getGeneratedIdCalls().submission).toBe(2)
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast'
+    })
+  })
+
+  test('enforces generated ID uniqueness across kinds and publication cycles', async () => {
+    const harness = createHarness()
+    harness.setGeneratedId('prepared', 'cross-kind-across-cycles')
+    const firstReview = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    expect(firstReview.preparedId).toBe('cross-kind-across-cycles')
+    harness.orchestrator.reset()
+    harness.clearGeneratedId('prepared')
+    harness.setGeneratedId('submission', 'cross-kind-across-cycles')
+    const secondSignedReview = await prepareAndSign(harness)
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(secondSignedReview.signedId),
+      'BROADCAST_FAILED'
+    )
+
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast'
+    })
+  })
+
+  test('keeps a generated ID burned when a later operation stage fails', async () => {
+    const harness = createHarness()
+    harness.setGeneratedId('prepared', 'prepared-before-later-failure')
+    const firstReview = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.failSigner(new Error('later signer failure'))
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(firstReview.preparedId),
+      'SIGNING_FAILED'
+    )
+    harness.orchestrator.reset()
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(harness.getGeneratedIdCalls().prepared).toBe(2)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'preparing'
+    })
+    expect(harness.calls.broadcast).toBe(0)
+  })
+
   test('forwards the exact operation signal to the primary signed-artifact audit', async () => {
     const harness = createHarness()
     const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
@@ -2392,6 +2524,122 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.calls.attest).toBe(1)
     }
   )
+
+  test.each(['message', 'activeLockingScriptHex', 'maxFeeSats'] as const)(
+    'contains a hostile Proxy thrown by request.%s and permits retry',
+    async property => {
+      const harness = createHarness()
+      let getterCalls = 0
+      let getPrototypeOfCalls = 0
+      const hostileThrownValue = new Proxy({}, {
+        getPrototypeOf() {
+          getPrototypeOfCalls += 1
+          throw new Error('request snapshot prototype trap must not execute')
+        }
+      })
+      const request = { ...DEFAULT_REQUEST }
+      Object.defineProperty(request, property, {
+        enumerable: true,
+        get() {
+          getterCalls += 1
+          throw hostileThrownValue
+        }
+      })
+
+      await expectCode(harness.orchestrator.prepare(request), 'PREPARATION_FAILED')
+
+      expect(getterCalls).toBe(1)
+      expect(getPrototypeOfCalls).toBe(0)
+      expect(harness.calls.attest).toBe(0)
+      expect(harness.orchestrator.getState()).toMatchObject({
+        status: 'failed',
+        stage: 'idle',
+        error: { code: 'PREPARATION_FAILED' }
+      })
+      expect(() => harness.orchestrator.reset()).not.toThrow()
+      await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
+        message: DEFAULT_REQUEST.message
+      })
+    }
+  )
+
+  test('falls back safely when a request getter throws an ownKeys-hostile Proxy', async () => {
+    const harness = createHarness()
+    let getterCalls = 0
+    let ownKeysCalls = 0
+    let getPrototypeOfCalls = 0
+    const hostileThrownValue = new Proxy({}, {
+      ownKeys() {
+        ownKeysCalls += 1
+        throw new Error('request snapshot ownKeys trap')
+      },
+      getPrototypeOf() {
+        getPrototypeOfCalls += 1
+        throw new Error('request snapshot prototype trap must not execute')
+      }
+    })
+    const request = { ...DEFAULT_REQUEST }
+    Object.defineProperty(request, 'message', {
+      enumerable: true,
+      get() {
+        getterCalls += 1
+        throw hostileThrownValue
+      }
+    })
+
+    await expectCode(harness.orchestrator.prepare(request), 'PREPARATION_FAILED')
+
+    expect(getterCalls).toBe(1)
+    expect(ownKeysCalls).toBeGreaterThan(0)
+    expect(getPrototypeOfCalls).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'idle',
+      error: { code: 'PREPARATION_FAILED' }
+    })
+  })
+
+  test('falls back safely when a request getter throws a descriptor-hostile Proxy', async () => {
+    const harness = createHarness()
+    let getterCalls = 0
+    let ownKeysCalls = 0
+    let descriptorCalls = 0
+    let getPrototypeOfCalls = 0
+    const hostileThrownValue = new Proxy({ diagnostic: 'unsafe' }, {
+      ownKeys() {
+        ownKeysCalls += 1
+        return ['diagnostic']
+      },
+      getOwnPropertyDescriptor() {
+        descriptorCalls += 1
+        throw new Error('request snapshot descriptor trap')
+      },
+      getPrototypeOf() {
+        getPrototypeOfCalls += 1
+        throw new Error('request snapshot prototype trap must not execute')
+      }
+    })
+    const request = { ...DEFAULT_REQUEST }
+    Object.defineProperty(request, 'message', {
+      enumerable: true,
+      get() {
+        getterCalls += 1
+        throw hostileThrownValue
+      }
+    })
+
+    await expectCode(harness.orchestrator.prepare(request), 'PREPARATION_FAILED')
+
+    expect(getterCalls).toBe(1)
+    expect(ownKeysCalls).toBeGreaterThan(0)
+    expect(descriptorCalls).toBeGreaterThan(0)
+    expect(getPrototypeOfCalls).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'idle',
+      error: { code: 'PREPARATION_FAILED' }
+    })
+  })
 
   test('does not read request getters or replace an existing prepared review', async () => {
     const harness = createHarness()
