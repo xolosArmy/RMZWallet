@@ -39,6 +39,7 @@ const NON_FIXTURE_P2PKH_LOCKING_SCRIPT_HEX =
   '76a914111111111111111111111111111111111111111188ac'
 const NO_AUDIT_OVERRIDE = Symbol('NO_AUDIT_OVERRIDE')
 const NO_BROADCAST_FAILURE = Symbol('NO_BROADCAST_FAILURE')
+const NO_ATTESTATION_OVERRIDE = Symbol('NO_ATTESTATION_OVERRIDE')
 const DEFAULT_REQUEST: Tm1PublicationRequest = Object.freeze({
   message: 'TM1 orchestrator regtest publication',
   activeLockingScriptHex: TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
@@ -275,7 +276,7 @@ function createHarness() {
   let ids = 0
   let utxos = cloneUtxos(fixtureUtxos())
   let chainIdentity = 'tm1-regtest-chain'
-  let attestationOverride: unknown = null
+  let attestationOverride: unknown = NO_ATTESTATION_OVERRIDE
   let signingDecision: unknown = Object.freeze({
     status: 'approved',
     authorizationId: 'sign-auth-1'
@@ -328,10 +329,12 @@ function createHarness() {
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (attestFailure) throw attestFailure
         if (attestDeferred) await attestDeferred.promise
-        return (attestationOverride ?? Object.freeze({
-          environment: 'deterministic-regtest-fixture',
-          chainIdentity
-        })) as Tm1RegtestNetworkAttestation
+        return (attestationOverride === NO_ATTESTATION_OVERRIDE
+          ? Object.freeze({
+            environment: 'deterministic-regtest-fixture',
+            chainIdentity
+          })
+          : attestationOverride) as Tm1RegtestNetworkAttestation
       }
     },
     utxoProvider: {
@@ -1586,6 +1589,146 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'attesting' })
   })
 
+  test('contains a resolved initial attestation whose descriptor trap throws an Error and permits retry', async () => {
+    const harness = createHarness()
+    const hostileAttestation = new Proxy({}, {
+      getOwnPropertyDescriptor() {
+        throw new Error('resolved attestation descriptor trap')
+      }
+    })
+    harness.setAttestation(hostileAttestation)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(harness.calls.utxos).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'attesting',
+      error: { code: 'PREPARATION_FAILED' }
+    })
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+    harness.setAttestation(Object.freeze({
+      environment: 'deterministic-regtest-fixture',
+      chainIdentity: 'retry-chain'
+    }))
+    await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
+      network: { chainIdentity: 'retry-chain' }
+    })
+    expect(harness.calls.attest).toBe(2)
+  })
+
+  test('contains a hostile Proxy thrown by a resolved initial attestation descriptor trap', async () => {
+    const harness = createHarness()
+    const trapCalls = {
+      getPrototypeOf: 0,
+      get: 0,
+      ownKeys: 0,
+      getOwnPropertyDescriptor: 0
+    }
+    const hostileThrownValue = new Proxy({}, {
+      getPrototypeOf() {
+        trapCalls.getPrototypeOf += 1
+        throw new Error('secondary prototype trap')
+      },
+      get() {
+        trapCalls.get += 1
+        throw new Error('secondary get trap')
+      },
+      ownKeys() {
+        trapCalls.ownKeys += 1
+        throw new Error('secondary ownKeys trap')
+      },
+      getOwnPropertyDescriptor() {
+        trapCalls.getOwnPropertyDescriptor += 1
+        throw new Error('secondary descriptor trap')
+      }
+    })
+    harness.setAttestation(new Proxy({}, {
+      getOwnPropertyDescriptor() {
+        throw hostileThrownValue
+      }
+    }))
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(trapCalls.getPrototypeOf).toBe(0)
+    expect(trapCalls.get).toBe(0)
+    expect(trapCalls.ownKeys).toBeGreaterThan(0)
+    expect(trapCalls.getOwnPropertyDescriptor).toBeGreaterThan(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'attesting',
+      error: { code: 'PREPARATION_FAILED' }
+    })
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+  })
+
+  test('does not invoke unrelated ownKeys or prototype traps on a valid resolved attestation', async () => {
+    const harness = createHarness()
+    const trapCalls = { ownKeys: 0, getPrototypeOf: 0 }
+    harness.setAttestation(new Proxy({
+      environment: 'deterministic-regtest-fixture',
+      chainIdentity: 'descriptor-only-chain'
+    }, {
+      ownKeys() {
+        trapCalls.ownKeys += 1
+        throw new Error('ownKeys must not be used')
+      },
+      getPrototypeOf() {
+        trapCalls.getPrototypeOf += 1
+        throw new Error('getPrototypeOf must not be used')
+      }
+    }))
+
+    await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
+      network: { chainIdentity: 'descriptor-only-chain' }
+    })
+
+    expect(trapCalls).toEqual({ ownKeys: 0, getPrototypeOf: 0 })
+    expect(harness.orchestrator.getState().status).toBe('reviewReady')
+  })
+
+  test('rejects accessor-backed initial attestation fields without invoking getters', async () => {
+    const harness = createHarness()
+    let getterCalls = 0
+    const attestation = { chainIdentity: 'chain-A' }
+    Object.defineProperty(attestation, 'environment', {
+      enumerable: true,
+      get() {
+        getterCalls += 1
+        throw new Error('attestation getter must not execute')
+      }
+    })
+    harness.setAttestation(attestation)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(getterCalls).toBe(0)
+    expect(harness.calls.utxos).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'attesting'
+    })
+  })
+
+  test.each([
+    ['null', null],
+    ['a primitive', 42],
+    ['an object missing required fields', {}]
+  ])('rejects %s resolved initial attestation as PREPARATION_FAILED', async (_label, attestation) => {
+    const harness = createHarness()
+    harness.setAttestation(attestation)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(harness.calls.utxos).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'attesting',
+      error: { code: 'PREPARATION_FAILED' }
+    })
+  })
+
   test.each([
     ['a non-regtest environment', { environment: 'production-mainnet', chainIdentity: 'chain-A' }],
     ['an invalid chain identity', { environment: 'deterministic-regtest-fixture', chainIdentity: '' }]
@@ -1603,6 +1746,53 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.calls.broadcast).toBe(0)
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'revalidating' })
   })
+
+  test.each([
+    ['a descriptor trap error', (): unknown => new Proxy({}, {
+      getOwnPropertyDescriptor() {
+        throw new Error('resolved re-attestation descriptor trap')
+      }
+    })],
+    ['a hostile Proxy thrown by a descriptor trap', (): unknown => {
+      const hostileThrownValue = new Proxy({}, {
+        getPrototypeOf() {
+          throw new Error('secondary re-attestation prototype trap')
+        },
+        ownKeys() {
+          throw new Error('secondary re-attestation ownKeys trap')
+        },
+        getOwnPropertyDescriptor() {
+          throw new Error('secondary re-attestation descriptor trap')
+        }
+      })
+      return new Proxy({}, {
+        getOwnPropertyDescriptor() {
+          throw hostileThrownValue
+        }
+      })
+    }],
+    ['a null result', (): unknown => null]
+  ] as const)(
+    'contains resolved signing re-attestation with %s using revalidation taxonomy',
+    async (_label, createAttestation) => {
+      const harness = createHarness()
+      const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+      harness.setAttestation(createAttestation())
+
+      await expectCode(
+        harness.orchestrator.authorizeAndSign(review.preparedId),
+        'CANDIDATE_REVALIDATION_FAILED'
+      )
+
+      expect(harness.calls.signer).toBe(0)
+      expect(harness.orchestrator.getState()).toMatchObject({
+        status: 'failed',
+        stage: 'revalidating',
+        error: { code: 'CANDIDATE_REVALIDATION_FAILED' }
+      })
+      expect(() => harness.orchestrator.reset()).not.toThrow()
+    }
+  )
 
   test('snapshots the publication request before pending attestation resolves', async () => {
     const harness = createHarness()

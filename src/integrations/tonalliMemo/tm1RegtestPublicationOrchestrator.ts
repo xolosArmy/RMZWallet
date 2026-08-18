@@ -316,17 +316,11 @@ implements Tm1RegtestPublicationOrchestrator {
       assertNotAborted(signal)
       this.transition({ status: 'attesting', message: requestSnapshot.message })
       assertNotAborted(signal)
-      let attestationResult: unknown
-      try {
-        attestationResult = await this.dependencies.networkAttestation.attest(signal)
-      } catch (externalError) {
-        throw trapSafePublicationError(
-          isAbortLike(externalError) ? 'ABORTED' : 'PREPARATION_FAILED',
-          externalError
-        )
-      }
-      assertNotAborted(signal)
-      const network = snapshotNetworkAttestation(attestationResult)
+      const network = await attestAndSnapshotNetwork({
+        attestationPort: this.dependencies.networkAttestation,
+        signal,
+        failureCode: 'PREPARATION_FAILED'
+      })
       this.transition({ status: 'preparing', message: requestSnapshot.message, network })
       assertNotAborted(signal)
 
@@ -451,25 +445,11 @@ implements Tm1RegtestPublicationOrchestrator {
         signingAuthorizationId
       })
       assertNotAborted(signal)
-      let attestationResult: unknown
-      try {
-        attestationResult = await this.dependencies.networkAttestation.attest(signal)
-      } catch (error) {
-        throw trapSafePublicationError(
-          isAbortLike(error) ? 'ABORTED' : 'CANDIDATE_REVALIDATION_FAILED',
-          error
-        )
-      }
-      assertNotAborted(signal)
-      let freshNetwork: Tm1RegtestNetworkAttestation
-      try {
-        freshNetwork = snapshotNetworkAttestation(attestationResult)
-      } catch (validationError) {
-        throw trapSafePublicationError(
-          'CANDIDATE_REVALIDATION_FAILED',
-          validationError
-        )
-      }
+      const freshNetwork = await attestAndSnapshotNetwork({
+        attestationPort: this.dependencies.networkAttestation,
+        signal,
+        failureCode: 'CANDIDATE_REVALIDATION_FAILED'
+      })
       if (
         freshNetwork.environment !== review.network.environment ||
         freshNetwork.chainIdentity !== review.network.chainIdentity
@@ -1003,6 +983,23 @@ function snapshotNetworkAttestation(value: unknown): Tm1RegtestNetworkAttestatio
     throw new Error('Invalid regtest network attestation')
   }
   return Object.freeze({ environment, chainIdentity })
+}
+
+async function attestAndSnapshotNetwork(input: Readonly<{
+  attestationPort: Tm1NetworkAttestationPort
+  signal?: AbortSignal
+  failureCode: 'PREPARATION_FAILED' | 'CANDIDATE_REVALIDATION_FAILED'
+}>): Promise<Tm1RegtestNetworkAttestation> {
+  try {
+    const rawAttestation = await input.attestationPort.attest(input.signal)
+    assertNotAborted(input.signal)
+    return snapshotNetworkAttestation(rawAttestation)
+  } catch (externalOrValidationError) {
+    throw trapSafePublicationError(
+      isAbortLike(externalOrValidationError) ? 'ABORTED' : input.failureCode,
+      externalOrValidationError
+    )
+  }
 }
 
 function isCanonical32ByteHashHex(value: unknown): value is string {
