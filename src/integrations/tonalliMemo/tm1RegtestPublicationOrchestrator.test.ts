@@ -27,6 +27,7 @@ import {
   type Tm1PublicationErrorCode,
   type Tm1PublicationRequest,
   type Tm1PublicationState,
+  type Tm1PublicationClock,
   type Tm1RegtestPublicationDependencies,
   type Tm1SigningAuthorizationRequest,
   type Tm1SignedReview
@@ -42,6 +43,7 @@ const NO_AUDIT_OVERRIDE = Symbol('NO_AUDIT_OVERRIDE')
 const NO_BROADCAST_FAILURE = Symbol('NO_BROADCAST_FAILURE')
 const NO_ATTESTATION_OVERRIDE = Symbol('NO_ATTESTATION_OVERRIDE')
 const NO_UTXO_OVERRIDE = Symbol('NO_UTXO_OVERRIDE')
+const NO_GENERATED_ID_OVERRIDE = Symbol('NO_GENERATED_ID_OVERRIDE')
 const DEFAULT_REQUEST: Tm1PublicationRequest = Object.freeze({
   message: 'TM1 orchestrator regtest publication',
   activeLockingScriptHex: TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
@@ -303,6 +305,17 @@ function cloneUtxos(utxos: readonly Tm1Draft02FreshUtxo[]): Tm1Draft02FreshUtxo[
 
 function createHarness() {
   let ids = 0
+  type GeneratedIdPrefix = Parameters<Tm1PublicationClock['createId']>[0]
+  const generatedIdOverrides: Record<GeneratedIdPrefix, unknown> = {
+    prepared: NO_GENERATED_ID_OVERRIDE,
+    signed: NO_GENERATED_ID_OVERRIDE,
+    submission: NO_GENERATED_ID_OVERRIDE
+  }
+  const generatedIdCalls: Record<GeneratedIdPrefix, number> = {
+    prepared: 0,
+    signed: 0,
+    submission: 0
+  }
   let utxos = cloneUtxos(fixtureUtxos())
   let utxoOverride: unknown = NO_UTXO_OVERRIDE
   let chainIdentity = 'tm1-regtest-chain'
@@ -485,8 +498,12 @@ function createHarness() {
     },
     clock: {
       createId(prefix) {
+        generatedIdCalls[prefix] += 1
         ids += 1
-        return `${prefix}-${ids}`
+        const override = generatedIdOverrides[prefix]
+        return (override === NO_GENERATED_ID_OVERRIDE
+          ? `${prefix}-${ids}`
+          : override) as string
       }
     }
   }
@@ -501,6 +518,13 @@ function createHarness() {
     setChainIdentity: (next: string) => { chainIdentity = next },
     setAttestation: (next: unknown) => { attestationOverride = next },
     setSigningDecision: (next: unknown) => { signingDecision = next },
+    setGeneratedId: (prefix: GeneratedIdPrefix, value: unknown) => {
+      generatedIdOverrides[prefix] = value
+    },
+    clearGeneratedId: (prefix: GeneratedIdPrefix) => {
+      generatedIdOverrides[prefix] = NO_GENERATED_ID_OVERRIDE
+    },
+    getGeneratedIdCalls: () => ({ ...generatedIdCalls }),
     setBroadcastDecision: (next: unknown) => { broadcastDecision = next },
     failBroadcastAuthorization: (error: unknown) => { broadcastAuthorizationFailure = error },
     failSigningAuthorization: (error: unknown) => { signingAuthorizationFailure = error },
@@ -898,6 +922,160 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(signedReview.signedId).toBe('signed-2')
     expect(receipt.submissionId).toBe('submission-3')
     expect(replacementCalls).toBe(0)
+  })
+
+  test.each([
+    ['an empty string', ''],
+    ['whitespace only', ' \t\n'],
+    ['null', null],
+    ['undefined', undefined],
+    ['a number', 123],
+    ['an object', { id: 'submission-object' }]
+  ])('rejects submission ID generated as %s before dispatch', async (_label, generatedId) => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.setGeneratedId('submission', generatedId)
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'BROADCAST_FAILED'
+    )
+
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.getGeneratedIdCalls()).toEqual({
+      prepared: 1,
+      signed: 1,
+      submission: 1
+    })
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast'
+    })
+  })
+
+  test('does not inspect a hostile object returned as a submission ID', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    let getterCalls = 0
+    let proxyTrapCalls = 0
+    const hostileId = new Proxy(Object.defineProperty({}, 'id', {
+      get() {
+        getterCalls += 1
+        throw new Error('generated ID accessor must not execute')
+      }
+    }), {
+      get() {
+        proxyTrapCalls += 1
+        throw new Error('generated ID get trap must not execute')
+      },
+      getPrototypeOf() {
+        proxyTrapCalls += 1
+        throw new Error('generated ID prototype trap must not execute')
+      },
+      ownKeys() {
+        proxyTrapCalls += 1
+        throw new Error('generated ID ownKeys trap must not execute')
+      },
+      getOwnPropertyDescriptor() {
+        proxyTrapCalls += 1
+        throw new Error('generated ID descriptor trap must not execute')
+      }
+    })
+    harness.setGeneratedId('submission', hostileId)
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'BROADCAST_FAILED'
+    )
+
+    expect(getterCalls).toBe(0)
+    expect(proxyTrapCalls).toBe(0)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast'
+    })
+  })
+
+  test('publishes normally with a valid generated submission ID', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const observed: Tm1PublicationState['status'][] = []
+    harness.orchestrator.subscribe(state => observed.push(state.status))
+
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+
+    expect(receipt.submissionId).toBe('submission-3')
+    expect(observed).toContain('broadcasting')
+    expect(observed.at(-1)).toBe('submitted')
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.getGeneratedIdCalls().submission).toBe(1)
+  })
+
+  test('releases the operation and permits reset and retry after an invalid submission ID', async () => {
+    const harness = createHarness()
+    const firstSignedReview = await prepareAndSign(harness)
+    harness.setGeneratedId('submission', '')
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(firstSignedReview.signedId),
+      'BROADCAST_FAILED'
+    )
+    expect(harness.calls.broadcast).toBe(0)
+
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+    harness.clearGeneratedId('submission')
+    const retrySignedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(retrySignedReview.signedId)
+
+    expect(receipt.submissionId).toBe('submission-6')
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('submitted')
+  })
+
+  test('rejects an invalid generated prepared ID as a preparation failure', async () => {
+    const harness = createHarness()
+    harness.setGeneratedId('prepared', null)
+
+    await expectCode(
+      harness.orchestrator.prepare(DEFAULT_REQUEST),
+      'PREPARATION_FAILED'
+    )
+
+    expect(harness.getGeneratedIdCalls()).toEqual({
+      prepared: 1,
+      signed: 0,
+      submission: 0
+    })
+    expect(harness.calls.signer).toBe(0)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'preparing'
+    })
+  })
+
+  test('rejects an invalid generated signed ID without publishing a signed review', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.setGeneratedId('signed', { id: 'signed-object' })
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'SIGNING_FAILED'
+    )
+
+    expect(harness.getGeneratedIdCalls()).toEqual({
+      prepared: 1,
+      signed: 1,
+      submission: 0
+    })
+    expect(harness.calls.signer).toBe(1)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'signing'
+    })
   })
 
   test('forwards the exact operation signal to the primary signed-artifact audit', async () => {

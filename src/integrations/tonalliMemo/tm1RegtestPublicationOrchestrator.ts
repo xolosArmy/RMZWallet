@@ -372,8 +372,13 @@ implements Tm1RegtestPublicationOrchestrator {
         sighashPolicy: TM1_DRAFT_02_SIGHASH_POLICY
       })
       const effectiveContent = encodeTm1Draft02CandidateEffectiveContent(candidate)
+      const preparedId = createValidatedPublicationId(
+        this.clock,
+        'prepared',
+        'PREPARATION_FAILED'
+      )
       const review = freezePreparedReview({
-        preparedId: this.clock.createId('prepared'),
+        preparedId,
         message: preview.eventData,
         network,
         candidate,
@@ -508,9 +513,14 @@ implements Tm1RegtestPublicationOrchestrator {
         signedArtifact,
         signal
       })
+      const signedId = createValidatedPublicationId(
+        this.clock,
+        'signed',
+        'SIGNING_FAILED'
+      )
       const signedReview = freezeSignedReview({
         preparedId: review.preparedId,
-        signedId: this.clock.createId('signed'),
+        signedId,
         txid: audited.artifact.txid,
         signedArtifactHash: audited.artifactHash,
         signedArtifact: audited.artifact,
@@ -581,14 +591,20 @@ implements Tm1RegtestPublicationOrchestrator {
         expectedTxid: signedReview.txid,
         expectedArtifactHash: signedReview.signedArtifactHash
       })
-      const submissionId = this.clock.createId('submission')
+      assertNotAborted(signal)
+      const submissionId = createValidatedPublicationId(
+        this.clock,
+        'submission',
+        'BROADCAST_FAILED'
+      )
+      assertNotAborted(signal)
+      const transportArtifact = cloneSignedArtifact(signedReview.signedArtifact)
       this.transition({
         status: 'broadcasting',
         signedReview,
         broadcastAuthorizationId
       })
       assertNotAborted(signal)
-      const transportArtifact = cloneSignedArtifact(signedReview.signedArtifact)
 
       try {
         const deliveryReceiptResult = await this.dependencies.deliveryTransport.broadcast(
@@ -1197,6 +1213,22 @@ function freezePublicationRequest(request: Tm1PublicationRequest): Tm1Publicatio
     activeLockingScriptHex: request.activeLockingScriptHex,
     maxFeeSats: request.maxFeeSats
   })
+}
+
+function createValidatedPublicationId(
+  clock: Tm1PublicationClock,
+  prefix: Parameters<Tm1PublicationClock['createId']>[0],
+  failureCode: 'PREPARATION_FAILED' | 'SIGNING_FAILED' | 'BROADCAST_FAILED'
+): string {
+  try {
+    const generatedId: unknown = clock.createId(prefix)
+    if (typeof generatedId !== 'string' || generatedId.trim().length === 0) {
+      throw new Error(`Invalid generated ${prefix} ID`)
+    }
+    return generatedId
+  } catch (externalOrValidationError) {
+    throw trapSafePublicationError(failureCode, externalOrValidationError)
+  }
 }
 
 function freezeSigningAuthorizationRequest(
