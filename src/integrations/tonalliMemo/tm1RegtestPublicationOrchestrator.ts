@@ -1005,6 +1005,10 @@ function snapshotNetworkAttestation(value: unknown): Tm1RegtestNetworkAttestatio
   return Object.freeze({ environment, chainIdentity })
 }
 
+function isCanonical32ByteHashHex(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)
+}
+
 function snapshotValidatedDeliveryReceipt(
   value: unknown,
   expectedTxid: string
@@ -1017,7 +1021,7 @@ function snapshotValidatedDeliveryReceipt(
   const snapshot = Object.freeze({ ...value }) as Record<PropertyKey, unknown>
   const txid = snapshot.txid
   const disposition = snapshot.disposition
-  if (typeof txid !== 'string' || !/^[0-9a-f]{64}$/.test(txid)) {
+  if (!isCanonical32ByteHashHex(txid)) {
     throw new Tm1PublicationError('BROADCAST_FAILED')
   }
   if (txid !== expectedTxid) throw new Tm1PublicationError('TXID_MISMATCH')
@@ -1045,7 +1049,7 @@ function snapshotValidatedConfirmation(
       'CONFIRMATION_FAILED: confirmations must be a positive safe integer'
     )
   }
-  if (blockHash !== undefined && blockHash.length === 0) {
+  if (blockHash !== undefined && !isCanonical32ByteHashHex(blockHash)) {
     throw new Tm1PublicationError('CONFIRMATION_FAILED')
   }
   if (
@@ -1359,8 +1363,7 @@ function snapshotValidatedSignedArtifact(value: unknown): Readonly<{
     inputCount <= 0 ||
     typeof feeSats !== 'bigint' ||
     feeSats < 0n ||
-    typeof txid !== 'string' ||
-    !/^[0-9a-f]{64}$/.test(txid) ||
+    !isCanonical32ByteHashHex(txid) ||
     typeof rawTransactionHex !== 'string' ||
     rawTransactionHex.length === 0 ||
     rawTransactionHex.length % 2 !== 0 ||

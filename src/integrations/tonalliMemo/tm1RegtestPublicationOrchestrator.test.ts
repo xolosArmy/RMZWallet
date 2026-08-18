@@ -44,6 +44,16 @@ const DEFAULT_REQUEST: Tm1PublicationRequest = Object.freeze({
   activeLockingScriptHex: TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
   maxFeeSats: 10_000n
 })
+const INVALID_CONFIRMATION_BLOCK_HASHES = [
+  ['non-canonical text', 'not-a-hash'],
+  ['63 hexadecimal characters', 'a'.repeat(63)],
+  ['65 hexadecimal characters', 'a'.repeat(65)],
+  ['a non-hexadecimal character', `${'a'.repeat(63)}g`],
+  ['a 0x prefix', `0x${'a'.repeat(64)}`],
+  ['leading whitespace', ` ${'a'.repeat(64)}`],
+  ['trailing whitespace', `${'a'.repeat(64)} `],
+  ['uppercase hexadecimal', 'A'.repeat(64)]
+] as const
 
 type Harness = ReturnType<typeof createHarness>
 
@@ -2444,6 +2454,157 @@ describe('TM1 regtest publication orchestrator', () => {
       txid: receipt.txid,
       confirmations: 1
     })
+  })
+
+  test('accepts a canonical confirmation block hash and keeps blockHash optional', async () => {
+    const withHash = createHarness()
+    const signedReview = await prepareAndSign(withHash)
+    const receipt = await withHash.orchestrator.approveAndBroadcast(signedReview.signedId)
+    const canonicalBlockHash = 'ab'.repeat(32)
+    withHash.setConfirmation(Object.freeze({
+      submissionId: receipt.submissionId,
+      txid: receipt.txid,
+      confirmations: 1,
+      blockHash: canonicalBlockHash
+    }))
+
+    await expect(withHash.orchestrator.confirm(receipt.submissionId)).resolves.toMatchObject({
+      blockHash: canonicalBlockHash
+    })
+    expect(withHash.orchestrator.getState().status).toBe('confirmed')
+
+    const withoutHash = createHarness()
+    const withoutHashSignedReview = await prepareAndSign(withoutHash)
+    const withoutHashReceipt = await withoutHash.orchestrator.approveAndBroadcast(
+      withoutHashSignedReview.signedId
+    )
+    withoutHash.setConfirmation(Object.freeze({
+      submissionId: withoutHashReceipt.submissionId,
+      txid: withoutHashReceipt.txid,
+      confirmations: 1
+    }))
+
+    const confirmation = await withoutHash.orchestrator.confirm(
+      withoutHashReceipt.submissionId
+    )
+    expect(confirmation).not.toHaveProperty('blockHash')
+    expect(withoutHash.orchestrator.getState().status).toBe('confirmed')
+  })
+
+  test.each(INVALID_CONFIRMATION_BLOCK_HASHES)(
+    'rejects confirmation blockHash with %s and preserves submitted evidence',
+    async (_caseName, blockHash) => {
+      const harness = createHarness()
+      const signedReview = await prepareAndSign(harness)
+      const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+      const submitted = harness.orchestrator.getState()
+      expect(submitted.status).toBe('submitted')
+      harness.setConfirmation(Object.freeze({
+        submissionId: receipt.submissionId,
+        txid: receipt.txid,
+        confirmations: 1,
+        blockHash
+      }))
+
+      await expectCode(
+        harness.orchestrator.confirm(receipt.submissionId),
+        'CONFIRMATION_FAILED'
+      )
+
+      expect(harness.orchestrator.getState()).toEqual(submitted)
+      expect(harness.calls.broadcast).toBe(1)
+      expect(harness.calls.broadcastAuthorization).toBe(1)
+    }
+  )
+
+  test('retries confirmation with a canonical block hash without rebroadcasting', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    const submitted = harness.orchestrator.getState()
+    expect(submitted.status).toBe('submitted')
+    harness.setConfirmation(Object.freeze({
+      submissionId: receipt.submissionId,
+      txid: receipt.txid,
+      confirmations: 1,
+      blockHash: 'not-a-hash'
+    }))
+
+    await expectCode(
+      harness.orchestrator.confirm(receipt.submissionId),
+      'CONFIRMATION_FAILED'
+    )
+    expect(harness.orchestrator.getState()).toEqual(submitted)
+
+    const canonicalBlockHash = 'de'.repeat(32)
+    harness.setConfirmation(Object.freeze({
+      submissionId: receipt.submissionId,
+      txid: receipt.txid,
+      confirmations: 2,
+      blockHash: canonicalBlockHash,
+      blockHeight: 112
+    }))
+    await expect(harness.orchestrator.confirm(receipt.submissionId)).resolves.toMatchObject({
+      submissionId: receipt.submissionId,
+      txid: signedReview.txid,
+      confirmations: 2,
+      blockHash: canonicalBlockHash
+    })
+
+    expect(harness.calls.confirm).toBe(2)
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.calls.broadcastAuthorization).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('confirmed')
+  })
+
+  test('preserves broadcast uncertainty for an invalid block hash and reconciles a valid retry', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.failBroadcast(new Error('response lost after dispatch'))
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'BROADCAST_FAILED'
+    )
+    const uncertain = harness.orchestrator.getState()
+    expect(uncertain.status).toBe('broadcastUncertain')
+    if (uncertain.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    harness.setConfirmation(Object.freeze({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: uncertain.uncertainty.txid,
+      confirmations: 1,
+      blockHash: 'not-a-hash'
+    }))
+
+    await expectCode(harness.orchestrator.reconcile(), 'CONFIRMATION_FAILED')
+
+    const restored = harness.orchestrator.getState()
+    expect(restored.status).toBe('broadcastUncertain')
+    if (restored.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    expect(restored.uncertainty.submissionId).toBe(uncertain.uncertainty.submissionId)
+    expect(restored.uncertainty.txid).toBe(signedReview.txid)
+    expect(restored.uncertainty.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+    expect(restored.uncertainty.signedArtifact.rawTransactionHex).toBe(
+      signedReview.signedArtifact.rawTransactionHex
+    )
+    expect(restored.uncertainty.broadcastAuthorizationId).toBe('broadcast-auth-1')
+    expect(restored.signedReview.signedId).toBe(signedReview.signedId)
+    expect(harness.calls.broadcast).toBe(1)
+
+    const canonicalBlockHash = 'ef'.repeat(32)
+    harness.setConfirmation(Object.freeze({
+      submissionId: restored.uncertainty.submissionId,
+      txid: restored.uncertainty.txid,
+      confirmations: 1,
+      blockHash: canonicalBlockHash,
+      blockHeight: 113
+    }))
+    await expect(harness.orchestrator.reconcile()).resolves.toMatchObject({
+      submissionId: restored.uncertainty.submissionId,
+      txid: signedReview.txid,
+      blockHash: canonicalBlockHash
+    })
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('confirmed')
   })
 
   test('rejects confirmation for a different txid', async () => {
