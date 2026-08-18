@@ -347,6 +347,7 @@ function createHarness() {
   let cooperativeUtxos = false
   let onSigningAuthorization: (() => void) | null = null
   let onBroadcastAuthorization: (() => void) | null = null
+  let onCreateId: ((prefix: GeneratedIdPrefix) => void) | null = null
   let broadcastDeferred: Deferred<Tm1RegtestDeliveryReceipt> | null = null
   let broadcastReceiptOverride: unknown = null
   let broadcastMutator: ((artifact: RegtestSignedTransaction) => void) | null = null
@@ -500,6 +501,7 @@ function createHarness() {
       createId(prefix) {
         generatedIdCalls[prefix] += 1
         ids += 1
+        onCreateId?.(prefix)
         const override = generatedIdOverrides[prefix]
         return (override === NO_GENERATED_ID_OVERRIDE
           ? `${prefix}-${ids}`
@@ -541,6 +543,7 @@ function createHarness() {
     failConfirmation: (error: unknown) => { confirmationFailure = error },
     onSigningAuthorization: (fn: () => void) => { onSigningAuthorization = fn },
     onBroadcastAuthorization: (fn: () => void) => { onBroadcastAuthorization = fn },
+    onCreateId: (fn: ((prefix: GeneratedIdPrefix) => void) | null) => { onCreateId = fn },
     deferBroadcast: () => {
       broadcastDeferred = createDeferred<Tm1RegtestDeliveryReceipt>()
       return broadcastDeferred
@@ -922,6 +925,120 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(signedReview.signedId).toBe('signed-2')
     expect(receipt.submissionId).toBe('submission-3')
     expect(replacementCalls).toBe(0)
+  })
+
+  test('honors a synchronous abort after generating a prepared ID and keeps the ID burned', async () => {
+    const harness = createHarness()
+    const controller = new AbortController()
+    const observed: Tm1PublicationState['status'][] = []
+    harness.orchestrator.subscribe(state => observed.push(state.status))
+    harness.setGeneratedId('prepared', 'prepared-aborted-by-clock')
+    harness.onCreateId(prefix => {
+      if (prefix === 'prepared') controller.abort()
+    })
+
+    await expectCode(
+      harness.orchestrator.prepare(DEFAULT_REQUEST, controller.signal),
+      'ABORTED'
+    )
+
+    expect(observed).not.toContain('reviewReady')
+    expect(harness.getGeneratedIdCalls()).toEqual({
+      prepared: 1,
+      signed: 0,
+      submission: 0
+    })
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'aborted',
+      stage: 'preparing'
+    })
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+    expect(harness.getGeneratedIdCalls().prepared).toBe(2)
+
+    harness.orchestrator.reset()
+    harness.clearGeneratedId('prepared')
+    harness.onCreateId(null)
+    await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
+      preparedId: 'prepared-3'
+    })
+  })
+
+  test('honors a synchronous abort after generating a signed ID and keeps the ID burned', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const controller = new AbortController()
+    const observed: Tm1PublicationState['status'][] = []
+    harness.orchestrator.subscribe(state => observed.push(state.status))
+    observed.length = 0
+    harness.setGeneratedId('signed', 'signed-aborted-by-clock')
+    harness.onCreateId(prefix => {
+      if (prefix === 'signed') controller.abort()
+    })
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId, controller.signal),
+      'ABORTED'
+    )
+
+    expect(observed).not.toContain('signedReviewReady')
+    expect(harness.getGeneratedIdCalls()).toEqual({
+      prepared: 1,
+      signed: 1,
+      submission: 0
+    })
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'aborted',
+      stage: 'signing'
+    })
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+
+    const retryReview = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(retryReview.preparedId),
+      'SIGNING_FAILED'
+    )
+    expect(harness.getGeneratedIdCalls().signed).toBe(2)
+
+    harness.orchestrator.reset()
+    harness.clearGeneratedId('signed')
+    harness.onCreateId(null)
+    await expect(prepareAndSign(harness)).resolves.toMatchObject({
+      signedId: 'signed-6'
+    })
+  })
+
+  test('keeps the post-submission-ID abort check before dispatch', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const controller = new AbortController()
+    const observed: Tm1PublicationState['status'][] = []
+    harness.orchestrator.subscribe(state => observed.push(state.status))
+    observed.length = 0
+    harness.setGeneratedId('submission', 'submission-aborted-by-clock')
+    harness.onCreateId(prefix => {
+      if (prefix === 'submission') controller.abort()
+    })
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId, controller.signal),
+      'ABORTED'
+    )
+
+    expect(harness.getGeneratedIdCalls()).toEqual({
+      prepared: 1,
+      signed: 1,
+      submission: 1
+    })
+    expect(harness.calls.broadcast).toBe(0)
+    expect(observed).not.toContain('broadcasting')
+    expect(observed).not.toContain('submitted')
+    expect(observed).not.toContain('broadcastUncertain')
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'aborted',
+      stage: 'approvingBroadcast'
+    })
   })
 
   test.each([

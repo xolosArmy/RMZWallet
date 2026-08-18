@@ -379,6 +379,7 @@ implements Tm1RegtestPublicationOrchestrator {
         'prepared',
         'PREPARATION_FAILED'
       )
+      assertNotAborted(signal)
       const review = freezePreparedReview({
         preparedId,
         message: preview.eventData,
@@ -521,6 +522,7 @@ implements Tm1RegtestPublicationOrchestrator {
         'signed',
         'SIGNING_FAILED'
       )
+      assertNotAborted(signal)
       const signedReview = freezeSignedReview({
         preparedId: review.preparedId,
         signedId,
