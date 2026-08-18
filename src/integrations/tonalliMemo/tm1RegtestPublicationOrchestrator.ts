@@ -593,9 +593,9 @@ implements Tm1RegtestPublicationOrchestrator {
         this.transition({ status: 'submitted', signedReview, receipt })
         return receipt
       } catch (error) {
-        const publicationError = error instanceof Tm1PublicationError
-          ? error
-          : new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', error)
+        // Dispatch may already have happened. Persist reconciliation evidence before
+        // inspecting an arbitrary rejection value, including a hostile Proxy.
+        const fallbackError = new Tm1PublicationError('BROADCAST_FAILED')
         this.transition({
           status: 'broadcastUncertain',
           signedReview,
@@ -607,9 +607,12 @@ implements Tm1RegtestPublicationOrchestrator {
             signedArtifact: signedReview.signedArtifact,
             signedArtifactHash: signedReview.signedArtifactHash,
             broadcastAuthorizationId,
-            error: publicationError
+            error: fallbackError
           })
         })
+
+        const publicationError = safeBroadcastRejectionDiagnostic(error, fallbackError)
+        this.tryEnrichBroadcastUncertainty(publicationError, fallbackError)
         throw publicationError
       }
     } catch (error) {
@@ -785,9 +788,9 @@ implements Tm1RegtestPublicationOrchestrator {
   ): Tm1PublicationError {
     const stage = toNonTerminalStatus(this.state.status)
     if (this.state.status === 'broadcastUncertain') {
-      return error instanceof Tm1PublicationError
-        ? error
-        : new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', error)
+      // Irreversible uncertainty is monotonic. Even a secondary hostile value
+      // cannot move this state back to an ordinary failure.
+      return safeBroadcastRejectionDiagnostic(error)
     }
     if (isAbortError(error)) {
       const publicationError = new Tm1PublicationError('ABORTED', 'ABORTED', error)
@@ -806,6 +809,29 @@ implements Tm1RegtestPublicationOrchestrator {
     const publicationError = new Tm1PublicationError(code, code, error)
     this.transition({ status: 'failed', stage, error: publicationError })
     return publicationError
+  }
+
+  private tryEnrichBroadcastUncertainty(
+    publicationError: Tm1PublicationError,
+    fallbackError: Tm1PublicationError
+  ): void {
+    if (publicationError === fallbackError || this.state.status !== 'broadcastUncertain') return
+
+    try {
+      const state = this.state
+      // Diagnostic enrichment is not a lifecycle transition. The safe uncertainty
+      // was already stored and published before the rejection was inspected.
+      this.state = cloneState({
+        status: 'broadcastUncertain',
+        signedReview: state.signedReview,
+        uncertainty: {
+          ...state.uncertainty,
+          error: publicationError
+        }
+      })
+    } catch {
+      // Keep the already-persisted fallback evidence intact.
+    }
   }
 }
 
@@ -1074,6 +1100,21 @@ function isAbortError(error: unknown): boolean {
 function isAbortLike(error: unknown): boolean {
   return isAbortError(error) ||
     (error instanceof Error && 'code' in error && error.code === 'OPERATION_ABORTED')
+}
+
+function safeBroadcastRejectionDiagnostic(
+  rejection: unknown,
+  fallback: Tm1PublicationError = new Tm1PublicationError('BROADCAST_FAILED')
+): Tm1PublicationError {
+  try {
+    if (rejection instanceof Tm1PublicationError) return clonePublicationError(rejection)
+    if (rejection === null || (typeof rejection !== 'object' && typeof rejection !== 'function')) {
+      return fallback
+    }
+    return new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', rejection)
+  } catch {
+    return fallback
+  }
 }
 
 function isNonFailureDomainError(code: Tm1PublicationErrorCode): boolean {

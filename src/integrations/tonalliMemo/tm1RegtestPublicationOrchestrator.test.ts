@@ -38,6 +38,7 @@ const WRONG_VALID_COMPRESSED_PUBLIC_KEY_HEX =
 const NON_FIXTURE_P2PKH_LOCKING_SCRIPT_HEX =
   '76a914111111111111111111111111111111111111111188ac'
 const NO_AUDIT_OVERRIDE = Symbol('NO_AUDIT_OVERRIDE')
+const NO_BROADCAST_FAILURE = Symbol('NO_BROADCAST_FAILURE')
 const DEFAULT_REQUEST: Tm1PublicationRequest = Object.freeze({
   message: 'TM1 orchestrator regtest publication',
   activeLockingScriptHex: TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
@@ -275,7 +276,7 @@ function createHarness() {
   let auditMutator: ((artifact: RegtestSignedTransaction) => RegtestSignedTransaction) | null = null
   let auditReturnUnchecked: unknown = NO_AUDIT_OVERRIDE
   const auditArtifacts: RegtestSignedTransaction[] = []
-  let broadcastFailure: unknown = null
+  let broadcastFailure: unknown = NO_BROADCAST_FAILURE
   let broadcastTxidOverride: string | null = null
   let confirmationOverride: unknown = null
   let confirmationFailure: unknown = null
@@ -393,7 +394,7 @@ function createHarness() {
         calls.broadcast += 1
         lastBroadcastArtifact = signedArtifact
         broadcastMutator?.(signedArtifact)
-        if (broadcastFailure) throw broadcastFailure
+        if (broadcastFailure !== NO_BROADCAST_FAILURE) throw broadcastFailure
         if (broadcastDeferred) return broadcastDeferred.promise
         if (broadcastReceiptOverride) return broadcastReceiptOverride as Tm1RegtestDeliveryReceipt
         return Object.freeze({
@@ -2076,6 +2077,114 @@ describe('TM1 regtest publication orchestrator', () => {
 
     await expectCode(harness.orchestrator.approveAndBroadcast(signedReview.signedId), 'BROADCAST_FAILED')
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'broadcastUncertain' })
+  })
+
+  test.each([
+    ['getPrototypeOf', (onTrap: () => void) => new Proxy({ diagnostic: 'untrusted' }, {
+      getPrototypeOf() {
+        onTrap()
+        throw new Error('getPrototypeOf trap must not escape')
+      }
+    }), 1],
+    ['ownKeys', (onTrap: () => void) => new Proxy({ diagnostic: 'untrusted' }, {
+      ownKeys() {
+        onTrap()
+        throw new Error('ownKeys trap must not escape')
+      }
+    }), 1],
+    ['getOwnPropertyDescriptor', (onTrap: () => void) => new Proxy({ diagnostic: 'untrusted' }, {
+      getOwnPropertyDescriptor() {
+        onTrap()
+        throw new Error('getOwnPropertyDescriptor trap must not escape')
+      }
+    }), 1],
+    ['get', (onTrap: () => void) => new Proxy({ diagnostic: 'untrusted' }, {
+      get() {
+        onTrap()
+        throw new Error('get trap must never be invoked')
+      }
+    }), 0]
+  ] as const)(
+    'persists broadcast uncertainty before best-effort diagnostics touch a hostile %s Proxy',
+    async (_trapName, createHostile, expectedTrapCalls) => {
+      const harness = createHarness()
+      const signedReview = await prepareAndSign(harness)
+      const trapStates: string[] = []
+      const hostile = createHostile(() => {
+        trapStates.push(harness.orchestrator.getState().status)
+      })
+      harness.failBroadcast(hostile)
+
+      await expectCode(
+        harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+        'BROADCAST_FAILED'
+      )
+
+      expect(harness.calls.broadcast).toBe(1)
+      expect(trapStates).toEqual(Array(expectedTrapCalls).fill('broadcastUncertain'))
+      const uncertain = expectBroadcastUncertainEvidence(harness, signedReview)
+      expect(uncertain.uncertainty.error.code).toBe('BROADCAST_FAILED')
+      expect(() => harness.orchestrator.reset()).toThrow(Tm1PublicationError)
+      expect(harness.orchestrator.getState().status).toBe('broadcastUncertain')
+
+      harness.setConfirmation(Object.freeze({
+        submissionId: uncertain.uncertainty.submissionId,
+        txid: signedReview.txid,
+        confirmations: 1,
+        blockHash: 'fc'.repeat(32),
+        blockHeight: 110
+      }))
+      await expect(harness.orchestrator.reconcile()).resolves.toMatchObject({
+        submissionId: uncertain.uncertainty.submissionId,
+        txid: signedReview.txid
+      })
+      expect(harness.calls.broadcast).toBe(1)
+      expect(harness.orchestrator.getState().status).toBe('confirmed')
+    }
+  )
+
+  test.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['number', 123],
+    ['symbol', Symbol('hostile rejection')],
+    ['function', function hostileRejection() { return undefined }]
+  ] as const)('records broadcast uncertainty for a post-dispatch %s rejection', async (_label, rejection) => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.failBroadcast(rejection)
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'BROADCAST_FAILED'
+    )
+
+    expect(harness.calls.broadcast).toBe(1)
+    const uncertain = expectBroadcastUncertainEvidence(harness, signedReview)
+    expect(uncertain.uncertainty.error.code).toBe('BROADCAST_FAILED')
+    expect(uncertain.uncertainty.error.message).toBe('BROADCAST_FAILED')
+  })
+
+  test('keeps an AbortError rejection post-dispatch in broadcastUncertain', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const abortError = new Error('transport aborted after dispatch')
+    abortError.name = 'AbortError'
+    harness.failBroadcast(abortError)
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'BROADCAST_FAILED'
+    )
+
+    expect(harness.calls.broadcast).toBe(1)
+    const uncertain = expectBroadcastUncertainEvidence(harness, signedReview)
+    expect(uncertain.uncertainty.error.code).toBe('BROADCAST_FAILED')
+    expect(innermostCause(uncertain.uncertainty.error)).toMatchObject({
+      name: 'AbortError',
+      message: 'transport aborted after dispatch'
+    })
+    expect(harness.orchestrator.getState().status).not.toBe('aborted')
   })
 
   test('moves txid accessor failures after transport resolution into broadcastUncertain and reconciles without rebroadcast', async () => {
