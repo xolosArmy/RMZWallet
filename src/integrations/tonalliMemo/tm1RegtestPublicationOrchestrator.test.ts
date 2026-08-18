@@ -4039,6 +4039,170 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(stateCause.message).toBe('simple failure')
   })
 
+  test('converts function-valued causes into isolated non-callable diagnostics', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause = function rejection() { return undefined } as (() => undefined) & {
+      code: string
+      message: string
+      metadata: { nested: { reason: string } }
+      customScalar: number
+      cause?: unknown
+    }
+    cause.code = 'ORIGINAL'
+    cause.message = 'original function rejection'
+    cause.metadata = { nested: { reason: 'original' } }
+    cause.customScalar = 7
+    cause.cause = cause
+    const listenerACauses: unknown[] = []
+    const listenerBCauses: unknown[] = []
+    harness.failSigner(cause)
+    harness.orchestrator.subscribe(state => {
+      if (state.status !== 'failed') return
+      const listenerCause = innermostCause(state.error) as {
+        metadata: { nested: { reason: string } }
+      }
+      listenerACauses.push(listenerCause)
+      listenerCause.metadata.nested.reason = 'listener-mutated'
+    })
+    harness.orchestrator.subscribe(state => {
+      if (state.status === 'failed') listenerBCauses.push(innermostCause(state.error))
+    })
+    let thrown: Tm1PublicationError | null = null
+
+    await harness.orchestrator.authorizeAndSign(review.preparedId).catch(error => { thrown = error })
+    if (thrown === null) throw new Error('expected thrown error')
+    const thrownCause = innermostCause(thrown) as {
+      name: string
+      code: string
+      message: string
+      metadata: { nested: { reason: string } }
+      customScalar: number
+      cause?: unknown
+    }
+
+    expect(thrownCause).not.toBe(cause)
+    expect(typeof thrownCause).toBe('object')
+    expect(thrownCause.name).toBe('rejection')
+    expect(thrownCause.code).toBe('ORIGINAL')
+    expect(thrownCause.message).toBe('original function rejection')
+    expect(thrownCause.metadata).toEqual({ nested: { reason: 'original' } })
+    expect(thrownCause.customScalar).toBe(7)
+    expect(thrownCause.cause).toBe(thrownCause)
+    expect(Object.prototype.hasOwnProperty.call(thrownCause, 'prototype')).toBe(false)
+    expect(listenerACauses).toHaveLength(1)
+    expect(listenerBCauses).toHaveLength(1)
+    expect(listenerACauses[0]).not.toBe(listenerBCauses[0])
+    expect(listenerBCauses[0]).toMatchObject({
+      code: 'ORIGINAL',
+      metadata: { nested: { reason: 'original' } }
+    })
+
+    cause.code = 'MUTATED'
+    cause.metadata.nested.reason = 'mutated'
+    expect(thrownCause.code).toBe('ORIGINAL')
+    expect(thrownCause.metadata.nested.reason).toBe('original')
+
+    thrownCause.code = 'CALLER_MUTATED'
+    thrownCause.metadata.nested.reason = 'caller-mutated'
+    const firstState = harness.orchestrator.getState()
+    expect(firstState.status).toBe('failed')
+    if (firstState.status !== 'failed') throw new Error('expected failed')
+    const firstStateCause = innermostCause(firstState.error) as typeof thrownCause
+    expect(firstStateCause.code).toBe('ORIGINAL')
+    expect(firstStateCause.metadata.nested.reason).toBe('original')
+
+    firstStateCause.code = 'SNAPSHOT_MUTATED'
+    firstStateCause.metadata.nested.reason = 'snapshot-mutated'
+    const secondState = harness.orchestrator.getState()
+    expect(secondState.status).toBe('failed')
+    if (secondState.status !== 'failed') throw new Error('expected failed')
+    expect(innermostCause(secondState.error)).toMatchObject({
+      code: 'ORIGINAL',
+      metadata: { nested: { reason: 'original' } }
+    })
+  })
+
+  test('never invokes accessors on function-valued causes', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cause = function accessorRejection() { return undefined }
+    let getterCalls = 0
+    Object.defineProperty(cause, 'diagnostic', {
+      configurable: true,
+      get() {
+        getterCalls += 1
+        throw new Error('function accessor must never execute')
+      }
+    })
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    expect(getterCalls).toBe(0)
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const clonedCause = innermostCause(state.error)
+    expect(typeof clonedCause).toBe('object')
+    expect(Object.prototype.hasOwnProperty.call(clonedCause, 'diagnostic')).toBe(false)
+  })
+
+  test.each([
+    ['ownKeys', () => new Proxy(function ownKeysRejection() { return undefined }, {
+      ownKeys() {
+        throw new Error('hostile ownKeys trap')
+      }
+    })],
+    ['getOwnPropertyDescriptor', () => new Proxy(
+      function descriptorRejection() { return undefined },
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('hostile descriptor trap')
+        }
+      }
+    )]
+  ] as const)('uses a safe fallback for a function Proxy with hostile %s reflection', async (_trap, createCause) => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.failSigner(createCause())
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    expect(innermostCause(state.error)).toEqual({
+      name: 'UnknownObject',
+      description: 'External object could not be cloned safely'
+    })
+  })
+
+  test('does not inspect the prototype of a function Proxy while cloning it', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    let getPrototypeOfCalls = 0
+    const source = function prototypeRejection() { return undefined }
+    ;(source as typeof source & { code: string }).code = 'ORIGINAL'
+    const cause = new Proxy(source, {
+      getPrototypeOf() {
+        getPrototypeOfCalls += 1
+        throw new Error('function prototype trap must not execute')
+      }
+    })
+    harness.failSigner(cause)
+
+    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+
+    expect(getPrototypeOfCalls).toBe(0)
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    const clonedCause = innermostCause(state.error)
+    expect(typeof clonedCause).toBe('object')
+    expect(clonedCause).toMatchObject({ code: 'ORIGINAL' })
+  })
+
   test('clones mutable plain object causes for failed state snapshots', async () => {
     const harness = createHarness()
     const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
@@ -4161,6 +4325,72 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(state.uncertainty.txid).toBe(signedReview.txid)
     expect(state.uncertainty.signedArtifactHash).toBe(signedReview.signedArtifactHash)
     expect(state.uncertainty.signedArtifact.rawTransactionHex).toBe(signedReview.signedArtifact.rawTransactionHex)
+  })
+
+  test('isolates a post-dispatch function rejection and reconciles without rebroadcast', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const cause = function transportRejection() { return undefined } as (() => undefined) & {
+      code: string
+      metadata: { nested: { reason: string } }
+    }
+    cause.code = 'ORIGINAL'
+    cause.metadata = { nested: { reason: 'original' } }
+    harness.failBroadcast(cause)
+    let thrown: Tm1PublicationError | null = null
+
+    await harness.orchestrator.approveAndBroadcast(signedReview.signedId).catch(error => {
+      thrown = error
+    })
+    if (thrown === null) throw new Error('expected broadcast error')
+
+    expect(harness.calls.broadcast).toBe(1)
+    const uncertain = expectBroadcastUncertainEvidence(harness, signedReview)
+    const storedCause = innermostCause(uncertain.uncertainty.error) as {
+      name: string
+      code: string
+      metadata: { nested: { reason: string } }
+    }
+    const thrownCause = innermostCause(thrown) as typeof storedCause
+    expect(uncertain.status).toBe('broadcastUncertain')
+    expect(storedCause).not.toBe(cause)
+    expect(thrownCause).not.toBe(cause)
+    expect(typeof storedCause).toBe('object')
+    expect(typeof thrownCause).toBe('object')
+    expect(storedCause).toMatchObject({
+      name: 'transportRejection',
+      code: 'ORIGINAL',
+      metadata: { nested: { reason: 'original' } }
+    })
+    expect(thrownCause).toMatchObject({
+      code: 'ORIGINAL',
+      metadata: { nested: { reason: 'original' } }
+    })
+
+    cause.code = 'MUTATED'
+    cause.metadata.nested.reason = 'mutated'
+    thrownCause.metadata.nested.reason = 'caller-mutated'
+    const subsequentState = harness.orchestrator.getState()
+    expect(subsequentState.status).toBe('broadcastUncertain')
+    if (subsequentState.status !== 'broadcastUncertain') throw new Error('expected uncertainty')
+    expect(innermostCause(subsequentState.uncertainty.error)).toMatchObject({
+      code: 'ORIGINAL',
+      metadata: { nested: { reason: 'original' } }
+    })
+
+    harness.setConfirmation(Object.freeze({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: signedReview.txid,
+      confirmations: 1,
+      blockHash: 'fd'.repeat(32),
+      blockHeight: 111
+    }))
+    await expect(harness.orchestrator.reconcile()).resolves.toMatchObject({
+      submissionId: uncertain.uncertainty.submissionId,
+      txid: signedReview.txid
+    })
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('confirmed')
   })
 
   test('clones circular plain object causes without stack overflow', async () => {

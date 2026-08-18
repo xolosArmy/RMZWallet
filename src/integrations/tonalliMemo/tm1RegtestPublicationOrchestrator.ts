@@ -1093,13 +1093,23 @@ function assertNotAborted(signal?: AbortSignal): void {
 }
 
 function isAbortError(error: unknown): boolean {
-  return (error instanceof Tm1PublicationError && error.code === 'ABORTED') ||
-    (error instanceof Error && error.name === 'AbortError')
+  if (typeof error === 'function') return false
+  try {
+    return (error instanceof Tm1PublicationError && error.code === 'ABORTED') ||
+      (error instanceof Error && error.name === 'AbortError')
+  } catch {
+    return false
+  }
 }
 
 function isAbortLike(error: unknown): boolean {
-  return isAbortError(error) ||
-    (error instanceof Error && 'code' in error && error.code === 'OPERATION_ABORTED')
+  if (typeof error === 'function') return false
+  try {
+    return isAbortError(error) ||
+      (error instanceof Error && 'code' in error && error.code === 'OPERATION_ABORTED')
+  } catch {
+    return false
+  }
 }
 
 function safeBroadcastRejectionDiagnostic(
@@ -1107,8 +1117,11 @@ function safeBroadcastRejectionDiagnostic(
   fallback: Tm1PublicationError = new Tm1PublicationError('BROADCAST_FAILED')
 ): Tm1PublicationError {
   try {
+    if (typeof rejection === 'function') {
+      return new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', rejection)
+    }
     if (rejection instanceof Tm1PublicationError) return clonePublicationError(rejection)
-    if (rejection === null || (typeof rejection !== 'object' && typeof rejection !== 'function')) {
+    if (rejection === null || typeof rejection !== 'object') {
       return fallback
     }
     return new Tm1PublicationError('BROADCAST_FAILED', 'BROADCAST_FAILED', rejection)
@@ -1434,7 +1447,11 @@ function isTm1PublicationErrorCode(value: unknown): value is Tm1PublicationError
 }
 
 function cloneErrorCause(cause: unknown, seen: WeakMap<object, unknown> = new WeakMap()): unknown {
-  if (cause === null || typeof cause !== 'object') return cause
+  if (cause === null || (typeof cause !== 'object' && typeof cause !== 'function')) return cause
+
+  // Functions are mutable objects even though typeof reports "function". Never
+  // retain their callability or share their identity across error snapshots.
+  if (typeof cause === 'function') return cloneFunctionCause(cause, seen)
 
   try {
     if (cause instanceof Tm1PublicationError) return clonePublicationError(cause, seen)
@@ -1472,6 +1489,59 @@ function cloneErrorCause(cause: unknown, seen: WeakMap<object, unknown> = new We
   }
 
   return unknownObjectCause()
+}
+
+function cloneFunctionCause(
+  source: object,
+  seen: WeakMap<object, unknown>
+): unknown {
+  const existing = seen.get(source)
+  if (existing !== undefined) return existing
+
+  const clone: Record<PropertyKey, unknown> = {}
+  seen.set(source, clone)
+
+  let keys: PropertyKey[]
+  try {
+    keys = Reflect.ownKeys(source)
+  } catch {
+    const fallback = unknownObjectCause()
+    seen.set(source, fallback)
+    return fallback
+  }
+
+  for (const key of keys) {
+    if (
+      key === 'length' ||
+      key === 'prototype' ||
+      key === 'arguments' ||
+      key === 'caller'
+    ) {
+      continue
+    }
+
+    let descriptor: PropertyDescriptor | undefined
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(source, key)
+    } catch {
+      const fallback = unknownObjectCause()
+      seen.set(source, fallback)
+      return fallback
+    }
+
+    // Accessors are external behavior. Omit them without invoking get or set.
+    if (descriptor === undefined || !('value' in descriptor)) continue
+    try {
+      Object.defineProperty(clone, key, {
+        ...descriptor,
+        value: cloneErrorCause(descriptor.value, seen)
+      })
+    } catch {
+      // An individual hostile data property is not allowed to escape cloning.
+    }
+  }
+
+  return clone
 }
 
 function cloneDataProperties(
