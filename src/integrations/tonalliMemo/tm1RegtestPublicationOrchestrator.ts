@@ -662,10 +662,12 @@ implements Tm1RegtestPublicationOrchestrator {
       const uncertainty = state.uncertainty
       this.transition({ status: 'broadcastUncertain', signedReview, uncertainty })
       if (isAbortLike(error)) {
-        throw new Tm1PublicationError('ABORTED', 'ABORTED', error)
+        throw trapSafePublicationError('ABORTED', error)
       }
-      if (error instanceof Tm1PublicationError && error.code === 'TXID_MISMATCH') throw error
-      throw new Tm1PublicationError('CONFIRMATION_FAILED', 'CONFIRMATION_FAILED', error)
+      if (safeOwnDataStringProperty(error, 'code') === 'TXID_MISMATCH') {
+        throw trapSafePublicationError('TXID_MISMATCH', error)
+      }
+      throw trapSafePublicationError('CONFIRMATION_FAILED', error)
     } finally {
       this.endOperation('reconcile')
     }
@@ -720,10 +722,12 @@ implements Tm1RegtestPublicationOrchestrator {
         receipt
       })
       if (isAbortLike(error)) {
-        throw new Tm1PublicationError('ABORTED', 'ABORTED', error)
+        throw trapSafePublicationError('ABORTED', error)
       }
-      if (error instanceof Tm1PublicationError && error.code === 'TXID_MISMATCH') throw error
-      throw new Tm1PublicationError('CONFIRMATION_FAILED', 'CONFIRMATION_FAILED', error)
+      if (safeOwnDataStringProperty(error, 'code') === 'TXID_MISMATCH') {
+        throw trapSafePublicationError('TXID_MISMATCH', error)
+      }
+      throw trapSafePublicationError('CONFIRMATION_FAILED', error)
     } finally {
       this.endOperation('confirm')
     }
@@ -848,15 +852,23 @@ async function auditSignedArtifact(input: Readonly<{
   expectedTxid?: string
   expectedArtifactHash?: string
 }>): Promise<Tm1AuditedArtifactEvidence> {
+  let auditResult: unknown
   try {
     assertNotAborted(input.signal)
-    const auditResult: unknown = await input.auditPort.auditSignedArtifact({
+    auditResult = await input.auditPort.auditSignedArtifact({
       review: freezePreparedReview(input.review),
       signedArtifact: input.signedArtifact,
       signal: input.signal
     })
     assertNotAborted(input.signal)
+  } catch (externalAuditError) {
+    if (isAbortLike(externalAuditError)) {
+      throw trapSafePublicationError('ABORTED', externalAuditError)
+    }
+    throw trapSafePublicationError('SIGNED_ARTIFACT_INVALID', externalAuditError)
+  }
 
+  try {
     const { artifact, transaction } = snapshotValidatedSignedArtifact(auditResult)
     auditTm1Draft02RegtestSignedTransaction({
       candidate: input.review.candidate,
@@ -874,12 +886,8 @@ async function auditSignedArtifact(input: Readonly<{
     }
 
     return Object.freeze({ artifact, artifactHash })
-  } catch (error) {
-    if (isAbortLike(error)) throw error
-    if (error instanceof Tm1PublicationError && error.code === 'SIGNED_ARTIFACT_INVALID') {
-      throw error
-    }
-    throw new Tm1PublicationError('SIGNED_ARTIFACT_INVALID', 'SIGNED_ARTIFACT_INVALID', error)
+  } catch (validationError) {
+    throw trapSafePublicationError('SIGNED_ARTIFACT_INVALID', validationError)
   }
 }
 
@@ -1093,23 +1101,13 @@ function assertNotAborted(signal?: AbortSignal): void {
 }
 
 function isAbortError(error: unknown): boolean {
-  if (typeof error === 'function') return false
-  try {
-    return (error instanceof Tm1PublicationError && error.code === 'ABORTED') ||
-      (error instanceof Error && error.name === 'AbortError')
-  } catch {
-    return false
-  }
+  return safeOwnDataStringProperty(error, 'code') === 'ABORTED' ||
+    safeOwnDataStringProperty(error, 'name') === 'AbortError'
 }
 
 function isAbortLike(error: unknown): boolean {
-  if (typeof error === 'function') return false
-  try {
-    return isAbortError(error) ||
-      (error instanceof Error && 'code' in error && error.code === 'OPERATION_ABORTED')
-  } catch {
-    return false
-  }
+  return isAbortError(error) ||
+    safeOwnDataStringProperty(error, 'code') === 'OPERATION_ABORTED'
 }
 
 function safeBroadcastRejectionDiagnostic(
@@ -1419,6 +1417,76 @@ function safeOwnDataDescriptor(
   } catch {
     return undefined
   }
+}
+
+function safeOwnDataStringProperty(
+  value: unknown,
+  key: PropertyKey
+): string | undefined {
+  if (
+    value === null ||
+    (typeof value !== 'object' && typeof value !== 'function')
+  ) {
+    return undefined
+  }
+  const descriptor = safeOwnDataDescriptor(value, key)
+  return typeof descriptor?.value === 'string' ? descriptor.value : undefined
+}
+
+function trapSafePublicationError(
+  code: Tm1PublicationErrorCode,
+  rejection: unknown
+): Tm1PublicationError {
+  return new Tm1PublicationError(
+    code,
+    code,
+    cloneExternalRejectionCause(rejection)
+  )
+}
+
+function cloneExternalRejectionCause(rejection: unknown): unknown {
+  if (
+    rejection === null ||
+    (typeof rejection !== 'object' && typeof rejection !== 'function')
+  ) {
+    return rejection
+  }
+
+  const seen = new WeakMap<object, unknown>()
+  if (typeof rejection === 'function') return cloneFunctionCause(rejection, seen)
+
+  const clone: Record<PropertyKey, unknown> = {}
+  seen.set(rejection, clone)
+
+  let keys: PropertyKey[]
+  try {
+    keys = Reflect.ownKeys(rejection)
+  } catch {
+    return unknownObjectCause()
+  }
+
+  for (const key of keys) {
+    if (key === 'stack') continue
+
+    let descriptor: PropertyDescriptor | undefined
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(rejection, key)
+    } catch {
+      return unknownObjectCause()
+    }
+    if (descriptor === undefined || !('value' in descriptor)) continue
+
+    try {
+      Object.defineProperty(clone, key, {
+        ...descriptor,
+        value: cloneErrorCause(descriptor.value, seen)
+      })
+    } catch {
+      // Keep the remaining safe diagnostic fields.
+    }
+  }
+
+  return clone
 }
 
 function isTm1PublicationErrorCode(value: unknown): value is Tm1PublicationErrorCode {

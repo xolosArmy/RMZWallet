@@ -1042,7 +1042,116 @@ describe('TM1 regtest publication orchestrator', () => {
     harness.failAudit(new Error('bad artifact'))
 
     await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNED_ARTIFACT_INVALID')
-    expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'signing' })
+    const state = harness.orchestrator.getState()
+    expect(state).toMatchObject({ status: 'failed', stage: 'signing' })
+    if (state.status !== 'failed') throw new Error('expected failed')
+    expect(innermostCause(state.error)).toMatchObject({ message: 'bad artifact' })
+  })
+
+  test('classifies a primary audit getPrototypeOf Proxy rejection without prototype inspection', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    let getPrototypeOfCalls = 0
+    harness.failAudit(new Proxy({}, {
+      getPrototypeOf() {
+        getPrototypeOfCalls += 1
+        throw new Error('audit prototype trap must not escape')
+      }
+    }))
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(getPrototypeOfCalls).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'signing',
+      error: { code: 'SIGNED_ARTIFACT_INVALID' }
+    })
+  })
+
+  test('classifies a broadcast re-audit getPrototypeOf Proxy before dispatch', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    let getPrototypeOfCalls = 0
+    harness.failAudit(new Proxy({}, {
+      getPrototypeOf() {
+        getPrototypeOfCalls += 1
+        throw new Error('re-audit prototype trap must not escape')
+      }
+    }))
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    expect(getPrototypeOfCalls).toBe(0)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'approvingBroadcast',
+      error: { code: 'SIGNED_ARTIFACT_INVALID' }
+    })
+    expect(harness.orchestrator.getState().status).not.toBe('broadcastUncertain')
+  })
+
+  test.each([
+    ['ownKeys', () => new Proxy({}, {
+      ownKeys() {
+        throw new Error('audit ownKeys trap must not escape')
+      }
+    })],
+    ['getOwnPropertyDescriptor', () => new Proxy({ diagnostic: 'unsafe' }, {
+      getOwnPropertyDescriptor() {
+        throw new Error('audit descriptor trap must not escape')
+      }
+    })]
+  ] as const)(
+    'maps a primary audit rejection with hostile %s reflection to SIGNED_ARTIFACT_INVALID',
+    async (_trap, createRejection) => {
+      const harness = createHarness()
+      const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+      harness.failAudit(createRejection())
+
+      await expectCode(
+        harness.orchestrator.authorizeAndSign(review.preparedId),
+        'SIGNED_ARTIFACT_INVALID'
+      )
+
+      expect(harness.orchestrator.getState()).toMatchObject({
+        status: 'failed',
+        stage: 'signing',
+        error: { code: 'SIGNED_ARTIFACT_INVALID' }
+      })
+    }
+  )
+
+  test('preserves safe diagnostics from a publication-error audit rejection', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.failAudit(new Tm1PublicationError(
+      'SIGNING_FAILED',
+      'external audit diagnostic',
+      { metadata: { reason: 'original' } }
+    ))
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'SIGNED_ARTIFACT_INVALID'
+    )
+
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    expect(innermostCause(state.error)).toMatchObject({
+      name: 'Tm1PublicationError',
+      message: 'external audit diagnostic',
+      code: 'SIGNING_FAILED',
+      cause: { metadata: { reason: 'original' } }
+    })
   })
 
   test.each([
@@ -2335,6 +2444,7 @@ describe('TM1 regtest publication orchestrator', () => {
     const harness = createHarness()
     const signedReview = await prepareAndSign(harness)
     const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    const submitted = harness.orchestrator.getState()
     harness.setConfirmation(Object.freeze({
       submissionId: receipt.submissionId,
       txid: '00'.repeat(32),
@@ -2342,6 +2452,8 @@ describe('TM1 regtest publication orchestrator', () => {
     }))
 
     await expectCode(harness.orchestrator.confirm(receipt.submissionId), 'TXID_MISMATCH')
+    expect(harness.orchestrator.getState()).toEqual(submitted)
+    expect(harness.calls.broadcast).toBe(1)
   })
 
   test('rejects a concurrent second publication', async () => {
@@ -3146,6 +3258,101 @@ describe('TM1 regtest publication orchestrator', () => {
     await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
       message: DEFAULT_REQUEST.message
     })
+  })
+
+  test('restores submitted evidence after a confirmation getPrototypeOf Proxy rejection and retries', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    const submitted = harness.orchestrator.getState()
+    expect(submitted.status).toBe('submitted')
+    let getPrototypeOfCalls = 0
+    harness.failConfirmation(new Proxy({}, {
+      getPrototypeOf() {
+        getPrototypeOfCalls += 1
+        throw new Error('confirmation prototype trap must not escape')
+      }
+    }))
+
+    await expectCode(
+      harness.orchestrator.confirm(receipt.submissionId),
+      'CONFIRMATION_FAILED'
+    )
+
+    expect(getPrototypeOfCalls).toBe(0)
+    expect(harness.orchestrator.getState()).toEqual(submitted)
+    const restored = harness.orchestrator.getState()
+    expect(restored.status).toBe('submitted')
+    if (restored.status !== 'submitted') throw new Error('expected submitted')
+    expect(restored.receipt).toEqual(receipt)
+    expect(restored.signedReview.signedId).toBe(signedReview.signedId)
+    expect(restored.signedReview.txid).toBe(signedReview.txid)
+    expect(restored.signedReview.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+    expect(restored.signedReview.signedArtifact.rawTransactionHex).toBe(
+      signedReview.signedArtifact.rawTransactionHex
+    )
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.calls.broadcastAuthorization).toBe(1)
+
+    harness.failConfirmation(null)
+    await expect(harness.orchestrator.confirm(receipt.submissionId)).resolves.toMatchObject({
+      submissionId: receipt.submissionId,
+      txid: receipt.txid,
+      confirmations: 1
+    })
+    expect(harness.calls.confirm).toBe(2)
+    expect(harness.calls.broadcast).toBe(1)
+    expect(harness.orchestrator.getState().status).toBe('confirmed')
+  })
+
+  test('contains a hostile confirmation getOwnPropertyDescriptor trap', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    let descriptorCalls = 0
+    harness.failConfirmation(new Proxy({}, {
+      getOwnPropertyDescriptor() {
+        descriptorCalls += 1
+        throw new Error('confirmation descriptor trap must not escape')
+      }
+    }))
+
+    await expectCode(
+      harness.orchestrator.confirm(receipt.submissionId),
+      'CONFIRMATION_FAILED'
+    )
+
+    expect(descriptorCalls).toBeGreaterThan(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'submitted',
+      receipt: { submissionId: receipt.submissionId, txid: receipt.txid }
+    })
+    expect(harness.calls.broadcast).toBe(1)
+  })
+
+  test('never invokes a confirmation rejection code getter', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    let getterCalls = 0
+    const rejection = {}
+    Object.defineProperty(rejection, 'code', {
+      configurable: true,
+      get() {
+        getterCalls += 1
+        throw new Error('confirmation code getter must never execute')
+      }
+    })
+    harness.failConfirmation(rejection)
+
+    await expectCode(
+      harness.orchestrator.confirm(receipt.submissionId),
+      'CONFIRMATION_FAILED'
+    )
+
+    expect(getterCalls).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'submitted' })
+    expect(harness.calls.broadcast).toBe(1)
   })
 
   test('keeps submitted receipt retryable when confirmation observation fails transiently', async () => {
