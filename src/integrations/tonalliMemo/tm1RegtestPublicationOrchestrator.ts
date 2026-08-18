@@ -316,13 +316,29 @@ implements Tm1RegtestPublicationOrchestrator {
       assertNotAborted(signal)
       this.transition({ status: 'attesting', message: requestSnapshot.message })
       assertNotAborted(signal)
-      const attestationResult = await this.dependencies.networkAttestation.attest(signal)
+      let attestationResult: unknown
+      try {
+        attestationResult = await this.dependencies.networkAttestation.attest(signal)
+      } catch (externalError) {
+        throw trapSafePublicationError(
+          isAbortLike(externalError) ? 'ABORTED' : 'PREPARATION_FAILED',
+          externalError
+        )
+      }
       assertNotAborted(signal)
       const network = snapshotNetworkAttestation(attestationResult)
       this.transition({ status: 'preparing', message: requestSnapshot.message, network })
       assertNotAborted(signal)
 
-      const utxos = await this.dependencies.utxoProvider.readUtxos(signal)
+      let utxos: readonly Tm1Draft02FreshUtxo[]
+      try {
+        utxos = await this.dependencies.utxoProvider.readUtxos(signal)
+      } catch (externalError) {
+        throw trapSafePublicationError(
+          isAbortLike(externalError) ? 'ABORTED' : 'PREPARATION_FAILED',
+          externalError
+        )
+      }
       assertNotAborted(signal)
       const preview = encodeTm1Draft02Post({
         eventData: requestSnapshot.message,
@@ -435,17 +451,23 @@ implements Tm1RegtestPublicationOrchestrator {
         signingAuthorizationId
       })
       assertNotAborted(signal)
+      let attestationResult: unknown
+      try {
+        attestationResult = await this.dependencies.networkAttestation.attest(signal)
+      } catch (error) {
+        throw trapSafePublicationError(
+          isAbortLike(error) ? 'ABORTED' : 'CANDIDATE_REVALIDATION_FAILED',
+          error
+        )
+      }
+      assertNotAborted(signal)
       let freshNetwork: Tm1RegtestNetworkAttestation
       try {
-        const attestationResult = await this.dependencies.networkAttestation.attest(signal)
-        assertNotAborted(signal)
         freshNetwork = snapshotNetworkAttestation(attestationResult)
-      } catch (error) {
-        if (isAbortLike(error)) throw error
-        throw new Tm1PublicationError(
+      } catch (validationError) {
+        throw trapSafePublicationError(
           'CANDIDATE_REVALIDATION_FAILED',
-          'CANDIDATE_REVALIDATION_FAILED',
-          error
+          validationError
         )
       }
       if (
@@ -458,10 +480,8 @@ implements Tm1RegtestPublicationOrchestrator {
       try {
         freshUtxos = await this.dependencies.utxoProvider.readUtxos(signal)
       } catch (error) {
-        if (isAbortLike(error)) throw error
-        throw new Tm1PublicationError(
-          'CANDIDATE_REVALIDATION_FAILED',
-          'CANDIDATE_REVALIDATION_FAILED',
+        throw trapSafePublicationError(
+          isAbortLike(error) ? 'ABORTED' : 'CANDIDATE_REVALIDATION_FAILED',
           error
         )
       }
@@ -1100,8 +1120,35 @@ function assertNotAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
 }
 
+const nativeDomExceptionNameGetter = (() => {
+  try {
+    if (typeof DOMException === 'undefined') return undefined
+    return Object.getOwnPropertyDescriptor(DOMException.prototype, 'name')?.get
+  } catch {
+    return undefined
+  }
+})()
+
+function isNativeDomExceptionAbort(error: unknown): boolean {
+  if (
+    nativeDomExceptionNameGetter === undefined ||
+    error === null ||
+    (typeof error !== 'object' && typeof error !== 'function')
+  ) {
+    return false
+  }
+
+  try {
+    return nativeDomExceptionNameGetter.call(error) === 'AbortError'
+  } catch {
+    // The trusted built-in getter brand-checks without invoking external traps.
+    return false
+  }
+}
+
 function isAbortError(error: unknown): boolean {
-  return safeOwnDataStringProperty(error, 'code') === 'ABORTED' ||
+  return isNativeDomExceptionAbort(error) ||
+    safeOwnDataStringProperty(error, 'code') === 'ABORTED' ||
     safeOwnDataStringProperty(error, 'name') === 'AbortError'
 }
 

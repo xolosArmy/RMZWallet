@@ -69,6 +69,12 @@ function createDeferred<T>(): Deferred<T> {
   return Object.freeze({ promise, resolve: resolveValue, reject: rejectValue })
 }
 
+function nativeAbortReason(): unknown {
+  const controller = new AbortController()
+  controller.abort()
+  return controller.signal.reason
+}
+
 function awaitCooperativeAudit<T>(
   deferred: Deferred<T>,
   signal?: AbortSignal
@@ -2750,6 +2756,82 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(confirmationHarness.orchestrator.getState().status).toBe('submitted')
   })
 
+  test('recognizes the native AbortController DOMException reason from the signer', async () => {
+    const reason = nativeAbortReason()
+    expect(reason).toBeDefined()
+    expect(Object.getOwnPropertyDescriptor(reason as object, 'name')).toBeUndefined()
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.failSigner(reason)
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'ABORTED'
+    )
+
+    expect(harness.calls.signer).toBe(1)
+    expect(harness.calls.audit).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({ status: 'aborted' })
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+  })
+
+  test('recognizes the native AbortController reason from the primary signed artifact audit', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.failAudit(nativeAbortReason())
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'ABORTED'
+    )
+
+    expect(harness.calls.audit).toBe(1)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState().status).toBe('aborted')
+  })
+
+  test('recognizes the native AbortController reason from the broadcast re-audit', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    harness.failAudit(nativeAbortReason())
+
+    await expectCode(
+      harness.orchestrator.approveAndBroadcast(signedReview.signedId),
+      'ABORTED'
+    )
+
+    expect(harness.calls.audit).toBe(2)
+    expect(harness.calls.broadcast).toBe(0)
+    expect(harness.orchestrator.getState().status).toBe('aborted')
+    expect(harness.orchestrator.getState().status).not.toBe('broadcastUncertain')
+  })
+
+  test('recognizes the native AbortController reason from confirmation and preserves retry evidence', async () => {
+    const harness = createHarness()
+    const signedReview = await prepareAndSign(harness)
+    const receipt = await harness.orchestrator.approveAndBroadcast(signedReview.signedId)
+    harness.failConfirmation(nativeAbortReason())
+
+    await expectCode(
+      harness.orchestrator.confirm(receipt.submissionId),
+      'ABORTED'
+    )
+
+    const submitted = harness.orchestrator.getState()
+    expect(submitted.status).toBe('submitted')
+    if (submitted.status !== 'submitted') throw new Error('expected submitted')
+    expect(submitted.receipt).toEqual(receipt)
+    expect(submitted.signedReview.signedArtifactHash).toBe(signedReview.signedArtifactHash)
+    expect(harness.calls.broadcast).toBe(1)
+
+    harness.failConfirmation(null)
+    await expect(harness.orchestrator.confirm(receipt.submissionId)).resolves.toMatchObject({
+      submissionId: receipt.submissionId,
+      txid: receipt.txid
+    })
+    expect(harness.calls.broadcast).toBe(1)
+  })
+
   test('rejects locally incoherent signed artifact bytes, hex, and txid before broadcast', async () => {
     const txidHarness = createHarness()
     const txidReview = await txidHarness.orchestrator.prepare(DEFAULT_REQUEST)
@@ -3599,6 +3681,9 @@ describe('TM1 regtest publication orchestrator', () => {
     if (state.status !== 'failed') throw new Error('expected failed')
     expect(state.error.code).toBe('PREPARATION_FAILED')
     expect(state.error.code).not.toBe('INVALID_STATE')
+    expect(innermostCause(state.error)).toMatchObject({
+      message: 'attestation transport unavailable'
+    })
   })
 
   test('maps ordinary prepare UTXO provider failures to PREPARATION_FAILED', async () => {
@@ -3612,6 +3697,166 @@ describe('TM1 regtest publication orchestrator', () => {
     if (state.status !== 'failed') throw new Error('expected failed')
     expect(state.error.code).toBe('PREPARATION_FAILED')
     expect(state.error.code).not.toBe('INVALID_STATE')
+  })
+
+  test('classifies a hostile attestation rejection without invoking its prototype trap and permits retry', async () => {
+    const harness = createHarness()
+    let getPrototypeOfCalls = 0
+    const rejection = new Proxy({}, {
+      getPrototypeOf() {
+        getPrototypeOfCalls += 1
+        throw new Error('attestation prototype trap must not execute')
+      }
+    })
+    harness.failAttestation(rejection)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(getPrototypeOfCalls).toBe(0)
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('failed')
+    if (state.status !== 'failed') throw new Error('expected failed')
+    expect(state.error.code).toBe('PREPARATION_FAILED')
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+    harness.failAttestation(null)
+    await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
+      message: DEFAULT_REQUEST.message
+    })
+    expect(harness.calls.attest).toBe(2)
+  })
+
+  test('classifies a hostile UTXO rejection without invoking its prototype trap', async () => {
+    const harness = createHarness()
+    let getPrototypeOfCalls = 0
+    const rejection = new Proxy({}, {
+      getPrototypeOf() {
+        getPrototypeOfCalls += 1
+        throw new Error('UTXO prototype trap must not execute')
+      }
+    })
+    harness.failUtxos(rejection)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(getPrototypeOfCalls).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      error: { code: 'PREPARATION_FAILED' }
+    })
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+  })
+
+  test.each([
+    ['ownKeys', () => new Proxy({}, {
+      ownKeys() {
+        throw new Error('preparation ownKeys trap')
+      }
+    })],
+    ['getOwnPropertyDescriptor', () => new Proxy(
+      { diagnostic: 'external rejection' },
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('preparation descriptor trap')
+        }
+      }
+    )]
+  ] as const)(
+    'uses safe diagnostics for a preparation rejection with hostile %s reflection',
+    async (_trap, createRejection) => {
+      const harness = createHarness()
+      harness.failAttestation(createRejection())
+
+      await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+      const state = harness.orchestrator.getState()
+      expect(state.status).toBe('failed')
+      if (state.status !== 'failed') throw new Error('expected failed')
+      expect(state.error.code).toBe('PREPARATION_FAILED')
+      expect(innermostCause(state.error)).toEqual({
+        name: 'UnknownObject',
+        description: 'External object could not be cloned safely'
+      })
+      expect(() => harness.orchestrator.reset()).not.toThrow()
+    }
+  )
+
+  test('classifies a native AbortController attestation reason as ABORTED', async () => {
+    const harness = createHarness()
+    harness.failAttestation(nativeAbortReason())
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'ABORTED')
+
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'aborted',
+      stage: 'attesting'
+    })
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+  })
+
+  test.each(['attestation', 'utxo'] as const)(
+    'classifies a hostile %s revalidation rejection as CANDIDATE_REVALIDATION_FAILED',
+    async port => {
+      const harness = createHarness()
+      const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+      let getPrototypeOfCalls = 0
+      const rejection = new Proxy({}, {
+        getPrototypeOf() {
+          getPrototypeOfCalls += 1
+          throw new Error(`${port} revalidation prototype trap must not execute`)
+        }
+      })
+      if (port === 'attestation') harness.failAttestation(rejection)
+      else harness.failUtxos(rejection)
+
+      await expectCode(
+        harness.orchestrator.authorizeAndSign(review.preparedId),
+        'CANDIDATE_REVALIDATION_FAILED'
+      )
+
+      expect(getPrototypeOfCalls).toBe(0)
+      expect(harness.orchestrator.getState()).toMatchObject({
+        status: 'failed',
+        error: { code: 'CANDIDATE_REVALIDATION_FAILED' }
+      })
+      expect(() => harness.orchestrator.reset()).not.toThrow()
+    }
+  )
+
+  test('does not classify an arbitrary fully hostile Proxy rejection as an abort', async () => {
+    const harness = createHarness()
+    const calls = {
+      getPrototypeOf: 0,
+      get: 0,
+      ownKeys: 0,
+      getOwnPropertyDescriptor: 0
+    }
+    const rejection = new Proxy({}, {
+      getPrototypeOf() {
+        calls.getPrototypeOf += 1
+        throw new Error('prototype trap')
+      },
+      get() {
+        calls.get += 1
+        throw new Error('get trap')
+      },
+      ownKeys() {
+        calls.ownKeys += 1
+        throw new Error('ownKeys trap')
+      },
+      getOwnPropertyDescriptor() {
+        calls.getOwnPropertyDescriptor += 1
+        throw new Error('descriptor trap')
+      }
+    })
+    harness.failAttestation(rejection)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(calls.getPrototypeOf).toBe(0)
+    expect(calls.get).toBe(0)
+    expect(calls.ownKeys).toBeGreaterThan(0)
+    expect(calls.getOwnPropertyDescriptor).toBeGreaterThan(0)
+    expect(harness.orchestrator.getState().status).not.toBe('aborted')
   })
 
   test('keeps invalid prepare lifecycle calls classified as INVALID_STATE', async () => {
