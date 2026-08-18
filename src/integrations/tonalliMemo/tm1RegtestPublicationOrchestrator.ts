@@ -324,16 +324,11 @@ implements Tm1RegtestPublicationOrchestrator {
       this.transition({ status: 'preparing', message: requestSnapshot.message, network })
       assertNotAborted(signal)
 
-      let utxos: readonly Tm1Draft02FreshUtxo[]
-      try {
-        utxos = await this.dependencies.utxoProvider.readUtxos(signal)
-      } catch (externalError) {
-        throw trapSafePublicationError(
-          isAbortLike(externalError) ? 'ABORTED' : 'PREPARATION_FAILED',
-          externalError
-        )
-      }
-      assertNotAborted(signal)
+      const utxos = await readAndSnapshotUtxos({
+        utxoProvider: this.dependencies.utxoProvider,
+        signal,
+        failureCode: 'PREPARATION_FAILED'
+      })
       const preview = encodeTm1Draft02Post({
         eventData: requestSnapshot.message,
         authorInputIndex: TM1_DRAFT_02_STANDARD_AUTHOR_INPUT_INDEX
@@ -456,16 +451,11 @@ implements Tm1RegtestPublicationOrchestrator {
       ) {
         throw new Tm1PublicationError('CANDIDATE_REVALIDATION_FAILED')
       }
-      let freshUtxos: readonly Tm1Draft02FreshUtxo[]
-      try {
-        freshUtxos = await this.dependencies.utxoProvider.readUtxos(signal)
-      } catch (error) {
-        throw trapSafePublicationError(
-          isAbortLike(error) ? 'ABORTED' : 'CANDIDATE_REVALIDATION_FAILED',
-          error
-        )
-      }
-      assertNotAborted(signal)
+      const freshUtxos = await readAndSnapshotUtxos({
+        utxoProvider: this.dependencies.utxoProvider,
+        signal,
+        failureCode: 'CANDIDATE_REVALIDATION_FAILED'
+      })
       assertCandidateStillValid(review, freshUtxos)
       assertBindingUnchanged(review)
       assertNotAborted(signal)
@@ -971,6 +961,18 @@ function readOptionalNumber(value: unknown, key: PropertyKey): number | undefine
   return descriptor.value
 }
 
+function readOptionalOwnDataProperty(value: unknown, key: PropertyKey): unknown {
+  if (value === null || typeof value !== 'object') {
+    throw new Error('Invalid external object')
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, key)
+  if (descriptor === undefined) return undefined
+  if (!('value' in descriptor)) {
+    throw new Error(`Invalid optional data property: ${String(key)}`)
+  }
+  return descriptor.value
+}
+
 function snapshotNetworkAttestation(value: unknown): Tm1RegtestNetworkAttestation {
   const environment = readRequiredOwnDataProperty(value, 'environment')
   const chainIdentity = readRequiredOwnDataProperty(value, 'chainIdentity')
@@ -1000,6 +1002,81 @@ async function attestAndSnapshotNetwork(input: Readonly<{
       externalOrValidationError
     )
   }
+}
+
+async function readAndSnapshotUtxos(input: Readonly<{
+  utxoProvider: Tm1UtxoProviderPort
+  signal?: AbortSignal
+  failureCode: 'PREPARATION_FAILED' | 'CANDIDATE_REVALIDATION_FAILED'
+}>): Promise<readonly Tm1Draft02FreshUtxo[]> {
+  try {
+    const rawUtxos: unknown = await input.utxoProvider.readUtxos(input.signal)
+    assertNotAborted(input.signal)
+    return snapshotUtxoCollection(rawUtxos)
+  } catch (externalOrValidationError) {
+    throw trapSafePublicationError(
+      isAbortLike(externalOrValidationError) ? 'ABORTED' : input.failureCode,
+      externalOrValidationError
+    )
+  }
+}
+
+function snapshotUtxoCollection(value: unknown): readonly Tm1Draft02FreshUtxo[] {
+  if (!Array.isArray(value)) throw new Error('Invalid UTXO collection')
+
+  const length = readRequiredOwnDataProperty(value, 'length')
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) {
+    throw new Error('Invalid UTXO collection length')
+  }
+
+  const snapshot = new Array<Tm1Draft02FreshUtxo>(length)
+  for (let index = 0; index < length; index += 1) {
+    const utxo = readRequiredOwnDataProperty(value, String(index))
+    snapshot[index] = snapshotFundingUtxo(utxo)
+  }
+  return Object.freeze(snapshot)
+}
+
+function snapshotFundingUtxo(value: unknown): Tm1Draft02FreshUtxo {
+  const txidValue = readRequiredOwnDataProperty(value, 'txid')
+  const outIdx = readRequiredOwnDataProperty(value, 'outIdx')
+  const sats = readRequiredOwnDataProperty(value, 'sats')
+  const lockingScriptValue = readRequiredOwnDataProperty(value, 'lockingScriptHex')
+  const token = readOptionalOwnDataProperty(value, 'token')
+
+  if (typeof txidValue !== 'string') throw new Error('Invalid UTXO txid')
+  const txid = txidValue.toLowerCase()
+  if (!isCanonical32ByteHashHex(txid)) throw new Error('Invalid UTXO txid')
+  if (
+    typeof outIdx !== 'number' ||
+    !Number.isSafeInteger(outIdx) ||
+    outIdx < 0 ||
+    outIdx > 0xffffffff
+  ) {
+    throw new Error('Invalid UTXO output index')
+  }
+  if (typeof sats !== 'bigint' || sats <= 0n || sats > 0xffffffffffffffffn) {
+    throw new Error('Invalid UTXO sats')
+  }
+  if (typeof lockingScriptValue !== 'string') throw new Error('Invalid UTXO locking script')
+  const lockingScriptHex = lockingScriptValue.toLowerCase()
+  if (
+    lockingScriptHex.length === 0 ||
+    lockingScriptHex.length % 2 !== 0 ||
+    !/^[0-9a-f]+$/.test(lockingScriptHex)
+  ) {
+    throw new Error('Invalid UTXO locking script')
+  }
+
+  return Object.freeze({
+    txid,
+    outIdx,
+    sats,
+    lockingScriptHex,
+    // Planning and revalidation only distinguish pure XEC from token-bearing
+    // UTXOs. Never retain an arbitrary nested token object from the provider.
+    token: token == null ? null : true
+  })
 }
 
 function isCanonical32ByteHashHex(value: unknown): value is string {

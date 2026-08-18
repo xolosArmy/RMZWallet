@@ -40,6 +40,7 @@ const NON_FIXTURE_P2PKH_LOCKING_SCRIPT_HEX =
 const NO_AUDIT_OVERRIDE = Symbol('NO_AUDIT_OVERRIDE')
 const NO_BROADCAST_FAILURE = Symbol('NO_BROADCAST_FAILURE')
 const NO_ATTESTATION_OVERRIDE = Symbol('NO_ATTESTATION_OVERRIDE')
+const NO_UTXO_OVERRIDE = Symbol('NO_UTXO_OVERRIDE')
 const DEFAULT_REQUEST: Tm1PublicationRequest = Object.freeze({
   message: 'TM1 orchestrator regtest publication',
   activeLockingScriptHex: TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
@@ -98,6 +99,33 @@ function awaitCooperativeAudit<T>(
     const onAbort = () => {
       cleanup()
       reject(new Tm1PublicationError('ABORTED'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    deferred.promise.then(
+      value => {
+        cleanup()
+        resolve(value)
+      },
+      error => {
+        cleanup()
+        reject(error)
+      }
+    )
+  })
+}
+
+function awaitCooperativeUtxos<T>(
+  deferred: Deferred<T>,
+  signal?: AbortSignal
+): Promise<T> {
+  if (signal?.aborted) return Promise.reject(signal.reason)
+  if (signal === undefined) return deferred.promise
+
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', onAbort)
+    const onAbort = () => {
+      cleanup()
+      reject(signal.reason)
     }
     signal.addEventListener('abort', onAbort, { once: true })
     deferred.promise.then(
@@ -275,6 +303,7 @@ function cloneUtxos(utxos: readonly Tm1Draft02FreshUtxo[]): Tm1Draft02FreshUtxo[
 function createHarness() {
   let ids = 0
   let utxos = cloneUtxos(fixtureUtxos())
+  let utxoOverride: unknown = NO_UTXO_OVERRIDE
   let chainIdentity = 'tm1-regtest-chain'
   let attestationOverride: unknown = NO_ATTESTATION_OVERRIDE
   let signingDecision: unknown = Object.freeze({
@@ -303,6 +332,7 @@ function createHarness() {
   let cooperativeAudit = false
   const auditSignals: Array<AbortSignal | undefined> = []
   let utxoDeferred: Deferred<readonly Tm1Draft02FreshUtxo[]> | null = null
+  let cooperativeUtxos = false
   let onSigningAuthorization: (() => void) | null = null
   let onBroadcastAuthorization: (() => void) | null = null
   let broadcastDeferred: Deferred<Tm1RegtestDeliveryReceipt> | null = null
@@ -342,7 +372,18 @@ function createHarness() {
         calls.utxos += 1
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (utxoFailure) throw utxoFailure
-        if (utxoDeferred) return utxoDeferred.promise
+        if (utxoDeferred) {
+          const deferred = utxoDeferred
+          if (cooperativeUtxos) {
+            utxoDeferred = null
+            cooperativeUtxos = false
+            return awaitCooperativeUtxos(deferred, signal)
+          }
+          return deferred.promise
+        }
+        if (utxoOverride !== NO_UTXO_OVERRIDE) {
+          return utxoOverride as readonly Tm1Draft02FreshUtxo[]
+        }
         return Object.freeze(cloneUtxos(utxos))
       }
     },
@@ -451,6 +492,7 @@ function createHarness() {
     dependencies,
     calls,
     setUtxos: (next: readonly Tm1Draft02FreshUtxo[]) => { utxos = cloneUtxos(next) },
+    setResolvedUtxos: (next: unknown) => { utxoOverride = next },
     setChainIdentity: (next: string) => { chainIdentity = next },
     setAttestation: (next: unknown) => { attestationOverride = next },
     setSigningDecision: (next: unknown) => { signingDecision = next },
@@ -509,6 +551,11 @@ function createHarness() {
     },
     deferUtxos: () => {
       utxoDeferred = createDeferred<readonly Tm1Draft02FreshUtxo[]>()
+      return utxoDeferred
+    },
+    deferCooperativeUtxos: () => {
+      utxoDeferred = createDeferred<readonly Tm1Draft02FreshUtxo[]>()
+      cooperativeUtxos = true
       return utxoDeferred
     }
   }
@@ -4093,6 +4140,286 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.orchestrator.getState()).toMatchObject({
       status: 'failed',
       error: { code: 'PREPARATION_FAILED' }
+    })
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+  })
+
+  test('contains a resolved UTXO collection before iterator or property access reaches planning', async () => {
+    const harness = createHarness()
+    const trapCalls = { iterator: 0, map: 0, descriptor: 0 }
+    const collection = new Proxy(fixtureUtxos(), {
+      get(target, key, receiver) {
+        // Promise resolution is allowed to probe then; unsafe collection APIs are not.
+        if (key === 'then') return undefined
+        if (key === Symbol.iterator) {
+          trapCalls.iterator += 1
+          throw new Error('UTXO iterator trap must not reach planning')
+        }
+        if (key === 'map') {
+          trapCalls.map += 1
+          throw new Error('UTXO map trap must not reach planning')
+        }
+        return Reflect.get(target, key, receiver)
+      },
+      getOwnPropertyDescriptor(target, key) {
+        if (key === '0') {
+          trapCalls.descriptor += 1
+          throw new Error('UTXO collection descriptor trap')
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      }
+    })
+    harness.setResolvedUtxos(collection)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(trapCalls).toEqual({ iterator: 0, map: 0, descriptor: 1 })
+    expect(harness.calls.signer).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'preparing',
+      error: { code: 'PREPARATION_FAILED' }
+    })
+  })
+
+  test('contains a hostile Proxy thrown while snapshotting a resolved UTXO collection', async () => {
+    const harness = createHarness()
+    const secondaryTrapCalls = { getPrototypeOf: 0, get: 0, ownKeys: 0, descriptor: 0 }
+    const hostileThrownValue = new Proxy({}, {
+      getPrototypeOf() {
+        secondaryTrapCalls.getPrototypeOf += 1
+        throw new Error('secondary UTXO prototype trap')
+      },
+      get() {
+        secondaryTrapCalls.get += 1
+        throw new Error('secondary UTXO get trap')
+      },
+      ownKeys() {
+        secondaryTrapCalls.ownKeys += 1
+        throw new Error('secondary UTXO ownKeys trap')
+      },
+      getOwnPropertyDescriptor() {
+        secondaryTrapCalls.descriptor += 1
+        throw new Error('secondary UTXO descriptor trap')
+      }
+    })
+    const collection = new Proxy(fixtureUtxos(), {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === '0') throw hostileThrownValue
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      }
+    })
+    harness.setResolvedUtxos(collection)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(secondaryTrapCalls.getPrototypeOf).toBe(0)
+    expect(secondaryTrapCalls.get).toBe(0)
+    expect(secondaryTrapCalls.ownKeys).toBeGreaterThan(0)
+    expect(secondaryTrapCalls.descriptor).toBeGreaterThan(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'preparing',
+      error: { code: 'PREPARATION_FAILED' }
+    })
+    expect(() => harness.orchestrator.reset()).not.toThrow()
+    harness.setResolvedUtxos(fixtureUtxos())
+    await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
+      message: DEFAULT_REQUEST.message
+    })
+  })
+
+  test('does not invoke ownKeys while snapshotting a valid resolved UTXO collection', async () => {
+    const harness = createHarness()
+    let ownKeysCalls = 0
+    harness.setResolvedUtxos(new Proxy(fixtureUtxos(), {
+      ownKeys() {
+        ownKeysCalls += 1
+        throw new Error('UTXO ownKeys trap must not execute')
+      }
+    }))
+
+    await expect(harness.orchestrator.prepare(DEFAULT_REQUEST)).resolves.toMatchObject({
+      candidate: { inputs: expect.any(Array) }
+    })
+
+    expect(ownKeysCalls).toBe(0)
+    expect(harness.orchestrator.getState().status).toBe('reviewReady')
+  })
+
+  test('rejects an accessor-backed UTXO array element without invoking its getter', async () => {
+    const harness = createHarness()
+    let getterCalls = 0
+    const collection: unknown[] = []
+    Object.defineProperty(collection, '0', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterCalls += 1
+        throw new Error('UTXO element getter must not execute')
+      }
+    })
+    collection.length = 1
+    harness.setResolvedUtxos(collection)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(getterCalls).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'preparing'
+    })
+  })
+
+  test.each([
+    ['a throwing field getter', (): { value: unknown; trapCalls: () => number; expectedCalls: number } => {
+      let getterCalls = 0
+      const utxo = { ...fixtureUtxos()[0] }
+      Object.defineProperty(utxo, 'txid', {
+        get() {
+          getterCalls += 1
+          throw new Error('UTXO field getter must not execute')
+        }
+      })
+      return { value: [utxo], trapCalls: () => getterCalls, expectedCalls: 0 }
+    }],
+    ['a hostile descriptor Proxy', (): { value: unknown; trapCalls: () => number; expectedCalls: number } => {
+      let descriptorCalls = 0
+      const utxo = new Proxy(fixtureUtxos()[0], {
+        getOwnPropertyDescriptor() {
+          descriptorCalls += 1
+          throw new Error('UTXO object descriptor trap')
+        }
+      })
+      return { value: [utxo], trapCalls: () => descriptorCalls, expectedCalls: 1 }
+    }]
+  ] as const)(
+    'rejects a normal collection containing %s before planning',
+    async (_label, createHostileEntry) => {
+      const harness = createHarness()
+      const hostile = createHostileEntry()
+      harness.setResolvedUtxos(hostile.value)
+
+      await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+      expect(hostile.trapCalls()).toBe(hostile.expectedCalls)
+      expect(harness.calls.signer).toBe(0)
+      expect(harness.orchestrator.getState()).toMatchObject({
+        status: 'failed',
+        stage: 'preparing'
+      })
+    }
+  )
+
+  test.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a primitive', 7],
+    ['a non-array object', {}],
+    ['a sparse array', new Array(1)],
+    ['a null entry', [null]],
+    ['a missing-field entry', [{}]],
+    ['an invalid txid', [{ ...fixtureUtxos()[0], txid: 'not-a-txid' }]],
+    ['an invalid output index', [{ ...fixtureUtxos()[0], outIdx: -1 }]],
+    ['an out-of-range output index', [{ ...fixtureUtxos()[0], outIdx: 0x1_0000_0000 }]],
+    ['an invalid satoshi value', [{ ...fixtureUtxos()[0], sats: 0n }]],
+    ['an out-of-range satoshi value', [{ ...fixtureUtxos()[0], sats: 0x1_0000_0000_0000_0000n }]],
+    ['an invalid locking script', [{ ...fixtureUtxos()[0], lockingScriptHex: 'not-hex' }]]
+  ])('rejects resolved UTXO collection with %s', async (_label, resolvedValue) => {
+    const harness = createHarness()
+    harness.setResolvedUtxos(resolvedValue)
+
+    await expectCode(harness.orchestrator.prepare(DEFAULT_REQUEST), 'PREPARATION_FAILED')
+
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'preparing',
+      error: { code: 'PREPARATION_FAILED' }
+    })
+    expect(harness.calls.signer).toBe(0)
+  })
+
+  test('isolates the planner, review, and state from provider UTXO mutation', async () => {
+    const harness = createHarness()
+    const pureUtxo = { ...fixtureUtxos()[0] }
+    const nestedToken = { nested: { category: 'external-token' } }
+    const tokenUtxo = { ...fixtureUtxos()[1], token: nestedToken }
+    const providerCollection = [pureUtxo, tokenUtxo]
+    harness.setResolvedUtxos(providerCollection)
+
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const originalInput = { ...review.candidate.inputs[0] }
+
+    pureUtxo.txid = 'ff'.repeat(32)
+    pureUtxo.outIdx = 99
+    pureUtxo.sats = 1n
+    pureUtxo.lockingScriptHex = '00'
+    nestedToken.nested.category = 'mutated-token'
+    providerCollection.length = 0
+
+    expect(review.candidate.inputs[0]).toEqual(originalInput)
+    expect(review.candidate.inputs[0].txid).toBe(TXID_A)
+    const state = harness.orchestrator.getState()
+    expect(state.status).toBe('reviewReady')
+    if (state.status !== 'reviewReady') throw new Error('expected review')
+    expect(state.review.candidate.inputs[0]).toEqual(originalInput)
+    expect(state.review.candidate.inputs).toHaveLength(1)
+  })
+
+  test.each([
+    ['a hostile collection descriptor', (): unknown => new Proxy(fixtureUtxos(), {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === '0') throw new Error('fresh UTXO descriptor trap')
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      }
+    })],
+    ['an accessor-backed entry', (): unknown => {
+      const collection: unknown[] = []
+      Object.defineProperty(collection, '0', {
+        get() {
+          throw new Error('fresh UTXO element getter must not execute')
+        }
+      })
+      collection.length = 1
+      return collection
+    }],
+    ['a malformed collection', (): unknown => null]
+  ] as const)(
+    'contains resolved UTXO revalidation with %s',
+    async (_label, createResolvedValue) => {
+      const harness = createHarness()
+      const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+      harness.setResolvedUtxos(createResolvedValue())
+
+      await expectCode(
+        harness.orchestrator.authorizeAndSign(review.preparedId),
+        'CANDIDATE_REVALIDATION_FAILED'
+      )
+
+      expect(harness.calls.signer).toBe(0)
+      expect(harness.orchestrator.getState()).toMatchObject({
+        status: 'failed',
+        stage: 'revalidating',
+        error: { code: 'CANDIDATE_REVALIDATION_FAILED' }
+      })
+      expect(() => harness.orchestrator.reset()).not.toThrow()
+    }
+  )
+
+  test('classifies a cooperative UTXO signal.reason abort as ABORTED and releases the operation', async () => {
+    const harness = createHarness()
+    harness.deferCooperativeUtxos()
+    const controller = new AbortController()
+    const promise = harness.orchestrator.prepare(DEFAULT_REQUEST, controller.signal)
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.calls.utxos).toBe(1)
+    controller.abort()
+
+    await expectCode(promise, 'ABORTED')
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'aborted',
+      stage: 'preparing'
     })
     expect(() => harness.orchestrator.reset()).not.toThrow()
   })
