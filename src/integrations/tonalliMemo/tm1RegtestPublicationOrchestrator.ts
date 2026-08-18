@@ -43,6 +43,7 @@ export type Tm1PublicationErrorCode =
   | 'PREPARATION_FAILED'
   | 'SIGNING_REJECTED'
   | 'SIGNING_AUTHORIZATION_EXPIRED'
+  | 'SIGNING_AUTHORIZATION_INVALID'
   | 'CANDIDATE_REVALIDATION_FAILED'
   | 'SIGNING_FAILED'
   | 'SIGNED_ARTIFACT_INVALID'
@@ -72,7 +73,12 @@ export type Tm1PublicationRequest = Readonly<{
 }>
 
 export type Tm1PublicationAuthorizationDecision = Readonly<
-  | { status: 'approved'; authorizationId: string }
+  | {
+    status: 'approved'
+    authorizationId: string
+    preparedId: string
+    bindingHash: string
+  }
   | { status: 'rejected'; reason?: string }
   | { status: 'expired'; reason?: string }
 >
@@ -126,6 +132,12 @@ export type Tm1PreparedReview = Readonly<{
   orderedInputs: readonly Tm1PublicationInput[]
   orderedOutputs: readonly Tm1PublicationOutput[]
   feeSats: bigint
+}>
+
+export type Tm1SigningAuthorizationRequest = Readonly<{
+  preparedId: string
+  bindingHash: string
+  review: Tm1PreparedReview
 }>
 
 export type Tm1SignedReview = Readonly<{
@@ -208,7 +220,7 @@ export interface Tm1UtxoProviderPort {
 
 export interface Tm1SigningAuthorizationPort {
   requestSigningAuthorization(
-    review: Tm1PreparedReview,
+    request: Tm1SigningAuthorizationRequest,
     signal?: AbortSignal
   ): Promise<Tm1PublicationAuthorizationDecision>
 }
@@ -407,17 +419,26 @@ implements Tm1RegtestPublicationOrchestrator {
       assertNotAborted(signal)
       this.transition({ status: 'authorizing', review })
       assertNotAborted(signal)
-      let decision: Tm1PublicationAuthorizationDecision
+      let authorizationResult: unknown
       try {
-        const authorizationResult = await this.dependencies.signingAuthorization.requestSigningAuthorization(
-          freezePreparedReview(review),
+        authorizationResult = await this.dependencies.signingAuthorization.requestSigningAuthorization(
+          freezeSigningAuthorizationRequest(review),
           signal
         )
         assertNotAborted(signal)
-        decision = snapshotSigningAuthorizationDecision(authorizationResult)
       } catch (error) {
         if (isAbortLike(error)) throw error
         throw new Tm1PublicationError('SIGNING_FAILED', 'SIGNING_FAILED', error)
+      }
+      let decision: Tm1PublicationAuthorizationDecision
+      try {
+        decision = snapshotSigningAuthorizationDecision(authorizationResult)
+      } catch (error) {
+        throw new Tm1PublicationError(
+          'SIGNING_AUTHORIZATION_INVALID',
+          'SIGNING_AUTHORIZATION_INVALID',
+          error
+        )
       }
       if (decision.status === 'rejected') {
         this.transition(rejectedState('signing', decision.reason))
@@ -429,6 +450,10 @@ implements Tm1RegtestPublicationOrchestrator {
           'SIGNING_AUTHORIZATION_EXPIRED',
           decision.reason ?? 'SIGNING_AUTHORIZATION_EXPIRED'
         )
+      }
+
+      if (!isSigningAuthorizationBound(decision, review)) {
+        throw new Tm1PublicationError('SIGNING_AUTHORIZATION_INVALID')
       }
 
       const signingAuthorizationId = decision.authorizationId
@@ -884,9 +909,15 @@ async function auditSignedArtifact(input: Readonly<{
 function snapshotSigningAuthorizationDecision(value: unknown): Tm1PublicationAuthorizationDecision {
   const status = readRequiredOwnDataProperty(value, 'status')
   if (status === 'approved') {
+    const bindingHash = readRequiredNonEmptyString(value, 'bindingHash')
+    if (!isCanonical32ByteHashHex(bindingHash)) {
+      throw new Error('Invalid signing authorization binding hash')
+    }
     return Object.freeze({
       status,
-      authorizationId: readRequiredNonEmptyString(value, 'authorizationId')
+      authorizationId: readRequiredNonEmptyString(value, 'authorizationId'),
+      preparedId: readRequiredNonEmptyString(value, 'preparedId'),
+      bindingHash
     })
   }
   if (status === 'rejected' || status === 'expired') {
@@ -1168,6 +1199,17 @@ function freezePublicationRequest(request: Tm1PublicationRequest): Tm1Publicatio
   })
 }
 
+function freezeSigningAuthorizationRequest(
+  review: Tm1PreparedReview
+): Tm1SigningAuthorizationRequest {
+  const reviewSnapshot = freezePreparedReview(review)
+  return Object.freeze({
+    preparedId: reviewSnapshot.preparedId,
+    bindingHash: reviewSnapshot.bindingHash,
+    review: reviewSnapshot
+  })
+}
+
 function assertCandidateStillValid(
   review: Tm1PreparedReview,
   freshUtxos: readonly Tm1Draft02FreshUtxo[]
@@ -1183,6 +1225,14 @@ function assertBindingUnchanged(review: Tm1PreparedReview): void {
   if (hashBytes(encodeTm1Draft02CandidateEffectiveContent(review.candidate)) !== review.bindingHash) {
     throw new Tm1PublicationError('CANDIDATE_REVALIDATION_FAILED')
   }
+}
+
+function isSigningAuthorizationBound(
+  decision: Extract<Tm1PublicationAuthorizationDecision, { status: 'approved' }>,
+  review: Tm1PreparedReview
+): boolean {
+  return decision.preparedId === review.preparedId &&
+    decision.bindingHash === review.bindingHash
 }
 
 function isBroadcastAuthorizationBound(
@@ -1623,6 +1673,7 @@ function isTm1PublicationErrorCode(value: unknown): value is Tm1PublicationError
     case 'PREPARATION_FAILED':
     case 'SIGNING_REJECTED':
     case 'SIGNING_AUTHORIZATION_EXPIRED':
+    case 'SIGNING_AUTHORIZATION_INVALID':
     case 'CANDIDATE_REVALIDATION_FAILED':
     case 'SIGNING_FAILED':
     case 'SIGNED_ARTIFACT_INVALID':

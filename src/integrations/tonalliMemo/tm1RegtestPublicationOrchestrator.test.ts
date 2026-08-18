@@ -28,6 +28,7 @@ import {
   type Tm1PublicationRequest,
   type Tm1PublicationState,
   type Tm1RegtestPublicationDependencies,
+  type Tm1SigningAuthorizationRequest,
   type Tm1SignedReview
 } from './tm1RegtestPublicationOrchestrator'
 
@@ -306,10 +307,7 @@ function createHarness() {
   let utxoOverride: unknown = NO_UTXO_OVERRIDE
   let chainIdentity = 'tm1-regtest-chain'
   let attestationOverride: unknown = NO_ATTESTATION_OVERRIDE
-  let signingDecision: unknown = Object.freeze({
-    status: 'approved',
-    authorizationId: 'sign-auth-1'
-  })
+  let signingDecision: unknown = null
   let signingAuthorizationDeferred: Deferred<Tm1PublicationAuthorizationDecision> | null = null
   let broadcastDecision: unknown = null
   let broadcastAuthorizationFailure: unknown = null
@@ -331,6 +329,7 @@ function createHarness() {
   let auditDeferred: Deferred<RegtestSignedTransaction> | null = null
   let cooperativeAudit = false
   const auditSignals: Array<AbortSignal | undefined> = []
+  const signingAuthorizationRequests: Tm1SigningAuthorizationRequest[] = []
   let utxoDeferred: Deferred<readonly Tm1Draft02FreshUtxo[]> | null = null
   let cooperativeUtxos = false
   let onSigningAuthorization: (() => void) | null = null
@@ -388,13 +387,19 @@ function createHarness() {
       }
     },
     signingAuthorization: {
-      async requestSigningAuthorization(_review, signal?: AbortSignal) {
+      async requestSigningAuthorization(request, signal?: AbortSignal) {
         calls.signingAuthorization += 1
+        signingAuthorizationRequests.push(request)
         onSigningAuthorization?.()
         if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
         if (signingAuthorizationFailure) throw signingAuthorizationFailure
         if (signingAuthorizationDeferred) return signingAuthorizationDeferred.promise
-        return signingDecision as Tm1PublicationAuthorizationDecision
+        return (signingDecision ?? Object.freeze({
+          status: 'approved',
+          authorizationId: 'sign-auth-1',
+          preparedId: request.preparedId,
+          bindingHash: request.bindingHash
+        })) as Tm1PublicationAuthorizationDecision
       }
     },
     signer: {
@@ -528,6 +533,7 @@ function createHarness() {
     getLastBroadcastArtifact: () => lastBroadcastArtifact,
     getAuditArtifacts: () => [...auditArtifacts],
     getAuditSignals: () => [...auditSignals],
+    getSigningAuthorizationRequests: () => [...signingAuthorizationRequests],
     deferConfirmation: () => {
       confirmationDeferred = createDeferred<Tm1Confirmation>()
       return confirmationDeferred
@@ -797,7 +803,9 @@ describe('TM1 regtest publication orchestrator', () => {
     }
     authorization.resolve(Object.freeze({
       status: 'approved',
-      authorizationId: 'sign-auth-snapshotted'
+      authorizationId: 'sign-auth-snapshotted',
+      preparedId: review.preparedId,
+      bindingHash: review.bindingHash
     }))
 
     await expect(promise).resolves.toMatchObject({ preparedId: review.preparedId })
@@ -1031,6 +1039,32 @@ describe('TM1 regtest publication orchestrator', () => {
     expect(harness.calls.broadcast).toBe(0)
   })
 
+  test('binds a nominal signing approval to the exact prepared review request', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+
+    const signedReview = await harness.orchestrator.authorizeAndSign(review.preparedId)
+
+    expect(harness.getSigningAuthorizationRequests()).toHaveLength(1)
+    const [request] = harness.getSigningAuthorizationRequests()
+    expect(request).toMatchObject({
+      preparedId: review.preparedId,
+      bindingHash: review.bindingHash,
+      review: {
+        preparedId: review.preparedId,
+        bindingHash: review.bindingHash
+      }
+    })
+    expect(Object.isFrozen(request)).toBe(true)
+    expect(harness.calls.signer).toBe(1)
+    expect(signedReview).toMatchObject({
+      preparedId: review.preparedId,
+      bindingHash: review.bindingHash,
+      signingAuthorizationId: 'sign-auth-1'
+    })
+    expect(harness.orchestrator.getState().status).toBe('signedReviewReady')
+  })
+
   test('handles rejected signing authorization as a typed terminal state', async () => {
     const harness = createHarness()
     const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
@@ -1052,16 +1086,220 @@ describe('TM1 regtest publication orchestrator', () => {
   })
 
   test.each([
-    ['an unrecognized status', { status: 'unknown', authorizationId: 'must-not-authorize' }],
-    ['an approved decision without a valid id', { status: 'approved', authorizationId: '' }]
-  ])('rejects malformed signing authorization with %s', async (_label, decision) => {
+    ['an unrecognized status', (review: { preparedId: string; bindingHash: string }) => ({
+      status: 'unknown',
+      authorizationId: 'must-not-authorize',
+      preparedId: review.preparedId,
+      bindingHash: review.bindingHash
+    })],
+    ['an approved decision without a valid id', (review: { preparedId: string; bindingHash: string }) => ({
+      status: 'approved',
+      authorizationId: '',
+      preparedId: review.preparedId,
+      bindingHash: review.bindingHash
+    })],
+    ['an approved decision without preparedId', (review: { bindingHash: string }) => ({
+      status: 'approved',
+      authorizationId: 'sign-auth-missing-prepared-id',
+      bindingHash: review.bindingHash
+    })],
+    ['an approved decision without bindingHash', (review: { preparedId: string }) => ({
+      status: 'approved',
+      authorizationId: 'sign-auth-missing-binding-hash',
+      preparedId: review.preparedId
+    })],
+    ['an approved decision with a malformed bindingHash', (review: { preparedId: string }) => ({
+      status: 'approved',
+      authorizationId: 'sign-auth-malformed-binding-hash',
+      preparedId: review.preparedId,
+      bindingHash: 'not-a-canonical-hash'
+    })]
+  ])('rejects malformed signing authorization with %s', async (_label, makeDecision) => {
     const harness = createHarness()
     const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
-    harness.setSigningDecision(decision)
+    harness.setSigningDecision(makeDecision(review))
 
-    await expectCode(harness.orchestrator.authorizeAndSign(review.preparedId), 'SIGNING_FAILED')
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'SIGNING_AUTHORIZATION_INVALID'
+    )
     expect(harness.calls.signer).toBe(0)
     expect(harness.orchestrator.getState()).toMatchObject({ status: 'failed', stage: 'authorizing' })
+  })
+
+  test.each([
+    ['the same preparedId but a different bindingHash', (review: Tm1SigningAuthorizationRequest) => ({
+      preparedId: review.preparedId,
+      bindingHash: '11'.repeat(32)
+    })],
+    ['a different preparedId but the current bindingHash', (review: Tm1SigningAuthorizationRequest) => ({
+      preparedId: `${review.preparedId}-stale`,
+      bindingHash: review.bindingHash
+    })]
+  ])('rejects signing approval bound to %s', async (_label, makeBinding) => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.setSigningDecision(Object.freeze({
+      status: 'approved',
+      authorizationId: 'sign-auth-wrong-binding',
+      ...makeBinding({
+        preparedId: review.preparedId,
+        bindingHash: review.bindingHash,
+        review
+      })
+    }))
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'SIGNING_AUTHORIZATION_INVALID'
+    )
+
+    expect(harness.calls.attest).toBe(1)
+    expect(harness.calls.utxos).toBe(1)
+    expect(harness.calls.signer).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'authorizing'
+    })
+  })
+
+  test.each(['authorizationId', 'preparedId', 'bindingHash'] as const)(
+    'does not invoke a hostile %s accessor on an approved signing decision',
+    async property => {
+      const harness = createHarness()
+      const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+      let getterCalls = 0
+      const decision: Record<string, unknown> = {
+        status: 'approved',
+        authorizationId: 'sign-auth-hostile-accessor',
+        preparedId: review.preparedId,
+        bindingHash: review.bindingHash
+      }
+      Object.defineProperty(decision, property, {
+        configurable: true,
+        get() {
+          getterCalls += 1
+          throw new Error('signing authorization getter must not execute')
+        }
+      })
+      harness.setSigningDecision(decision)
+
+      await expectCode(
+        harness.orchestrator.authorizeAndSign(review.preparedId),
+        'SIGNING_AUTHORIZATION_INVALID'
+      )
+
+      expect(getterCalls).toBe(0)
+      expect(harness.calls.signer).toBe(0)
+      expect(harness.orchestrator.getState()).toMatchObject({
+        status: 'failed',
+        stage: 'authorizing'
+      })
+    }
+  )
+
+  test('contains a signing decision Proxy with a hostile descriptor trap', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    let descriptorCalls = 0
+    harness.setSigningDecision(new Proxy({}, {
+      getOwnPropertyDescriptor() {
+        descriptorCalls += 1
+        throw new Error('signing authorization descriptor trap must not escape')
+      }
+    }))
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(review.preparedId),
+      'SIGNING_AUTHORIZATION_INVALID'
+    )
+
+    expect(descriptorCalls).toBe(1)
+    expect(harness.calls.signer).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'authorizing'
+    })
+  })
+
+  test('never invokes getPrototypeOf while validating a signing decision Proxy', async () => {
+    const harness = createHarness()
+    const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    let getPrototypeOfCalls = 0
+    harness.setSigningDecision(new Proxy({
+      status: 'approved',
+      authorizationId: 'sign-auth-proxy',
+      preparedId: review.preparedId,
+      bindingHash: review.bindingHash
+    }, {
+      getPrototypeOf() {
+        getPrototypeOfCalls += 1
+        throw new Error('signing authorization prototype trap must not execute')
+      }
+    }))
+
+    await expect(harness.orchestrator.authorizeAndSign(review.preparedId)).resolves.toMatchObject({
+      preparedId: review.preparedId,
+      signingAuthorizationId: 'sign-auth-proxy'
+    })
+
+    expect(getPrototypeOfCalls).toBe(0)
+    expect(harness.calls.signer).toBe(1)
+  })
+
+  test('rejects a cached approval for a different prepared identity after reset', async () => {
+    const harness = createHarness()
+    const firstReview = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    const cachedApproval = Object.freeze({
+      status: 'approved',
+      authorizationId: 'sign-auth-cached-first-review',
+      preparedId: firstReview.preparedId,
+      bindingHash: firstReview.bindingHash
+    })
+    harness.orchestrator.reset()
+    const secondReview = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    expect(secondReview.preparedId).not.toBe(firstReview.preparedId)
+    expect(secondReview.bindingHash).toBe(firstReview.bindingHash)
+    harness.setSigningDecision(cachedApproval)
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(secondReview.preparedId),
+      'SIGNING_AUTHORIZATION_INVALID'
+    )
+
+    expect(harness.calls.signer).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'authorizing'
+    })
+  })
+
+  test('rejects an old content binding even when the adapter reports the current preparedId', async () => {
+    const harness = createHarness()
+    const firstReview = await harness.orchestrator.prepare(DEFAULT_REQUEST)
+    harness.orchestrator.reset()
+    const changedReview = await harness.orchestrator.prepare(Object.freeze({
+      ...DEFAULT_REQUEST,
+      message: `${DEFAULT_REQUEST.message} with changed approved content`
+    }))
+    expect(changedReview.bindingHash).not.toBe(firstReview.bindingHash)
+    harness.setSigningDecision(Object.freeze({
+      status: 'approved',
+      authorizationId: 'sign-auth-old-content',
+      preparedId: changedReview.preparedId,
+      bindingHash: firstReview.bindingHash
+    }))
+
+    await expectCode(
+      harness.orchestrator.authorizeAndSign(changedReview.preparedId),
+      'SIGNING_AUTHORIZATION_INVALID'
+    )
+
+    expect(harness.calls.signer).toBe(0)
+    expect(harness.orchestrator.getState()).toMatchObject({
+      status: 'failed',
+      stage: 'authorizing'
+    })
   })
 
   test('rejects a mutated UTXO after review approval', async () => {
@@ -1467,7 +1705,12 @@ describe('TM1 regtest publication orchestrator', () => {
   test('snapshots approved signing authorization before re-attestation awaits', async () => {
     const harness = createHarness()
     const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
-    const mutableDecision = { status: 'approved' as const, authorizationId: 'auth-original' }
+    const mutableDecision = {
+      status: 'approved' as const,
+      authorizationId: 'auth-original',
+      preparedId: review.preparedId,
+      bindingHash: review.bindingHash
+    }
     const attestation = harness.deferAttestation()
     const observedAuthorizationIds: string[] = []
     harness.setSigningDecision(mutableDecision)
@@ -1504,7 +1747,12 @@ describe('TM1 regtest publication orchestrator', () => {
   test('keeps signing authorization when provider mutates approved id to undefined', async () => {
     const harness = createHarness()
     const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
-    const mutableDecision = { status: 'approved' as const, authorizationId: 'auth-original' }
+    const mutableDecision = {
+      status: 'approved' as const,
+      authorizationId: 'auth-original',
+      preparedId: review.preparedId,
+      bindingHash: review.bindingHash
+    }
     const attestation = harness.deferAttestation()
     harness.setSigningDecision(mutableDecision)
 
@@ -1525,7 +1773,12 @@ describe('TM1 regtest publication orchestrator', () => {
   test('keeps signing authorization stable during pending signing and later object reuse', async () => {
     const harness = createHarness()
     const review = await harness.orchestrator.prepare(DEFAULT_REQUEST)
-    const mutableDecision = { status: 'approved' as const, authorizationId: 'auth-original' }
+    const mutableDecision = {
+      status: 'approved' as const,
+      authorizationId: 'auth-original',
+      preparedId: review.preparedId,
+      bindingHash: review.bindingHash
+    }
     const signer = harness.deferSigner()
     harness.setSigningDecision(mutableDecision)
 
