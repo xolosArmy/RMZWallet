@@ -740,6 +740,91 @@ describe('universal authorization-only grants', () => {
     ])
   })
 
+  test('publishes a grant when the effective terminal remains authorized before expiry', async () => {
+    let consumed = false
+    const events: string[] = []
+    const lock = new InstrumentedLock(events)
+    const ledger: ApprovalConsumptionLedger = {
+      async consume() {
+        consumed = true
+      }
+    }
+    const core = new UniversalAuthorizationCore({
+      enabled: true,
+      lock,
+      approvalLedger: ledger,
+      now: () => consumed ? TEST_NOW + 99 : TEST_NOW,
+      createCapabilityId: operationId => `${operationId}:before-expiry`
+    })
+    const adapter = reviewAuthorizationAdapter(events)
+    const handle = core.startAuthorization(
+      envelope('authorization-before-expiry', 100),
+      adapter
+    )
+    await handle.ready
+
+    await expect(handle.authorize()).resolves.toMatchObject({
+      authorizationId: 'authorization-before-expiry:before-expiry'
+    })
+    expect(handle.state()).toBe('authorized')
+    expect(core.activeOperationId).toBeNull()
+  })
+
+  test('does not publish a consumed grant when expiry wins terminalization', async () => {
+    const events: string[] = []
+    const lock = new InstrumentedLock(events)
+    const records = new Map<string, ApprovalConsumption>()
+    let consumed = false
+    let postConsumeClockReads = 0
+    const now = () => {
+      if (!consumed) return TEST_NOW
+      postConsumeClockReads += 1
+      return postConsumeClockReads === 1 ? TEST_NOW : TEST_NOW + 100
+    }
+    const ledger: ApprovalConsumptionLedger = {
+      async consume(consumption) {
+        if (records.has(consumption.operationId)) {
+          throw new UniversalAuthorizationError('APPROVAL_ALREADY_CONSUMED')
+        }
+        records.set(consumption.operationId, consumption)
+        consumed = true
+      }
+    }
+    const core = new UniversalAuthorizationCore({
+      enabled: true,
+      lock,
+      approvalLedger: ledger,
+      now,
+      createCapabilityId: operationId => `${operationId}:expiry-race`
+    })
+    const adapter = reviewAuthorizationAdapter(events)
+    const first = core.startAuthorization(
+      envelope('authorization-terminal-expiry', 100),
+      adapter
+    )
+    await first.ready
+
+    await expect(first.authorize()).rejects.toThrowError('REQUEST_EXPIRED')
+
+    expect(first.state()).toBe('expired')
+    expect(first.history().at(-1)).toBe('expired')
+    expect(records.get('authorization-terminal-expiry')?.capabilityId)
+      .toBe('authorization-terminal-expiry:expiry-race')
+    expect(lock.leases.get('authorization-terminal-expiry')?.releaseCalls).toBe(1)
+    expect(core.activeOperationId).toBeNull()
+
+    consumed = false
+    postConsumeClockReads = 0
+    const retry = core.startAuthorization(
+      envelope('authorization-terminal-expiry', 100),
+      adapter
+    )
+    await retry.ready
+    await expect(retry.authorize()).rejects.toThrowError('APPROVAL_ALREADY_CONSUMED')
+    expect(retry.state()).toBe('failed')
+    expect(records).toHaveLength(1)
+  })
+
   test('keeps the existing signing path lifecycle and signer invocation unchanged', async () => {
     const testHarness = harness()
     const handle = testHarness.core.start(envelope('legacy-signing'), testHarness.adapter)
@@ -1000,5 +1085,64 @@ describe('universal authorization-only grants', () => {
     expect(() => handle.authorize()).toThrowError('INVALID_CAPABILITY_ID')
     expect(handle.state()).toBe('failed')
     expect(testHarness.ledger.consumeCalls).toBe(0)
+  })
+
+  test.each([
+    ['Error', () => { throw new Error('hostile capability source') }],
+    ['plain hostile value', () => { throw Object.create(null) }]
+  ])('finalizes and releases authorization ownership when createCapabilityId throws %s', async (
+    _description,
+    createCapabilityId
+  ) => {
+    const testHarness = createAuthorizationHarness({}, { createCapabilityId })
+    const handle = testHarness.core.startAuthorization(
+      envelope('authorization-capability-throw'),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    expect(() => handle.authorize()).toThrowError('INVALID_CAPABILITY_ID')
+
+    expect(handle.state()).toBe('failed')
+    expect(handle.history().at(-1)).toBe('failed')
+    expect(testHarness.core.activeOperationId).toBeNull()
+    expect(testHarness.lock.leases.get('authorization-capability-throw')?.releaseCalls).toBe(1)
+    expect(testHarness.ledger.consumeCalls).toBe(0)
+
+    const retry = testHarness.core.startAuthorization(
+      envelope('authorization-capability-retry'),
+      testHarness.adapter
+    )
+    await retry.ready
+    retry.reject()
+    expect(retry.state()).toBe('rejected')
+  })
+
+  test('finalizes the legacy signing path when createCapabilityId throws', async () => {
+    const testHarness = harness()
+    const core = new UniversalAuthorizationCore({
+      enabled: true,
+      lock: testHarness.lock,
+      approvalLedger: testHarness.ledger,
+      now: Date.now,
+      createCapabilityId: () => { throw new Error('hostile capability source') }
+    })
+    const handle = core.start(
+      envelope('legacy-capability-throw'),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    expect(() => handle.approve()).toThrowError('INVALID_CAPABILITY_ID')
+
+    expect(handle.state()).toBe('failed')
+    expect(core.activeOperationId).toBeNull()
+    expect(testHarness.lock.leases.get('legacy-capability-throw')?.releaseCalls).toBe(1)
+    expect(testHarness.adapter.signApprovedContent).not.toHaveBeenCalled()
+
+    const retry = core.start(envelope('legacy-capability-retry'), testHarness.adapter)
+    await retry.ready
+    retry.reject()
+    expect(retry.state()).toBe('rejected')
   })
 })

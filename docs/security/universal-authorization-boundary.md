@@ -117,6 +117,17 @@ carrera después de que el ledger registró el consumo pero antes de que el
 caller observe el grant, el identificador permanece quemado. El core nunca
 revierte el ledger.
 
+La terminalización efectiva también es autoritativa. Si el reloj cruza
+`expiresAt` después del consumo pero antes de que `authorized` gane, el terminal
+es `expired`, `authorize()` no devuelve un grant y la capacidad consumida sigue
+quemada. No hay rollback ni reutilización aunque el caller nunca haya observado
+el `authorizationId`.
+
+La creación inyectada de capability IDs está dentro del boundary de fallo en
+ambos caminos. Un throw o ID inválido se normaliza, termina el contexto en
+`failed` (o `expired` si ese terminal ganó), libera el lease y elimina la
+operación activa antes de propagar el error seguro.
+
 `startAuthorization` puede enlazar un `AbortSignal` externo antes de iniciar la
 preparación. El handle expone únicamente el `AbortSignal` interno de solo
 lectura, nunca su `AbortController`, para que un decision provider pendiente

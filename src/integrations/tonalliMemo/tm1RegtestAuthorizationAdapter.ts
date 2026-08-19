@@ -274,6 +274,8 @@ implements Tm1SigningAuthorizationPort {
         } catch {
           throw new Tm1RegtestAuthorizationAdapterError('AUTHORIZATION_CORE_FAILED')
         }
+        const terminalAfterReject = classifyTerminal(handle, signal)
+        if (terminalAfterReject) return terminalAfterReject
         assertExternalNotAborted(signal)
         if (safeHandleState(handle) !== 'rejected') {
           throw new Tm1RegtestAuthorizationAdapterError('AUTHORIZATION_CORE_FAILED')

@@ -353,12 +353,7 @@ export class UniversalAuthorizationCore {
       this.enterTerminal(context, 'failed', new UniversalAuthorizationError('INVALID_APPROVAL_CONTEXT'))
       throw new UniversalAuthorizationError('INVALID_APPROVAL_CONTEXT')
     }
-    context.capability = new InMemoryApprovalCapability(
-      context.envelope.operationId,
-      this.createCapabilityId(context.envelope.operationId),
-      context.contentHash,
-      context.envelope.expiresAt
-    )
+    this.createApprovalCapability(context, context.contentHash)
     this.transition(context, 'approving', 'revalidating')
     return this.revalidateAndSign(context)
   }
@@ -369,19 +364,31 @@ export class UniversalAuthorizationCore {
       this.enterTerminal(context, 'failed', new UniversalAuthorizationError('INVALID_APPROVAL_CONTEXT'))
       throw new UniversalAuthorizationError('INVALID_APPROVAL_CONTEXT')
     }
-    const capabilityId = this.createCapabilityId(context.envelope.operationId)
-    if (typeof capabilityId !== 'string' || capabilityId.trim().length === 0) {
-      this.enterTerminal(context, 'failed', new UniversalAuthorizationError('INVALID_CAPABILITY_ID'))
-      throw new UniversalAuthorizationError('INVALID_CAPABILITY_ID')
-    }
-    context.capability = new InMemoryApprovalCapability(
-      context.envelope.operationId,
-      capabilityId,
-      context.contentHash,
-      context.envelope.expiresAt
-    )
+    this.createApprovalCapability(context, context.contentHash)
     this.transition(context, 'approving', 'revalidating')
     return this.revalidateAndAuthorize(context)
+  }
+
+  private createApprovalCapability(
+    context: OperationContext,
+    contentHash: UniversalContentHash
+  ): void {
+    try {
+      const capabilityId = this.createCapabilityId(context.envelope.operationId)
+      if (typeof capabilityId !== 'string' || capabilityId.trim().length === 0) {
+        throw new UniversalAuthorizationError('INVALID_CAPABILITY_ID')
+      }
+      context.capability = new InMemoryApprovalCapability(
+        context.envelope.operationId,
+        capabilityId,
+        contentHash,
+        context.envelope.expiresAt
+      )
+    } catch {
+      const error = new UniversalAuthorizationError('INVALID_CAPABILITY_ID')
+      this.enterTerminal(context, 'failed', error)
+      throw error
+    }
   }
 
   private async revalidateAndAuthorize(
@@ -399,7 +406,12 @@ export class UniversalAuthorizationCore {
         contentHash: approvedHash,
         expiresAt: context.envelope.expiresAt
       })
-      this.enterTerminal(context, 'authorized')
+      const terminal = this.enterTerminal(context, 'authorized')
+      if (terminal !== 'authorized') {
+        throw new UniversalAuthorizationError(
+          terminal === 'expired' ? 'REQUEST_EXPIRED' : 'AUTHORIZATION_NOT_GRANTED'
+        )
+      }
       return grant
     } catch (error) {
       this.failUnlessFinalized(context, error)
@@ -566,15 +578,20 @@ export class UniversalAuthorizationCore {
   private enterTerminal(
     context: OperationContext,
     requestedTerminal: UniversalTerminalState,
-    reason: unknown = new UniversalAuthorizationError(`OPERATION_${requestedTerminal.toUpperCase()}`)
-  ): void {
-    if (context.finalized) return
-    if (this.active !== context || this.active.envelope.operationId !== context.envelope.operationId) return
+    reason?: unknown
+  ): UniversalTerminalState | null {
+    if (context.finalized) return context.state as UniversalTerminalState
+    if (
+      this.active !== context ||
+      this.active.envelope.operationId !== context.envelope.operationId
+    ) return null
     const terminal = context.state !== 'signing' &&
       this.now() >= context.envelope.expiresAt &&
       requestedTerminal !== 'completed'
       ? 'expired'
       : requestedTerminal
+    const terminalReason = reason ??
+      new UniversalAuthorizationError(`OPERATION_${terminal.toUpperCase()}`)
     const allowed = UNIVERSAL_STATE_TRANSITIONS[context.state] as readonly UniversalAuthorizationState[]
     if (!allowed.includes(terminal)) {
       throw new UniversalAuthorizationError('INVALID_STATE_TRANSITION')
@@ -586,13 +603,14 @@ export class UniversalAuthorizationCore {
         !context.lease.isOwned()
       ) throw new UniversalAuthorizationError('LEASE_NOT_OWNED')
     }
-    context.controller.abort(reason)
+    context.controller.abort(terminalReason)
     context.capability?.invalidate()
     context.state = terminal
     context.history.push(terminal)
     context.finalized = true
-    if (!context.ready.isSettled()) context.ready.reject(reason)
+    if (!context.ready.isSettled()) context.ready.reject(terminalReason)
     this.cleanup(context)
+    return terminal
   }
 
   private cleanup(context: OperationContext): void {

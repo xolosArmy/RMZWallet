@@ -63,6 +63,8 @@ The adapter reconstructs the same frozen universal review in `prepareReview()` a
 
 Before returning `approved`, the adapter defensively snapshots and validates the grant's nonempty `authorizationId`, exact operation ID, exact universal content hash, and exact valid expiry. `authorizationId` is the identifier of an already-consumed capability. It is evidence of the completed authorization step, not a reusable bearer permission. Aborting after ledger consumption never restores or unburns it.
 
+The effective core terminal must be exactly `authorized` before a grant can be observed. If expiry wins after ledger consumption, the adapter returns TM1 `expired`; the consumed capability remains permanently burned and no `approved` result reaches Phase 6-B.
+
 Phase 6-B remains responsible for fresh network/UTXO revalidation after authorization and before invoking its signer.
 
 ## Decisions, expiry, and cancellation
@@ -74,7 +76,12 @@ Expiry belongs exclusively to `UniversalAuthorizationCore`. While the provider i
 1. externally aborted signal -> throw a standard `AbortError`;
 2. core state `expired` -> return TM1 `expired`;
 3. core state `aborted` -> throw `AbortError`;
-4. any other rejection -> normalized adapter/core failure.
+4. expected core state `rejected` -> return the provider's TM1 rejection;
+5. any other terminal or state -> normalized adapter/core failure.
+
+After asking the core to reject, the adapter rereads the effective terminal
+instead of assuming `rejected` won. This closes the deterministic race where
+the provider rejects while the core clock has already reached expiry.
 
 The external signal is passed to `startAuthorization()` and therefore bridged before prepare or other externally controlled authorization callbacks. The adapter also checks cancellation before request snapshotting, after external calls, before authorization, and before returning a grant.
 

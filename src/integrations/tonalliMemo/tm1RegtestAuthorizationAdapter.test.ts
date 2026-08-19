@@ -309,6 +309,66 @@ describe('TM1 regtest authorization adapter', () => {
     expect(harness.ledger.records).toHaveLength(0)
   })
 
+  test('maps rejection to expired when the core clock crosses expiry before reject terminalizes', async () => {
+    let now = NOW
+    const harness = createHarness({
+      ttlMs: 100,
+      now: () => now,
+      provider: async () => {
+        now = NOW + 100
+        return { status: 'rejected', reason: 'too late' }
+      }
+    })
+
+    await expect(harness.adapter.requestSigningAuthorization(signingRequest())).resolves.toEqual({
+      status: 'expired',
+      reason: 'TM1 signing authorization expired'
+    })
+    expect(harness.ledger.records).toHaveLength(0)
+  })
+
+  test('gives external abort precedence over simultaneous rejection and expiry', async () => {
+    let now = NOW
+    const controller = new AbortController()
+    const harness = createHarness({
+      ttlMs: 100,
+      now: () => now,
+      provider: async () => {
+        now = NOW + 100
+        controller.abort()
+        return { status: 'rejected' }
+      }
+    })
+
+    await expect(harness.adapter.requestSigningAuthorization(
+      signingRequest(),
+      controller.signal
+    )).rejects.toMatchObject({ name: 'AbortError' })
+    expect(harness.ledger.records).toHaveLength(0)
+  })
+
+  test('maps expiry-after-consume to expired and never exposes an approved grant', async () => {
+    const ledger = new TestLedger()
+    let consumed = false
+    let postConsumeClockReads = 0
+    ledger.onConsume = () => { consumed = true }
+    const now = () => {
+      if (!consumed) return NOW
+      postConsumeClockReads += 1
+      return postConsumeClockReads === 1 ? NOW : NOW + 100
+    }
+    const harness = createHarness({ ledger, now, ttlMs: 100 })
+
+    await expect(harness.adapter.requestSigningAuthorization(signingRequest())).resolves.toEqual({
+      status: 'expired',
+      reason: 'TM1 signing authorization expired'
+    })
+    expect(ledger.records).toHaveLength(1)
+    expect(ledger.records[0]?.capabilityId).toBe(
+      'tm1-authorization-1:authorization-capability'
+    )
+  })
+
   test('maps core expiry while the decision provider is pending', async () => {
     const harness = createHarness({
       ttlMs: 10,
@@ -768,13 +828,17 @@ function fixtureUtxos(): readonly Tm1Draft02FreshUtxo[] {
 
 function integrationHarness(
   provider: Tm1RegtestAuthorizationDecisionProvider['requestDecision'],
-  ttlMs = 10_000
+  ttlMs = 10_000,
+  options: Readonly<{
+    ledger?: TestLedger
+    now?: () => number
+  }> = {}
 ) {
   const events: string[] = []
   let adapterIds = 0
   let publicationIds = 0
-  const ledger = new TestLedger()
-  const now = ttlMs <= 100 ? Date.now : () => NOW
+  const ledger = options.ledger ?? new TestLedger()
+  const now = options.now ?? (ttlMs <= 100 ? Date.now : () => NOW)
   const core = new UniversalAuthorizationCore({
     enabled: true,
     lock: new TestLock(),
@@ -938,5 +1002,29 @@ describe('TM1 adapter integration with the unchanged 6-B orchestrator', () => {
       error instanceof Tm1PublicationError && error.code === 'ABORTED'
     )
     expect(harness.calls.signer).toBe(0)
+  })
+
+  test('expiry after capability consumption never reaches the 6-B signer', async () => {
+    const ledger = new TestLedger()
+    let consumed = false
+    let postConsumeClockReads = 0
+    ledger.onConsume = () => { consumed = true }
+    const now = () => {
+      if (!consumed) return NOW
+      postConsumeClockReads += 1
+      return postConsumeClockReads === 1 ? NOW : NOW + 100
+    }
+    const harness = integrationHarness(
+      async () => ({ status: 'approved' }),
+      100,
+      { ledger, now }
+    )
+    const review = await harness.orchestrator.prepare(PUBLICATION_REQUEST)
+
+    await expect(harness.orchestrator.authorizeAndSign(review.preparedId)).rejects.toMatchObject({
+      code: 'SIGNING_AUTHORIZATION_EXPIRED'
+    })
+    expect(harness.calls.signer).toBe(0)
+    expect(ledger.records).toHaveLength(1)
   })
 })
