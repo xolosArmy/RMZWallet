@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type {
   UniversalAuthorizationAdapter,
+  UniversalReviewAuthorizationAdapter,
   UniversalReviewSnapshot,
   UniversalSignedResult
 } from './adapters'
@@ -11,6 +12,8 @@ import type {
 import { InMemoryApprovalCapability } from './approval'
 import {
   UniversalAuthorizationCore,
+  UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS,
+  type UniversalAuthorizationCoreDependencies,
   type UniversalOperationHandle
 } from './core'
 import {
@@ -164,6 +167,23 @@ const syntheticAdapter = (
   }))
 })
 
+const reviewAuthorizationAdapter = (
+  events: string[],
+  functions: Pick<AdapterFunctions, 'prepare' | 'revalidate'> = {}
+): UniversalReviewAuthorizationAdapter => ({
+  profileId: PROFILE_ID,
+  prepareReview: vi.fn(functions.prepare ?? (async (_envelope, signal) => {
+    events.push('prepare')
+    if (signal.aborted) throw new UniversalAuthorizationError('OPERATION_ABORTED')
+    return review()
+  })),
+  revalidateReview: vi.fn(functions.revalidate ?? (async (_envelope, approved, signal) => {
+    events.push('revalidate')
+    if (signal.aborted) throw new UniversalAuthorizationError('OPERATION_ABORTED')
+    return approved
+  }))
+})
+
 type Harness = Readonly<{
   core: UniversalAuthorizationCore
   lock: InstrumentedLock
@@ -203,6 +223,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.useRealTimers()
 })
 
@@ -659,5 +680,628 @@ describe('universal authorization ownership and lifecycle', () => {
       'signing',
       'completed'
     ])
+  })
+})
+
+describe('universal authorization-only grants', () => {
+  const createAuthorizationHarness = (
+    functions: Pick<AdapterFunctions, 'prepare' | 'revalidate'> = {},
+    dependencies: Partial<UniversalAuthorizationCoreDependencies> = {}
+  ) => {
+    const events: string[] = []
+    const lock = new InstrumentedLock(events)
+    const ledger = new InstrumentedLedger(events)
+    const adapter = reviewAuthorizationAdapter(events, functions)
+    const core = new UniversalAuthorizationCore({
+      enabled: true,
+      lock,
+      approvalLedger: ledger,
+      now: Date.now,
+      createCapabilityId: operationId => `${operationId}:authorization-capability`,
+      ...dependencies
+    })
+    return Object.freeze({ core, lock, ledger, adapter, events })
+  }
+
+  test('authorizes only after revalidation and one-use ledger consumption', async () => {
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(
+      envelope('authorization-only'),
+      testHarness.adapter
+    )
+    const prepared = await handle.ready
+    const grant = await handle.authorize()
+
+    expect(grant).toEqual({
+      authorizationId: 'authorization-only:authorization-capability',
+      operationId: 'authorization-only',
+      contentHash: prepared.contentHash,
+      expiresAt: Date.now() + 10_000
+    })
+    expect(testHarness.events).toEqual([
+      'acquire:authorization-only',
+      'prepare',
+      'revalidate',
+      'consume:authorization-only',
+      'release:authorization-only'
+    ])
+    expect(handle.state()).toBe('authorized')
+    expect(handle.history()).toEqual([
+      'disabled',
+      'receiving',
+      'preparing',
+      'reviewReady',
+      'approving',
+      'revalidating',
+      'authorized'
+    ])
+    expect(Object.keys(testHarness.adapter).sort()).toEqual([
+      'prepareReview',
+      'profileId',
+      'revalidateReview'
+    ])
+  })
+
+  test('publishes a grant when the effective terminal remains authorized before expiry', async () => {
+    let consumed = false
+    const events: string[] = []
+    const lock = new InstrumentedLock(events)
+    const ledger: ApprovalConsumptionLedger = {
+      async consume() {
+        consumed = true
+      }
+    }
+    const core = new UniversalAuthorizationCore({
+      enabled: true,
+      lock,
+      approvalLedger: ledger,
+      now: () => consumed ? TEST_NOW + 99 : TEST_NOW,
+      createCapabilityId: operationId => `${operationId}:before-expiry`
+    })
+    const adapter = reviewAuthorizationAdapter(events)
+    const handle = core.startAuthorization(
+      envelope('authorization-before-expiry', 100),
+      adapter
+    )
+    await handle.ready
+
+    await expect(handle.authorize()).resolves.toMatchObject({
+      authorizationId: 'authorization-before-expiry:before-expiry'
+    })
+    expect(handle.state()).toBe('authorized')
+    expect(core.activeOperationId).toBeNull()
+  })
+
+  test('does not publish a consumed grant when expiry wins terminalization', async () => {
+    const events: string[] = []
+    const lock = new InstrumentedLock(events)
+    const records = new Map<string, ApprovalConsumption>()
+    let consumed = false
+    let postConsumeClockReads = 0
+    const now = () => {
+      if (!consumed) return TEST_NOW
+      postConsumeClockReads += 1
+      return postConsumeClockReads === 1 ? TEST_NOW : TEST_NOW + 100
+    }
+    const ledger: ApprovalConsumptionLedger = {
+      async consume(consumption) {
+        if (records.has(consumption.operationId)) {
+          throw new UniversalAuthorizationError('APPROVAL_ALREADY_CONSUMED')
+        }
+        records.set(consumption.operationId, consumption)
+        consumed = true
+      }
+    }
+    const core = new UniversalAuthorizationCore({
+      enabled: true,
+      lock,
+      approvalLedger: ledger,
+      now,
+      createCapabilityId: operationId => `${operationId}:expiry-race`
+    })
+    const adapter = reviewAuthorizationAdapter(events)
+    const first = core.startAuthorization(
+      envelope('authorization-terminal-expiry', 100),
+      adapter
+    )
+    await first.ready
+
+    await expect(first.authorize()).rejects.toThrowError('REQUEST_EXPIRED')
+
+    expect(first.state()).toBe('expired')
+    expect(first.history().at(-1)).toBe('expired')
+    expect(records.get('authorization-terminal-expiry')?.capabilityId)
+      .toBe('authorization-terminal-expiry:expiry-race')
+    expect(lock.leases.get('authorization-terminal-expiry')?.releaseCalls).toBe(1)
+    expect(core.activeOperationId).toBeNull()
+
+    consumed = false
+    postConsumeClockReads = 0
+    const retry = core.startAuthorization(
+      envelope('authorization-terminal-expiry', 100),
+      adapter
+    )
+    await retry.ready
+    await expect(retry.authorize()).rejects.toThrowError('APPROVAL_ALREADY_CONSUMED')
+    expect(retry.state()).toBe('failed')
+    expect(records).toHaveLength(1)
+  })
+
+  test('keeps the existing signing path lifecycle and signer invocation unchanged', async () => {
+    const testHarness = harness()
+    const handle = testHarness.core.start(envelope('legacy-signing'), testHarness.adapter)
+    await handle.ready
+    await handle.approve()
+
+    expect(handle.history()).toEqual([
+      'disabled',
+      'receiving',
+      'preparing',
+      'reviewReady',
+      'approving',
+      'revalidating',
+      'signing',
+      'completed'
+    ])
+    expect(testHarness.adapter.signApprovedContent).toHaveBeenCalledTimes(1)
+  })
+
+  test('rejects without consuming a capability', async () => {
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(envelope(), testHarness.adapter)
+    await handle.ready
+    handle.reject()
+
+    expect(handle.state()).toBe('rejected')
+    expect(testHarness.ledger.consumeCalls).toBe(0)
+    expect(testHarness.lock.leases.get('operation-a')?.releaseCalls).toBe(1)
+  })
+
+  test('expires while reviewReady and aborts the exposed internal signal', async () => {
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(
+      envelope('authorization-expiry', 100),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    await vi.advanceTimersByTimeAsync(101)
+
+    expect(handle.state()).toBe('expired')
+    expect(handle.signal.aborted).toBe(true)
+    expect(testHarness.ledger.consumeCalls).toBe(0)
+    expect(testHarness.lock.leases.get('authorization-expiry')?.releaseCalls).toBe(1)
+  })
+
+  test('expires once when the remaining lifetime equals the platform timer maximum', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(
+      envelope('authorization-timer-max', UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    expect(timerSpy).toHaveBeenCalledTimes(1)
+    expect(timerSpy).toHaveBeenLastCalledWith(
+      expect.any(Function),
+      UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS
+    )
+
+    await vi.advanceTimersByTimeAsync(UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS)
+
+    expect(handle.state()).toBe('expired')
+    expect(handle.history().filter(state => state === 'expired')).toHaveLength(1)
+    expect(testHarness.lock.leases.get('authorization-timer-max')?.releaseCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('chunks a lifetime one millisecond above the platform timer maximum', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(
+      envelope('authorization-timer-max-plus-one', UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS + 1),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    expect(timerSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.any(Function),
+      UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS
+    )
+
+    await vi.advanceTimersByTimeAsync(UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS)
+
+    expect(handle.state()).toBe('reviewReady')
+    expect(timerSpy).toHaveBeenNthCalledWith(2, expect.any(Function), 1)
+    expect(vi.getTimerCount()).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(1)
+
+    expect(handle.state()).toBe('expired')
+    expect(handle.history().filter(state => state === 'expired')).toHaveLength(1)
+    expect(testHarness.lock.leases.get('authorization-timer-max-plus-one')?.releaseCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('rearms multi-chunk lifetimes without an immediate timer spin', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    const testHarness = createAuthorizationHarness()
+    const remainderMs = 7
+    const handle = testHarness.core.startAuthorization(
+      envelope(
+        'authorization-timer-multiple-chunks',
+        UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS * 2 + remainderMs
+      ),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    await vi.advanceTimersByTimeAsync(UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS)
+    expect(handle.state()).toBe('reviewReady')
+    expect(timerSpy).toHaveBeenCalledTimes(2)
+    expect(timerSpy).toHaveBeenLastCalledWith(
+      expect.any(Function),
+      UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS
+    )
+
+    await vi.advanceTimersByTimeAsync(UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS)
+    expect(handle.state()).toBe('reviewReady')
+    expect(timerSpy).toHaveBeenCalledTimes(3)
+    expect(timerSpy).toHaveBeenLastCalledWith(expect.any(Function), remainderMs)
+
+    await vi.advanceTimersByTimeAsync(remainderMs)
+
+    expect(handle.state()).toBe('expired')
+    expect(timerSpy).toHaveBeenCalledTimes(3)
+    expect(testHarness.lock.leases.get('authorization-timer-multiple-chunks')?.releaseCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('caps an unsafe lifetime difference formed from safe envelope timestamps', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    const now = Number.MIN_SAFE_INTEGER
+    const testHarness = createAuthorizationHarness({}, { now: () => now })
+    const extremeEnvelope = {
+      ...rawEnvelope('authorization-extreme-lifetime'),
+      issuedAt: Number.MIN_SAFE_INTEGER,
+      expiresAt: Number.MAX_SAFE_INTEGER
+    } as UniversalAuthorizationEnvelopeV1
+
+    const handle = testHarness.core.startAuthorization(extremeEnvelope, testHarness.adapter)
+    await handle.ready
+
+    expect(Number.isSafeInteger(extremeEnvelope.expiresAt - now)).toBe(false)
+    expect(timerSpy).toHaveBeenCalledTimes(1)
+    expect(timerSpy).toHaveBeenLastCalledWith(
+      expect.any(Function),
+      UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS
+    )
+
+    handle.abort()
+    expect(handle.state()).toBe('aborted')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('cancels a capped timer when authorization aborts before later chunks', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(
+      envelope(
+        'authorization-timer-abort',
+        UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS * 3
+      ),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    handle.abort()
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(handle.state()).toBe('aborted')
+    expect(handle.history().filter(state => state === 'aborted')).toHaveLength(1)
+    expect(timerSpy).toHaveBeenCalledTimes(1)
+    expect(testHarness.lock.leases.get('authorization-timer-abort')?.releaseCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('rearms an early expiry wake-up until the injected clock reaches expiresAt', async () => {
+    let now = TEST_NOW
+    const testHarness = createAuthorizationHarness({}, { now: () => now })
+    const handle = testHarness.core.startAuthorization(
+      envelope('authorization-early-wakeup', 100),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(handle.state()).toBe('reviewReady')
+    expect(handle.signal.aborted).toBe(false)
+    expect(testHarness.core.activeOperationId).toBe('authorization-early-wakeup')
+
+    now = TEST_NOW + 100
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(handle.state()).toBe('expired')
+    expect(handle.signal.aborted).toBe(true)
+    expect(testHarness.core.activeOperationId).toBeNull()
+    expect(testHarness.lock.leases.get('authorization-early-wakeup')?.releaseCalls).toBe(1)
+  })
+
+  test('does not invoke lock or prepare for an already-aborted external signal', () => {
+    const testHarness = createAuthorizationHarness()
+    const controller = new AbortController()
+    controller.abort()
+
+    expect(() => testHarness.core.startAuthorization(
+      envelope(),
+      testHarness.adapter,
+      { signal: controller.signal }
+    )).toThrowError('OPERATION_ABORTED')
+    expect(testHarness.lock.acquireCalls).toBe(0)
+    expect(testHarness.adapter.prepareReview).not.toHaveBeenCalled()
+  })
+
+  test('bridges external abort during preparation and blocks late continuation', async () => {
+    const preparation = controlled<UniversalReviewSnapshot>()
+    const testHarness = createAuthorizationHarness({ prepare: () => preparation.promise })
+    const controller = new AbortController()
+    const handle = testHarness.core.startAuthorization(
+      envelope(),
+      testHarness.adapter,
+      { signal: controller.signal }
+    )
+    await Promise.resolve()
+
+    controller.abort()
+    preparation.resolve(review())
+
+    await expectRejected(handle.ready)
+    expect(handle.state()).toBe('aborted')
+    expect(handle.signal.aborted).toBe(true)
+    expect(testHarness.adapter.revalidateReview).not.toHaveBeenCalled()
+  })
+
+  test('bridges external abort during revalidation and produces no grant', async () => {
+    const revalidation = controlled<UniversalReviewSnapshot>()
+    const testHarness = createAuthorizationHarness({ revalidate: () => revalidation.promise })
+    const controller = new AbortController()
+    const handle = testHarness.core.startAuthorization(
+      envelope(),
+      testHarness.adapter,
+      { signal: controller.signal }
+    )
+    const prepared = await handle.ready
+    const authorization = handle.authorize()
+
+    controller.abort()
+    revalidation.resolve(prepared.review)
+
+    await expectRejected(authorization)
+    expect(handle.state()).toBe('aborted')
+    expect(testHarness.ledger.consumeCalls).toBe(0)
+  })
+
+  test('double authorize creates and consumes exactly one capability', async () => {
+    const revalidation = controlled<UniversalReviewSnapshot>()
+    const testHarness = createAuthorizationHarness({ revalidate: () => revalidation.promise })
+    const handle = testHarness.core.startAuthorization(envelope(), testHarness.adapter)
+    const prepared = await handle.ready
+    const first = handle.authorize()
+
+    expect(() => handle.authorize()).toThrowError('UNEXPECTED_OPERATION_STATE')
+    revalidation.resolve(prepared.review)
+    await first
+
+    expect(testHarness.ledger.consumeCalls).toBe(1)
+  })
+
+  test('preserves single active operation ownership for authorization-only handles', async () => {
+    const testHarness = createAuthorizationHarness()
+    const first = testHarness.core.startAuthorization(
+      envelope('authorization-owner-a'),
+      testHarness.adapter
+    )
+
+    expect(() => testHarness.core.startAuthorization(
+      envelope('authorization-owner-b'),
+      testHarness.adapter
+    )).toThrowError('OPERATION_ALREADY_ACTIVE')
+    await first.ready
+    first.cleanup()
+    expect(testHarness.core.activeOperationId).toBeNull()
+  })
+
+  test('cleanup is idempotent and permits a later authorization operation', async () => {
+    const testHarness = createAuthorizationHarness()
+    const first = testHarness.core.startAuthorization(
+      envelope('authorization-cleanup-a'),
+      testHarness.adapter
+    )
+    await first.ready
+    first.cleanup()
+    first.cleanup()
+
+    const second = testHarness.core.startAuthorization(
+      envelope('authorization-cleanup-b'),
+      testHarness.adapter
+    )
+    await second.ready
+    second.reject()
+
+    expect(first.history().filter(state => state === 'aborted')).toHaveLength(1)
+    expect(testHarness.lock.leases.get('authorization-cleanup-a')?.releaseCalls).toBe(1)
+  })
+
+  test('defensively isolates the prepared review before authorization', async () => {
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(envelope(), testHarness.adapter)
+    const prepared = await handle.ready
+    prepared.review.effectiveContent[0] = 255
+
+    await handle.authorize()
+
+    const approvedReview = vi.mocked(testHarness.adapter.revalidateReview).mock.calls[0][1]
+    expect(Array.from(approvedReview.effectiveContent)).toEqual([1, 2, 3])
+  })
+
+  test('rejects authorization when revalidated content changes', async () => {
+    const testHarness = createAuthorizationHarness({
+      revalidate: async () => review([1, 2, 4])
+    })
+    const handle = testHarness.core.startAuthorization(envelope(), testHarness.adapter)
+    await handle.ready
+
+    await expect(handle.authorize()).rejects.toThrowError('CONTENT_BINDING_MISMATCH')
+
+    expect(handle.state()).toBe('failed')
+    expect(testHarness.ledger.consumeCalls).toBe(0)
+  })
+
+  test('returns the exact universal content hash committed before approval', async () => {
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(envelope(), testHarness.adapter)
+    const prepared = await handle.ready
+    const grant = await handle.authorize()
+
+    expect(grant.contentHash).toBe(prepared.contentHash)
+    expect(grant.contentHash).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(Object.isFrozen(grant)).toBe(true)
+  })
+
+  test('relies on the durable ledger to reject reuse of an operation capability', async () => {
+    const testHarness = createAuthorizationHarness()
+    const first = testHarness.core.startAuthorization(
+      envelope('authorization-reuse'),
+      testHarness.adapter
+    )
+    await first.ready
+    await first.authorize()
+
+    const second = testHarness.core.startAuthorization(
+      envelope('authorization-reuse'),
+      testHarness.adapter
+    )
+    await second.ready
+    await expect(second.authorize()).rejects.toThrowError('APPROVAL_ALREADY_CONSUMED')
+
+    expect(second.state()).toBe('failed')
+  })
+
+  test('burns a consumed capability when external abort wins before grant publication', async () => {
+    const events: string[] = []
+    const lock = new InstrumentedLock(events)
+    const controller = new AbortController()
+    const records = new Map<string, ApprovalConsumption>()
+    let abortAfterConsume = true
+    const ledger: ApprovalConsumptionLedger = {
+      async consume(consumption) {
+        if (records.has(consumption.operationId)) {
+          throw new UniversalAuthorizationError('APPROVAL_ALREADY_CONSUMED')
+        }
+        records.set(consumption.operationId, consumption)
+        if (abortAfterConsume) controller.abort()
+      }
+    }
+    const adapter = reviewAuthorizationAdapter(events)
+    const core = new UniversalAuthorizationCore({
+      enabled: true,
+      lock,
+      approvalLedger: ledger,
+      now: Date.now,
+      createCapabilityId: operationId => `${operationId}:burned-capability`
+    })
+    const first = core.startAuthorization(
+      envelope('authorization-burned'),
+      adapter,
+      { signal: controller.signal }
+    )
+    await first.ready
+
+    await expect(first.authorize()).rejects.toThrowError('OPERATION_ABORTED')
+    expect(first.state()).toBe('aborted')
+    expect(records.get('authorization-burned')?.capabilityId)
+      .toBe('authorization-burned:burned-capability')
+
+    abortAfterConsume = false
+    const retry = core.startAuthorization(
+      envelope('authorization-burned'),
+      adapter,
+      { signal: new AbortController().signal }
+    )
+    await retry.ready
+    await expect(retry.authorize()).rejects.toThrowError('APPROVAL_ALREADY_CONSUMED')
+    expect(retry.state()).toBe('failed')
+  })
+
+  test('rejects an invalid authorization-only capability id before ledger consumption', async () => {
+    const testHarness = createAuthorizationHarness({}, { createCapabilityId: () => '' })
+    const handle = testHarness.core.startAuthorization(envelope(), testHarness.adapter)
+    await handle.ready
+
+    expect(() => handle.authorize()).toThrowError('INVALID_CAPABILITY_ID')
+    expect(handle.state()).toBe('failed')
+    expect(testHarness.ledger.consumeCalls).toBe(0)
+  })
+
+  test.each([
+    ['Error', () => { throw new Error('hostile capability source') }],
+    ['plain hostile value', () => { throw Object.create(null) }]
+  ])('finalizes and releases authorization ownership when createCapabilityId throws %s', async (
+    _description,
+    createCapabilityId
+  ) => {
+    const testHarness = createAuthorizationHarness({}, { createCapabilityId })
+    const handle = testHarness.core.startAuthorization(
+      envelope('authorization-capability-throw'),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    expect(() => handle.authorize()).toThrowError('INVALID_CAPABILITY_ID')
+
+    expect(handle.state()).toBe('failed')
+    expect(handle.history().at(-1)).toBe('failed')
+    expect(testHarness.core.activeOperationId).toBeNull()
+    expect(testHarness.lock.leases.get('authorization-capability-throw')?.releaseCalls).toBe(1)
+    expect(testHarness.ledger.consumeCalls).toBe(0)
+
+    const retry = testHarness.core.startAuthorization(
+      envelope('authorization-capability-retry'),
+      testHarness.adapter
+    )
+    await retry.ready
+    retry.reject()
+    expect(retry.state()).toBe('rejected')
+  })
+
+  test('finalizes the legacy signing path when createCapabilityId throws', async () => {
+    const testHarness = harness()
+    const core = new UniversalAuthorizationCore({
+      enabled: true,
+      lock: testHarness.lock,
+      approvalLedger: testHarness.ledger,
+      now: Date.now,
+      createCapabilityId: () => { throw new Error('hostile capability source') }
+    })
+    const handle = core.start(
+      envelope('legacy-capability-throw'),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    expect(() => handle.approve()).toThrowError('INVALID_CAPABILITY_ID')
+
+    expect(handle.state()).toBe('failed')
+    expect(core.activeOperationId).toBeNull()
+    expect(testHarness.lock.leases.get('legacy-capability-throw')?.releaseCalls).toBe(1)
+    expect(testHarness.adapter.signApprovedContent).not.toHaveBeenCalled()
+
+    const retry = core.start(envelope('legacy-capability-retry'), testHarness.adapter)
+    await retry.ready
+    retry.reject()
+    expect(retry.state()).toBe('rejected')
   })
 })

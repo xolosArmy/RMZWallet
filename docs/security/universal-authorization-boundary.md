@@ -37,6 +37,11 @@ El envelope v1 es cerrado y contiene solo identidad de operación, perfil declar
 
 El núcleo no interpreta activos, scripts, comisiones, cambios, salidas, metadata ni proveedores de red. Los contratos están separados únicamente en `prepareReview`, `revalidateReview` y `signApprovedContent`. Las pruebas inyectan exclusivamente un adaptador sintético; el registro productivo está vacío.
 
+El núcleo también ofrece un camino separado de autorización sin firma mediante
+`startAuthorization`. Este camino recibe únicamente `profileId`, `prepareReview`
+y `revalidateReview`; no acepta ni invoca `signApprovedContent`. Su resultado es
+un `UniversalAuthorizationGrant`, no bytes firmados.
+
 ## Ciclo de vida y propiedad
 
 Las transiciones positivas son explícitas:
@@ -85,6 +90,61 @@ acquire
 ```
 
 El núcleo no acepta transmisores, no importa servicios de wallet, proveedores de indexación ni librerías de protocolo, y no entrega ni difunde automáticamente el resultado.
+
+## Autorización sin firma
+
+El camino authorization-only conserva la misma validación de envelope, lease,
+review defensivo, hash universal, revalidación exacta y consumo one-use:
+
+```text
+receiving
+→ preparing
+→ reviewReady
+→ approving
+→ revalidating
+→ consume
+→ authorized
+```
+
+`authorized` es terminal. No existe transición por `signing` y no se acepta un
+signer. El grant contiene `authorizationId`, `operationId`, `contentHash` y
+`expiresAt`. `authorizationId` es exactamente el identificador de una capacidad
+que ya fue consumida con éxito en el ledger; es evidencia no redimible y nunca
+un bearer capability reutilizable.
+
+La capacidad se publica sólo después del consumo. Si una cancelación gana la
+carrera después de que el ledger registró el consumo pero antes de que el
+caller observe el grant, el identificador permanece quemado. El core nunca
+revierte el ledger.
+
+La terminalización efectiva también es autoritativa. Si el reloj cruza
+`expiresAt` después del consumo pero antes de que `authorized` gane, el terminal
+es `expired`, `authorize()` no devuelve un grant y la capacidad consumida sigue
+quemada. No hay rollback ni reutilización aunque el caller nunca haya observado
+el `authorizationId`.
+
+La creación inyectada de capability IDs está dentro del boundary de fallo en
+ambos caminos. Un throw o ID inválido se normaliza, termina el contexto en
+`failed` (o `expired` si ese terminal ganó), libera el lease y elimina la
+operación activa antes de propagar el error seguro.
+
+`startAuthorization` puede enlazar un `AbortSignal` externo antes de iniciar la
+preparación. El handle expone únicamente el `AbortSignal` interno de solo
+lectura, nunca su `AbortController`, para que un decision provider pendiente
+observe aborto, expiración y cleanup. El core sigue siendo el único propietario
+de la expiración. El adapter compite la decisión externa contra esa señal: un
+provider que ignore cancelación no puede retener el guard activo, y cualquier
+rechazo tardío de su promesa queda observado sin alterar el terminal ya ganado.
+
+Si el scheduler despierta antes de que el reloj inyectado alcance `expiresAt`,
+el core rearma el tiempo restante. Cada llamada a `setTimeout` queda limitada a
+`2_147_483_647` ms y lifetimes mayores se esperan en chunks. Los extremos del
+envelope son enteros seguros; aunque su diferencia no lo sea, el cap ocurre
+antes de entregarla al runtime. Esto evita tanto perder la expiración como un
+loop inmediato por overflow del timer de plataforma.
+
+Este camino no cambia `start()`, `replace()`, `approve()` ni el flujo histórico
+`revalidating → signing → completed`.
 
 ## Contención productiva y límites de alcance
 
