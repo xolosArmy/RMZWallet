@@ -40,6 +40,8 @@ export type UniversalTerminalState = Extract<
   'authorized' | 'completed' | 'rejected' | 'expired' | 'aborted' | 'failed'
 >
 
+export const UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS = 2_147_483_647
+
 export const UNIVERSAL_STATE_TRANSITIONS = Object.freeze({
   disabled: ['receiving', 'expired', 'aborted', 'failed'] as const,
   receiving: ['preparing', 'expired', 'aborted', 'failed'] as const,
@@ -573,9 +575,12 @@ export class UniversalAuthorizationCore {
   }
 
   private scheduleExpiry(context: OperationContext, delayMs: number): void {
+    const boundedDelayMs = delayMs > 0
+      ? Math.min(delayMs, UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS)
+      : 0
     context.expiryTimer = setTimeout(
       () => this.expire(context),
-      Math.max(0, delayMs)
+      boundedDelayMs
     )
   }
 

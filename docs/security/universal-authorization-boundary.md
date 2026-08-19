@@ -132,9 +132,16 @@ operación activa antes de propagar el error seguro.
 preparación. El handle expone únicamente el `AbortSignal` interno de solo
 lectura, nunca su `AbortController`, para que un decision provider pendiente
 observe aborto, expiración y cleanup. El core sigue siendo el único propietario
-de la expiración. Si el scheduler despierta antes de que el reloj inyectado
-alcance `expiresAt`, el core rearma el tiempo restante; un wake-up temprano no
-puede perder definitivamente la expiración ni dejar pendiente al provider.
+de la expiración. El adapter compite la decisión externa contra esa señal: un
+provider que ignore cancelación no puede retener el guard activo, y cualquier
+rechazo tardío de su promesa queda observado sin alterar el terminal ya ganado.
+
+Si el scheduler despierta antes de que el reloj inyectado alcance `expiresAt`,
+el core rearma el tiempo restante. Cada llamada a `setTimeout` queda limitada a
+`2_147_483_647` ms y lifetimes mayores se esperan en chunks. Los extremos del
+envelope son enteros seguros; aunque su diferencia no lo sea, el cap ocurre
+antes de entregarla al runtime. Esto evita tanto perder la expiración como un
+loop inmediato por overflow del timer de plataforma.
 
 Este camino no cambia `start()`, `replace()`, `approve()` ni el flujo histórico
 `revalidating → signing → completed`.

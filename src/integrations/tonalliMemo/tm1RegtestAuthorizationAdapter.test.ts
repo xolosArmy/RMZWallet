@@ -404,6 +404,179 @@ describe('TM1 regtest authorization adapter', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
+  test('provider never settles and core expiry releases guards for immediate retry', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    let calls = 0
+    const providerStarted = deferred<void>()
+    const harness = createHarness({
+      ttlMs: 100,
+      now: Date.now,
+      provider: () => {
+        calls += 1
+        if (calls === 1) {
+          providerStarted.resolve()
+          return new Promise<Tm1RegtestAuthorizationProviderDecision>(() => undefined)
+        }
+        return Promise.resolve({ status: 'approved' })
+      }
+    })
+    const first = harness.adapter.requestSigningAuthorization(signingRequest())
+    await providerStarted.promise
+
+    await vi.advanceTimersByTimeAsync(100)
+
+    await expect(first).resolves.toEqual({
+      status: 'expired',
+      reason: 'TM1 signing authorization expired'
+    })
+    expect((harness.core as UniversalAuthorizationCore).activeOperationId).toBeNull()
+    expect(harness.lock.leases.get('tm1-authorization-1')?.releaseCalls).toBe(1)
+    await expect(harness.adapter.requestSigningAuthorization(signingRequest())).resolves.toMatchObject({
+      status: 'approved'
+    })
+    expect(harness.lock.acquireCalls).toBe(2)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('provider never settles and external abort releases guards for immediate retry', async () => {
+    let calls = 0
+    const providerStarted = deferred<void>()
+    const harness = createHarness({
+      provider: () => {
+        calls += 1
+        if (calls === 1) {
+          providerStarted.resolve()
+          return new Promise<Tm1RegtestAuthorizationProviderDecision>(() => undefined)
+        }
+        return Promise.resolve({ status: 'approved' })
+      }
+    })
+    const controller = new AbortController()
+    const first = harness.adapter.requestSigningAuthorization(
+      signingRequest(),
+      controller.signal
+    )
+    await providerStarted.promise
+
+    controller.abort()
+
+    await expect(first).rejects.toMatchObject({ name: 'AbortError' })
+    expect((harness.core as UniversalAuthorizationCore).activeOperationId).toBeNull()
+    expect(harness.lock.leases.get('tm1-authorization-1')?.releaseCalls).toBe(1)
+    await expect(harness.adapter.requestSigningAuthorization(signingRequest())).resolves.toMatchObject({
+      status: 'approved'
+    })
+    expect(harness.lock.acquireCalls).toBe(2)
+  })
+
+  test('observes a provider rejection that arrives after external abort wins', async () => {
+    let calls = 0
+    let rejectLate: (reason?: unknown) => void = () => undefined
+    const providerStarted = deferred<void>()
+    const lateProvider = new Promise<Tm1RegtestAuthorizationProviderDecision>((_resolve, reject) => {
+      rejectLate = reject
+    })
+    const harness = createHarness({
+      provider: () => {
+        calls += 1
+        if (calls === 1) {
+          providerStarted.resolve()
+          return lateProvider
+        }
+        return Promise.resolve({ status: 'approved' })
+      }
+    })
+    const controller = new AbortController()
+    const first = harness.adapter.requestSigningAuthorization(
+      signingRequest(),
+      controller.signal
+    )
+    await providerStarted.promise
+
+    controller.abort()
+    await expect(first).rejects.toMatchObject({ name: 'AbortError' })
+
+    rejectLate(new Error('late provider rejection'))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect((harness.core as UniversalAuthorizationCore).activeOperationId).toBeNull()
+    expect(harness.ledger.records).toHaveLength(0)
+    await expect(harness.adapter.requestSigningAuthorization(signingRequest())).resolves.toMatchObject({
+      status: 'approved'
+    })
+  })
+
+  test('ignores a provider approval that arrives after expiry wins', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    let calls = 0
+    const providerStarted = deferred<void>()
+    const lateDecision = deferred<Tm1RegtestAuthorizationProviderDecision>()
+    const harness = createHarness({
+      ttlMs: 100,
+      now: Date.now,
+      provider: () => {
+        calls += 1
+        if (calls === 1) {
+          providerStarted.resolve()
+          return lateDecision.promise
+        }
+        return Promise.resolve({ status: 'approved' })
+      }
+    })
+    const first = harness.adapter.requestSigningAuthorization(signingRequest())
+    await providerStarted.promise
+
+    await vi.advanceTimersByTimeAsync(100)
+    const firstResult = await first
+
+    lateDecision.resolve({ status: 'approved' })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(firstResult).toEqual({
+      status: 'expired',
+      reason: 'TM1 signing authorization expired'
+    })
+    expect(harness.ledger.records).toHaveLength(0)
+    expect((harness.core as UniversalAuthorizationCore).activeOperationId).toBeNull()
+    await expect(harness.adapter.requestSigningAuthorization(signingRequest())).resolves.toMatchObject({
+      status: 'approved'
+    })
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('provider cancellation race preserves nominal approval', async () => {
+    const harness = createHarness({ provider: async () => ({ status: 'approved' }) })
+
+    await expect(harness.adapter.requestSigningAuthorization(signingRequest())).resolves.toMatchObject({
+      status: 'approved',
+      preparedId: PREPARED_ID,
+      bindingHash: BINDING_HASH
+    })
+    expect(harness.ledger.records).toHaveLength(1)
+  })
+
+  test('provider cancellation race preserves provider failure mapping', async () => {
+    const providerStarted = deferred<void>()
+    const providerFailure = deferred<Tm1RegtestAuthorizationProviderDecision>()
+    const harness = createHarness({
+      provider: () => {
+        providerStarted.resolve()
+        return providerFailure.promise
+      }
+    })
+    const result = harness.adapter.requestSigningAuthorization(signingRequest())
+    await providerStarted.promise
+
+    providerFailure.reject(new Error('provider failed before cancellation'))
+
+    await expectAdapterCode(result, 'AUTHORIZATION_PROVIDER_FAILED')
+    expect(harness.ledger.records).toHaveLength(0)
+  })
+
   test('rejects an already-aborted external signal before core callbacks', async () => {
     const startAuthorization = vi.fn()
     const harness = createHarness({ core: { startAuthorization } })

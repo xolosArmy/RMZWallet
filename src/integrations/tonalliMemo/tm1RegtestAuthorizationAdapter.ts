@@ -133,6 +133,13 @@ type RequestSnapshot = Readonly<{
   review: Tm1RegtestAuthorizationReviewSnapshot
 }>
 
+type ProviderDecisionWaitResult = Readonly<
+  | { status: 'decision'; value: unknown }
+  | { status: 'cancelled' }
+>
+
+const PROVIDER_CANCELLED = Object.freeze({ status: 'cancelled' as const })
+
 export class Tm1RegtestAuthorizationAdapter
 implements Tm1SigningAuthorizationPort {
   private readonly dependencies: SnapshottedDependencies
@@ -253,9 +260,10 @@ implements Tm1SigningAuthorizationPort {
         expiresAt,
         contentHash: prepared.contentHash
       })
-      let rawDecision: unknown
+      let providerResult: ProviderDecisionWaitResult
       try {
-        rawDecision = await this.dependencies.requestDecision(
+        providerResult = await awaitProviderDecisionOrCancellation(
+          this.dependencies.requestDecision,
           providerRequest,
           handle.signal
         )
@@ -264,6 +272,12 @@ implements Tm1SigningAuthorizationPort {
         if (terminal) return terminal
         throw new Tm1RegtestAuthorizationAdapterError('AUTHORIZATION_PROVIDER_FAILED')
       }
+      if (providerResult.status === 'cancelled') {
+        const terminal = classifyTerminal(handle, signal)
+        if (terminal) return terminal
+        throw new Tm1RegtestAuthorizationAdapterError('AUTHORIZATION_CORE_FAILED')
+      }
+      const rawDecision = providerResult.value
       const terminalAfterDecision = classifyTerminal(handle, signal)
       if (terminalAfterDecision) return terminalAfterDecision
       const decision = snapshotProviderDecision(rawDecision)
@@ -345,6 +359,46 @@ implements Tm1SigningAuthorizationPort {
     assertExternalNotAborted(signal)
     return requireNonEmptyString(value, 'INVALID_AUTHORIZATION_CONFIGURATION')
   }
+}
+
+function awaitProviderDecisionOrCancellation(
+  requestDecision: Tm1RegtestAuthorizationDecisionProvider['requestDecision'],
+  request: Tm1RegtestAuthorizationDecisionRequest,
+  signal: AbortSignal
+): Promise<ProviderDecisionWaitResult> {
+  if (signal.aborted) return Promise.resolve(PROVIDER_CANCELLED)
+
+  let providerPromise: Promise<unknown>
+  try {
+    providerPromise = Promise.resolve(requestDecision(request, signal))
+  } catch (error) {
+    return Promise.reject(error)
+  }
+
+  // The provider may reject after cancellation wins. Keep the original
+  // promise observed independently of the race so that rejection stays safe.
+  void providerPromise.catch(() => undefined)
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (continuation: () => void) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      continuation()
+    }
+    const onAbort = () => finish(() => resolve(PROVIDER_CANCELLED))
+
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (signal.aborted) {
+      onAbort()
+      return
+    }
+    providerPromise.then(
+      value => finish(() => resolve(Object.freeze({ status: 'decision', value }))),
+      error => finish(() => reject(error))
+    )
+  })
 }
 
 export function encodeTm1RegtestSigningAuthorizationPayload(input: Readonly<{

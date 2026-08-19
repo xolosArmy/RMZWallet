@@ -12,6 +12,7 @@ import type {
 import { InMemoryApprovalCapability } from './approval'
 import {
   UniversalAuthorizationCore,
+  UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS,
   type UniversalAuthorizationCoreDependencies,
   type UniversalOperationHandle
 } from './core'
@@ -222,6 +223,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.useRealTimers()
 })
 
@@ -869,6 +871,139 @@ describe('universal authorization-only grants', () => {
     expect(handle.signal.aborted).toBe(true)
     expect(testHarness.ledger.consumeCalls).toBe(0)
     expect(testHarness.lock.leases.get('authorization-expiry')?.releaseCalls).toBe(1)
+  })
+
+  test('expires once when the remaining lifetime equals the platform timer maximum', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(
+      envelope('authorization-timer-max', UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    expect(timerSpy).toHaveBeenCalledTimes(1)
+    expect(timerSpy).toHaveBeenLastCalledWith(
+      expect.any(Function),
+      UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS
+    )
+
+    await vi.advanceTimersByTimeAsync(UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS)
+
+    expect(handle.state()).toBe('expired')
+    expect(handle.history().filter(state => state === 'expired')).toHaveLength(1)
+    expect(testHarness.lock.leases.get('authorization-timer-max')?.releaseCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('chunks a lifetime one millisecond above the platform timer maximum', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(
+      envelope('authorization-timer-max-plus-one', UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS + 1),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    expect(timerSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.any(Function),
+      UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS
+    )
+
+    await vi.advanceTimersByTimeAsync(UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS)
+
+    expect(handle.state()).toBe('reviewReady')
+    expect(timerSpy).toHaveBeenNthCalledWith(2, expect.any(Function), 1)
+    expect(vi.getTimerCount()).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(1)
+
+    expect(handle.state()).toBe('expired')
+    expect(handle.history().filter(state => state === 'expired')).toHaveLength(1)
+    expect(testHarness.lock.leases.get('authorization-timer-max-plus-one')?.releaseCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('rearms multi-chunk lifetimes without an immediate timer spin', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    const testHarness = createAuthorizationHarness()
+    const remainderMs = 7
+    const handle = testHarness.core.startAuthorization(
+      envelope(
+        'authorization-timer-multiple-chunks',
+        UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS * 2 + remainderMs
+      ),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    await vi.advanceTimersByTimeAsync(UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS)
+    expect(handle.state()).toBe('reviewReady')
+    expect(timerSpy).toHaveBeenCalledTimes(2)
+    expect(timerSpy).toHaveBeenLastCalledWith(
+      expect.any(Function),
+      UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS
+    )
+
+    await vi.advanceTimersByTimeAsync(UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS)
+    expect(handle.state()).toBe('reviewReady')
+    expect(timerSpy).toHaveBeenCalledTimes(3)
+    expect(timerSpy).toHaveBeenLastCalledWith(expect.any(Function), remainderMs)
+
+    await vi.advanceTimersByTimeAsync(remainderMs)
+
+    expect(handle.state()).toBe('expired')
+    expect(timerSpy).toHaveBeenCalledTimes(3)
+    expect(testHarness.lock.leases.get('authorization-timer-multiple-chunks')?.releaseCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('caps an unsafe lifetime difference formed from safe envelope timestamps', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    const now = Number.MIN_SAFE_INTEGER
+    const testHarness = createAuthorizationHarness({}, { now: () => now })
+    const extremeEnvelope = {
+      ...rawEnvelope('authorization-extreme-lifetime'),
+      issuedAt: Number.MIN_SAFE_INTEGER,
+      expiresAt: Number.MAX_SAFE_INTEGER
+    } as UniversalAuthorizationEnvelopeV1
+
+    const handle = testHarness.core.startAuthorization(extremeEnvelope, testHarness.adapter)
+    await handle.ready
+
+    expect(Number.isSafeInteger(extremeEnvelope.expiresAt - now)).toBe(false)
+    expect(timerSpy).toHaveBeenCalledTimes(1)
+    expect(timerSpy).toHaveBeenLastCalledWith(
+      expect.any(Function),
+      UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS
+    )
+
+    handle.abort()
+    expect(handle.state()).toBe('aborted')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('cancels a capped timer when authorization aborts before later chunks', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    const testHarness = createAuthorizationHarness()
+    const handle = testHarness.core.startAuthorization(
+      envelope(
+        'authorization-timer-abort',
+        UNIVERSAL_AUTHORIZATION_MAX_TIMER_DELAY_MS * 3
+      ),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    handle.abort()
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(handle.state()).toBe('aborted')
+    expect(handle.history().filter(state => state === 'aborted')).toHaveLength(1)
+    expect(timerSpy).toHaveBeenCalledTimes(1)
+    expect(testHarness.lock.leases.get('authorization-timer-abort')?.releaseCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   test('rearms an early expiry wake-up until the injected clock reaches expiresAt', async () => {
