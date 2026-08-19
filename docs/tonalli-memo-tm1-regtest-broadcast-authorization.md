@@ -1,6 +1,6 @@
 # TM1 regtest broadcast authorization adapter (Phase 6-D)
 
-Phase 6-D adds a framework-independent adapter from the broadcast-authorization port of the unchanged TM1 regtest publication orchestrator to `UniversalAuthorizationCore.startAuthorization()`. It authorizes one exact transmission intent. It does not sign, audit, access chain state, or broadcast a transaction.
+Phase 6-D adds a framework-independent adapter from the broadcast-authorization port of the unchanged TM1 regtest publication orchestrator to `UniversalAuthorizationCore.startAuthorization()`. The approval it produces authorizes broadcast of one exact signed artifact, subject to the remaining orchestrator checks. The adapter itself does not sign, audit, access chain state, or transmit the transaction. After approval, the orchestrator re-audits the artifact before it may dispatch it.
 
 ## Separate human approvals
 

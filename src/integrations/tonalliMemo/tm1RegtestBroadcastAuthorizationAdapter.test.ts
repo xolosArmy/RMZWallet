@@ -14,7 +14,10 @@ import type {
   UniversalOperationLease,
   UniversalOperationLock
 } from '../../features/externalSign/lock'
-import type { UniversalReviewAuthorizationAdapter } from '../../features/externalSign/adapters'
+import type {
+  UniversalReviewAuthorizationAdapter,
+  UniversalReviewSnapshot
+} from '../../features/externalSign/adapters'
 import {
   TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
   signTm1Draft02RegtestCandidate
@@ -219,6 +222,7 @@ type FakeCoreOptions = Readonly<{
   readyError?: unknown
   authorizeError?: unknown
   grant?: (expected: UniversalAuthorizationGrant) => unknown
+  onPrepareReview?: (review: UniversalReviewSnapshot) => void
   onAuthorize?: () => void
 }>
 
@@ -241,6 +245,7 @@ function fakeCore(options: FakeCoreOptions = {}): Tm1RegtestBroadcastAuthorizati
       const ready = (async () => {
         if (options.readyError !== undefined) throw options.readyError
         const review = await adapter.prepareReview(envelope, controller.signal)
+        options.onPrepareReview?.(review)
         const contentHash = await calculateUniversalContentHash(
           envelope,
           review.effectiveContent,
@@ -311,6 +316,23 @@ describe('TM1 regtest authorization adapter', () => {
     expect(TM1_REGTEST_BROADCAST_AUTHORIZATION_PROFILE_ID).toBe(
       'tonalli.tm1-regtest.broadcast-authorization.v1'
     )
+  })
+
+  test('states the exact broadcast authority and the remaining orchestrator checks', async () => {
+    const preparedReview: { value: UniversalReviewSnapshot | null } = { value: null }
+    const harness = createHarness({
+      core: fakeCore({ onPrepareReview: review => { preparedReview.value = review } })
+    })
+
+    await harness.adapter.requestBroadcastAuthorization(signedReview())
+
+    const intent = preparedReview.value?.fields.find(field => field.label === 'Intent')?.value
+    expect(intent).toBe(
+      'Authorizes broadcast of this exact signed artifact. ' +
+      'This authorization adapter does not itself sign, audit, or transmit it. ' +
+      'The publication orchestrator re-audits the signed artifact before dispatch.'
+    )
+    expect(intent).not.toContain('no broadcast')
   })
 
   test('maps provider rejection through handle.reject()', async () => {

@@ -588,7 +588,10 @@ function snapshotSignedArtifact(
 function buildUniversalReview(snapshot: RequestSnapshot): UniversalReviewSnapshot {
   const fields: readonly UniversalReviewField[] = Object.freeze([
     Object.freeze({ label: 'Profile', value: TM1_REGTEST_BROADCAST_AUTHORIZATION_PROFILE_ID }),
-    Object.freeze({ label: 'Intent', value: 'Authorize TM1 regtest transmission; no signing, audit, or broadcast' }),
+    Object.freeze({
+      label: 'Intent',
+      value: 'Authorizes broadcast of this exact signed artifact. This authorization adapter does not itself sign, audit, or transmit it. The publication orchestrator re-audits the signed artifact before dispatch.'
+    }),
     Object.freeze({ label: 'Signed ID', value: snapshot.signedId }),
     Object.freeze({ label: 'Transaction ID', value: snapshot.txid }),
     Object.freeze({ label: 'Signed artifact hash', value: snapshot.signedArtifactHash }),
