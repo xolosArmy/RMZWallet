@@ -132,7 +132,9 @@ operación activa antes de propagar el error seguro.
 preparación. El handle expone únicamente el `AbortSignal` interno de solo
 lectura, nunca su `AbortController`, para que un decision provider pendiente
 observe aborto, expiración y cleanup. El core sigue siendo el único propietario
-de la expiración.
+de la expiración. Si el scheduler despierta antes de que el reloj inyectado
+alcance `expiresAt`, el core rearma el tiempo restante; un wake-up temprano no
+puede perder definitivamente la expiración ni dejar pendiente al provider.
 
 Este camino no cambia `start()`, `replace()`, `approve()` ni el flujo histórico
 `revalidating → signing → completed`.

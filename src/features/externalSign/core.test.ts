@@ -871,6 +871,30 @@ describe('universal authorization-only grants', () => {
     expect(testHarness.lock.leases.get('authorization-expiry')?.releaseCalls).toBe(1)
   })
 
+  test('rearms an early expiry wake-up until the injected clock reaches expiresAt', async () => {
+    let now = TEST_NOW
+    const testHarness = createAuthorizationHarness({}, { now: () => now })
+    const handle = testHarness.core.startAuthorization(
+      envelope('authorization-early-wakeup', 100),
+      testHarness.adapter
+    )
+    await handle.ready
+
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(handle.state()).toBe('reviewReady')
+    expect(handle.signal.aborted).toBe(false)
+    expect(testHarness.core.activeOperationId).toBe('authorization-early-wakeup')
+
+    now = TEST_NOW + 100
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(handle.state()).toBe('expired')
+    expect(handle.signal.aborted).toBe(true)
+    expect(testHarness.core.activeOperationId).toBeNull()
+    expect(testHarness.lock.leases.get('authorization-early-wakeup')?.releaseCalls).toBe(1)
+  })
+
   test('does not invoke lock or prepare for an already-aborted external signal', () => {
     const testHarness = createAuthorizationHarness()
     const controller = new AbortController()

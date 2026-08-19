@@ -300,10 +300,7 @@ export class UniversalAuthorizationCore {
     }
 
     if (!context.finalized) {
-      context.expiryTimer = setTimeout(
-        () => this.expire(context),
-        Math.max(0, validatedEnvelope.expiresAt - this.now())
-      )
+      this.scheduleExpiry(context, validatedEnvelope.expiresAt - this.now())
       void this.prepare(context)
     }
     return context
@@ -561,12 +558,25 @@ export class UniversalAuthorizationCore {
   }
 
   private expire(context: OperationContext): void {
-    if (context.finalized || this.now() < context.envelope.expiresAt) return
+    if (context.finalized) return
+    const remainingMs = context.envelope.expiresAt - this.now()
+    if (remainingMs > 0) {
+      this.scheduleExpiry(context, remainingMs)
+      return
+    }
+    context.expiryTimer = null
     if (context.state === 'signing') {
       this.signalSigningCancellation(context, 'OPERATION_EXPIRED_AFTER_SIGNING')
       return
     }
     this.enterTerminal(context, 'expired')
+  }
+
+  private scheduleExpiry(context: OperationContext, delayMs: number): void {
+    context.expiryTimer = setTimeout(
+      () => this.expire(context),
+      Math.max(0, delayMs)
+    )
   }
 
   private signalSigningCancellation(context: OperationContext, code: string): void {

@@ -64,6 +64,7 @@ function deferred<T>(): Deferred<T> {
 class TestLease implements UniversalOperationLease {
   readonly ownerOperationId: string
   private owned = true
+  releaseCalls = 0
 
   constructor(operationId: string) {
     this.ownerOperationId = operationId
@@ -74,17 +75,21 @@ class TestLease implements UniversalOperationLease {
   }
 
   release(): void {
+    this.releaseCalls += 1
     this.owned = false
   }
 }
 
 class TestLock implements UniversalOperationLock {
   acquireCalls = 0
+  readonly leases = new Map<string, TestLease>()
 
   async acquire(operationId: string, signal: AbortSignal): Promise<UniversalOperationLease> {
     this.acquireCalls += 1
     if (signal.aborted) throw signal.reason
-    return new TestLease(operationId)
+    const lease = new TestLease(operationId)
+    this.leases.set(operationId, lease)
+    return lease
   }
 }
 
@@ -370,17 +375,33 @@ describe('TM1 regtest authorization adapter', () => {
   })
 
   test('maps core expiry while the decision provider is pending', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    const providerStarted = deferred<void>()
+    const providerSignal: { value: AbortSignal | null } = { value: null }
     const harness = createHarness({
-      ttlMs: 10,
+      ttlMs: 100,
       now: Date.now,
-      provider: async (_request, signal) => abortAwarePending(signal)
+      provider: async (_request, signal) => {
+        providerSignal.value = signal
+        providerStarted.resolve()
+        return abortAwarePending(signal)
+      }
     })
+    const result = harness.adapter.requestSigningAuthorization(signingRequest())
+    await providerStarted.promise
 
-    await expect(harness.adapter.requestSigningAuthorization(signingRequest())).resolves.toEqual({
+    await vi.advanceTimersByTimeAsync(100)
+
+    await expect(result).resolves.toEqual({
       status: 'expired',
       reason: 'TM1 signing authorization expired'
     })
+    expect(providerSignal.value?.aborted).toBe(true)
+    expect((harness.core as UniversalAuthorizationCore).activeOperationId).toBeNull()
+    expect(harness.lock.leases.get('tm1-authorization-1')?.releaseCalls).toBe(1)
     expect(harness.ledger.records).toHaveLength(0)
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   test('rejects an already-aborted external signal before core callbacks', async () => {
@@ -607,22 +628,37 @@ describe('TM1 regtest authorization adapter', () => {
   })
 
   test('allows retry after expiry', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
     let calls = 0
+    const providerStarted = deferred<void>()
     const harness = createHarness({
-      ttlMs: 10,
+      ttlMs: 100,
       now: Date.now,
       provider: async (_request, signal) => {
         calls += 1
-        return calls === 1 ? abortAwarePending(signal) : { status: 'approved' }
+        if (calls === 1) {
+          providerStarted.resolve()
+          return abortAwarePending(signal)
+        }
+        return { status: 'approved' }
       }
     })
+    const first = harness.adapter.requestSigningAuthorization(signingRequest())
+    await providerStarted.promise
 
-    await expect(harness.adapter.requestSigningAuthorization(signingRequest())).resolves.toMatchObject({
+    await vi.advanceTimersByTimeAsync(100)
+
+    await expect(first).resolves.toMatchObject({
       status: 'expired'
     })
+    expect((harness.core as UniversalAuthorizationCore).activeOperationId).toBeNull()
+    expect(harness.lock.leases.get('tm1-authorization-1')?.releaseCalls).toBe(1)
     await expect(harness.adapter.requestSigningAuthorization(signingRequest())).resolves.toMatchObject({
       status: 'approved'
     })
+    expect(harness.lock.acquireCalls).toBe(2)
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   test('allows retry after external abort', async () => {
@@ -839,9 +875,10 @@ function integrationHarness(
   let publicationIds = 0
   const ledger = options.ledger ?? new TestLedger()
   const now = options.now ?? (ttlMs <= 100 ? Date.now : () => NOW)
+  const lock = new TestLock()
   const core = new UniversalAuthorizationCore({
     enabled: true,
-    lock: new TestLock(),
+    lock,
     approvalLedger: ledger,
     now,
     createCapabilityId: operationId => `${operationId}:integration-capability`
@@ -928,7 +965,9 @@ function integrationHarness(
     orchestrator: new Tm1RegtestPublicationOrchestratorImpl(dependencies),
     calls,
     events,
-    ledger
+    ledger,
+    core,
+    lock
   })
 }
 
@@ -974,16 +1013,30 @@ describe('TM1 adapter integration with the unchanged 6-B orchestrator', () => {
   })
 
   test('core expiry prevents 6-B signer invocation', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    const providerStarted = deferred<void>()
     const harness = integrationHarness(
-      async (_request, signal) => abortAwarePending(signal),
-      10
+      async (_request, signal) => {
+        providerStarted.resolve()
+        return abortAwarePending(signal)
+      },
+      100
     )
     const review = await harness.orchestrator.prepare(PUBLICATION_REQUEST)
-
-    await expect(harness.orchestrator.authorizeAndSign(review.preparedId)).rejects.toMatchObject({
+    const result = harness.orchestrator.authorizeAndSign(review.preparedId)
+    const resultExpectation = expect(result).rejects.toMatchObject({
       code: 'SIGNING_AUTHORIZATION_EXPIRED'
     })
+    await providerStarted.promise
+
+    await vi.advanceTimersByTimeAsync(100)
+
+    await resultExpectation
     expect(harness.calls.signer).toBe(0)
+    expect(harness.core.activeOperationId).toBeNull()
+    expect(harness.lock.leases.get('integration-authorization-1')?.releaseCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   test('external abort prevents 6-B signer invocation', async () => {
