@@ -26,7 +26,7 @@
     "@x402-xec/axios": "0.1.0",
     "@x402-xec/core": "0.1.0",
     "@x402-xec/payments": "0.1.0",
-    "@xolosarmy/tonalli-core": "github:xolosArmy/tonalli-core",
+    "@xolosarmy/tonalli-core": "github:xolosArmy/tonalli-core#cfe4cb1575b22ed258565717c000ac535aa98c67",
     "axios": "^1.7.0",
     "buffer": "^6.0.3",
     "chronik-client": "^3.5.0",
