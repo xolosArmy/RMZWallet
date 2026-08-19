@@ -41,7 +41,9 @@ export interface SignApprovedContentAdapter {
   }>): Promise<UniversalSignedResult>
 }
 
-export type UniversalAuthorizationAdapter = Readonly<{ profileId: string }> &
+export type UniversalReviewAuthorizationAdapter = Readonly<{ profileId: string }> &
   PrepareReviewAdapter &
-  RevalidateReviewAdapter &
+  RevalidateReviewAdapter
+
+export type UniversalAuthorizationAdapter = UniversalReviewAuthorizationAdapter &
   SignApprovedContentAdapter
