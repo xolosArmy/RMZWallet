@@ -1,5 +1,7 @@
 # TM1 Draft 0.2 regtest E2E harness
 
+> Historical Phase 6-A design. Phase 6-G supersedes this direct-authority flow with the [interactive closed-runtime E2E](./tonalli-memo-tm1-regtest-e2e-runtime.md). The remaining content is retained as historical evidence.
+
 ## Status
 
 This harness is an isolated Node.js acceptance tool for Phase 6-A. It is not mounted in React, is not part of the browser bundle, and does not enable production or mainnet publication.
