@@ -478,7 +478,7 @@ describe('TM1 regtest E2E bounded observation', () => {
 
     await expect(run).resolves.toEqual({ exitCode: 22, status: 'confirmationUnresolved' })
     expect(harness.confirmCalls).toBe(
-      Math.floor(TM1_REGTEST_E2E_CONFIRMATION_DEADLINE_MS / TM1_REGTEST_E2E_CONFIRMATION_POLL_MS) + 1
+      Math.floor(TM1_REGTEST_E2E_CONFIRMATION_DEADLINE_MS / TM1_REGTEST_E2E_CONFIRMATION_POLL_MS)
     )
   })
 
@@ -558,6 +558,204 @@ describe('TM1 regtest E2E bounded observation', () => {
     installRuntime()
     await runTm1RegtestE2eCli(runOptions(io))
     expect(io.output()).not.toMatch(/fixture-wif-secret-marker/i)
+  })
+
+  test('46. never-settling confirm is bounded by the global deadline', async () => {
+    vi.useFakeTimers()
+    const never = new Promise<ReturnType<typeof confirmationResult>>(() => undefined)
+    const harness = installRuntime({ confirmImplementation: async () => never })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo()))
+    await vi.advanceTimersByTimeAsync(TM1_REGTEST_E2E_CONFIRMATION_DEADLINE_MS)
+
+    await expect(run).resolves.toEqual({ exitCode: 22, status: 'confirmationUnresolved' })
+    expect(harness.confirmCalls).toBe(1)
+    expect(harness.confirmSignals[0]?.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('47. never-settling reconcile is bounded without retransmission', async () => {
+    vi.useFakeTimers()
+    const never = new Promise<ReturnType<typeof confirmationResult>>(() => undefined)
+    const harness = installRuntime({
+      broadcastUncertain: true,
+      reconcileImplementation: async () => never
+    })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo()))
+    await vi.advanceTimersByTimeAsync(TM1_REGTEST_E2E_CONFIRMATION_DEADLINE_MS)
+
+    await expect(run).resolves.toEqual({ exitCode: 21, status: 'broadcastUncertain' })
+    expect(harness.reconcileCalls).toBe(1)
+    expect(harness.approveCalls).toBe(1)
+    expect(harness.reconcileSignals[0]?.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('48. late positive confirm cannot replace deadline exit 22', async () => {
+    vi.useFakeTimers()
+    const late = deferred<ReturnType<typeof confirmationResult>>()
+    const harness = installRuntime({ confirmImplementation: async () => late.promise })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo()))
+    await vi.advanceTimersByTimeAsync(TM1_REGTEST_E2E_CONFIRMATION_DEADLINE_MS)
+    const terminal = await run
+
+    late.resolve(confirmationResult())
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(terminal).toEqual({ exitCode: 22, status: 'confirmationUnresolved' })
+    expect(harness.confirmCalls).toBe(1)
+  })
+
+  test('49. late confirm rejection is observed after deadline exit 22', async () => {
+    vi.useFakeTimers()
+    const late = deferred<ReturnType<typeof confirmationResult>>()
+    installRuntime({ confirmImplementation: async () => late.promise })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo()))
+    await vi.advanceTimersByTimeAsync(TM1_REGTEST_E2E_CONFIRMATION_DEADLINE_MS)
+    const terminal = await run
+
+    late.reject(codedError('LATE_CONFIRM_REJECTION'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(terminal).toEqual({ exitCode: 22, status: 'confirmationUnresolved' })
+  })
+
+  test('50. late positive reconcile cannot replace deadline exit 21', async () => {
+    vi.useFakeTimers()
+    const late = deferred<ReturnType<typeof confirmationResult>>()
+    const harness = installRuntime({
+      broadcastUncertain: true,
+      reconcileImplementation: async () => late.promise
+    })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo()))
+    await vi.advanceTimersByTimeAsync(TM1_REGTEST_E2E_CONFIRMATION_DEADLINE_MS)
+    const terminal = await run
+
+    late.resolve(confirmationResult())
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(terminal).toEqual({ exitCode: 21, status: 'broadcastUncertain' })
+    expect(harness.reconcileCalls).toBe(1)
+    expect(harness.approveCalls).toBe(1)
+  })
+
+  test('51. late reconcile rejection is observed after deadline exit 21', async () => {
+    vi.useFakeTimers()
+    const late = deferred<ReturnType<typeof confirmationResult>>()
+    installRuntime({
+      broadcastUncertain: true,
+      reconcileImplementation: async () => late.promise
+    })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo()))
+    await vi.advanceTimersByTimeAsync(TM1_REGTEST_E2E_CONFIRMATION_DEADLINE_MS)
+    const terminal = await run
+
+    late.reject(codedError('LATE_RECONCILE_REJECTION'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(terminal).toEqual({ exitCode: 21, status: 'broadcastUncertain' })
+  })
+
+  test('52. retry receives only the remaining global confirmation budget', async () => {
+    vi.useFakeTimers()
+    const first = deferred<ReturnType<typeof confirmationResult>>()
+    const never = new Promise<ReturnType<typeof confirmationResult>>(() => undefined)
+    const harness = installRuntime({
+      confirmImplementation: async (_submissionId, _signal, call) =>
+        call === 1 ? first.promise : never
+    })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo()))
+    await vi.advanceTimersByTimeAsync(118_500)
+    first.reject(codedError('CONFIRMATION_FAILED'))
+    await vi.advanceTimersByTimeAsync(TM1_REGTEST_E2E_CONFIRMATION_POLL_MS)
+
+    expect(harness.confirmCalls).toBe(2)
+    await vi.advanceTimersByTimeAsync(499)
+    expect(harness.confirmSignals[1]?.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+
+    await expect(run).resolves.toEqual({ exitCode: 22, status: 'confirmationUnresolved' })
+    expect(harness.confirmCalls).toBe(2)
+    expect(harness.confirmSignals[1]?.aborted).toBe(true)
+  })
+
+  test('53. retry sleep is capped by the remaining global deadline', async () => {
+    vi.useFakeTimers()
+    const harness = installRuntime({
+      confirmImplementation: async () => new Promise((_, reject) => {
+        setTimeout(() => reject(codedError('CONFIRMATION_FAILED')), 119_500)
+      })
+    })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo()))
+    await vi.advanceTimersByTimeAsync(119_999)
+
+    expect(harness.confirmCalls).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
+
+    await expect(run).resolves.toEqual({ exitCode: 22, status: 'confirmationUnresolved' })
+    expect(harness.confirmCalls).toBe(1)
+  })
+
+  test('54. confirm settled just before deadline remains successful', async () => {
+    vi.useFakeTimers()
+    const pending = deferred<ReturnType<typeof confirmationResult>>()
+    installRuntime({ confirmImplementation: async () => pending.promise })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo()))
+    await vi.advanceTimersByTimeAsync(TM1_REGTEST_E2E_CONFIRMATION_DEADLINE_MS - 1)
+    pending.resolve(confirmationResult())
+    await vi.advanceTimersByTimeAsync(0)
+
+    await expect(run).resolves.toEqual({ exitCode: 0, status: 'confirmed' })
+  })
+
+  test('55. reconcile settled just before deadline remains successful', async () => {
+    vi.useFakeTimers()
+    const pending = deferred<ReturnType<typeof confirmationResult>>()
+    installRuntime({
+      broadcastUncertain: true,
+      reconcileImplementation: async () => pending.promise
+    })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo()))
+    await vi.advanceTimersByTimeAsync(TM1_REGTEST_E2E_CONFIRMATION_DEADLINE_MS - 1)
+    pending.resolve(confirmationResult())
+    await vi.advanceTimersByTimeAsync(0)
+
+    await expect(run).resolves.toEqual({ exitCode: 0, status: 'confirmed' })
+  })
+
+  test('56. external abort wins while never-settling confirm is pending', async () => {
+    vi.useFakeTimers()
+    const controller = new AbortController()
+    const never = new Promise<ReturnType<typeof confirmationResult>>(() => undefined)
+    const harness = installRuntime({ confirmImplementation: async () => never })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo(), true, controller.signal))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(harness.confirmCalls).toBe(1)
+
+    controller.abort()
+
+    await expect(run).resolves.toEqual({ exitCode: 130, status: 'aborted' })
+    expect(harness.confirmCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  test('57. external abort wins while never-settling reconcile is pending', async () => {
+    vi.useFakeTimers()
+    const controller = new AbortController()
+    const never = new Promise<ReturnType<typeof confirmationResult>>(() => undefined)
+    const harness = installRuntime({
+      broadcastUncertain: true,
+      reconcileImplementation: async () => never
+    })
+    const run = runTm1RegtestE2eCli(runOptions(approvalIo(), true, controller.signal))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(harness.reconcileCalls).toBe(1)
+
+    controller.abort()
+
+    await expect(run).resolves.toEqual({ exitCode: 130, status: 'aborted' })
+    expect(harness.reconcileCalls).toBe(1)
+    expect(harness.approveCalls).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
   })
 })
 
@@ -747,6 +945,15 @@ type RuntimeBehavior = Readonly<{
   broadcastUncertain?: boolean
   reconcileFailures?: number
   onBroadcasting?: () => void
+  confirmImplementation?: (
+    submissionId: string,
+    signal: AbortSignal,
+    call: number
+  ) => Promise<ReturnType<typeof confirmationResult>>
+  reconcileImplementation?: (
+    signal: AbortSignal,
+    call: number
+  ) => Promise<ReturnType<typeof confirmationResult>>
 }>
 
 function installRuntime(behavior: RuntimeBehavior = {}) {
@@ -755,6 +962,8 @@ function installRuntime(behavior: RuntimeBehavior = {}) {
   let reconcileCalls = 0
   let approveCalls = 0
   let broadcastCompleted = false
+  const confirmSignals: AbortSignal[] = []
+  const reconcileSignals: AbortSignal[] = []
   let state: Record<string, unknown> = { status: 'idle' }
   const listeners = new Set<(value: Record<string, unknown>) => void>()
   const transition = (value: Record<string, unknown>): void => {
@@ -815,9 +1024,20 @@ function installRuntime(behavior: RuntimeBehavior = {}) {
         transition({ status: 'submitted', signedReview: signed, receipt })
         return receipt
       },
-      confirm: async () => {
+      confirm: async (submissionId: string, signal: AbortSignal) => {
         confirmCalls += 1
         calls.push('confirm')
+        confirmSignals.push(signal)
+        if (behavior.confirmImplementation) {
+          const confirmation = await behavior.confirmImplementation(
+            submissionId,
+            signal,
+            confirmCalls
+          )
+          if (signal.aborted) throw codedError('ABORTED')
+          transition({ status: 'confirmed', receipt, confirmation })
+          return confirmation
+        }
         if (behavior.confirmationErrorCode) throw codedError(behavior.confirmationErrorCode)
         if (confirmCalls <= (behavior.confirmationFailures ?? 0)) {
           transition({ status: 'submitted', signedReview: signed, receipt })
@@ -827,9 +1047,16 @@ function installRuntime(behavior: RuntimeBehavior = {}) {
         transition({ status: 'confirmed', receipt, confirmation })
         return confirmation
       },
-      reconcile: async () => {
+      reconcile: async (signal: AbortSignal) => {
         reconcileCalls += 1
         calls.push('reconcile')
+        reconcileSignals.push(signal)
+        if (behavior.reconcileImplementation) {
+          const confirmation = await behavior.reconcileImplementation(signal, reconcileCalls)
+          if (signal.aborted) throw codedError('ABORTED')
+          transition({ status: 'confirmed', receipt, confirmation })
+          return confirmation
+        }
         if (reconcileCalls <= (behavior.reconcileFailures ?? 0)) {
           transition(broadcastUncertainState(signed))
           throw codedError('CONFIRMATION_FAILED')
@@ -848,7 +1075,9 @@ function installRuntime(behavior: RuntimeBehavior = {}) {
     get confirmCalls() { return confirmCalls },
     get reconcileCalls() { return reconcileCalls },
     get approveCalls() { return approveCalls },
-    get broadcastCompleted() { return broadcastCompleted }
+    get broadcastCompleted() { return broadcastCompleted },
+    confirmSignals,
+    reconcileSignals
   }
 }
 

@@ -30,6 +30,10 @@ type SigningDecisionRequest = Parameters<SigningDecisionProvider['requestDecisio
 type BroadcastDecisionRequest = Parameters<BroadcastDecisionProvider['requestDecision']>[0]
 type Tm1RegtestRuntime = ReturnType<typeof createTm1RegtestRuntime>
 type Tm1RegtestRuntimeState = ReturnType<Tm1RegtestRuntime['getState']>
+type ObservationResult<T> = Readonly<
+  | { status: 'settled'; value: T }
+  | { status: 'deadlineExpired' }
+>
 
 export type Tm1RegtestE2eLineResult = Readonly<
   | { status: 'line'; value: string }
@@ -229,8 +233,24 @@ async function observeSubmitted(
   ) + 1
 
   for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) {
+      if (signal.aborted) return aborted(io)
+      io.writeLine(`CONFIRMATION TIMEOUT submissionId=${submissionId}`)
+      return result(22, 'confirmationUnresolved')
+    }
     try {
-      const confirmation = await runtime.confirm(submissionId, signal)
+      const observation = await observeWithinRemainingDeadline(
+        remainingMs,
+        signal,
+        attemptSignal => runtime.confirm(submissionId, attemptSignal)
+      )
+      if (observation.status === 'deadlineExpired') {
+        if (signal.aborted) return aborted(io)
+        io.writeLine(`CONFIRMATION TIMEOUT submissionId=${submissionId}`)
+        return result(22, 'confirmationUnresolved')
+      }
+      const confirmation = observation.value
       writeConfirmation(io, 'CONFIRMATION', confirmation)
       return result(0, 'confirmed')
     } catch (error) {
@@ -240,12 +260,16 @@ async function observeSubmitted(
         io.writeLine(`CONFIRMATION [${safeErrorCode(error) ?? 'UNEXPECTED_ERROR'}]`)
         return result(22, 'confirmationUnresolved')
       }
-      if (attempt + 1 >= maximumAttempts || Date.now() >= deadline) {
+      const retryRemainingMs = deadline - Date.now()
+      if (attempt + 1 >= maximumAttempts || retryRemainingMs <= 0) {
         io.writeLine(`CONFIRMATION TIMEOUT submissionId=${submissionId}`)
         return result(22, 'confirmationUnresolved')
       }
       try {
-        await abortableDelay(TM1_REGTEST_E2E_CONFIRMATION_POLL_MS, signal)
+        await abortableDelay(
+          Math.min(TM1_REGTEST_E2E_CONFIRMATION_POLL_MS, retryRemainingMs),
+          signal
+        )
       } catch {
         return aborted(io)
       }
@@ -266,8 +290,24 @@ async function observeBroadcastUncertain(
   ) + 1
 
   for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) {
+      if (signal.aborted) return aborted(io)
+      io.writeLine('RECONCILIATION TIMEOUT: broadcast remains uncertain')
+      return result(21, 'broadcastUncertain')
+    }
     try {
-      const confirmation = await runtime.reconcile(signal)
+      const observation = await observeWithinRemainingDeadline(
+        remainingMs,
+        signal,
+        attemptSignal => runtime.reconcile(attemptSignal)
+      )
+      if (observation.status === 'deadlineExpired') {
+        if (signal.aborted) return aborted(io)
+        io.writeLine('RECONCILIATION TIMEOUT: broadcast remains uncertain')
+        return result(21, 'broadcastUncertain')
+      }
+      const confirmation = observation.value
       writeConfirmation(io, 'RECONCILIATION', confirmation)
       return result(0, 'confirmed')
     } catch (error) {
@@ -280,12 +320,16 @@ async function observeBroadcastUncertain(
         io.writeLine(`RECONCILIATION [${safeErrorCode(error) ?? 'UNEXPECTED_ERROR'}]`)
         return result(21, 'broadcastUncertain')
       }
-      if (attempt + 1 >= maximumAttempts || Date.now() >= deadline) {
+      const retryRemainingMs = deadline - Date.now()
+      if (attempt + 1 >= maximumAttempts || retryRemainingMs <= 0) {
         io.writeLine('RECONCILIATION TIMEOUT: broadcast remains uncertain')
         return result(21, 'broadcastUncertain')
       }
       try {
-        await abortableDelay(TM1_REGTEST_E2E_CONFIRMATION_POLL_MS, signal)
+        await abortableDelay(
+          Math.min(TM1_REGTEST_E2E_CONFIRMATION_POLL_MS, retryRemainingMs),
+          signal
+        )
       } catch {
         return aborted(io)
       }
@@ -293,6 +337,58 @@ async function observeBroadcastUncertain(
   }
 
   return result(21, 'broadcastUncertain')
+}
+
+function observeWithinRemainingDeadline<T>(
+  remainingMs: number,
+  externalSignal: AbortSignal,
+  observe: (attemptSignal: AbortSignal) => Promise<T>
+): Promise<ObservationResult<T>> {
+  if (externalSignal.aborted) return Promise.reject(abortError())
+  if (remainingMs <= 0) {
+    return Promise.resolve(Object.freeze({ status: 'deadlineExpired' as const }))
+  }
+
+  const attemptController = new AbortController()
+  const pending = Promise.resolve().then(() => {
+    if (attemptController.signal.aborted) throw abortError()
+    return observe(attemptController.signal)
+  })
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const cleanup = (): void => {
+      clearTimeout(timer)
+      externalSignal.removeEventListener('abort', onExternalAbort)
+    }
+    const finish = (settle: () => void): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      settle()
+      attemptController.abort()
+    }
+    const onExternalAbort = (): void => finish(() => reject(abortError()))
+    const timer = setTimeout(() => {
+      finish(() => resolve(Object.freeze({ status: 'deadlineExpired' as const })))
+    }, remainingMs)
+
+    externalSignal.addEventListener('abort', onExternalAbort, { once: true })
+    if (externalSignal.aborted) {
+      onExternalAbort()
+      return
+    }
+    pending.then(
+      value => finish(() => {
+        if (externalSignal.aborted) reject(abortError())
+        else resolve(Object.freeze({ status: 'settled' as const, value }))
+      }),
+      error => finish(() => {
+        if (externalSignal.aborted) reject(abortError())
+        else reject(safeError(error))
+      })
+    )
+  })
 }
 
 function writeSigningReview(
