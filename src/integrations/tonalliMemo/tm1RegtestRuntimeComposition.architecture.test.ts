@@ -9,8 +9,7 @@ const CLOSED_PATHS = [
   'src/integrations/tonalliMemo/tm1RegtestPublicationOrchestrator.ts',
   'src/integrations/tonalliMemo/tm1RegtestAuthorizationAdapter.ts',
   'src/integrations/tonalliMemo/tm1RegtestBroadcastAuthorizationAdapter.ts',
-  'src/integrations/tonalliMemo/tm1RegtestDualAuthorizationComposition.ts',
-  'scripts/run-tm1-regtest-e2e.ts'
+  'src/integrations/tonalliMemo/tm1RegtestDualAuthorizationComposition.ts'
 ]
 
 const source = (relativePath: string): string => readFileSync(
@@ -51,12 +50,15 @@ describe('TM1 concrete regtest runtime architectural boundaries', () => {
     )
   })
 
-  test('does not import or mutate the legacy E2E harness', () => {
+  test('stays independent while the E2E executable consumes its public facade', () => {
     const runtime = source('./tm1RegtestRuntimeComposition.ts')
     const script = source('../../../scripts/run-tm1-regtest-e2e.ts')
+    const helper = source('../../../scripts/tm1-regtest-e2e-cli.ts')
 
     expect(runtime).not.toMatch(/run-tm1-regtest-e2e/)
-    expect(script).not.toContain('createTm1RegtestRuntime')
+    expect(script).toContain("from './tm1-regtest-e2e-cli'")
+    expect(helper).toContain('createTm1RegtestRuntime({')
+    expect(helper).not.toContain('new Tm1RegtestPublicationOrchestratorImpl')
   })
 
   test('uses the concrete regtest transport and never the in-memory transport', () => {
@@ -180,9 +182,24 @@ describe('TM1 concrete regtest runtime architectural boundaries', () => {
     expect(lock).toContain('cfe4cb1575b22ed258565717c000ac535aa98c67')
   })
 
-  test('all closed Phase 6-B through 6-E files and the legacy script remain unchanged', () => {
+  test('all closed Phase 6-B through 6-E files remain unchanged', () => {
     const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url))
     const diff = execFileSync('git', ['diff', BASE, '--', ...CLOSED_PATHS], {
+      cwd: repositoryRoot,
+      encoding: 'utf8'
+    })
+
+    expect(diff).toBe('')
+  })
+
+  test('the concrete 6-F runtime source remains unchanged from the Phase 6-G base', () => {
+    const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url))
+    const diff = execFileSync('git', [
+      'diff',
+      'ea0cd8acc283ea7291db3c53bb74a5679115add5',
+      '--',
+      'src/integrations/tonalliMemo/tm1RegtestRuntimeComposition.ts'
+    ], {
       cwd: repositoryRoot,
       encoding: 'utf8'
     })
