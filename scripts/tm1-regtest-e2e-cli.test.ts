@@ -229,12 +229,120 @@ describe('TM1 regtest E2E prompt lifecycle', () => {
   test('19b. node text I/O resolves EOF and closes resources', async () => {
     const input = new PassThrough()
     const output = new PassThrough()
-    const io = createNodeInteractiveTextIo(input, output)
+    const io = createNodeInteractiveTextIo(input, output, () => undefined)
     input.end()
 
     await expect(io.readLine('prompt: ', new AbortController().signal)).resolves.toEqual({
       status: 'eof'
     })
+  })
+})
+
+describe('TM1 regtest E2E readline SIGINT bridge', () => {
+  test('40. readline SIGINT during SIGN triggers external abort and ignores late input', async () => {
+    const harness = nodeIoHarness()
+    const decision = createInteractiveSigningDecisionProvider(harness.io).requestDecision(
+      signingRequest(),
+      harness.controller.signal
+    )
+    await waitForOutput(harness, `Type ${SIGN_PHRASE}`)
+
+    harness.input.write('\x03')
+    await expect(decision).rejects.toMatchObject({ name: 'AbortError' })
+    harness.input.write(`${SIGN_PHRASE}\n`)
+    await Promise.resolve()
+
+    expect(harness.requestExternalAbort).toHaveBeenCalledTimes(1)
+    expect(harness.controller.signal.aborted).toBe(true)
+    expect(harness.transcript()).not.toContain('END_OF_INPUT')
+  })
+
+  test('41. readline SIGINT during BROADCAST triggers external abort and ignores late input', async () => {
+    const harness = nodeIoHarness()
+    const decision = createInteractiveBroadcastDecisionProvider(harness.io).requestDecision(
+      broadcastRequest(),
+      harness.controller.signal
+    )
+    await waitForOutput(harness, `Type ${BROADCAST_PHRASE}`)
+
+    harness.input.write('\x03')
+    await expect(decision).rejects.toMatchObject({ name: 'AbortError' })
+    harness.input.write(`${BROADCAST_PHRASE}\n`)
+    await Promise.resolve()
+
+    expect(harness.requestExternalAbort).toHaveBeenCalledTimes(1)
+    expect(harness.controller.signal.aborted).toBe(true)
+    expect(harness.transcript()).not.toContain('END_OF_INPUT')
+  })
+
+  test('42. CLI readline SIGINT during SIGN exits 130, never rejection or expiry', async () => {
+    const harness = nodeIoHarness()
+    installRuntime()
+    const run = runTm1RegtestE2eCli(runOptions(harness.io, true, harness.controller.signal))
+    await waitForOutput(harness, `Type ${SIGN_PHRASE}`)
+
+    harness.input.write('\x03')
+
+    await expect(run).resolves.toEqual({ exitCode: 130, status: 'aborted' })
+    expect(harness.transcript()).not.toMatch(/END_OF_INPUT|REJECTED|EXPIRED/)
+  })
+
+  test('43. CLI readline SIGINT during BROADCAST exits 130, never rejection or expiry', async () => {
+    const harness = nodeIoHarness()
+    installRuntime()
+    const run = runTm1RegtestE2eCli(runOptions(harness.io, true, harness.controller.signal))
+    await waitForOutput(harness, `Type ${SIGN_PHRASE}`)
+    harness.input.write(`${SIGN_PHRASE}\n`)
+    await waitForOutput(harness, `Type ${BROADCAST_PHRASE}`)
+
+    harness.input.write('\x03')
+
+    await expect(run).resolves.toEqual({ exitCode: 130, status: 'aborted' })
+    expect(harness.transcript()).not.toMatch(/END_OF_INPUT|REJECTED|EXPIRED/)
+  })
+
+  test('44. duplicate readline SIGINT settles once and removes prompt resources', async () => {
+    const harness = nodeIoHarness()
+    const removeAbort = vi.spyOn(harness.controller.signal, 'removeEventListener')
+    const decision = createInteractiveSigningDecisionProvider(harness.io).requestDecision(
+      signingRequest(),
+      harness.controller.signal
+    )
+    let settlements = 0
+    void decision.then(() => { settlements += 1 }, () => { settlements += 1 })
+    await waitForOutput(harness, `Type ${SIGN_PHRASE}`)
+    const dataListenersDuringPrompt = harness.input.listenerCount('data')
+
+    harness.input.write('\x03\x03')
+    await expect(decision).rejects.toMatchObject({ name: 'AbortError' })
+    await Promise.resolve()
+
+    expect(settlements).toBe(1)
+    expect(harness.requestExternalAbort).toHaveBeenCalledTimes(1)
+    expect(removeAbort).toHaveBeenCalledWith('abort', expect.any(Function))
+    expect(harness.input.listenerCount('data')).toBeLessThanOrEqual(dataListenersDuringPrompt)
+    expect(harness.input.listenerCount('keypress')).toBe(0)
+  })
+
+  test('45. normal SIGN and BROADCAST approvals remain available', async () => {
+    const harness = nodeIoHarness()
+    const signing = createInteractiveSigningDecisionProvider(harness.io).requestDecision(
+      signingRequest(),
+      harness.controller.signal
+    )
+    await waitForOutput(harness, `Type ${SIGN_PHRASE}`)
+    harness.input.write(`${SIGN_PHRASE}\n`)
+    await expect(signing).resolves.toEqual({ status: 'approved' })
+
+    const broadcast = createInteractiveBroadcastDecisionProvider(harness.io).requestDecision(
+      broadcastRequest(),
+      harness.controller.signal
+    )
+    await waitForOutput(harness, `Type ${BROADCAST_PHRASE}`)
+    harness.input.write(`${BROADCAST_PHRASE}\n`)
+
+    await expect(broadcast).resolves.toEqual({ status: 'approved' })
+    expect(harness.requestExternalAbort).not.toHaveBeenCalled()
   })
 })
 
@@ -458,6 +566,37 @@ type ScriptedIo = Tm1RegtestE2eTextIo & Readonly<{
   prompts: string[]
   output: () => string
 }>
+
+type NodeIoHarness = Readonly<{
+  controller: AbortController
+  input: PassThrough
+  io: Tm1RegtestE2eTextIo
+  requestExternalAbort: ReturnType<typeof vi.fn>
+  transcript: () => string
+}>
+
+function nodeIoHarness(): NodeIoHarness {
+  const controller = new AbortController()
+  const input = new PassThrough()
+  const output = new PassThrough()
+  let transcript = ''
+  output.on('data', chunk => { transcript += String(chunk) })
+  const requestExternalAbort = vi.fn(() => {
+    if (!controller.signal.aborted) controller.abort()
+  })
+
+  return {
+    controller,
+    input,
+    io: createNodeInteractiveTextIo(input, output, requestExternalAbort),
+    requestExternalAbort,
+    transcript: () => transcript
+  }
+}
+
+async function waitForOutput(harness: NodeIoHarness, value: string): Promise<void> {
+  await vi.waitFor(() => expect(harness.transcript()).toContain(value))
+}
 
 function scriptedIo(responses: readonly Tm1RegtestE2eLineResult[]): ScriptedIo {
   const remaining = [...responses]

@@ -67,14 +67,15 @@ export type Tm1RegtestE2eRunResult = Readonly<{
 
 export function createNodeInteractiveTextIo(
   input: Readable,
-  output: Writable
+  output: Writable,
+  onInterrupt: () => void
 ): Tm1RegtestE2eTextIo {
   return Object.freeze({
     writeLine: (line: string): void => {
       output.write(`${line}\n`)
     },
     readLine: (prompt: string, signal: AbortSignal): Promise<Tm1RegtestE2eLineResult> =>
-      readNodeLine(input, output, prompt, signal)
+      readNodeLine(input, output, prompt, signal, onInterrupt)
   })
 }
 
@@ -469,7 +470,8 @@ function readNodeLine(
   input: Readable,
   output: Writable,
   prompt: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  onInterrupt: () => void
 ): Promise<Tm1RegtestE2eLineResult> {
   if (signal.aborted) return Promise.reject(abortError())
 
@@ -479,6 +481,7 @@ function readNodeLine(
     const cleanup = (): void => {
       signal.removeEventListener('abort', onAbort)
       readline.removeListener('close', onClose)
+      readline.removeListener('SIGINT', onSigint)
       readline.close()
     }
     const finish = (settle: () => void): void => {
@@ -489,9 +492,18 @@ function readNodeLine(
     }
     const onAbort = (): void => finish(() => reject(abortError()))
     const onClose = (): void => finish(() => resolve(Object.freeze({ status: 'eof' })))
+    const onSigint = (): void => {
+      try {
+        onInterrupt()
+      } catch {
+        // The prompt still fails closed if the trusted bridge unexpectedly throws.
+      }
+      finish(() => reject(abortError()))
+    }
 
     signal.addEventListener('abort', onAbort, { once: true })
     readline.once('close', onClose)
+    readline.on('SIGINT', onSigint)
     if (signal.aborted) {
       onAbort()
       return

@@ -14,20 +14,26 @@ async function main(): Promise<void> {
   const endpoint = readOption('--endpoint') ?? readEnv('TM1_REGTEST_CHRONIK_URL') ?? DEFAULT_ENDPOINT
   const message = readOption('--message') ?? readEnv('TM1_REGTEST_MESSAGE') ?? DEFAULT_MESSAGE
   const controller = new AbortController()
-  const onSigint = (): void => controller.abort()
-  process.once('SIGINT', onSigint)
+  const requestExternalAbort = (): void => {
+    if (!controller.signal.aborted) controller.abort()
+  }
+  process.on('SIGINT', requestExternalAbort)
 
   try {
     const result = await runTm1RegtestE2eCli({
       endpoint,
       message,
       isTty: process.stdin.isTTY === true,
-      io: createNodeInteractiveTextIo(process.stdin, process.stdout),
+      io: createNodeInteractiveTextIo(
+        process.stdin,
+        process.stdout,
+        requestExternalAbort
+      ),
       signal: controller.signal
     })
     process.exitCode = result.exitCode
   } finally {
-    process.removeListener('SIGINT', onSigint)
+    process.removeListener('SIGINT', requestExternalAbort)
   }
 }
 
