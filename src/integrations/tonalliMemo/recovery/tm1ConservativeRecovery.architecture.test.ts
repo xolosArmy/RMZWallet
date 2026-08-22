@@ -126,20 +126,47 @@ describe('TM1 conservative recovery architectural boundaries', () => {
     expect(diff).toBe('')
   })
 
-  test('does not change package manifests or add an assumed persistence dependency', () => {
+  test('limits package changes to the reviewed Node runtime policy', () => {
     const repositoryRoot = fileURLToPath(new URL('../../../../', import.meta.url))
-    const diff = execFileSync('git', [
-      'diff',
-      BASE,
-      '--',
-      'package.json',
-      'package-lock.json'
+    const readBaseJson = (path: string): Record<string, unknown> => JSON.parse(
+      execFileSync('git', ['show', `${BASE}:${path}`], {
+        cwd: repositoryRoot,
+        encoding: 'utf8'
+      })
+    ) as Record<string, unknown>
+    const packageJson = JSON.parse(source('../../../../package.json')) as Record<string, unknown>
+    const packageLock = JSON.parse(source('../../../../package-lock.json')) as Record<string, unknown>
+    const packageWithoutRuntimePolicy = structuredClone(packageJson)
+    const lockWithoutRuntimePolicy = structuredClone(packageLock)
+    const packageLockRoot = (
+      packageLock.packages as Record<string, Record<string, unknown>>
+    )['']
+    const lockWithoutRuntimePolicyRoot = (
+      lockWithoutRuntimePolicy.packages as Record<string, Record<string, unknown>>
+    )['']
+
+    expect(packageJson.engines).toEqual({ node: '>=24.18.0 <25' })
+    expect((packageJson.scripts as Record<string, unknown>).pretest)
+      .toBe('node scripts/assert-supported-node-runtime.mjs')
+    expect(packageLockRoot.engines)
+      .toEqual({ node: '>=24.18.0 <25' })
+
+    delete packageWithoutRuntimePolicy.engines
+    delete (packageWithoutRuntimePolicy.scripts as Record<string, unknown>).pretest
+    delete lockWithoutRuntimePolicyRoot.engines
+
+    expect(packageWithoutRuntimePolicy).toEqual(readBaseJson('package.json'))
+    expect(lockWithoutRuntimePolicy).toEqual(readBaseJson('package-lock.json'))
+
+    const dependencyDiff = execFileSync('git', [
+      'diff', BASE, '--', 'package.json', 'package-lock.json'
     ], {
       cwd: repositoryRoot,
       encoding: 'utf8'
     })
-
-    expect(diff).toBe('')
+    expect(dependencyDiff).not.toMatch(
+      /better-sqlite3|["']sqlite3["']|sql\.js|@sqlite\.org\/sqlite-wasm/
+    )
   })
 
   test('preserves the canonical Tonalli Core pin', () => {
