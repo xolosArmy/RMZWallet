@@ -18,5 +18,11 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["vite.config.ts", "server/**/*.ts", "api/**/*.ts", "netlify/functions/**/*.ts"]
+  "include": [
+    "vite.config.ts",
+    "server/**/*.ts",
+    "api/**/*.ts",
+    "netlify/functions/**/*.ts",
+    "scripts/tm1-recovery-store-crash-worker.ts"
+  ]
 }
