@@ -722,7 +722,8 @@ function assertDispatchBindings(record: Tm1PublicationRecoveryRecord): void {
     record.broadcastAuthorization === null ||
     record.dispatchIntent.txid !== record.signed.txid ||
     record.dispatchIntent.signedArtifactHash !== record.signed.signedArtifactHash ||
-    record.dispatchIntent.broadcastCapabilityId !== record.broadcastAuthorization.capabilityId
+    record.dispatchIntent.broadcastCapabilityId !== record.broadcastAuthorization.capabilityId ||
+    record.dispatchIntent.committedAt < record.broadcastAuthorization.consumedAt
   ) malformed()
   if (
     record.transportAcknowledgement !== null &&
@@ -750,8 +751,18 @@ function assertTransitionIdentity(
     previous.schemaVersion !== next.schemaVersion ||
     previous.publicationId !== next.publicationId ||
     next.revision !== previous.revision + 1 ||
-    next.ownerEpoch !== previous.ownerEpoch
+    next.ownerEpoch !== previous.ownerEpoch ||
+    !hasValidDispatchAuthorizationOrdering(previous) ||
+    !hasValidDispatchAuthorizationOrdering(next)
   ) failTransition()
+}
+
+function hasValidDispatchAuthorizationOrdering(
+  record: Tm1PublicationRecoveryRecord
+): boolean {
+  if (record.dispatchIntent === null) return true
+  return record.broadcastAuthorization !== null &&
+    record.dispatchIntent.committedAt >= record.broadcastAuthorization.consumedAt
 }
 
 function assertDurableEvidenceUnchanged(

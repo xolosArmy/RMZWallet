@@ -409,6 +409,182 @@ describe('TM1 conservative durable publication controller', () => {
     })
   })
 
+  test.each([2_500, 2_600])(
+    'accepts dispatch committedAt %i at or after BROADCAST consumption',
+    committedAt => {
+      const valid = outcomeUnknownRecord()
+      const snapshot = parseTm1PublicationRecoveryRecord({
+        ...valid,
+        dispatchIntent: {
+          ...valid.dispatchIntent,
+          committedAt
+        }
+      })
+
+      expect(snapshot.dispatchIntent?.committedAt).toBe(committedAt)
+      expect(Object.isFrozen(snapshot.dispatchIntent)).toBe(true)
+    }
+  )
+
+  test('rejects persisted dispatch committed before BROADCAST consumption', () => {
+    const valid = outcomeUnknownRecord()
+    const invalid = {
+      ...valid,
+      dispatchIntent: {
+        ...valid.dispatchIntent,
+        committedAt: 2_499
+      }
+    }
+
+    expect(() => parseTm1PublicationRecoveryRecord(invalid)).toThrowError(
+      expect.objectContaining({ code: 'MALFORMED_RECOVERY_RECORD' })
+    )
+  })
+
+  test('rejects invalid dispatch ordering through commit without mutation', async () => {
+    const before = preDispatchRecord()
+    const store = new TestOnlyInMemoryRecoveryStore(before)
+    const validAfter = outcomeUnknownRecord()
+    const invalidAfter = {
+      ...validAfter,
+      dispatchIntent: {
+        ...validAfter.dispatchIntent,
+        committedAt: 2_499
+      }
+    } as Tm1PublicationRecoveryRecord
+
+    expect(() => assertTm1DispatchIntentTransition(before, invalidAfter)).toThrowError(
+      expect.objectContaining({ code: 'INVALID_RECOVERY_TRANSITION' })
+    )
+    await expect(store.commitDispatchIntent({
+      ...command(before),
+      nextRecord: invalidAfter
+    })).rejects.toMatchObject({ code: 'MALFORMED_RECOVERY_RECORD' })
+    await expect(store.load(PUBLICATION_ID)).resolves.toMatchObject({
+      revision: before.revision,
+      ownerEpoch: before.ownerEpoch,
+      phase: 'preDispatch',
+      dispatchIntent: null
+    })
+  })
+
+  test('rejects invalid dispatch ordering in recovery and acknowledgement paths', () => {
+    const valid = outcomeUnknownRecord()
+    const invalid = {
+      ...valid,
+      dispatchIntent: {
+        ...valid.dispatchIntent,
+        committedAt: 2_499
+      }
+    } as Tm1PublicationRecoveryRecord
+    const invalidRecoveryNext = {
+      ...invalid,
+      revision: invalid.revision + 1,
+      lastObservation: {
+        status: 'absent' as const,
+        txid: HASH_B,
+        observedAt: 4_000
+      }
+    } as Tm1PublicationRecoveryRecord
+    const invalidAcknowledgedNext = {
+      ...invalid,
+      revision: invalid.revision + 1,
+      phase: 'submittedObserved',
+      transportAcknowledgement: {
+        txid: HASH_B,
+        disposition: 'accepted',
+        acknowledgedAt: 2_700
+      }
+    } as Tm1PublicationRecoveryRecord
+
+    expect(() => assertTm1RecoveryTransition(invalid, invalidRecoveryNext)).toThrowError(
+      expect.objectContaining({ code: 'INVALID_RECOVERY_TRANSITION' })
+    )
+    expect(() => assertTm1TransportAcknowledgementTransition(
+      invalid,
+      invalidAcknowledgedNext
+    )).toThrowError(expect.objectContaining({ code: 'INVALID_RECOVERY_TRANSITION' }))
+    expect(() => createTm1TransportAcknowledgedRecord(
+      invalid,
+      acceptedAcknowledgement()
+    )).toThrowError(expect.objectContaining({ code: 'MALFORMED_RECOVERY_RECORD' }))
+  })
+
+  test('rejects invalid hydrated ordering before invoking the recovery observer', async () => {
+    const valid = outcomeUnknownRecord()
+    const invalid = {
+      ...valid,
+      dispatchIntent: {
+        ...valid.dispatchIntent,
+        committedAt: 2_499
+      }
+    }
+    const observer = observerResult()
+    const controller = createTm1DurablePublicationController({
+      store: {
+        ...emptyStore(),
+        load: vi.fn().mockResolvedValue(invalid)
+      },
+      observer
+    })
+
+    await expect(controller.reconcile(command(valid))).rejects.toMatchObject({
+      code: 'MALFORMED_RECOVERY_RECORD'
+    })
+    expect(observer.observe).not.toHaveBeenCalled()
+  })
+
+  test('fails closed on malformed or hostile dispatch timestamps', () => {
+    const valid = outcomeUnknownRecord()
+    expect(() => parseTm1PublicationRecoveryRecord({
+      ...valid,
+      dispatchIntent: {
+        ...valid.dispatchIntent,
+        committedAt: Number.NaN
+      }
+    })).toThrowError(expect.objectContaining({ code: 'MALFORMED_RECOVERY_RECORD' }))
+
+    let getterCalls = 0
+    const hostileDispatchIntent = { ...valid.dispatchIntent }
+    Object.defineProperty(hostileDispatchIntent, 'committedAt', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1
+        return 2_600
+      }
+    })
+    expect(() => parseTm1PublicationRecoveryRecord({
+      ...valid,
+      dispatchIntent: hostileDispatchIntent
+    })).toThrowError(expect.objectContaining({ code: 'MALFORMED_RECOVERY_RECORD' }))
+    expect(getterCalls).toBe(0)
+  })
+
+  test('accepts the complete causal timeline at equality boundaries', async () => {
+    const base = outcomeUnknownRecord()
+    const before = parseTm1PublicationRecoveryRecord({
+      ...base,
+      dispatchIntent: {
+        ...base.dispatchIntent,
+        committedAt: 2_500
+      }
+    })
+    const store = new TestOnlyInMemoryRecoveryStore(before)
+
+    const committed = await store.commitTransportAcknowledgement({
+      ...command(before),
+      acknowledgement: acceptedAcknowledgement({ acknowledgedAt: 2_500 })
+    }) as Tm1PublicationRecoveryRecord
+
+    expect(committed).toMatchObject({
+      phase: 'submittedObserved',
+      revision: before.revision + 1,
+      broadcastAuthorization: { consumedAt: 2_500 },
+      dispatchIntent: { committedAt: 2_500 },
+      transportAcknowledgement: { acknowledgedAt: 2_500 }
+    })
+  })
+
   test('durably commits a matching accepted acknowledgement for the exact dispatch', async () => {
     const before = outcomeUnknownRecord()
     const store = new TestOnlyInMemoryRecoveryStore(before)

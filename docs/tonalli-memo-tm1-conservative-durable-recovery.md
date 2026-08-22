@@ -102,6 +102,11 @@ owner-epoch fencing, and grants no transport authority. Repeated
 acknowledgements are rejected deterministically rather than treated as another
 dispatch.
 
+Durable timestamps must preserve the causal ordering
+`BROADCAST consumedAt <= dispatchIntent committedAt <= accepted acknowledgement acknowledgedAt`.
+Equality is valid. This rejects contradictory evidence but is not a claim that
+wall clocks or clocks across processes are trusted or synchronized.
+
 If the transport throws, the process dies, its response is malformed or the
 acknowledgement cannot be durably committed, the attempt remains
 `outcomeUnknown` and observation-only. Neither absence nor ambiguity permits a
