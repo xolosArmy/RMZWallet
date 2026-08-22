@@ -20,6 +20,7 @@ import {
 import {
   outcomeUnknownRecord,
   preparedRecord,
+  signingConsumedRecord,
   signingPendingRecord
 } from './tm1SqliteTestFixtures'
 
@@ -80,6 +81,135 @@ describe('TM1 SQLite real-file and process behavior', () => {
     await expect(second.load(record.publicationId)).resolves.toEqual(claimed)
     first.close()
     second.close()
+  })
+
+  test('load reads publication and capability evidence from one WAL snapshot', async () => {
+    const { databasePath } = emptyPath()
+    const reader = openStore(databasePath)
+    const writer = openStore(databasePath, 20)
+    const before = signingPendingRecord()
+    const after = signingConsumedRecord()
+    await reader.create({ record: before })
+
+    const seam = readSeam(reader)
+    const selectPublicationRow = seam.selectPublicationRow.bind(reader)
+    let writerCommit: Promise<unknown> | undefined
+    let interleaved = false
+    seam.selectPublicationRow = publicationId => {
+      const row = selectPublicationRow(publicationId)
+      if (!interleaved) {
+        interleaved = true
+        expect(seam.database.isTransaction).toBe(true)
+        writerCommit = writer.commitExecutionEvidence({
+          publicationId: before.publicationId,
+          expectedRevision: before.revision,
+          expectedOwnerEpoch: before.ownerEpoch,
+          nextRecord: after,
+          newlyConsumedCapabilityIds: [after.signingAuthorization!.capabilityId]
+        })
+        void writerCommit.catch(() => undefined)
+      }
+      return row
+    }
+
+    await expect(reader.load(before.publicationId)).resolves.toEqual(before)
+    expect(interleaved).toBe(true)
+    if (writerCommit === undefined) throw new Error('WRITER_COMMIT_NOT_STARTED')
+    await expect(writerCommit).resolves.toEqual(after)
+    expect(seam.database.isTransaction).toBe(false)
+    await expect(reader.load(before.publicationId)).resolves.toEqual(after)
+    reader.close()
+    writer.close()
+  })
+
+  test('listRecoverable hydrates every record from one WAL snapshot', async () => {
+    const { databasePath } = emptyPath()
+    const reader = openStore(databasePath)
+    const writer = openStore(databasePath, 20)
+    const before = signingPendingRecord()
+    const after = signingConsumedRecord()
+    await reader.create({ record: before })
+
+    const seam = readSeam(reader)
+    const selectPublicationRows = seam.selectPublicationRows.bind(reader)
+    let writerCommit: Promise<unknown> | undefined
+    let interleaved = false
+    seam.selectPublicationRows = () => {
+      const rows = selectPublicationRows()
+      if (!interleaved) {
+        interleaved = true
+        expect(seam.database.isTransaction).toBe(true)
+        writerCommit = writer.commitExecutionEvidence({
+          publicationId: before.publicationId,
+          expectedRevision: before.revision,
+          expectedOwnerEpoch: before.ownerEpoch,
+          nextRecord: after,
+          newlyConsumedCapabilityIds: [after.signingAuthorization!.capabilityId]
+        })
+        void writerCommit.catch(() => undefined)
+      }
+      return rows
+    }
+
+    await expect(reader.listRecoverable()).resolves.toEqual([before])
+    expect(interleaved).toBe(true)
+    if (writerCommit === undefined) throw new Error('WRITER_COMMIT_NOT_STARTED')
+    await expect(writerCommit).resolves.toEqual(after)
+    expect(seam.database.isTransaction).toBe(false)
+    await expect(reader.listRecoverable()).resolves.toEqual([after])
+    reader.close()
+    writer.close()
+  })
+
+  test('standalone failing reads roll back their snapshots and preserve taxonomy', async () => {
+    const { databasePath } = emptyPath()
+    const setup = openStore(databasePath)
+    const corrupt = preparedRecord({ publicationId: 'publication:a-corrupt' })
+    const valid = preparedRecord({ publicationId: 'publication:z-valid' })
+    await setup.create({ record: corrupt })
+    await setup.create({ record: valid })
+    setup.close()
+    corruptDigest(databasePath, corrupt.publicationId)
+
+    const reader = openStore(databasePath)
+    const seam = readSeam(reader)
+    await expect(reader.load(corrupt.publicationId)).rejects.toMatchObject({
+      code: 'RECOVERY_STORE_FAILED'
+    })
+    expect(seam.database.isTransaction).toBe(false)
+    await expect(reader.listRecoverable()).rejects.toMatchObject({
+      code: 'RECOVERY_STORE_FAILED'
+    })
+    expect(seam.database.isTransaction).toBe(false)
+    await expect(reader.load(valid.publicationId)).resolves.toEqual(valid)
+    reader.close()
+  })
+
+  test('read helper neither commits nor rolls back a caller-owned transaction', async () => {
+    const { databasePath } = emptyPath()
+    const setup = openStore(databasePath)
+    const corrupt = preparedRecord({ publicationId: 'publication:a-corrupt' })
+    const valid = preparedRecord({ publicationId: 'publication:z-valid' })
+    await setup.create({ record: corrupt })
+    await setup.create({ record: valid })
+    setup.close()
+    corruptDigest(databasePath, corrupt.publicationId)
+
+    const reader = openStore(databasePath)
+    const database = readSeam(reader).database
+    database.exec('BEGIN')
+    await expect(reader.load(valid.publicationId)).resolves.toEqual(valid)
+    expect(database.isTransaction).toBe(true)
+    database.exec('COMMIT')
+
+    database.exec('BEGIN')
+    await expect(reader.load(corrupt.publicationId)).rejects.toMatchObject({
+      code: 'RECOVERY_STORE_FAILED'
+    })
+    expect(database.isTransaction).toBe(true)
+    database.exec('ROLLBACK')
+    await expect(reader.load(valid.publicationId)).resolves.toEqual(valid)
+    reader.close()
   })
 
   test('normalizes a bounded BUSY timeout and leaves state unchanged', async () => {
@@ -294,6 +424,30 @@ function openStore(
     ...(busyTimeoutMs === undefined ? {} : { busyTimeoutMs }),
     now: () => 1_000
   })
+}
+
+type Tm1SqliteReadTestSeam = {
+  database: DatabaseSync
+  selectPublicationRow(
+    publicationId: string
+  ): Record<string, unknown> | undefined
+  selectPublicationRows(): Record<string, unknown>[]
+}
+
+function readSeam(
+  store: Tm1SqlitePublicationRecoveryStore
+): Tm1SqliteReadTestSeam {
+  return store as unknown as Tm1SqliteReadTestSeam
+}
+
+function corruptDigest(databasePath: string, publicationId: string): void {
+  const database = new DatabaseSync(databasePath, { allowExtension: false })
+  database.prepare(`
+    UPDATE tm1_publications
+    SET record_sha256 = ?
+    WHERE publication_id = ?
+  `).run('0'.repeat(64), publicationId)
+  database.close()
 }
 
 function spawnWorker(

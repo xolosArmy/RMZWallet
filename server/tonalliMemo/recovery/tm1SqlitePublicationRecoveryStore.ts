@@ -130,8 +130,10 @@ implements Tm1PublicationRecoveryStore {
     try {
       this.assertOpen()
       requirePublicationId(publicationId)
-      const row = this.selectPublicationRow(publicationId)
-      return row === undefined ? null : this.parsePublicationRow(row)
+      return this.withReadSnapshot(() => {
+        const row = this.selectPublicationRow(publicationId)
+        return row === undefined ? null : this.parsePublicationRow(row)
+      })
     } catch (error) {
       throw normalizeStoreBoundaryError(error)
     }
@@ -140,18 +142,15 @@ implements Tm1PublicationRecoveryStore {
   async listRecoverable(): Promise<unknown> {
     try {
       this.assertOpen()
-      const rows = this.database.prepare(`
-        SELECT ${PUBLICATION_COLUMNS}
-        FROM tm1_publications
-        ORDER BY publication_id
-      `).all()
-      return Object.freeze(rows
-        .map(row => this.parsePublicationRow(row))
-        .filter(record =>
-          record.phase === 'preDispatch' ||
-          record.phase === 'outcomeUnknown' ||
-          record.phase === 'submittedObserved'
-        ))
+      return this.withReadSnapshot(() => Object.freeze(
+        this.selectPublicationRows()
+          .map(row => this.parsePublicationRow(row))
+          .filter(record =>
+            record.phase === 'preDispatch' ||
+            record.phase === 'outcomeUnknown' ||
+            record.phase === 'submittedObserved'
+          )
+      ))
     } catch (error) {
       throw normalizeStoreBoundaryError(error)
     }
@@ -323,6 +322,26 @@ implements Tm1PublicationRecoveryStore {
     if (this.closed || !this.database.isOpen) storeFailure()
   }
 
+  private withReadSnapshot<T>(operation: () => T): T {
+    if (this.database.isTransaction) return operation()
+
+    this.database.exec('BEGIN')
+    try {
+      const result = operation()
+      this.database.exec('COMMIT')
+      return result
+    } catch (error) {
+      if (this.database.isTransaction) {
+        try {
+          this.database.exec('ROLLBACK')
+        } catch {
+          // The original read or validation failure remains authoritative.
+        }
+      }
+      throw error
+    }
+  }
+
   private withImmediateTransaction<T>(operation: () => T): T {
     this.database.exec('BEGIN IMMEDIATE')
     try {
@@ -366,6 +385,14 @@ implements Tm1PublicationRecoveryStore {
       FROM tm1_publications
       WHERE publication_id = ?
     `).get(publicationId)
+  }
+
+  private selectPublicationRows(): Record<string, unknown>[] {
+    return this.database.prepare(`
+      SELECT ${PUBLICATION_COLUMNS}
+      FROM tm1_publications
+      ORDER BY publication_id
+    `).all()
   }
 
   private parsePublicationRow(row: Record<string, unknown>): Tm1PublicationRecoveryRecord {
