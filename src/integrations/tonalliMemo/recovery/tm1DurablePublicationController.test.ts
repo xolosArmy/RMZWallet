@@ -10,10 +10,13 @@ import {
   assertTm1ExecutionEvidenceTransition,
   assertTm1OwnershipTransition,
   assertTm1RecoveryTransition,
+  assertTm1TransportAcknowledgementTransition,
   consumedCapabilityIds,
+  createTm1TransportAcknowledgedRecord,
   parseTm1PublicationRecoveryRecord,
   type Tm1PublicationRecoveryRecord,
-  type Tm1RecoveryPreDispatchStage
+  type Tm1RecoveryPreDispatchStage,
+  type Tm1TransportAcknowledgementCommitEvidence
 } from './tm1PublicationRecoveryModel'
 import {
   Tm1PublicationRecoveryStoreError,
@@ -22,7 +25,8 @@ import {
   type Tm1RecoveryStoreDispatchIntentCommit,
   type Tm1RecoveryStoreExecutionCommit,
   type Tm1RecoveryStoreOwnershipClaim,
-  type Tm1RecoveryStoreRecoveryCommit
+  type Tm1RecoveryStoreRecoveryCommit,
+  type Tm1RecoveryStoreTransportAcknowledgementCommit
 } from './tm1PublicationRecoveryStore'
 
 const HASH_A = 'aa'.repeat(32)
@@ -149,6 +153,20 @@ function observerResult(
   return Object.freeze({ observe: vi.fn().mockResolvedValue(result) })
 }
 
+function acceptedAcknowledgement(
+  overrides: Partial<Tm1TransportAcknowledgementCommitEvidence> = {}
+): Tm1TransportAcknowledgementCommitEvidence {
+  return {
+    submissionId: 'submission:one',
+    signedId: 'signed:one',
+    txid: HASH_B,
+    signedArtifactHash: HASH_C,
+    disposition: 'accepted',
+    acknowledgedAt: 2_700,
+    ...overrides
+  }
+}
+
 class TestOnlyInMemoryRecoveryStore implements Tm1PublicationRecoveryStore {
   private readonly records = new Map<string, Tm1PublicationRecoveryRecord>()
   private readonly capabilityIds = new Set<string>()
@@ -192,6 +210,16 @@ class TestOnlyInMemoryRecoveryStore implements Tm1PublicationRecoveryStore {
     const current = this.current(input)
     const next = parseTm1PublicationRecoveryRecord(input.nextRecord)
     assertTm1DispatchIntentTransition(current, next)
+    this.records.set(current.publicationId, next)
+    return next
+  }
+
+  async commitTransportAcknowledgement(
+    input: Tm1RecoveryStoreTransportAcknowledgementCommit
+  ): Promise<unknown> {
+    const current = this.current(input)
+    const next = createTm1TransportAcknowledgedRecord(current, input.acknowledgement)
+    assertTm1TransportAcknowledgementTransition(current, next)
     this.records.set(current.publicationId, next)
     return next
   }
@@ -376,8 +404,190 @@ describe('TM1 conservative durable publication controller', () => {
     expect(committed).toEqual(after)
     await expect(store.load(PUBLICATION_ID)).resolves.toMatchObject({
       phase: 'outcomeUnknown',
-      dispatchIntent: { txid: HASH_B }
+      dispatchIntent: { txid: HASH_B },
+      transportAcknowledgement: null
     })
+  })
+
+  test('durably commits a matching accepted acknowledgement for the exact dispatch', async () => {
+    const before = outcomeUnknownRecord()
+    const store = new TestOnlyInMemoryRecoveryStore(before)
+
+    const committed = await store.commitTransportAcknowledgement({
+      ...command(before),
+      acknowledgement: acceptedAcknowledgement()
+    }) as Tm1PublicationRecoveryRecord
+
+    expect(committed).toMatchObject({
+      revision: before.revision + 1,
+      phase: 'submittedObserved',
+      signed: {
+        signedId: 'signed:one',
+        txid: HASH_B,
+        signedArtifactHash: HASH_C
+      },
+      dispatchIntent: {
+        submissionId: 'submission:one',
+        txid: HASH_B,
+        signedArtifactHash: HASH_C
+      },
+      transportAcknowledgement: {
+        txid: HASH_B,
+        disposition: 'accepted',
+        acknowledgedAt: 2_700
+      }
+    })
+    expect(committed.signingAuthorization).toEqual(before.signingAuthorization)
+    expect(committed.broadcastAuthorization).toEqual(before.broadcastAuthorization)
+    expect(Object.isFrozen(committed)).toBe(true)
+    expect(Object.isFrozen(committed.transportAcknowledgement)).toBe(true)
+  })
+
+  test('keeps acknowledgement outside the generic recovery transition path', () => {
+    const before = outcomeUnknownRecord()
+    const acknowledged = createTm1TransportAcknowledgedRecord(
+      before,
+      acceptedAcknowledgement()
+    )
+
+    expect(() => assertTm1RecoveryTransition(before, acknowledged)).toThrowError(
+      expect.objectContaining({ code: 'INVALID_RECOVERY_TRANSITION' })
+    )
+    expect(() => assertTm1TransportAcknowledgementTransition(
+      before,
+      acknowledged
+    )).not.toThrow()
+  })
+
+  test('rejects stale acknowledgement revision and owner epoch', async () => {
+    const before = outcomeUnknownRecord()
+    const store = new TestOnlyInMemoryRecoveryStore(before)
+
+    await expect(store.commitTransportAcknowledgement({
+      ...command(before),
+      expectedRevision: before.revision - 1,
+      acknowledgement: acceptedAcknowledgement()
+    })).rejects.toMatchObject({ code: 'REVISION_MISMATCH' })
+    await expect(store.commitTransportAcknowledgement({
+      ...command(before),
+      expectedOwnerEpoch: before.ownerEpoch - 1,
+      acknowledgement: acceptedAcknowledgement()
+    })).rejects.toMatchObject({ code: 'STALE_OWNER_EPOCH' })
+    await expect(store.load(PUBLICATION_ID)).resolves.toEqual(before)
+  })
+
+  test('rejects acknowledgement before a durable dispatch intent exists', async () => {
+    const before = preDispatchRecord()
+    const store = new TestOnlyInMemoryRecoveryStore(before)
+
+    await expect(store.commitTransportAcknowledgement({
+      ...command(before),
+      acknowledgement: acceptedAcknowledgement()
+    })).rejects.toMatchObject({ code: 'INVALID_RECOVERY_TRANSITION' })
+  })
+
+  test.each([
+    ['submissionId', 'submission:different'],
+    ['signedId', 'signed:different'],
+    ['txid', HASH_A],
+    ['signedArtifactHash', HASH_A]
+  ] as const)('rejects acknowledgement with mismatched %s', async (field, value) => {
+    const before = outcomeUnknownRecord()
+    const store = new TestOnlyInMemoryRecoveryStore(before)
+
+    await expect(store.commitTransportAcknowledgement({
+      ...command(before),
+      acknowledgement: acceptedAcknowledgement({ [field]: value })
+    })).rejects.toMatchObject({ code: 'INVALID_RECOVERY_TRANSITION' })
+    await expect(store.load(PUBLICATION_ID)).resolves.toEqual(before)
+  })
+
+  test('rejects repeated acknowledgement deterministically', async () => {
+    const before = outcomeUnknownRecord()
+    const store = new TestOnlyInMemoryRecoveryStore(before)
+    const first = await store.commitTransportAcknowledgement({
+      ...command(before),
+      acknowledgement: acceptedAcknowledgement()
+    }) as Tm1PublicationRecoveryRecord
+
+    await expect(store.commitTransportAcknowledgement({
+      ...command(before),
+      acknowledgement: acceptedAcknowledgement()
+    })).rejects.toMatchObject({ code: 'REVISION_MISMATCH' })
+    await expect(store.commitTransportAcknowledgement({
+      ...command(first),
+      acknowledgement: acceptedAcknowledgement({ acknowledgedAt: 2_800 })
+    })).rejects.toMatchObject({ code: 'INVALID_RECOVERY_TRANSITION' })
+    await expect(store.load(PUBLICATION_ID)).resolves.toEqual(first)
+  })
+
+  test('does not downgrade a confirmed record when acknowledgement arrives late', async () => {
+    const confirmed = parseTm1PublicationRecoveryRecord({
+      ...submittedRecord(),
+      revision: 7,
+      phase: 'confirmedObserved',
+      lastObservation: {
+        status: 'confirmed',
+        txid: HASH_B,
+        observedAt: 3_500,
+        confirmations: 1,
+        blockHash: BLOCK_HASH,
+        blockHeight: 109
+      }
+    })
+    const store = new TestOnlyInMemoryRecoveryStore(confirmed)
+
+    await expect(store.commitTransportAcknowledgement({
+      ...command(confirmed),
+      acknowledgement: acceptedAcknowledgement()
+    })).rejects.toMatchObject({ code: 'INVALID_RECOVERY_TRANSITION' })
+    await expect(store.load(PUBLICATION_ID)).resolves.toEqual(confirmed)
+  })
+
+  test('fails closed on malformed or hostile acknowledgement evidence', async () => {
+    const before = outcomeUnknownRecord()
+    const store = new TestOnlyInMemoryRecoveryStore(before)
+    let getterCalls = 0
+    const accessor = { ...acceptedAcknowledgement() }
+    Object.defineProperty(accessor, 'txid', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1
+        return HASH_B
+      }
+    })
+
+    await expect(store.commitTransportAcknowledgement({
+      ...command(before),
+      acknowledgement: accessor as Tm1TransportAcknowledgementCommitEvidence
+    })).rejects.toMatchObject({ code: 'MALFORMED_RECOVERY_RECORD' })
+    expect(getterCalls).toBe(0)
+
+    const hostile = new Proxy({}, {
+      ownKeys: () => { throw new Error('hostile acknowledgement') }
+    })
+    await expect(store.commitTransportAcknowledgement({
+      ...command(before),
+      acknowledgement: hostile as Tm1TransportAcknowledgementCommitEvidence
+    })).rejects.toMatchObject({ code: 'MALFORMED_RECOVERY_RECORD' })
+    await expect(store.commitTransportAcknowledgement({
+      ...command(before),
+      acknowledgement: {
+        ...acceptedAcknowledgement(),
+        disposition: 'ambiguous'
+      } as unknown as Tm1TransportAcknowledgementCommitEvidence
+    })).rejects.toMatchObject({ code: 'MALFORMED_RECOVERY_RECORD' })
+    await expect(store.load(PUBLICATION_ID)).resolves.toEqual(before)
+  })
+
+  test('rejects acknowledgement timestamps before the durable dispatch intent', async () => {
+    const before = outcomeUnknownRecord()
+    const store = new TestOnlyInMemoryRecoveryStore(before)
+
+    await expect(store.commitTransportAcknowledgement({
+      ...command(before),
+      acknowledgement: acceptedAcknowledgement({ acknowledgedAt: 2_599 })
+    })).rejects.toMatchObject({ code: 'INVALID_RECOVERY_TRANSITION' })
   })
 
   test('keeps outcomeUnknown when exact txid is absent', async () => {
@@ -772,6 +982,7 @@ function emptyStore(): Tm1PublicationRecoveryStore {
     create: unavailable,
     commitExecutionEvidence: unavailable,
     commitDispatchIntent: unavailable,
+    commitTransportAcknowledgement: unavailable,
     commitRecoveryTransition: unavailable,
     claimOwnership: unavailable
   }

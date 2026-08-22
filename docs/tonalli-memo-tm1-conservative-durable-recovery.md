@@ -33,19 +33,26 @@ preDispatch
 
 broadcastAuthorizationConsumed
   -> atomic durable dispatchIntent/outcomeUnknown
+  -> positive transport acknowledgement OR positive Chronik observation
   -> submittedObserved
   -> confirmedObserved
 ```
 
-`outcomeUnknown` can remain unknown or advance only through positive read-only
-observation. It cannot transition back to `preDispatch`, cannot produce a new
-authorization and cannot enter a transport-capable state.
+`outcomeUnknown` can remain unknown or advance only through positive evidence:
+an accepted result returned by the already-executed single transport call, or
+a read-only Chronik observation. It cannot transition back to `preDispatch`,
+cannot produce a new authorization and cannot enter a transport-capable state.
 
 An `absent` observation keeps the phase unknown. Chronik unavailability or a
 malformed response does not modify the durable record. A mempool observation
 advances to `submittedObserved`; an exact positive block observation advances
 to `confirmedObserved`. A later absent read cannot regress a previously
 submitted observation into authority to retransmit.
+
+`submittedObserved` therefore means that submission is positively evidenced,
+not necessarily that Chronik was the evidence source. A durable
+`transportAcknowledgement` identifies an accepted response from the exact
+dispatch intent; `lastObservation` identifies read-only Chronik evidence.
 
 ## Durable evidence, not durable authority
 
@@ -81,11 +88,24 @@ validated exact artifact
   -> exact BROADCAST human authorization consumed
   -> durable dispatchIntent/outcomeUnknown committed
   -> existing closed transport may be called
+  -> accepted return is durably committed as transportAcknowledgement
 ```
 
 `Tm1PublicationRecoveryStore.commitDispatchIntent()` represents the dedicated
 atomic persistence operation. General recovery updates cannot add or change a
-dispatch intent.
+dispatch intent. After that commit, the existing single transport may execute.
+If it returns the exact positive accepted result,
+`commitTransportAcknowledgement()` may persist that result and advance the
+record to `submittedObserved`. The acknowledgement operation checks the same
+`submissionId + signedId + txid + signedArtifactHash`, uses revision CAS and
+owner-epoch fencing, and grants no transport authority. Repeated
+acknowledgements are rejected deterministically rather than treated as another
+dispatch.
+
+If the transport throws, the process dies, its response is malformed or the
+acknowledgement cannot be durably committed, the attempt remains
+`outcomeUnknown` and observation-only. Neither absence nor ambiguity permits a
+retry or rebroadcast. Recovery only observes the exact txid.
 
 Phase 6-I-A does **not** splice a second transport path around the closed
 runtime. The current orchestrator/runtime has no awaited persistence hook at
@@ -106,7 +126,8 @@ deployment boundary must be decided first. Any concrete store must provide:
 - owner-epoch fencing and atomic takeover;
 - monotonic transition enforcement;
 - atomic dispatch-intent persistence;
-- durable acknowledgement and confirmation recording;
+- a dedicated CAS for exact, positive transport acknowledgement recording;
+- durable confirmation recording;
 - failure after partial or malformed writes without returning fabricated
   authority.
 

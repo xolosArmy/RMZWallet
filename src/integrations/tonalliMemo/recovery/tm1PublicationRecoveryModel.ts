@@ -105,6 +105,15 @@ export type Tm1TransportAcknowledgementEvidence = Readonly<{
   acknowledgedAt: number
 }>
 
+export type Tm1TransportAcknowledgementCommitEvidence = Readonly<{
+  submissionId: string
+  signedId: string
+  txid: string
+  signedArtifactHash: string
+  disposition: 'accepted'
+  acknowledgedAt: number
+}>
+
 export type Tm1RecoveryObservationEvidence = Readonly<
   | {
     status: 'absent' | 'mempool'
@@ -312,6 +321,68 @@ export function assertTm1DispatchIntentTransition(
   assertStableEvidence(previous.broadcastAuthorization, next.broadcastAuthorization)
 }
 
+export function createTm1TransportAcknowledgedRecord(
+  previousValue: unknown,
+  acknowledgementValue: unknown
+): Tm1PublicationRecoveryRecord {
+  const previous = parseTm1PublicationRecoveryRecord(previousValue)
+  const acknowledgement = parseTm1TransportAcknowledgementCommitEvidence(
+    acknowledgementValue
+  )
+  if (
+    previous.phase !== 'outcomeUnknown' ||
+    previous.dispatchIntent === null ||
+    previous.signed === null ||
+    previous.transportAcknowledgement !== null ||
+    acknowledgement.submissionId !== previous.dispatchIntent.submissionId ||
+    acknowledgement.signedId !== previous.signed.signedId ||
+    acknowledgement.txid !== previous.dispatchIntent.txid ||
+    acknowledgement.txid !== previous.signed.txid ||
+    acknowledgement.signedArtifactHash !== previous.dispatchIntent.signedArtifactHash ||
+    acknowledgement.signedArtifactHash !== previous.signed.signedArtifactHash ||
+    acknowledgement.acknowledgedAt < previous.dispatchIntent.committedAt
+  ) failTransition()
+
+  const next = parseTm1PublicationRecoveryRecord({
+    ...previous,
+    revision: previous.revision + 1,
+    phase: 'submittedObserved',
+    transportAcknowledgement: {
+      txid: acknowledgement.txid,
+      disposition: acknowledgement.disposition,
+      acknowledgedAt: acknowledgement.acknowledgedAt
+    }
+  })
+  assertTm1TransportAcknowledgementTransition(previous, next)
+  return next
+}
+
+export function assertTm1TransportAcknowledgementTransition(
+  previous: Tm1PublicationRecoveryRecord,
+  next: Tm1PublicationRecoveryRecord
+): void {
+  assertTransitionIdentity(previous, next)
+  if (
+    previous.phase !== 'outcomeUnknown' ||
+    previous.dispatchIntent === null ||
+    previous.signed === null ||
+    previous.transportAcknowledgement !== null ||
+    next.phase !== 'submittedObserved' ||
+    next.transportAcknowledgement === null ||
+    next.transportAcknowledgement.disposition !== 'accepted' ||
+    next.transportAcknowledgement.txid !== previous.dispatchIntent.txid ||
+    next.transportAcknowledgement.acknowledgedAt < previous.dispatchIntent.committedAt
+  ) failTransition()
+
+  assertStableEvidence(previous.prepared, next.prepared)
+  assertStableEvidence(previous.signed, next.signed)
+  assertStableEvidence(previous.signingAuthorization, next.signingAuthorization)
+  assertStableEvidence(previous.broadcastAuthorization, next.broadcastAuthorization)
+  assertStableEvidence(previous.dispatchIntent, next.dispatchIntent)
+  assertStableEvidence(previous.lastObservation, next.lastObservation)
+  assertStableEvidence(previous.terminal, next.terminal)
+}
+
 export function assertTm1ExecutionEvidenceTransition(
   previous: Tm1PublicationRecoveryRecord,
   next: Tm1PublicationRecoveryRecord
@@ -450,6 +521,29 @@ function parseTransportAcknowledgement(
   if (dataValue(record, 'disposition') !== 'accepted') malformed()
   return Object.freeze({
     txid: requireCanonicalHash(dataValue(record, 'txid')),
+    disposition: 'accepted',
+    acknowledgedAt: requireNonNegativeSafeInteger(dataValue(record, 'acknowledgedAt'))
+  })
+}
+
+export function parseTm1TransportAcknowledgementCommitEvidence(
+  value: unknown
+): Tm1TransportAcknowledgementCommitEvidence {
+  assertNoForbiddenAuthorityFields(value)
+  const record = exactRecord(value, [
+    'submissionId',
+    'signedId',
+    'txid',
+    'signedArtifactHash',
+    'disposition',
+    'acknowledgedAt'
+  ])
+  if (dataValue(record, 'disposition') !== 'accepted') malformed()
+  return Object.freeze({
+    submissionId: requireIdentifier(dataValue(record, 'submissionId')),
+    signedId: requireIdentifier(dataValue(record, 'signedId')),
+    txid: requireCanonicalHash(dataValue(record, 'txid')),
+    signedArtifactHash: requireCanonicalHash(dataValue(record, 'signedArtifactHash')),
     disposition: 'accepted',
     acknowledgedAt: requireNonNegativeSafeInteger(dataValue(record, 'acknowledgedAt'))
   })
@@ -632,7 +726,10 @@ function assertDispatchBindings(record: Tm1PublicationRecoveryRecord): void {
   ) malformed()
   if (
     record.transportAcknowledgement !== null &&
-    record.transportAcknowledgement.txid !== record.dispatchIntent.txid
+    (
+      record.transportAcknowledgement.txid !== record.dispatchIntent.txid ||
+      record.transportAcknowledgement.acknowledgedAt < record.dispatchIntent.committedAt
+    )
   ) malformed()
 }
 

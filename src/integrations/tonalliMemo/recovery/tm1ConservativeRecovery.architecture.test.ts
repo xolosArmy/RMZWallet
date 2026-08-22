@@ -78,15 +78,20 @@ describe('TM1 conservative recovery architectural boundaries', () => {
     )
   })
 
-  test('makes dispatch intent a specialized atomic store operation', () => {
+  test('makes dispatch intent and returned acknowledgement specialized store operations', () => {
     const store = source('./tm1PublicationRecoveryStore.ts')
     const controller = source('./tm1DurablePublicationController.ts')
+    const applicationPort = source('./tm1PublicationApplicationPort.ts')
 
     expect(store).toContain('commitDispatchIntent(')
+    expect(store).toContain('commitTransportAcknowledgement(')
     expect(store).toContain('must finish durably before the closed runtime')
+    expect(store).toContain('already-executed dispatch')
     expect(store).toContain('commitRecoveryTransition')
     expect(controller).not.toContain('.commitDispatchIntent(')
+    expect(controller).not.toContain('.commitTransportAcknowledgement(')
     expect(controller).not.toContain('.commitExecutionEvidence(')
+    expect(applicationPort).not.toContain('commitTransportAcknowledgement')
   })
 
   test('requires revision CAS, fencing, and globally unique capability consumption', () => {

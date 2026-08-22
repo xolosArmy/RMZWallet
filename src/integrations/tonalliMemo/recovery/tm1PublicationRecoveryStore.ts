@@ -1,5 +1,6 @@
 import type {
-  Tm1PublicationRecoveryRecord
+  Tm1PublicationRecoveryRecord,
+  Tm1TransportAcknowledgementCommitEvidence
 } from './tm1PublicationRecoveryModel'
 
 export type Tm1PublicationRecoveryStoreErrorCode =
@@ -48,6 +49,19 @@ export type Tm1RecoveryStoreDispatchIntentCommit = Readonly<
   }
 >
 
+export type Tm1RecoveryStoreTransportAcknowledgementCommit = Readonly<
+  Tm1RecoveryStoreExpectedVersion & {
+    /**
+     * Positive evidence returned by the one dispatch already represented by
+     * the durable dispatch intent. This data is identity, not authority: the
+     * store must verify every field against its current record and must never
+     * invoke a transport while committing it. Implementations must apply
+     * `createTm1TransportAcknowledgedRecord` or equivalent validation.
+     */
+    acknowledgement: Tm1TransportAcknowledgementCommitEvidence
+  }
+>
+
 export type Tm1RecoveryStoreRecoveryCommit = Readonly<
   Tm1RecoveryStoreExpectedVersion & {
     /** Recovery commits are observation/abandonment only. */
@@ -69,7 +83,9 @@ export type Tm1RecoveryStoreOwnershipClaim = Readonly<
  * monotonic transitions. `commitRecoveryTransition` must reject any attempt
  * to add or mutate a dispatch intent. `commitDispatchIntent` is the only store
  * operation that may atomically add that evidence, and it grants no transport
- * capability by itself.
+ * capability by itself. `commitTransportAcknowledgement` may only persist a
+ * positive result returned by that exact, already-executed dispatch; repeated
+ * acknowledgement commits are rejected by CAS or transition validation.
  *
  * All return values are `unknown` deliberately: callers re-validate and clone
  * the persistence boundary instead of trusting an implementation's objects.
@@ -80,6 +96,9 @@ export interface Tm1PublicationRecoveryStore {
   create(input: Tm1RecoveryStoreCreate): Promise<unknown>
   commitExecutionEvidence(input: Tm1RecoveryStoreExecutionCommit): Promise<unknown>
   commitDispatchIntent(input: Tm1RecoveryStoreDispatchIntentCommit): Promise<unknown>
+  commitTransportAcknowledgement(
+    input: Tm1RecoveryStoreTransportAcknowledgementCommit
+  ): Promise<unknown>
   commitRecoveryTransition(input: Tm1RecoveryStoreRecoveryCommit): Promise<unknown>
   claimOwnership(input: Tm1RecoveryStoreOwnershipClaim): Promise<unknown>
 }
