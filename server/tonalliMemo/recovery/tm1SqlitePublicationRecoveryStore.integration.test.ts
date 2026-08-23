@@ -23,6 +23,7 @@ import {
   createTm1SqlitePublicationRecoveryStore,
   type Tm1SqlitePublicationRecoveryStore
 } from './tm1SqlitePublicationRecoveryStore'
+import type { Tm1CanonicalRecoveryRecord } from './tm1SqliteSchema'
 import {
   outcomeUnknownRecord,
   preparedRecord,
@@ -181,6 +182,228 @@ describe('TM1 SQLite real-file and process behavior', () => {
     await expect(second.load(record.publicationId)).resolves.toEqual(claimed)
     first.close()
     second.close()
+  })
+
+  test('rejects the post-open AFTER INSERT deletion-trigger exploit', async () => {
+    const { databasePath } = emptyPath()
+    const store = openStore(databasePath)
+    const attacker = new DatabaseSync(databasePath, { allowExtension: false })
+    attacker.exec(`
+      CREATE TRIGGER hostile_delete_after_insert
+      AFTER INSERT ON tm1_publications
+      BEGIN
+        DELETE FROM tm1_publications
+        WHERE publication_id = NEW.publication_id;
+      END
+    `)
+
+    await expect(store.create({ record: preparedRecord() })).rejects.toMatchObject({
+      code: 'RECOVERY_STORE_FAILED'
+    })
+    expect(readSeam(store).database.isTransaction).toBe(false)
+    expect(attacker.prepare('SELECT count(*) AS count FROM tm1_publications').get()?.count)
+      .toBe(0)
+    expect(attacker.prepare(`
+      SELECT name
+      FROM sqlite_schema
+      WHERE type = 'trigger' AND name = 'hostile_delete_after_insert'
+    `).get()?.name).toBe('hostile_delete_after_insert')
+
+    attacker.close()
+    store.close()
+  })
+
+  test('rejects a post-open AFTER UPDATE trigger before mutating a record', async () => {
+    const { databasePath } = emptyPath()
+    const store = openStore(databasePath)
+    const record = preparedRecord()
+    await store.create({ record })
+    const attacker = new DatabaseSync(databasePath, { allowExtension: false })
+    attacker.exec(`
+      CREATE TRIGGER hostile_delete_after_update
+      AFTER UPDATE ON tm1_publications
+      BEGIN
+        DELETE FROM tm1_publications
+        WHERE publication_id = NEW.publication_id;
+      END
+    `)
+
+    await expect(store.claimOwnership({
+      publicationId: record.publicationId,
+      expectedRevision: record.revision,
+      expectedOwnerEpoch: record.ownerEpoch,
+      nextOwnerEpoch: 1
+    })).rejects.toMatchObject({ code: 'RECOVERY_STORE_FAILED' })
+    expect(readSeam(store).database.isTransaction).toBe(false)
+    expect(attacker.prepare(`
+      SELECT revision, owner_epoch
+      FROM tm1_publications
+      WHERE publication_id = ?
+    `).get(record.publicationId)).toEqual({ revision: 0, owner_epoch: 0 })
+
+    attacker.close()
+    store.close()
+  })
+
+  test.each([
+    [
+      'unexpected view through load',
+      'CREATE VIEW hostile_publications AS SELECT publication_id FROM tm1_publications',
+      'load'
+    ],
+    [
+      'unexpected index through listRecoverable',
+      'CREATE INDEX hostile_owner_idx ON tm1_publications(owner_epoch)',
+      'list'
+    ],
+    [
+      'dropped required index through load',
+      'DROP INDEX tm1_publications_txid_idx',
+      'load'
+    ]
+  ] as const)('detects a post-open %s', async (_description, mutation, operation) => {
+    const { databasePath } = emptyPath()
+    const store = openStore(databasePath)
+    const record = preparedRecord()
+    await store.create({ record })
+    const attacker = new DatabaseSync(databasePath, { allowExtension: false })
+    attacker.exec(mutation)
+
+    const result = operation === 'load'
+      ? store.load(record.publicationId)
+      : store.listRecoverable()
+    await expect(result).rejects.toMatchObject({ code: 'RECOVERY_STORE_FAILED' })
+    expect(readSeam(store).database.isTransaction).toBe(false)
+
+    attacker.close()
+    store.close()
+  })
+
+  test('accepts a later operation after external restoration to exact canonical v1', async () => {
+    const { databasePath } = emptyPath()
+    const store = openStore(databasePath)
+    const record = preparedRecord()
+    await store.create({ record })
+    const attacker = new DatabaseSync(databasePath, { allowExtension: false })
+    attacker.exec(`
+      CREATE VIEW hostile_publications AS
+      SELECT publication_id FROM tm1_publications
+    `)
+
+    await expect(store.load(record.publicationId)).rejects.toMatchObject({
+      code: 'RECOVERY_STORE_FAILED'
+    })
+    expect(readSeam(store).database.isTransaction).toBe(false)
+    attacker.exec('DROP VIEW hostile_publications')
+    await expect(store.load(record.publicationId)).resolves.toEqual(record)
+
+    attacker.close()
+    store.close()
+  })
+
+  test('BEGIN IMMEDIATE prevents DDL between write attestation and mutation', async () => {
+    const { databasePath } = emptyPath()
+    const store = openStore(databasePath)
+    const attacker = new DatabaseSync(databasePath, {
+      allowExtension: false,
+      timeout: 20
+    })
+    attacker.exec('PRAGMA busy_timeout = 20')
+    const seam = readSeam(store)
+    const insertPublication = seam.insertPublication.bind(store)
+    let blockedDdlError: unknown
+    seam.insertPublication = canonical => {
+      try {
+        attacker.exec(`
+          CREATE TRIGGER hostile_delete_after_insert
+          AFTER INSERT ON tm1_publications
+          BEGIN
+            DELETE FROM tm1_publications
+            WHERE publication_id = NEW.publication_id;
+          END
+        `)
+      } catch (error) {
+        blockedDdlError = error
+      }
+      insertPublication(canonical)
+    }
+    const record = preparedRecord()
+
+    await expect(store.create({ record })).resolves.toEqual(record)
+    expect(blockedDdlError).toMatchObject({ code: 'ERR_SQLITE_ERROR', errcode: 5 })
+    expect(attacker.prepare(`
+      SELECT publication_id
+      FROM tm1_publications
+      WHERE publication_id = ?
+    `).get(record.publicationId)?.publication_id).toBe(record.publicationId)
+
+    attacker.exec(`
+      CREATE TRIGGER hostile_delete_after_insert
+      AFTER INSERT ON tm1_publications
+      BEGIN
+        DELETE FROM tm1_publications
+        WHERE publication_id = NEW.publication_id;
+      END
+    `)
+    await expect(store.load(record.publicationId)).rejects.toMatchObject({
+      code: 'RECOVERY_STORE_FAILED'
+    })
+
+    attacker.close()
+    store.close()
+  })
+
+  test('a coherent read snapshot may finish before the next operation detects DDL', async () => {
+    const { databasePath } = emptyPath()
+    const store = openStore(databasePath)
+    const record = preparedRecord()
+    await store.create({ record })
+    const attacker = new DatabaseSync(databasePath, { allowExtension: false })
+    const seam = readSeam(store)
+    const selectPublicationRow = seam.selectPublicationRow.bind(store)
+    let ddlCommitted = false
+    seam.selectPublicationRow = publicationId => {
+      const row = selectPublicationRow(publicationId)
+      attacker.exec(`
+        CREATE VIEW hostile_publications AS
+        SELECT publication_id FROM tm1_publications
+      `)
+      ddlCommitted = true
+      return row
+    }
+
+    await expect(store.load(record.publicationId)).resolves.toEqual(record)
+    expect(ddlCommitted).toBe(true)
+    seam.selectPublicationRow = selectPublicationRow
+    await expect(store.load(record.publicationId)).rejects.toMatchObject({
+      code: 'RECOVERY_STORE_FAILED'
+    })
+
+    attacker.close()
+    store.close()
+  })
+
+  test('schema failure inside a caller-owned read transaction preserves ownership', async () => {
+    const { databasePath } = emptyPath()
+    const store = openStore(databasePath)
+    const record = preparedRecord()
+    await store.create({ record })
+    const attacker = new DatabaseSync(databasePath, { allowExtension: false })
+    attacker.exec(`
+      CREATE VIEW hostile_publications AS
+      SELECT publication_id FROM tm1_publications
+    `)
+    const database = readSeam(store).database
+    database.exec('BEGIN')
+
+    await expect(store.load(record.publicationId)).rejects.toMatchObject({
+      code: 'RECOVERY_STORE_FAILED'
+    })
+    expect(database.isTransaction).toBe(true)
+    database.exec('ROLLBACK')
+
+    attacker.close()
+    store.close()
   })
 
   test('load reads publication and capability evidence from one WAL snapshot', async () => {
@@ -528,6 +751,7 @@ function openStore(
 
 type Tm1SqliteReadTestSeam = {
   database: DatabaseSync
+  insertPublication(canonical: Tm1CanonicalRecoveryRecord): void
   selectPublicationRow(
     publicationId: string
   ): Record<string, unknown> | undefined

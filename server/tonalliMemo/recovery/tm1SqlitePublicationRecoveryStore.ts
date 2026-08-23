@@ -32,7 +32,8 @@ import {
 } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
 import {
   initializeOrVerifyTm1SqliteSchema,
-  inspectTm1SqliteSchema
+  inspectTm1SqliteSchema,
+  verifyTm1SqliteSchemaV1
 } from './tm1SqliteMigrations'
 import {
   canonicalizeTm1RecoveryRecord,
@@ -280,29 +281,31 @@ implements Tm1PublicationRecoveryStore {
   inspectDurability(): Tm1SqliteDurabilityState {
     try {
       this.assertOpen()
-      const sqliteVersion = this.database.prepare(
-        'SELECT sqlite_version() AS version'
-      ).get()?.version
-      const journalMode = readPragmaString(this.database, 'journal_mode')
-      const synchronous = readPragmaInteger(this.database, 'synchronous')
-      const foreignKeys = readPragmaInteger(this.database, 'foreign_keys')
-      const trustedSchema = readPragmaInteger(this.database, 'trusted_schema')
-      const busyTimeoutMs = readPragmaInteger(this.database, 'busy_timeout', 'timeout')
-      if (
-        typeof sqliteVersion !== 'string' ||
-        journalMode !== 'wal' ||
-        synchronous !== 2 ||
-        foreignKeys !== 1 ||
-        trustedSchema !== 0 ||
-        busyTimeoutMs !== this.busyTimeoutMs
-      ) storeFailure()
-      return Object.freeze({
-        sqliteVersion,
-        journalMode,
-        synchronous,
-        foreignKeys,
-        trustedSchema,
-        busyTimeoutMs
+      return this.withReadSnapshot(() => {
+        const sqliteVersion = this.database.prepare(
+          'SELECT sqlite_version() AS version'
+        ).get()?.version
+        const journalMode = readPragmaString(this.database, 'journal_mode')
+        const synchronous = readPragmaInteger(this.database, 'synchronous')
+        const foreignKeys = readPragmaInteger(this.database, 'foreign_keys')
+        const trustedSchema = readPragmaInteger(this.database, 'trusted_schema')
+        const busyTimeoutMs = readPragmaInteger(this.database, 'busy_timeout', 'timeout')
+        if (
+          typeof sqliteVersion !== 'string' ||
+          journalMode !== 'wal' ||
+          synchronous !== 2 ||
+          foreignKeys !== 1 ||
+          trustedSchema !== 0 ||
+          busyTimeoutMs !== this.busyTimeoutMs
+        ) storeFailure()
+        return Object.freeze({
+          sqliteVersion,
+          journalMode,
+          synchronous,
+          foreignKeys,
+          trustedSchema,
+          busyTimeoutMs
+        })
       })
     } catch (error) {
       throw normalizeStoreBoundaryError(error)
@@ -324,10 +327,17 @@ implements Tm1PublicationRecoveryStore {
   }
 
   private withReadSnapshot<T>(operation: () => T): T {
-    if (this.database.isTransaction) return operation()
+    if (this.database.isTransaction) {
+      // Full attestation per operation is an intentional conservative choice:
+      // it binds authoritative reads to the caller-owned snapshot too.
+      verifyTm1SqliteSchemaV1(this.database)
+      return operation()
+    }
 
     this.database.exec('BEGIN')
     try {
+      // Establish and attest the same snapshot used by all hydration queries.
+      verifyTm1SqliteSchemaV1(this.database)
       const result = operation()
       this.database.exec('COMMIT')
       return result
@@ -346,6 +356,8 @@ implements Tm1PublicationRecoveryStore {
   private withImmediateTransaction<T>(operation: () => T): T {
     this.database.exec('BEGIN IMMEDIATE')
     try {
+      // The reserved write lock closes the DDL TOCTOU after attestation.
+      verifyTm1SqliteSchemaV1(this.database)
       const result = operation()
       this.database.exec('COMMIT')
       return result
