@@ -18,12 +18,20 @@ import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, test } from 'vitest'
 import type { Tm1PublicationRecoveryRecord } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryModel'
-import { inspectTm1SqliteSchema } from './tm1SqliteMigrations'
+import {
+  initializeOrVerifyTm1SqliteSchema,
+  inspectTm1SqliteSchema
+} from './tm1SqliteMigrations'
 import {
   createTm1SqlitePublicationRecoveryStore,
   type Tm1SqlitePublicationRecoveryStore
 } from './tm1SqlitePublicationRecoveryStore'
-import type { Tm1CanonicalRecoveryRecord } from './tm1SqliteSchema'
+import {
+  TM1_SQLITE_APPLICATION_ID,
+  TM1_SQLITE_PHYSICAL_SCHEMA_VERSION,
+  TM1_SQLITE_SCHEMA_V1_SQL,
+  type Tm1CanonicalRecoveryRecord
+} from './tm1SqliteSchema'
 import { encodeTm1SqliteIdentifierKey } from './tm1SqliteIdentifierKey'
 import {
   outcomeUnknownRecord,
@@ -47,6 +55,78 @@ afterEach(async () => {
 })
 
 describe('TM1 SQLite real-file and process behavior', () => {
+  test('rejects an unrelated DELETE database without persistent TM1 side effects', () => {
+    const { databasePath } = emptyPath()
+    const before = createUnrelatedDatabase(databasePath)
+    expect(before).toMatchObject({
+      journalMode: 'delete',
+      applicationId: 123_456,
+      userVersion: 77,
+      sentinelRows: [{ id: 1, value: 'preserve-me' }]
+    })
+    expect(before.schema.map(row => row.name)).toEqual(['unrelated_sentinel'])
+    expect(databaseSidecars(databasePath)).toEqual([])
+
+    expectOpenToFail(databasePath)
+
+    expect(databaseSidecars(databasePath)).toEqual([])
+    expect(snapshotUnrelatedDatabase(databasePath)).toEqual(before)
+  })
+
+  test('rejects spoofed TM1 markers and wrong schema before WAL mutation', () => {
+    const { databasePath } = emptyPath()
+    const before = createUnrelatedDatabase(databasePath, true)
+    expect(before).toMatchObject({
+      journalMode: 'delete',
+      applicationId: TM1_SQLITE_APPLICATION_ID,
+      userVersion: TM1_SQLITE_PHYSICAL_SCHEMA_VERSION
+    })
+    expect(before.schema.map(row => row.name)).toContain('unrelated_sentinel')
+    expect(databaseSidecars(databasePath)).toEqual([])
+
+    expectOpenToFail(databasePath)
+
+    expect(databaseSidecars(databasePath)).toEqual([])
+    expect(snapshotUnrelatedDatabase(databasePath)).toEqual(before)
+  })
+
+  test('rolls back failed pre-WAL identity inspection and leaves no transaction open', () => {
+    const { databasePath } = emptyPath()
+    const before = createUnrelatedDatabase(databasePath)
+    const database = new DatabaseSync(databasePath, { allowExtension: false })
+
+    let thrown: unknown
+    try {
+      initializeOrVerifyTm1SqliteSchema(database, 1_000)
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toMatchObject({ code: 'RECOVERY_STORE_FAILED' })
+    expect(database.isTransaction).toBe(false)
+    database.close()
+    expect(databaseSidecars(databasePath)).toEqual([])
+    expect(snapshotUnrelatedDatabase(databasePath)).toEqual(before)
+  })
+
+  test('attests canonical TM1 v1 in DELETE mode before transitioning it to WAL', async () => {
+    const { databasePath } = emptyPath()
+    createCanonicalDeleteDatabase(databasePath)
+    expect(databaseSidecars(databasePath)).toEqual([])
+
+    const store = openStore(databasePath)
+    expect(store.inspectDurability().journalMode).toBe('wal')
+    const record = preparedRecord()
+    await expect(store.create({ record })).resolves.toEqual(record)
+    await expect(store.load(record.publicationId)).resolves.toEqual(record)
+    store.close()
+
+    const raw = new DatabaseSync(databasePath, { allowExtension: false })
+    expect(inspectTm1SqliteSchema(raw)).toBe('v1')
+    expect(readPragmaString(raw, 'journal_mode')).toBe('wal')
+    raw.close()
+  })
+
   test('initializes canonical v1 from a pre-existing empty file and reopens it', async () => {
     const { databasePath } = emptyPath()
     const descriptor = openSync(databasePath, 'wx', 0o600)
@@ -93,6 +173,30 @@ describe('TM1 SQLite real-file and process behavior', () => {
 
     const raw = new DatabaseSync(databasePath, { allowExtension: false })
     expect(inspectTm1SqliteSchema(raw)).toBe('v1')
+    raw.close()
+  })
+
+  test('bounds concurrent WAL transition after both processes attest canonical v1', async () => {
+    const { databasePath } = emptyPath()
+    createCanonicalDeleteDatabase(databasePath)
+    const first = spawnWorker('open-on-command', databasePath)
+    const second = spawnWorker('open-on-command', databasePath)
+    await expect(Promise.all([nextMessage(first), nextMessage(second)]))
+      .resolves.toEqual([{ status: 'ready' }, { status: 'ready' }])
+
+    const firstOpened = nextMessage(first)
+    const secondOpened = nextMessage(second)
+    first.send?.({ command: 'open' })
+    second.send?.({ command: 'open' })
+    await expect(Promise.all([firstOpened, secondOpened])).resolves.toEqual([
+      { status: 'opened', empty: true, journalMode: 'wal' },
+      { status: 'opened', empty: true, journalMode: 'wal' }
+    ])
+    await Promise.all([killWorker(first), killWorker(second)])
+
+    const raw = new DatabaseSync(databasePath, { allowExtension: false })
+    expect(inspectTm1SqliteSchema(raw)).toBe('v1')
+    expect(readPragmaString(raw, 'journal_mode')).toBe('wal')
     raw.close()
   })
 
@@ -546,13 +650,13 @@ describe('TM1 SQLite real-file and process behavior', () => {
     const record = preparedRecord()
     await setup.create({ record })
     setup.close()
+    const contender = openStore(databasePath, 20)
 
     const locker = new DatabaseSync(databasePath, {
       allowExtension: false,
       timeout: 20
     })
     locker.exec('BEGIN IMMEDIATE')
-    const contender = openStore(databasePath, 20)
     await expect(contender.claimOwnership({
       publicationId: record.publicationId,
       expectedRevision: record.revision,
@@ -572,6 +676,9 @@ describe('TM1 SQLite real-file and process behavior', () => {
       const store = openStore(databasePath)
       await store.create({ record: preparedRecord() })
       store.close()
+      const raw = new DatabaseSync(databasePath, { allowExtension: false })
+      expect(readPragmaString(raw, 'journal_mode', 'DELETE')).toBe('delete')
+      raw.close()
       chmodSync(databasePath, 0o400)
 
       let thrown: unknown
@@ -581,6 +688,7 @@ describe('TM1 SQLite real-file and process behavior', () => {
         thrown = error
       }
       expect(thrown).toMatchObject({ code: 'RECOVERY_STORE_FAILED' })
+      expect(databaseSidecars(databasePath)).toEqual([])
     }
   )
 
@@ -598,6 +706,7 @@ describe('TM1 SQLite real-file and process behavior', () => {
       code: 'RECOVERY_STORE_FAILED',
       message: 'RECOVERY_STORE_FAILED'
     })
+    expect(databaseSidecars(databasePath)).toEqual([])
   })
 
   test('rolls back a real transaction when transition validation throws', async () => {
@@ -752,6 +861,121 @@ function openStore(
     ...(busyTimeoutMs === undefined ? {} : { busyTimeoutMs }),
     now: () => 1_000
   })
+}
+
+type UnrelatedDatabaseSnapshot = Readonly<{
+  journalMode: string
+  schema: readonly Record<string, unknown>[]
+  sentinelRows: readonly Record<string, unknown>[]
+  applicationId: number
+  userVersion: number
+}>
+
+function createUnrelatedDatabase(
+  databasePath: string,
+  spoofTm1Markers = false
+): UnrelatedDatabaseSnapshot {
+  const database = new DatabaseSync(databasePath, { allowExtension: false })
+  database.exec('PRAGMA journal_mode = DELETE')
+  if (spoofTm1Markers) {
+    database.exec(TM1_SQLITE_SCHEMA_V1_SQL)
+    database.prepare(`
+      INSERT INTO tm1_store_metadata (
+        singleton_id,
+        physical_schema_version,
+        created_at
+      ) VALUES (1, ?, ?)
+    `).run(TM1_SQLITE_PHYSICAL_SCHEMA_VERSION, 1_000)
+  }
+  database.exec(`
+    CREATE TABLE unrelated_sentinel (
+      id INTEGER PRIMARY KEY,
+      value TEXT NOT NULL
+    ) STRICT;
+    INSERT INTO unrelated_sentinel (id, value) VALUES (1, 'preserve-me');
+  `)
+  database.exec(`PRAGMA application_id = ${
+    spoofTm1Markers ? TM1_SQLITE_APPLICATION_ID : 123_456
+  }`)
+  database.exec(`PRAGMA user_version = ${
+    spoofTm1Markers ? TM1_SQLITE_PHYSICAL_SCHEMA_VERSION : 77
+  }`)
+  database.close()
+  if (process.platform !== 'win32') chmodSync(databasePath, 0o600)
+  return snapshotUnrelatedDatabase(databasePath)
+}
+
+function snapshotUnrelatedDatabase(databasePath: string): UnrelatedDatabaseSnapshot {
+  const database = new DatabaseSync(databasePath, { allowExtension: false })
+  try {
+    return Object.freeze({
+      journalMode: readPragmaString(database, 'journal_mode'),
+      schema: Object.freeze(database.prepare(`
+        SELECT type, name, tbl_name, sql
+        FROM sqlite_schema
+        WHERE name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+      `).all().map(row => Object.freeze({ ...row }))),
+      sentinelRows: Object.freeze(database.prepare(`
+        SELECT id, value
+        FROM unrelated_sentinel
+        ORDER BY id
+      `).all().map(row => Object.freeze({ ...row }))),
+      applicationId: readPragmaInteger(database, 'application_id'),
+      userVersion: readPragmaInteger(database, 'user_version')
+    })
+  } finally {
+    database.close()
+  }
+}
+
+function createCanonicalDeleteDatabase(databasePath: string): void {
+  const initialized = openStore(databasePath)
+  initialized.close()
+  const database = new DatabaseSync(databasePath, { allowExtension: false })
+  try {
+    expect(inspectTm1SqliteSchema(database)).toBe('v1')
+    expect(readPragmaString(database, 'journal_mode', 'DELETE')).toBe('delete')
+  } finally {
+    database.close()
+  }
+}
+
+function expectOpenToFail(databasePath: string): void {
+  let thrown: unknown
+  try {
+    openStore(databasePath)
+  } catch (error) {
+    thrown = error
+  }
+  expect(thrown).toMatchObject({
+    code: 'RECOVERY_STORE_FAILED',
+    message: 'RECOVERY_STORE_FAILED'
+  })
+}
+
+function databaseSidecars(databasePath: string): string[] {
+  return [`${databasePath}-wal`, `${databasePath}-shm`]
+    .filter(path => existsSync(path))
+}
+
+function readPragmaString(
+  database: DatabaseSync,
+  pragma: string,
+  assignedValue?: string
+): string {
+  const row = assignedValue === undefined
+    ? database.prepare(`PRAGMA ${pragma}`).get()
+    : database.prepare(`PRAGMA ${pragma} = ${assignedValue}`).get()
+  const value = row?.[pragma]
+  if (typeof value !== 'string') throw new Error('INVALID_TEST_PRAGMA')
+  return value.toLowerCase()
+}
+
+function readPragmaInteger(database: DatabaseSync, pragma: string): number {
+  const value = database.prepare(`PRAGMA ${pragma}`).get()?.[pragma]
+  if (typeof value !== 'number') throw new Error('INVALID_TEST_PRAGMA')
+  return value
 }
 
 type Tm1SqliteReadTestSeam = {

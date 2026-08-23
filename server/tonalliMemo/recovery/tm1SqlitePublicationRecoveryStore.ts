@@ -6,6 +6,7 @@ import {
   openSync
 } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { DatabaseSync } from 'node:sqlite'
 import {
   Tm1PublicationRecoveryError,
@@ -32,7 +33,6 @@ import {
 } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
 import {
   initializeOrVerifyTm1SqliteSchema,
-  inspectTm1SqliteSchema,
   verifyTm1SqliteSchemaV1
 } from './tm1SqliteMigrations'
 import { encodeTm1SqliteIdentifierKey } from './tm1SqliteIdentifierKey'
@@ -47,6 +47,8 @@ import {
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000
 const MAX_BUSY_TIMEOUT_MS = 60_000
+const WAL_MODE_RETRY_INTERVAL_MS = 10
+const WAL_MODE_RETRY_SIGNAL = new Int32Array(new SharedArrayBuffer(4))
 const PUBLICATION_COLUMNS = `
   publication_id,
   domain_schema,
@@ -106,13 +108,15 @@ implements Tm1PublicationRecoveryStore {
       database.exec('PRAGMA trusted_schema = OFF')
       database.exec(`PRAGMA busy_timeout = ${bindings.busyTimeoutMs}`)
 
-      requestWalMode(database)
-      database.exec('PRAGMA synchronous = FULL')
+      // Only connection-local safety settings run before this complete
+      // identity check. The initializer mutates only an observed empty store.
       const createdAt = readNow(bindings.now)
-      if (!hasVerifiedV1Schema(database)) {
-        initializeOrVerifyTm1SqliteSchema(database, createdAt)
-      }
+      initializeOrVerifyTm1SqliteSchema(database, createdAt)
+      // WAL is persistent, so it is requested only for an attested TM1 store.
+      requestWalMode(database, bindings.busyTimeoutMs)
       if (readPragmaString(database, 'journal_mode') !== 'wal') storeFailure()
+      database.exec('PRAGMA synchronous = FULL')
+      verifyTm1SqliteSchemaV1(database)
 
       this.database = database
       this.busyTimeoutMs = bindings.busyTimeoutMs
@@ -690,17 +694,29 @@ function isFileAlreadyExistsError(error: unknown): boolean {
   )
 }
 
-function requestWalMode(database: DatabaseSync): void {
-  try {
-    if (readPragmaString(database, 'journal_mode', 'WAL') !== 'wal') {
-      storeFailure()
+function requestWalMode(database: DatabaseSync, busyTimeoutMs: number): void {
+  const deadline = performance.now() + busyTimeoutMs
+  while (true) {
+    try {
+      if (readPragmaString(database, 'journal_mode', 'WAL') === 'wal') return
+    } catch (error) {
+      if (!isSqliteBusyError(error)) throw error
     }
-  } catch (error) {
-    // A concurrent first opener may hold SQLite's journal-header lock while
-    // installing WAL. Defer only SQLITE_BUSY to the existing transactional
-    // schema initializer, then require the durable mode immediately after it.
-    if (isSqliteBusyError(error)) return
-    throw error
+
+    try {
+      if (readPragmaString(database, 'journal_mode') === 'wal') return
+    } catch (error) {
+      if (!isSqliteBusyError(error)) throw error
+    }
+
+    const remainingMs = deadline - performance.now()
+    if (remainingMs <= 0) storeFailure()
+    Atomics.wait(
+      WAL_MODE_RETRY_SIGNAL,
+      0,
+      0,
+      Math.min(WAL_MODE_RETRY_INTERVAL_MS, remainingMs)
+    )
   }
 }
 
@@ -713,18 +729,6 @@ function isSqliteBusyError(error: unknown): boolean {
     'errcode' in error &&
     error.errcode === 5
   )
-}
-
-function hasVerifiedV1Schema(database: DatabaseSync): boolean {
-  try {
-    return inspectTm1SqliteSchema(database) === 'v1'
-  } catch (error) {
-    if (
-      error instanceof Tm1PublicationRecoveryStoreError ||
-      isSqliteBusyError(error)
-    ) return false
-    throw error
-  }
 }
 
 function snapshotExpectedVersion(
