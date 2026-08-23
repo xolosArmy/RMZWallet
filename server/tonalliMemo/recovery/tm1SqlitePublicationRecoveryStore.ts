@@ -2,7 +2,6 @@ import {
   accessSync,
   closeSync,
   constants as fsConstants,
-  existsSync,
   lstatSync,
   openSync
 } from 'node:fs'
@@ -105,11 +104,13 @@ implements Tm1PublicationRecoveryStore {
       database.exec('PRAGMA trusted_schema = OFF')
       database.exec(`PRAGMA busy_timeout = ${bindings.busyTimeoutMs}`)
 
-      const schemaState = inspectTm1SqliteSchema(database)
-      const journalMode = readPragmaString(database, 'journal_mode', 'WAL')
-      if (journalMode !== 'wal') storeFailure()
+      requestWalMode(database)
       database.exec('PRAGMA synchronous = FULL')
-      initializeOrVerifyTm1SqliteSchema(database, schemaState, readNow(bindings.now))
+      const createdAt = readNow(bindings.now)
+      if (!hasVerifiedV1Schema(database)) {
+        initializeOrVerifyTm1SqliteSchema(database, createdAt)
+      }
+      if (readPragmaString(database, 'journal_mode') !== 'wal') storeFailure()
 
       this.database = database
       this.busyTimeoutMs = bindings.busyTimeoutMs
@@ -641,10 +642,7 @@ function prepareSecureDatabaseFile(databasePath: string): void {
     if ((parentStat.mode & 0o077) !== 0) storeFailure()
   }
 
-  if (!existsSync(databasePath)) {
-    const descriptor = openSync(databasePath, 'wx', 0o600)
-    closeSync(descriptor)
-  }
+  ensureDatabaseFile(databasePath)
   const databaseStat = lstatSync(databasePath)
   if (!databaseStat.isFile() || databaseStat.isSymbolicLink()) storeFailure()
   if (
@@ -652,6 +650,63 @@ function prepareSecureDatabaseFile(databasePath: string): void {
     ((databaseStat.mode & 0o600) !== 0o600 || (databaseStat.mode & 0o077) !== 0)
   ) storeFailure()
   accessSync(databasePath, fsConstants.R_OK | fsConstants.W_OK)
+}
+
+function ensureDatabaseFile(databasePath: string): void {
+  let descriptor: number
+  try {
+    descriptor = openSync(databasePath, 'wx', 0o600)
+  } catch (error) {
+    if (isFileAlreadyExistsError(error)) return
+    throw error
+  }
+  closeSync(descriptor)
+}
+
+function isFileAlreadyExistsError(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    'code' in error &&
+    error.code === 'EEXIST'
+  )
+}
+
+function requestWalMode(database: DatabaseSync): void {
+  try {
+    if (readPragmaString(database, 'journal_mode', 'WAL') !== 'wal') {
+      storeFailure()
+    }
+  } catch (error) {
+    // A concurrent first opener may hold SQLite's journal-header lock while
+    // installing WAL. Defer only SQLITE_BUSY to the existing transactional
+    // schema initializer, then require the durable mode immediately after it.
+    if (isSqliteBusyError(error)) return
+    throw error
+  }
+}
+
+function isSqliteBusyError(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    'code' in error &&
+    error.code === 'ERR_SQLITE_ERROR' &&
+    'errcode' in error &&
+    error.errcode === 5
+  )
+}
+
+function hasVerifiedV1Schema(database: DatabaseSync): boolean {
+  try {
+    return inspectTm1SqliteSchema(database) === 'v1'
+  } catch (error) {
+    if (
+      error instanceof Tm1PublicationRecoveryStoreError ||
+      isSqliteBusyError(error)
+    ) return false
+    throw error
+  }
 }
 
 function snapshotExpectedVersion(

@@ -58,32 +58,28 @@ export function inspectTm1SqliteSchema(
 
 export function initializeOrVerifyTm1SqliteSchema(
   database: DatabaseSync,
-  expectedState: Tm1SqliteSchemaState,
   createdAt: number
 ): void {
   if (!Number.isSafeInteger(createdAt) || createdAt < 0) schemaFailure()
-  if (expectedState === 'v1') {
-    verifyTm1SqliteSchemaV1(database)
-    return
-  }
 
+  // Schema identity markers are written as separate SQLite statements inside
+  // the migration transaction. Serialize before the first inspection so a
+  // concurrent opener cannot observe that transaction mid-initialization.
   database.exec('BEGIN IMMEDIATE')
   try {
     const currentState = inspectTm1SqliteSchema(database)
-    if (currentState === 'v1') {
-      database.exec('COMMIT')
-      return
+    if (currentState === 'empty') {
+      database.exec(TM1_SQLITE_SCHEMA_V1_SQL)
+      database.prepare(`
+        INSERT INTO tm1_store_metadata (
+          singleton_id,
+          physical_schema_version,
+          created_at
+        ) VALUES (1, ?, ?)
+      `).run(TM1_SQLITE_PHYSICAL_SCHEMA_VERSION, createdAt)
+      database.exec(`PRAGMA application_id = ${TM1_SQLITE_APPLICATION_ID}`)
+      database.exec(`PRAGMA user_version = ${TM1_SQLITE_PHYSICAL_SCHEMA_VERSION}`)
     }
-    database.exec(TM1_SQLITE_SCHEMA_V1_SQL)
-    database.prepare(`
-      INSERT INTO tm1_store_metadata (
-        singleton_id,
-        physical_schema_version,
-        created_at
-      ) VALUES (1, ?, ?)
-    `).run(TM1_SQLITE_PHYSICAL_SCHEMA_VERSION, createdAt)
-    database.exec(`PRAGMA application_id = ${TM1_SQLITE_APPLICATION_ID}`)
-    database.exec(`PRAGMA user_version = ${TM1_SQLITE_PHYSICAL_SCHEMA_VERSION}`)
     database.exec('COMMIT')
   } catch (error) {
     if (database.isTransaction) {

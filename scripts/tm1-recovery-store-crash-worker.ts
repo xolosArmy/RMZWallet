@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { closeSync, openSync, readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import {
   parseTm1PublicationRecoveryRecord,
@@ -19,6 +19,10 @@ try {
     await loadOnly(databasePath, requireArgument(argument))
   } else if (mode === 'stale-recovery') {
     await staleRecovery(databasePath, requireArgument(argument))
+  } else if (mode === 'open-on-command') {
+    await openOnCommand(databasePath)
+  } else if (mode === 'create-empty-and-hold') {
+    createEmptyAndHold(databasePath)
   } else {
     fail('INVALID_WORKER_INPUT')
   }
@@ -116,6 +120,47 @@ async function staleRecovery(path: string, publicationId: string): Promise<void>
     }
   })
   keepAlive()
+}
+
+async function openOnCommand(path: string): Promise<void> {
+  send({ status: 'ready' })
+  await waitForCommand('open')
+  const store = createTm1SqlitePublicationRecoveryStore({
+    databasePath: path,
+    now: () => 1_000
+  })
+  const record = await store.load('publication:first-open')
+  const durability = store.inspectDurability()
+  store.close()
+  send({
+    status: 'opened',
+    empty: record === null,
+    journalMode: durability.journalMode
+  })
+}
+
+function createEmptyAndHold(path: string): void {
+  const descriptor = openSync(path, 'wx', 0o600)
+  closeSync(descriptor)
+  send({ status: 'empty-file-created' })
+  keepAlive()
+}
+
+function waitForCommand(expected: string): Promise<void> {
+  return new Promise((resolveCommand, rejectCommand) => {
+    process.once('message', message => {
+      if (
+        !message ||
+        typeof message !== 'object' ||
+        !('command' in message) ||
+        message.command !== expected
+      ) {
+        rejectCommand(new Error('INVALID_WORKER_INPUT'))
+        return
+      }
+      resolveCommand()
+    })
+  })
 }
 
 function requireArgument(value: string | undefined): string {

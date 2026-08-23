@@ -1,7 +1,12 @@
 import { fork, type ChildProcess } from 'node:child_process'
 import {
   chmodSync,
+  closeSync,
+  existsSync,
+  lstatSync,
   mkdtempSync,
+  openSync,
+  readlinkSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -13,6 +18,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, test } from 'vitest'
 import type { Tm1PublicationRecoveryRecord } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryModel'
+import { inspectTm1SqliteSchema } from './tm1SqliteMigrations'
 import {
   createTm1SqlitePublicationRecoveryStore,
   type Tm1SqlitePublicationRecoveryStore
@@ -39,6 +45,100 @@ afterEach(async () => {
 })
 
 describe('TM1 SQLite real-file and process behavior', () => {
+  test('initializes canonical v1 from a pre-existing empty file and reopens it', async () => {
+    const { databasePath } = emptyPath()
+    const descriptor = openSync(databasePath, 'wx', 0o600)
+    closeSync(descriptor)
+    const record = preparedRecord()
+
+    const first = openStore(databasePath)
+    await expect(first.create({ record })).resolves.toEqual(record)
+    await expect(first.load(record.publicationId)).resolves.toEqual(record)
+    first.close()
+
+    const raw = new DatabaseSync(databasePath, { allowExtension: false })
+    expect(inspectTm1SqliteSchema(raw)).toBe('v1')
+    raw.close()
+
+    const reopened = openStore(databasePath)
+    await expect(reopened.load(record.publicationId)).resolves.toEqual(record)
+    reopened.close()
+  })
+
+  test('two processes first-open one absent path and both obtain a usable store', async () => {
+    const { directory, databasePath } = emptyPath()
+    const first = spawnWorker('open-on-command', databasePath)
+    const second = spawnWorker('open-on-command', databasePath)
+    await expect(Promise.all([nextMessage(first), nextMessage(second)]))
+      .resolves.toEqual([{ status: 'ready' }, { status: 'ready' }])
+    expect(existsSync(databasePath)).toBe(false)
+
+    const firstOpened = nextMessage(first)
+    const secondOpened = nextMessage(second)
+    first.send?.({ command: 'open' })
+    second.send?.({ command: 'open' })
+    await expect(Promise.all([firstOpened, secondOpened])).resolves.toEqual([
+      { status: 'opened', empty: true, journalMode: 'wal' },
+      { status: 'opened', empty: true, journalMode: 'wal' }
+    ])
+    await Promise.all([killWorker(first), killWorker(second)])
+
+    expect(readdirSync(directory).filter(name => name.endsWith('.db')))
+      .toEqual(['recovery.db'])
+    const reopened = openStore(databasePath)
+    await expect(reopened.load('publication:first-open')).resolves.toBeNull()
+    reopened.close()
+
+    const raw = new DatabaseSync(databasePath, { allowExtension: false })
+    expect(inspectTm1SqliteSchema(raw)).toBe('v1')
+    raw.close()
+  })
+
+  test('recovers after the exclusive creator dies before schema initialization', async () => {
+    const { databasePath } = emptyPath()
+    const creator = spawnWorker('create-empty-and-hold', databasePath)
+    await expect(nextMessage(creator)).resolves.toEqual({ status: 'empty-file-created' })
+    expect(lstatSync(databasePath).size).toBe(0)
+    await killWorker(creator)
+
+    const record = preparedRecord()
+    const recovery = openStore(databasePath)
+    await expect(recovery.create({ record })).resolves.toEqual(record)
+    recovery.close()
+
+    const reopened = openStore(databasePath)
+    await expect(reopened.load(record.publicationId)).resolves.toEqual(record)
+    reopened.close()
+  })
+
+  test('keeps non-EEXIST filesystem failures fail-closed', () => {
+    const { directory } = emptyPath()
+    const databasePath = join(directory, 'missing-parent', 'recovery.db')
+
+    let thrown: unknown
+    try {
+      openStore(databasePath)
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toMatchObject({
+      code: 'RECOVERY_STORE_FAILED',
+      message: 'RECOVERY_STORE_FAILED'
+    })
+    expect(existsSync(databasePath)).toBe(false)
+  })
+
+  test.skipIf(process.platform !== 'linux')(
+    'closes first-open and SQLite file descriptors when the store closes',
+    () => {
+      const { databasePath } = emptyPath()
+      const store = openStore(databasePath)
+      store.close()
+
+      expect(openDescriptorsFor(databasePath)).toEqual([])
+    }
+  )
+
   test('persists through close/reopen and a WAL checkpoint', async () => {
     const { databasePath } = emptyPath()
     const record = outcomeUnknownRecord()
@@ -532,5 +632,18 @@ function readDirectory(root: string): string[] {
   return readdirSync(root, { withFileTypes: true }).flatMap(entry => {
     const path = join(root, entry.name)
     return entry.isDirectory() ? readDirectory(path) : [path]
+  })
+}
+
+function openDescriptorsFor(databasePath: string): string[] {
+  return readdirSync('/proc/self/fd').flatMap(descriptor => {
+    try {
+      const target = readlinkSync(join('/proc/self/fd', descriptor))
+      return target === databasePath || target.startsWith(`${databasePath}-`)
+        ? [target]
+        : []
+    } catch {
+      return []
+    }
   })
 }
