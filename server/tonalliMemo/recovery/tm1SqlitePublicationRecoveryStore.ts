@@ -35,6 +35,7 @@ import {
   inspectTm1SqliteSchema,
   verifyTm1SqliteSchemaV1
 } from './tm1SqliteMigrations'
+import { encodeTm1SqliteIdentifierKey } from './tm1SqliteIdentifierKey'
 import {
   canonicalizeTm1RecoveryRecord,
   consumedCapabilityEvidenceRows,
@@ -184,12 +185,17 @@ implements Tm1PublicationRecoveryStore {
       return this.withImmediateTransaction(() => {
         const current = this.currentForMutation(expected)
         assertTm1ExecutionEvidenceTransition(current, next.record)
-        const previousIds = new Set(consumedCapabilityIds(current))
+        const previousIds = new Set(
+          consumedCapabilityIds(current).map(encodeTm1SqliteIdentifierKey)
+        )
         const newRows = consumedCapabilityEvidenceRows(next.record).filter(
           row => !previousIds.has(row.capabilityId)
         )
         const actualIds = newRows.map(row => row.capabilityId)
-        if (!equalStringLists(declaredCapabilityIds, actualIds)) storeFailure()
+        if (!equalStringLists(
+          declaredCapabilityIds.map(encodeTm1SqliteIdentifierKey),
+          actualIds
+        )) storeFailure()
         this.insertCapabilityRows(newRows)
         this.updatePublication(next, expected)
         return next.record
@@ -397,7 +403,7 @@ implements Tm1PublicationRecoveryStore {
       SELECT ${PUBLICATION_COLUMNS}
       FROM tm1_publications
       WHERE publication_id = ?
-    `).get(publicationId)
+    `).get(encodeTm1SqliteIdentifierKey(publicationId))
   }
 
   private selectPublicationRows(): Record<string, unknown>[] {
@@ -449,7 +455,7 @@ implements Tm1PublicationRecoveryStore {
       FROM tm1_consumed_capabilities
       WHERE publication_id = ?
       ORDER BY kind
-    `).all(record.publicationId)
+    `).all(encodeTm1SqliteIdentifierKey(record.publicationId))
     const expectedRows = [...consumedCapabilityEvidenceRows(record)]
       .sort((left, right) => left.kind.localeCompare(right.kind))
     if (actualRows.length !== expectedRows.length) storeFailure()
@@ -534,7 +540,7 @@ implements Tm1PublicationRecoveryStore {
       mirrors.dispatchCommittedAt,
       mirrors.ackTxid,
       mirrors.acknowledgedAt,
-      expected.publicationId,
+      encodeTm1SqliteIdentifierKey(expected.publicationId),
       expected.expectedRevision,
       expected.expectedOwnerEpoch
     )
@@ -561,7 +567,7 @@ implements Tm1PublicationRecoveryStore {
   ): void {
     const seen = new Set<string>()
     for (const row of rows) {
-      if (seen.has(row.capabilityId) || this.capabilityExists(row.capabilityId)) {
+      if (seen.has(row.capabilityId) || this.capabilityKeyExists(row.capabilityId)) {
         throw new Tm1PublicationRecoveryStoreError(
           'DUPLICATE_CAPABILITY_CONSUMPTION'
         )
@@ -603,12 +609,12 @@ implements Tm1PublicationRecoveryStore {
     }
   }
 
-  private capabilityExists(capabilityId: string): boolean {
+  private capabilityKeyExists(capabilityKey: string): boolean {
     return this.database.prepare(`
       SELECT 1 AS present
       FROM tm1_consumed_capabilities
       WHERE capability_id = ?
-    `).get(capabilityId)?.present === 1
+    `).get(capabilityKey)?.present === 1
   }
 }
 

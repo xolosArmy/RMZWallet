@@ -24,6 +24,7 @@ import {
   type Tm1SqlitePublicationRecoveryStore
 } from './tm1SqlitePublicationRecoveryStore'
 import type { Tm1CanonicalRecoveryRecord } from './tm1SqliteSchema'
+import { encodeTm1SqliteIdentifierKey } from './tm1SqliteIdentifierKey'
 import {
   outcomeUnknownRecord,
   preparedRecord,
@@ -239,7 +240,10 @@ describe('TM1 SQLite real-file and process behavior', () => {
       SELECT revision, owner_epoch
       FROM tm1_publications
       WHERE publication_id = ?
-    `).get(record.publicationId)).toEqual({ revision: 0, owner_epoch: 0 })
+    `).get(encodeTm1SqliteIdentifierKey(record.publicationId))).toEqual({
+      revision: 0,
+      owner_epoch: 0
+    })
 
     attacker.close()
     store.close()
@@ -335,7 +339,8 @@ describe('TM1 SQLite real-file and process behavior', () => {
       SELECT publication_id
       FROM tm1_publications
       WHERE publication_id = ?
-    `).get(record.publicationId)?.publication_id).toBe(record.publicationId)
+    `).get(encodeTm1SqliteIdentifierKey(record.publicationId))?.publication_id)
+      .toBe(encodeTm1SqliteIdentifierKey(record.publicationId))
 
     attacker.exec(`
       CREATE TRIGGER hostile_delete_after_insert
@@ -770,7 +775,7 @@ function corruptDigest(databasePath: string, publicationId: string): void {
     UPDATE tm1_publications
     SET record_sha256 = ?
     WHERE publication_id = ?
-  `).run('0'.repeat(64), publicationId)
+  `).run('0'.repeat(64), encodeTm1SqliteIdentifierKey(publicationId))
   database.close()
 }
 

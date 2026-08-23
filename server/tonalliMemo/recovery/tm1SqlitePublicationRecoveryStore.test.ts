@@ -8,6 +8,7 @@ import {
   canonicalizeTm1RecoveryRecord,
   sha256Hex
 } from './tm1SqliteSchema'
+import { encodeTm1SqliteIdentifierKey } from './tm1SqliteIdentifierKey'
 import {
   createTm1SqlitePublicationRecoveryStore,
   type Tm1SqlitePublicationRecoveryStore
@@ -28,23 +29,44 @@ const temporaryDirectories: string[] = []
 
 type PersistedIdentifierField =
   | 'publication_id'
-  | 'capability_id'
-  | 'operation_id'
+  | 'prepared_id'
+  | 'signing_capability_id'
+  | 'signing_operation_id'
+  | 'signed_id'
+  | 'broadcast_capability_id'
+  | 'broadcast_operation_id'
+  | 'dispatch_submission_id'
 
 const PERSISTED_IDENTIFIER_FIELDS: readonly PersistedIdentifierField[] = Object.freeze([
   'publication_id',
-  'capability_id',
-  'operation_id'
+  'prepared_id',
+  'signing_capability_id',
+  'signing_operation_id',
+  'signed_id',
+  'broadcast_capability_id',
+  'broadcast_operation_id',
+  'dispatch_submission_id'
 ])
 
 const VALID_DOMAIN_IDENTIFIERS = Object.freeze([
-  { label: 'NUL at the first code unit', value: '\u0000identifier' },
-  { label: 'NUL in the middle', value: 'identifier\u0000value' },
-  { label: 'NUL at the last code unit', value: 'identifier\u0000' },
-  { label: 'astral Unicode', value: 'identifier:\ud83d\ude00' },
+  { label: 'a lone high surrogate at the first code unit', value: '\ud800identifier' },
+  { label: 'a lone high surrogate in the middle', value: 'identifier:\ud800:value' },
+  { label: 'a lone high surrogate at the last code unit', value: 'identifier:\ud800' },
+  { label: 'a lone low surrogate', value: 'identifier:\udc00' },
+  { label: 'a distinct lone high surrogate', value: 'identifier:\ud801' },
+  { label: 'a valid surrogate pair', value: 'identifier:\ud83d\ude00' },
+  { label: 'embedded NUL', value: 'identifier\u0000value' },
+  { label: 'BMP Unicode', value: 'identifier:ñ:漢' },
+  { label: 'a combining sequence', value: 'identifier:e\u0301' },
+  {
+    label: 'mixed ASCII, BMP, astral and lone-surrogate code units',
+    value: 'identifier:ñ:\ud83d\ude00:\ud800:end'
+  },
   { label: 'the 256-code-unit ASCII maximum', value: 'a'.repeat(256) },
-  { label: 'the 256-code-unit astral maximum', value: '\ud83d\ude00'.repeat(128) },
-  { label: 'a mixed 256-code-unit boundary', value: `${'a'.repeat(254)}\ud83d\ude00` }
+  {
+    label: 'a mixed exact 256-code-unit boundary',
+    value: `${'a'.repeat(252)}\ud83d\ude00\ud800ñ`
+  }
 ])
 
 const INVALID_DOMAIN_IDENTIFIERS = Object.freeze([
@@ -64,6 +86,18 @@ afterEach(() => {
 })
 
 describe('TM1 Node SQLite recovery store', () => {
+  test('encodes physical keys from exact UTF-16 code units', () => {
+    expect(encodeTm1SqliteIdentifierKey('A')).toBe('u16:0041')
+    expect(encodeTm1SqliteIdentifierKey('\u0000')).toBe('u16:0000')
+    expect(encodeTm1SqliteIdentifierKey('\ud83d\ude00')).toBe('u16:d83dde00')
+    expect(encodeTm1SqliteIdentifierKey('\ud800')).toBe('u16:d800')
+    expect(new Set([
+      encodeTm1SqliteIdentifierKey('\ud800'),
+      encodeTm1SqliteIdentifierKey('\ud801'),
+      encodeTm1SqliteIdentifierKey('\ufffd')
+    ]).size).toBe(3)
+  })
+
   test('creates a real WAL/FULL store with the required connection policy', () => {
     const { store } = harness({ busyTimeoutMs: 321 })
 
@@ -104,6 +138,12 @@ describe('TM1 Node SQLite recovery store', () => {
 
         expect(readIdentifier(created, field)).toBe(value)
         expect(value.length).toBeLessThanOrEqual(256)
+        const physicalKeys = readPhysicalIdentifiers(databasePath, field, record)
+        expect(physicalKeys.length).toBeGreaterThan(0)
+        for (const physicalKey of physicalKeys) {
+          expect(physicalKey).toBe(encodeTm1SqliteIdentifierKey(value))
+          expect(physicalKey).not.toContain('\ufffd')
+        }
         first.close()
 
         const reopened = openStore(databasePath)
@@ -129,6 +169,82 @@ describe('TM1 Node SQLite recovery store', () => {
         store.close()
       }
     )
+  })
+
+  test('round-trips the exact Codex lone-surrogate publication ID', async () => {
+    const { databasePath } = emptyPath()
+    const publicationId = 'publication:\ud800'
+    const record = preparedRecord({ publicationId })
+    const first = openStore(databasePath)
+    await expect(first.create({ record })).resolves.toEqual(record)
+    expect(readPhysicalIdentifiers(databasePath, 'publication_id', record))
+      .toEqual(['u16:007000750062006c00690063006100740069006f006e003ad800'])
+    first.close()
+
+    const reopened = openStore(databasePath)
+    const loaded = await reopened.load(publicationId) as Tm1PublicationRecoveryRecord
+    expect(loaded).toEqual(record)
+    expect(loaded.publicationId).toBe(publicationId)
+    expect(loaded.publicationId.charCodeAt(loaded.publicationId.length - 1)).toBe(0xd800)
+    expect(loaded.publicationId).not.toContain('\ufffd')
+    reopened.close()
+  })
+
+  test('keeps distinct lone-surrogate publication IDs collision-free', async () => {
+    const { store, databasePath } = harness()
+    const firstId = 'publication:\ud800'
+    const secondId = 'publication:\ud801'
+    const first = preparedRecord({ publicationId: firstId })
+    const second = preparedRecord({ publicationId: secondId })
+
+    await expect(store.create({ record: first })).resolves.toEqual(first)
+    await expect(store.create({ record: second })).resolves.toEqual(second)
+    await expect(store.load(firstId)).resolves.toEqual(first)
+    await expect(store.load(secondId)).resolves.toEqual(second)
+    const listed = await store.listRecoverable() as readonly Tm1PublicationRecoveryRecord[]
+    expect(listed.map(record => record.publicationId)).toEqual([firstId, secondId])
+
+    const database = new DatabaseSync(databasePath, { allowExtension: false })
+    expect(database.prepare(`
+      SELECT publication_id
+      FROM tm1_publications
+      ORDER BY publication_id
+    `).all().map(row => row.publication_id)).toEqual([
+      encodeTm1SqliteIdentifierKey(firstId),
+      encodeTm1SqliteIdentifierKey(secondId)
+    ])
+    database.close()
+    store.close()
+  })
+
+  test('preserves encoded surrogate capability PKs and publication FKs', async () => {
+    const { store, databasePath } = harness()
+    const first = signingConsumedRecord({
+      publicationId: 'publication:first',
+      signingCapabilityId: 'capability:\ud800'
+    })
+    const second = signingConsumedRecord({
+      publicationId: 'publication:second',
+      signingCapabilityId: 'capability:\ud801'
+    })
+
+    await expect(store.create({ record: first })).resolves.toEqual(first)
+    await expect(store.create({ record: second })).resolves.toEqual(second)
+    await expect(store.load(first.publicationId)).resolves.toEqual(first)
+    await expect(store.load(second.publicationId)).resolves.toEqual(second)
+
+    const database = new DatabaseSync(databasePath, { allowExtension: false })
+    expect(database.prepare('PRAGMA foreign_key_check').all()).toEqual([])
+    expect(database.prepare(`
+      SELECT capability_id
+      FROM tm1_consumed_capabilities
+      ORDER BY capability_id
+    `).all().map(row => row.capability_id)).toEqual([
+      encodeTm1SqliteIdentifierKey(first.signingAuthorization!.capabilityId),
+      encodeTm1SqliteIdentifierKey(second.signingAuthorization!.capabilityId)
+    ])
+    database.close()
+    store.close()
   })
 
   test('canonical serialization is stable across caller property order', () => {
@@ -429,12 +545,38 @@ describe('TM1 Node SQLite recovery store', () => {
     reopened.close()
   })
 
-  test('fails closed on mirrored-column mismatch', async () => {
+  test('fails closed on a valid-but-wrong encoded mirror key', async () => {
     const { store, databasePath } = harness()
     const record = preparedRecord()
     await store.create({ record })
     store.close()
-    mutate(databasePath, 'UPDATE tm1_publications SET prepared_id = ?', 'prepared:hostile')
+    mutate(
+      databasePath,
+      'UPDATE tm1_publications SET prepared_id = ?',
+      encodeTm1SqliteIdentifierKey('prepared:hostile')
+    )
+
+    const reopened = openStore(databasePath)
+    await expect(reopened.load(record.publicationId)).rejects.toMatchObject({
+      code: 'RECOVERY_STORE_FAILED'
+    })
+    reopened.close()
+  })
+
+  test.each([
+    'bad:0000',
+    'u16:000g',
+    'u16:000'
+  ])('fails closed on malformed physical identifier key %s', async malformedKey => {
+    const { store, databasePath } = harness()
+    const record = preparedRecord()
+    await store.create({ record })
+    store.close()
+    mutateIgnoringChecks(
+      databasePath,
+      'UPDATE tm1_publications SET prepared_id = ?',
+      malformedKey
+    )
 
     const reopened = openStore(databasePath)
     await expect(reopened.load(record.publicationId)).rejects.toMatchObject({
@@ -465,7 +607,7 @@ describe('TM1 Node SQLite recovery store', () => {
     mutate(
       databasePath,
       'DELETE FROM tm1_consumed_capabilities WHERE capability_id = ?',
-      record.signingAuthorization!.capabilityId
+      encodeTm1SqliteIdentifierKey(record.signingAuthorization!.capabilityId)
     )
 
     const reopened = openStore(databasePath)
@@ -513,7 +655,7 @@ describe('TM1 Node SQLite recovery store', () => {
       hostileRecordJson,
       sha256Hex(hostileRecordJson)
     )
-    mutate(
+    mutateIgnoringChecks(
       databasePath,
       'UPDATE tm1_consumed_capabilities SET operation_id = ?',
       invalidOperationId
@@ -579,20 +721,53 @@ function mutate(databasePath: string, sql: string, ...values: string[]): void {
   database.close()
 }
 
+function mutateIgnoringChecks(
+  databasePath: string,
+  sql: string,
+  ...values: string[]
+): void {
+  const database = new DatabaseSync(databasePath, { allowExtension: false })
+  database.exec('PRAGMA ignore_check_constraints = ON')
+  database.prepare(sql).run(...values)
+  database.close()
+}
+
 function recordWithIdentifier(
   field: PersistedIdentifierField,
   value: string
 ): Tm1PublicationRecoveryRecord {
-  const record = signingConsumedRecord()
+  const record = outcomeUnknownRecord()
   return {
     ...record,
     ...(field === 'publication_id' ? { publicationId: value } : {}),
+    prepared: {
+      ...record.prepared!,
+      ...(field === 'prepared_id' ? { preparedId: value } : {})
+    },
+    signed: {
+      ...record.signed!,
+      ...(field === 'signed_id' ? { signedId: value } : {})
+    },
     signingAuthorization: {
       ...record.signingAuthorization!,
-      ...(field === 'capability_id' ? { capabilityId: value } : {}),
-      ...(field === 'operation_id' ? { operationId: value } : {})
+      ...(field === 'signing_capability_id' ? { capabilityId: value } : {}),
+      ...(field === 'signing_operation_id' ? { operationId: value } : {}),
+      ...(field === 'prepared_id' ? { preparedId: value } : {})
+    },
+    broadcastAuthorization: {
+      ...record.broadcastAuthorization!,
+      ...(field === 'broadcast_capability_id' ? { capabilityId: value } : {}),
+      ...(field === 'broadcast_operation_id' ? { operationId: value } : {}),
+      ...(field === 'signed_id' ? { signedId: value } : {})
+    },
+    dispatchIntent: {
+      ...record.dispatchIntent!,
+      ...(field === 'broadcast_capability_id'
+        ? { broadcastCapabilityId: value }
+        : {}),
+      ...(field === 'dispatch_submission_id' ? { submissionId: value } : {})
     }
-  }
+  } as Tm1PublicationRecoveryRecord
 }
 
 function readIdentifier(
@@ -601,7 +776,73 @@ function readIdentifier(
 ): string {
   switch (field) {
     case 'publication_id': return record.publicationId
-    case 'capability_id': return record.signingAuthorization!.capabilityId
-    case 'operation_id': return record.signingAuthorization!.operationId
+    case 'prepared_id': return record.prepared!.preparedId
+    case 'signing_capability_id': return record.signingAuthorization!.capabilityId
+    case 'signing_operation_id': return record.signingAuthorization!.operationId
+    case 'signed_id': return record.signed!.signedId
+    case 'broadcast_capability_id': return record.broadcastAuthorization!.capabilityId
+    case 'broadcast_operation_id': return record.broadcastAuthorization!.operationId
+    case 'dispatch_submission_id': return record.dispatchIntent!.submissionId
   }
+}
+
+function readPhysicalIdentifiers(
+  databasePath: string,
+  field: PersistedIdentifierField,
+  record: Tm1PublicationRecoveryRecord
+): string[] {
+  const database = new DatabaseSync(databasePath, { allowExtension: false })
+  const publicationKey = encodeTm1SqliteIdentifierKey(record.publicationId)
+  const publication = database.prepare(`
+    SELECT publication_id, prepared_id, signed_id,
+      dispatch_submission_id, dispatch_capability_id
+    FROM tm1_publications
+    WHERE publication_id = ?
+  `).get(publicationKey)
+  const capabilities = database.prepare(`
+    SELECT kind, capability_id, publication_id, operation_id, prepared_id, signed_id
+    FROM tm1_consumed_capabilities
+    WHERE publication_id = ?
+    ORDER BY kind
+  `).all(publicationKey)
+  database.close()
+  if (publication === undefined) throw new Error('MISSING_PHYSICAL_PUBLICATION')
+  const signing = capabilities.find(row => row.kind === 'SIGN')
+  const broadcast = capabilities.find(row => row.kind === 'BROADCAST')
+
+  switch (field) {
+    case 'publication_id':
+      return [
+        requireTestString(publication.publication_id),
+        ...capabilities.map(row => requireTestString(row.publication_id))
+      ]
+    case 'prepared_id':
+      return [
+        requireTestString(publication.prepared_id),
+        requireTestString(signing?.prepared_id)
+      ]
+    case 'signing_capability_id':
+      return [requireTestString(signing?.capability_id)]
+    case 'signing_operation_id':
+      return [requireTestString(signing?.operation_id)]
+    case 'signed_id':
+      return [
+        requireTestString(publication.signed_id),
+        requireTestString(broadcast?.signed_id)
+      ]
+    case 'broadcast_capability_id':
+      return [
+        requireTestString(publication.dispatch_capability_id),
+        requireTestString(broadcast?.capability_id)
+      ]
+    case 'broadcast_operation_id':
+      return [requireTestString(broadcast?.operation_id)]
+    case 'dispatch_submission_id':
+      return [requireTestString(publication.dispatch_submission_id)]
+  }
+}
+
+function requireTestString(value: unknown): string {
+  if (typeof value !== 'string') throw new Error('MISSING_PHYSICAL_IDENTIFIER')
+  return value
 }

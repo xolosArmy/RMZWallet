@@ -4,10 +4,16 @@ import {
   type Tm1PublicationRecoveryRecord
 } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryModel'
 import { Tm1PublicationRecoveryStoreError } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
+import { encodeTm1SqliteIdentifierKey } from './tm1SqliteIdentifierKey'
 
 export const TM1_SQLITE_PHYSICAL_SCHEMA_VERSION = 1
 export const TM1_SQLITE_APPLICATION_ID = 0x544d3131
 
+/**
+ * Identifier-bearing TEXT columns below are physical storage keys, never raw
+ * domain identifiers. They use `u16:` plus four lowercase hex digits for each
+ * JavaScript UTF-16 code unit. Hash/protocol columns remain canonical raw ASCII.
+ */
 export const TM1_SQLITE_SCHEMA_V1_SQL = `
 CREATE TABLE tm1_store_metadata (
   singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
@@ -46,6 +52,11 @@ CREATE TABLE tm1_publications (
   dispatch_committed_at INTEGER CHECK (dispatch_committed_at >= 0),
   ack_txid TEXT,
   acknowledged_at INTEGER CHECK (acknowledged_at >= 0),
+  CHECK (${physicalIdentifierKeyCheck('publication_id')}),
+  CHECK (${nullablePhysicalIdentifierKeyCheck('prepared_id')}),
+  CHECK (${nullablePhysicalIdentifierKeyCheck('signed_id')}),
+  CHECK (${nullablePhysicalIdentifierKeyCheck('dispatch_submission_id')}),
+  CHECK (${nullablePhysicalIdentifierKeyCheck('dispatch_capability_id')}),
   CHECK (
     (prepared_id IS NULL AND binding_hash IS NULL) OR
     (prepared_id IS NOT NULL AND binding_hash IS NOT NULL)
@@ -96,6 +107,11 @@ CREATE TABLE tm1_consumed_capabilities (
   signed_id TEXT,
   txid TEXT,
   signed_artifact_hash TEXT,
+  CHECK (${physicalIdentifierKeyCheck('capability_id')}),
+  CHECK (${physicalIdentifierKeyCheck('publication_id')}),
+  CHECK (${physicalIdentifierKeyCheck('operation_id')}),
+  CHECK (${nullablePhysicalIdentifierKeyCheck('prepared_id')}),
+  CHECK (${nullablePhysicalIdentifierKeyCheck('signed_id')}),
   CHECK (consumed_at < expires_at),
   CHECK (
     (kind = 'SIGN' AND prepared_id IS NOT NULL AND binding_hash IS NOT NULL AND
@@ -110,6 +126,18 @@ CREATE INDEX tm1_consumed_capabilities_publication_idx
   ON tm1_consumed_capabilities(publication_id, kind);
 `
 
+function physicalIdentifierKeyCheck(column: string): string {
+  return `length(${column}) BETWEEN 8 AND 1028 AND ` +
+    `substr(${column}, 1, 4) = 'u16:' AND ` +
+    `(length(${column}) - 4) % 4 = 0 AND ` +
+    `substr(${column}, 5) NOT GLOB '*[^0-9a-f]*'`
+}
+
+function nullablePhysicalIdentifierKeyCheck(column: string): string {
+  return `${column} IS NULL OR (${physicalIdentifierKeyCheck(column)})`
+}
+
+/** Identifier properties in this physical mirror type contain `u16:` keys. */
 export type Tm1SqlitePublicationMirrors = Readonly<{
   publicationId: string
   domainSchema: string
@@ -130,6 +158,7 @@ export type Tm1SqlitePublicationMirrors = Readonly<{
   acknowledgedAt: number | null
 }>
 
+/** Identifier properties in this physical evidence type contain `u16:` keys. */
 export type Tm1SqliteCapabilityEvidenceRow = Readonly<{
   capabilityId: string
   publicationId: string
@@ -186,14 +215,14 @@ export function consumedCapabilityEvidenceRows(
     ...(signing === null
       ? []
       : [Object.freeze({
-          capabilityId: signing.capabilityId,
-          publicationId: record.publicationId,
+          capabilityId: encodeTm1SqliteIdentifierKey(signing.capabilityId),
+          publicationId: encodeTm1SqliteIdentifierKey(record.publicationId),
           kind: 'SIGN' as const,
-          operationId: signing.operationId,
+          operationId: encodeTm1SqliteIdentifierKey(signing.operationId),
           contentHash: signing.contentHash,
           consumedAt: signing.consumedAt,
           expiresAt: signing.expiresAt,
-          preparedId: signing.preparedId,
+          preparedId: encodeTm1SqliteIdentifierKey(signing.preparedId),
           bindingHash: signing.bindingHash,
           signedId: null,
           txid: null,
@@ -202,16 +231,16 @@ export function consumedCapabilityEvidenceRows(
     ...(broadcast === null
       ? []
       : [Object.freeze({
-          capabilityId: broadcast.capabilityId,
-          publicationId: record.publicationId,
+          capabilityId: encodeTm1SqliteIdentifierKey(broadcast.capabilityId),
+          publicationId: encodeTm1SqliteIdentifierKey(record.publicationId),
           kind: 'BROADCAST' as const,
-          operationId: broadcast.operationId,
+          operationId: encodeTm1SqliteIdentifierKey(broadcast.operationId),
           contentHash: broadcast.contentHash,
           consumedAt: broadcast.consumedAt,
           expiresAt: broadcast.expiresAt,
           preparedId: null,
           bindingHash: null,
-          signedId: broadcast.signedId,
+          signedId: encodeTm1SqliteIdentifierKey(broadcast.signedId),
           txid: broadcast.txid,
           signedArtifactHash: broadcast.signedArtifactHash
         })])
@@ -222,24 +251,32 @@ function publicationMirrors(
   record: Tm1PublicationRecoveryRecord
 ): Tm1SqlitePublicationMirrors {
   return Object.freeze({
-    publicationId: record.publicationId,
+    publicationId: encodeTm1SqliteIdentifierKey(record.publicationId),
     domainSchema: record.schema,
     domainSchemaVersion: record.schemaVersion,
     revision: record.revision,
     ownerEpoch: record.ownerEpoch,
     phase: record.phase,
-    preparedId: record.prepared?.preparedId ?? null,
+    preparedId: encodeNullableIdentifier(record.prepared?.preparedId ?? null),
     bindingHash: record.prepared?.bindingHash ?? null,
-    signedId: record.signed?.signedId ?? null,
+    signedId: encodeNullableIdentifier(record.signed?.signedId ?? null),
     txid: record.signed?.txid ?? null,
     signedArtifactHash: record.signed?.signedArtifactHash ?? null,
     broadcastConsumedAt: record.broadcastAuthorization?.consumedAt ?? null,
-    dispatchSubmissionId: record.dispatchIntent?.submissionId ?? null,
-    dispatchCapabilityId: record.dispatchIntent?.broadcastCapabilityId ?? null,
+    dispatchSubmissionId: encodeNullableIdentifier(
+      record.dispatchIntent?.submissionId ?? null
+    ),
+    dispatchCapabilityId: encodeNullableIdentifier(
+      record.dispatchIntent?.broadcastCapabilityId ?? null
+    ),
     dispatchCommittedAt: record.dispatchIntent?.committedAt ?? null,
     ackTxid: record.transportAcknowledgement?.txid ?? null,
     acknowledgedAt: record.transportAcknowledgement?.acknowledgedAt ?? null
   })
+}
+
+function encodeNullableIdentifier(value: string | null): string | null {
+  return value === null ? null : encodeTm1SqliteIdentifierKey(value)
 }
 
 function encodeCanonicalJson(value: unknown): string {
