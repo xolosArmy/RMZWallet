@@ -26,6 +26,37 @@ import {
 
 const temporaryDirectories: string[] = []
 
+type PersistedIdentifierField =
+  | 'publication_id'
+  | 'capability_id'
+  | 'operation_id'
+
+const PERSISTED_IDENTIFIER_FIELDS: readonly PersistedIdentifierField[] = Object.freeze([
+  'publication_id',
+  'capability_id',
+  'operation_id'
+])
+
+const VALID_DOMAIN_IDENTIFIERS = Object.freeze([
+  { label: 'NUL at the first code unit', value: '\u0000identifier' },
+  { label: 'NUL in the middle', value: 'identifier\u0000value' },
+  { label: 'NUL at the last code unit', value: 'identifier\u0000' },
+  { label: 'astral Unicode', value: 'identifier:\ud83d\ude00' },
+  { label: 'the 256-code-unit ASCII maximum', value: 'a'.repeat(256) },
+  { label: 'the 256-code-unit astral maximum', value: '\ud83d\ude00'.repeat(128) },
+  { label: 'a mixed 256-code-unit boundary', value: `${'a'.repeat(254)}\ud83d\ude00` }
+])
+
+const INVALID_DOMAIN_IDENTIFIERS = Object.freeze([
+  { label: 'empty', value: '' },
+  { label: 'whitespace-only', value: ' \t ' },
+  { label: 'leading whitespace', value: ' identifier' },
+  { label: 'trailing whitespace', value: 'identifier ' },
+  { label: '257 ASCII code units', value: 'a'.repeat(257) },
+  { label: '258 astral code units', value: '\ud83d\ude00'.repeat(129) },
+  { label: 'a mixed 257-code-unit boundary', value: `${'a'.repeat(255)}\ud83d\ude00` }
+])
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true })
@@ -60,6 +91,44 @@ describe('TM1 Node SQLite recovery store', () => {
     expect(Object.isFrozen(loaded.prepared)).toBe(true)
     expect(await store.load('publication:missing')).toBeNull()
     store.close()
+  })
+
+  describe.each(PERSISTED_IDENTIFIER_FIELDS)('%s domain compatibility', field => {
+    test.each(VALID_DOMAIN_IDENTIFIERS)(
+      'round-trips $label exactly across close and reopen',
+      async ({ value }) => {
+        const { databasePath } = emptyPath()
+        const record = recordWithIdentifier(field, value)
+        const first = openStore(databasePath)
+        const created = await first.create({ record }) as Tm1PublicationRecoveryRecord
+
+        expect(readIdentifier(created, field)).toBe(value)
+        expect(value.length).toBeLessThanOrEqual(256)
+        first.close()
+
+        const reopened = openStore(databasePath)
+        const loaded = await reopened.load(record.publicationId) as Tm1PublicationRecoveryRecord
+        expect(readIdentifier(loaded, field)).toBe(value)
+        expect(loaded).toEqual(created)
+        reopened.close()
+      }
+    )
+
+    test.each(INVALID_DOMAIN_IDENTIFIERS)(
+      'rejects $label through the closed parser before persistence',
+      async ({ value }) => {
+        const { store } = harness()
+        const record = recordWithIdentifier(field, value)
+
+        await expect(store.create({ record })).rejects.toMatchObject({
+          code: field === 'publication_id'
+            ? 'INVALID_PUBLICATION_ID'
+            : 'MALFORMED_RECOVERY_RECORD'
+        })
+        await expect(store.listRecoverable()).resolves.toEqual([])
+        store.close()
+      }
+    )
   })
 
   test('canonical serialization is stable across caller property order', () => {
@@ -426,6 +495,37 @@ describe('TM1 Node SQLite recovery store', () => {
     reopened.close()
   })
 
+  test('fails closed when out-of-band state contains a domain-invalid operation ID', async () => {
+    const { store, databasePath } = harness()
+    const record = signingConsumedRecord()
+    const canonical = canonicalizeTm1RecoveryRecord(record)
+    await store.create({ record })
+    store.close()
+
+    const decoded = JSON.parse(canonical.recordJson) as Record<string, unknown>
+    const signingAuthorization = decoded.signingAuthorization as Record<string, unknown>
+    const invalidOperationId = 'a'.repeat(257)
+    signingAuthorization.operationId = invalidOperationId
+    const hostileRecordJson = JSON.stringify(decoded)
+    mutate(
+      databasePath,
+      'UPDATE tm1_publications SET record_json = ?, record_sha256 = ?',
+      hostileRecordJson,
+      sha256Hex(hostileRecordJson)
+    )
+    mutate(
+      databasePath,
+      'UPDATE tm1_consumed_capabilities SET operation_id = ?',
+      invalidOperationId
+    )
+
+    const reopened = openStore(databasePath)
+    await expect(reopened.load(record.publicationId)).rejects.toMatchObject({
+      code: 'MALFORMED_RECOVERY_RECORD'
+    })
+    reopened.close()
+  })
+
   test('fails closed on unsupported physical schema versions', () => {
     const { databasePath } = emptyPath()
     const database = new DatabaseSync(databasePath, { allowExtension: false })
@@ -477,4 +577,31 @@ function mutate(databasePath: string, sql: string, ...values: string[]): void {
   const database = new DatabaseSync(databasePath, { allowExtension: false })
   database.prepare(sql).run(...values)
   database.close()
+}
+
+function recordWithIdentifier(
+  field: PersistedIdentifierField,
+  value: string
+): Tm1PublicationRecoveryRecord {
+  const record = signingConsumedRecord()
+  return {
+    ...record,
+    ...(field === 'publication_id' ? { publicationId: value } : {}),
+    signingAuthorization: {
+      ...record.signingAuthorization!,
+      ...(field === 'capability_id' ? { capabilityId: value } : {}),
+      ...(field === 'operation_id' ? { operationId: value } : {})
+    }
+  }
+}
+
+function readIdentifier(
+  record: Tm1PublicationRecoveryRecord,
+  field: PersistedIdentifierField
+): string {
+  switch (field) {
+    case 'publication_id': return record.publicationId
+    case 'capability_id': return record.signingAuthorization!.capabilityId
+    case 'operation_id': return record.signingAuthorization!.operationId
+  }
 }

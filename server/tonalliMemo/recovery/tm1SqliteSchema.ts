@@ -16,7 +16,7 @@ CREATE TABLE tm1_store_metadata (
 ) STRICT;
 
 CREATE TABLE tm1_publications (
-  publication_id TEXT PRIMARY KEY CHECK (length(publication_id) BETWEEN 1 AND 256),
+  publication_id TEXT PRIMARY KEY,
   domain_schema TEXT NOT NULL CHECK (domain_schema = 'tonalli.tm1-publication-recovery'),
   domain_schema_version INTEGER NOT NULL CHECK (domain_schema_version = 1),
   revision INTEGER NOT NULL CHECK (revision >= 0),
@@ -81,10 +81,10 @@ CREATE INDEX tm1_publications_txid_idx
   WHERE txid IS NOT NULL;
 
 CREATE TABLE tm1_consumed_capabilities (
-  capability_id TEXT PRIMARY KEY CHECK (length(capability_id) BETWEEN 1 AND 256),
+  capability_id TEXT PRIMARY KEY,
   publication_id TEXT NOT NULL REFERENCES tm1_publications(publication_id) ON DELETE RESTRICT,
   kind TEXT NOT NULL CHECK (kind IN ('SIGN', 'BROADCAST')),
-  operation_id TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
+  operation_id TEXT NOT NULL,
   content_hash TEXT NOT NULL CHECK (
     length(content_hash) = 71 AND content_hash GLOB 'sha256:*' AND
     substr(content_hash, 8) NOT GLOB '*[^0-9a-f]*'

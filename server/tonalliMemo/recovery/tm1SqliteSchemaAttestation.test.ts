@@ -43,8 +43,13 @@ describe('TM1 SQLite v1 physical-schema attestation', () => {
     )],
     ['changed publication primary-key semantics', (sql: string) => replaceRequired(
       sql,
-      '  publication_id TEXT PRIMARY KEY CHECK (length(publication_id) BETWEEN 1 AND 256),',
-      '  publication_id TEXT UNIQUE NOT NULL CHECK (length(publication_id) BETWEEN 1 AND 256),'
+      '  publication_id TEXT PRIMARY KEY,',
+      '  publication_id TEXT UNIQUE NOT NULL,'
+    )],
+    ['an obsolete SQLite identifier-length approximation', (sql: string) => replaceRequired(
+      sql,
+      '  publication_id TEXT PRIMARY KEY,',
+      '  publication_id TEXT PRIMARY KEY CHECK (length(publication_id) BETWEEN 1 AND 256),'
     )],
     ['changed capability uniqueness semantics', (sql: string) => replaceRequired(
       sql,
