@@ -3,7 +3,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, test } from 'vitest'
-import type { Tm1PublicationRecoveryRecord } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryModel'
+import type {
+  Tm1PublicationRecoveryRecord,
+  Tm1TransportAcknowledgementCommitEvidence
+} from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryModel'
 import {
   canonicalizeTm1RecoveryRecord,
   sha256Hex
@@ -515,6 +518,133 @@ describe('TM1 Node SQLite recovery store', () => {
     store.close()
   })
 
+  test.each(['txid', 'acknowledgedAt'] as const)(
+    'rejects an enumerable %s accessor without invoking it or opening a transaction',
+    async field => {
+      const { store } = harness()
+      const current = outcomeUnknownRecord()
+      const acknowledgement = acknowledgementFor(current) as Record<string, unknown>
+      let getterCalls = 0
+      Object.defineProperty(acknowledgement, field, {
+        enumerable: true,
+        get: () => {
+          getterCalls += 1
+          return field === 'txid' ? HASH_B : current.dispatchIntent!.committedAt
+        }
+      })
+      await store.create({ record: current })
+
+      await expect(store.commitTransportAcknowledgement({
+        publicationId: current.publicationId,
+        expectedRevision: current.revision,
+        expectedOwnerEpoch: current.ownerEpoch,
+        acknowledgement: acknowledgement as Tm1TransportAcknowledgementCommitEvidence
+      })).rejects.toMatchObject({ code: 'MALFORMED_RECOVERY_RECORD' })
+      expect(getterCalls).toBe(0)
+      expect(readStoreDatabase(store).isTransaction).toBe(false)
+      await expect(store.load(current.publicationId)).resolves.toEqual(current)
+      store.close()
+    }
+  )
+
+  test('rejects a non-enumerable forbidden authority field before snapshotting', async () => {
+    const { store } = harness()
+    const current = outcomeUnknownRecord()
+    const acknowledgement = acknowledgementFor(current) as Record<string, unknown>
+    Object.defineProperty(acknowledgement, 'transport', {
+      enumerable: false,
+      value: Object.freeze({ broadcast: true })
+    })
+    await store.create({ record: current })
+
+    await expect(store.commitTransportAcknowledgement({
+      publicationId: current.publicationId,
+      expectedRevision: current.revision,
+      expectedOwnerEpoch: current.ownerEpoch,
+      acknowledgement: acknowledgement as Tm1TransportAcknowledgementCommitEvidence
+    })).rejects.toMatchObject({ code: 'FORBIDDEN_AUTHORITY_FIELD' })
+    expect(readStoreDatabase(store).isTransaction).toBe(false)
+    await expect(store.load(current.publicationId)).resolves.toEqual(current)
+    store.close()
+  })
+
+  test('rejects symbol-keyed acknowledgement evidence without mutation', async () => {
+    const { store } = harness()
+    const current = outcomeUnknownRecord()
+    const acknowledgement = acknowledgementFor(current) as Record<PropertyKey, unknown>
+    acknowledgement[Symbol('hostile')] = true
+    await store.create({ record: current })
+
+    await expect(store.commitTransportAcknowledgement({
+      publicationId: current.publicationId,
+      expectedRevision: current.revision,
+      expectedOwnerEpoch: current.ownerEpoch,
+      acknowledgement: acknowledgement as Tm1TransportAcknowledgementCommitEvidence
+    })).rejects.toMatchObject({ code: 'MALFORMED_RECOVERY_RECORD' })
+    expect(readStoreDatabase(store).isTransaction).toBe(false)
+    await expect(store.load(current.publicationId)).resolves.toEqual(current)
+    store.close()
+  })
+
+  test('rejects acknowledgement evidence with a custom prototype without mutation', async () => {
+    const { store } = harness()
+    const current = outcomeUnknownRecord()
+    const acknowledgement = Object.assign(
+      Object.create(Object.freeze({ inheritedAuthority: true })),
+      acknowledgementFor(current)
+    ) as Tm1TransportAcknowledgementCommitEvidence
+    await store.create({ record: current })
+
+    await expect(store.commitTransportAcknowledgement({
+      publicationId: current.publicationId,
+      expectedRevision: current.revision,
+      expectedOwnerEpoch: current.ownerEpoch,
+      acknowledgement
+    })).rejects.toMatchObject({ code: 'MALFORMED_RECOVERY_RECORD' })
+    expect(readStoreDatabase(store).isTransaction).toBe(false)
+    await expect(store.load(current.publicationId)).resolves.toEqual(current)
+    store.close()
+  })
+
+  test('accepts null-prototype acknowledgement evidence through the closed parser', async () => {
+    const { store } = harness()
+    const current = outcomeUnknownRecord()
+    const acknowledgement = Object.assign(
+      Object.create(null),
+      acknowledgementFor(current)
+    ) as Tm1TransportAcknowledgementCommitEvidence
+    await store.create({ record: current })
+
+    const committed = await store.commitTransportAcknowledgement({
+      publicationId: current.publicationId,
+      expectedRevision: current.revision,
+      expectedOwnerEpoch: current.ownerEpoch,
+      acknowledgement
+    }) as Tm1PublicationRecoveryRecord
+    expect(committed.phase).toBe('submittedObserved')
+    expect(Object.isFrozen(committed)).toBe(true)
+    expect(Object.isFrozen(committed.transportAcknowledgement)).toBe(true)
+    store.close()
+  })
+
+  test('persists a canonical acknowledgement exactly across close and reopen', async () => {
+    const { store, databasePath } = harness()
+    const current = outcomeUnknownRecord()
+    await store.create({ record: current })
+
+    const committed = await store.commitTransportAcknowledgement({
+      publicationId: current.publicationId,
+      expectedRevision: current.revision,
+      expectedOwnerEpoch: current.ownerEpoch,
+      acknowledgement: acknowledgementFor(current)
+    }) as Tm1PublicationRecoveryRecord
+    store.close()
+
+    const reopened = openStore(databasePath)
+    await expect(reopened.load(current.publicationId)).resolves.toEqual(committed)
+    reopened.close()
+  })
+
   test('persists observation-only recovery transitions', async () => {
     const { store } = harness()
     const current = outcomeUnknownRecord()
@@ -713,6 +843,23 @@ function openStore(
     ...(busyTimeoutMs === undefined ? {} : { busyTimeoutMs }),
     now: () => 1_000
   })
+}
+
+function acknowledgementFor(
+  current: Tm1PublicationRecoveryRecord
+): Tm1TransportAcknowledgementCommitEvidence {
+  return {
+    submissionId: current.dispatchIntent!.submissionId,
+    signedId: current.signed!.signedId,
+    txid: HASH_B,
+    signedArtifactHash: HASH_C,
+    disposition: 'accepted',
+    acknowledgedAt: current.dispatchIntent!.committedAt
+  }
+}
+
+function readStoreDatabase(store: Tm1SqlitePublicationRecoveryStore): DatabaseSync {
+  return (store as unknown as { database: DatabaseSync }).database
 }
 
 function mutate(databasePath: string, sql: string, ...values: string[]): void {

@@ -18,6 +18,7 @@ import {
   consumedCapabilityIds,
   createTm1TransportAcknowledgedRecord,
   parseTm1PublicationRecoveryRecord,
+  parseTm1TransportAcknowledgementCommitEvidence,
   type Tm1PublicationRecoveryRecord
 } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryModel'
 import {
@@ -233,7 +234,9 @@ implements Tm1PublicationRecoveryStore {
     try {
       this.assertOpen()
       const expected = snapshotExpectedVersion(input)
-      const acknowledgement = snapshotUnknown(input.acknowledgement)
+      const parsedAcknowledgement =
+        parseTm1TransportAcknowledgementCommitEvidence(input.acknowledgement)
+      const acknowledgement = snapshotUnknown(parsedAcknowledgement)
       return this.withImmediateTransaction(() => {
         const current = this.currentForMutation(expected)
         const nextRecord = createTm1TransportAcknowledgedRecord(current, acknowledgement)
