@@ -47,17 +47,57 @@ function groupToken(tokenId: unknown = GROUP_TOKEN_ID, tokenType: unknown = GROU
   return {
     tokenId,
     tokenType,
+    entryIdx: 1,
     atoms: 1n,
     isMintBaton: false
+  }
+}
+
+const BASE_TOKEN_ENTRY = Object.freeze({
+  isInvalid: false,
+  burnSummary: '',
+  failedColorings: [],
+  actualBurnAtoms: 0n,
+  intentionalBurnAtoms: 0n,
+  burnsMintBatons: false
+})
+
+function childTokenEntry(overrides: Record<string, unknown> = {}) {
+  return {
+    ...BASE_TOKEN_ENTRY,
+    tokenId: CHILD_TOKEN_ID,
+    tokenType: CHILD_TOKEN_TYPE,
+    txType: 'GENESIS',
+    groupTokenId: GROUP_TOKEN_ID,
+    ...overrides
+  }
+}
+
+function groupTokenEntry(overrides: Record<string, unknown> = {}) {
+  return {
+    ...BASE_TOKEN_ENTRY,
+    tokenId: GROUP_TOKEN_ID,
+    tokenType: GROUP_TOKEN_TYPE,
+    txType: 'NONE',
+    ...overrides
   }
 }
 
 function genesisTx(
   inputs: unknown[] = [{ token: groupToken() }],
   outputs: unknown[] = [],
-  txid: unknown = CHILD_TOKEN_ID
+  txid: unknown = CHILD_TOKEN_ID,
+  overrides: Record<string, unknown> = {}
 ) {
-  return { txid, inputs, outputs }
+  return {
+    txid,
+    inputs,
+    outputs,
+    tokenEntries: [childTokenEntry(), groupTokenEntry()],
+    tokenFailedParsings: [],
+    tokenStatus: 'TOKEN_STATUS_NORMAL',
+    ...overrides
+  }
 }
 
 function makeReader(...results: readonly unknown[]) {
@@ -127,6 +167,20 @@ describe('extractNftCollectionEvidence', () => {
       number: 1
     })
     const { reader } = makeReader(childTokenInfo(), genesisTx([{ token: fungibleToken }]))
+
+    await expect(extractNftCollectionEvidence(CHILD_TOKEN_ID, reader)).resolves.toEqual({
+      kind: 'unverified',
+      reason: 'invalid-group-type'
+    })
+  })
+
+  test('rejects an ALP token numbered 129 in input[0]', async () => {
+    const alpToken = groupToken(GROUP_TOKEN_ID, {
+      protocol: 'ALP',
+      type: 'ALP_TOKEN_TYPE_STANDARD',
+      number: 129
+    })
+    const { reader } = makeReader(childTokenInfo(), genesisTx([{ token: alpToken }]))
 
     await expect(extractNftCollectionEvidence(CHILD_TOKEN_ID, reader)).resolves.toEqual({
       kind: 'unverified',
@@ -209,6 +263,84 @@ describe('extractNftCollectionEvidence', () => {
       kind: 'unverified',
       reason: 'invalid-group-type'
     })
+  })
+
+  test.each([
+    ['mint baton', { isMintBaton: true }],
+    ['zero Group atoms', { atoms: 0n }],
+    ['more than one Group atom', { atoms: 2n }],
+    ['numeric rather than bigint atoms', { atoms: 1 }]
+  ])('rejects semantically invalid Group consumption: %s', async (_label, overrides) => {
+    const token = { ...groupToken(), ...overrides }
+    const { reader } = makeReader(childTokenInfo(), genesisTx([{ token }]))
+
+    await expect(extractNftCollectionEvidence(CHILD_TOKEN_ID, reader)).resolves.toEqual(
+      malformedEvidence
+    )
+  })
+
+  test.each([
+    [
+      'non-normal transaction status',
+      genesisTx(undefined, undefined, undefined, { tokenStatus: 'TOKEN_STATUS_NOT_NORMAL' })
+    ],
+    [
+      'unknown transaction status',
+      genesisTx(undefined, undefined, undefined, { tokenStatus: 'TOKEN_STATUS_UNKNOWN' })
+    ],
+    [
+      'non-Genesis Child operation',
+      genesisTx(undefined, undefined, undefined, {
+        tokenEntries: [childTokenEntry({ txType: 'SEND' }), groupTokenEntry()]
+      })
+    ],
+    [
+      'invalid Child entry',
+      genesisTx(undefined, undefined, undefined, {
+        tokenEntries: [childTokenEntry({ isInvalid: true }), groupTokenEntry()]
+      })
+    ],
+    [
+      'invalid Group entry',
+      genesisTx(undefined, undefined, undefined, {
+        tokenEntries: [childTokenEntry(), groupTokenEntry({ isInvalid: true })]
+      })
+    ],
+    [
+      'non-NONE Group entry operation',
+      genesisTx(undefined, undefined, undefined, {
+        tokenEntries: [childTokenEntry(), groupTokenEntry({ txType: 'SEND' })]
+      })
+    ],
+    [
+      'failed token parsing',
+      genesisTx(undefined, undefined, undefined, {
+        tokenFailedParsings: [{ pushdataIdx: 0, bytes: '00', error: 'invalid' }]
+      })
+    ],
+    [
+      'Child entry with a different Group ID',
+      genesisTx(undefined, undefined, undefined, {
+        tokenEntries: [
+          childTokenEntry({ groupTokenId: UNKNOWN_GROUP_TOKEN_ID }),
+          groupTokenEntry()
+        ]
+      })
+    ],
+    [
+      'input token entryIdx points to Child entry',
+      genesisTx([{ token: { ...groupToken(), entryIdx: 0 } }])
+    ],
+    [
+      'input token entryIdx is out of range',
+      genesisTx([{ token: { ...groupToken(), entryIdx: 99 } }])
+    ]
+  ])('rejects incoherent Chronik transaction semantics: %s', async (_label, txResult) => {
+    const { reader } = makeReader(childTokenInfo(), txResult)
+
+    await expect(extractNftCollectionEvidence(CHILD_TOKEN_ID, reader)).resolves.toEqual(
+      malformedEvidence
+    )
   })
 
   test.each([
@@ -348,7 +480,12 @@ describe('read-only evidence pipeline with collection policy', () => {
   async function evidenceForGroup(groupTokenId: string) {
     const { reader } = makeReader(
       childTokenInfo(),
-      genesisTx([{ token: groupToken(groupTokenId) }])
+      genesisTx([{ token: groupToken(groupTokenId) }], undefined, undefined, {
+        tokenEntries: [
+          childTokenEntry({ groupTokenId }),
+          groupTokenEntry({ tokenId: groupTokenId })
+        ]
+      })
     )
 
     return extractNftCollectionEvidence(CHILD_TOKEN_ID, reader)

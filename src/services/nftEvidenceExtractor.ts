@@ -12,7 +12,16 @@ type UnverifiedReason = Extract<
 
 type ExternalRecord = object
 
+type ParsedTokenEntry = {
+  readonly tokenId: string
+  readonly tokenType: ReturnType<typeof readTokenType>
+  readonly txType: string
+  readonly isInvalid: boolean
+  readonly groupTokenId: unknown
+}
+
 const CANONICAL_TOKEN_ID_PATTERN = /^[0-9a-f]{64}$/
+const MAX_TOKEN_ENTRIES = 4096
 const MALFORMED_PROPERTY = Symbol('malformed-property')
 const NFT1_CHILD_TYPE = Object.freeze({
   protocol: 'SLP',
@@ -105,6 +114,59 @@ function isExactTokenType(
   )
 }
 
+function readDenseArray(value: unknown, maximumLength: number): readonly unknown[] | null {
+  if (!Array.isArray(value)) {
+    return null
+  }
+
+  const length = readOwnDataProperty(value, 'length')
+  if (
+    length === MALFORMED_PROPERTY ||
+    typeof length !== 'number' ||
+    !Number.isSafeInteger(length) ||
+    length < 0 ||
+    length > maximumLength
+  ) {
+    return null
+  }
+
+  const items: unknown[] = []
+  for (let index = 0; index < length; index += 1) {
+    const item = readOwnDataProperty(value, index)
+    if (item === undefined || item === MALFORMED_PROPERTY) {
+      return null
+    }
+    items.push(item)
+  }
+
+  return items
+}
+
+function readTokenEntry(value: unknown): ParsedTokenEntry | null {
+  const record = asExternalRecord(value)
+  if (record === null) {
+    return null
+  }
+
+  const tokenId = readOwnDataProperty(record, 'tokenId')
+  const tokenType = readTokenType(readOwnDataProperty(record, 'tokenType'))
+  const txType = readOwnDataProperty(record, 'txType')
+  const isInvalid = readOwnDataProperty(record, 'isInvalid')
+  const groupTokenId = readOwnDataProperty(record, 'groupTokenId')
+
+  if (
+    !isCanonicalTokenId(tokenId) ||
+    tokenType === null ||
+    typeof txType !== 'string' ||
+    typeof isInvalid !== 'boolean' ||
+    groupTokenId === MALFORMED_PROPERTY
+  ) {
+    return null
+  }
+
+  return { tokenId, tokenType, txType, isInvalid, groupTokenId }
+}
+
 function isUnambiguousChronikNotFound(error: unknown, tokenId: string): boolean {
   try {
     if (!(error instanceof Error)) {
@@ -168,11 +230,46 @@ export async function extractNftCollectionEvidence(
 
     const genesisTxid = readOwnDataProperty(genesis, 'txid')
     const inputs = readOwnDataProperty(genesis, 'inputs')
+    const tokenEntriesValue = readOwnDataProperty(genesis, 'tokenEntries')
+    const tokenFailedParsingsValue = readOwnDataProperty(genesis, 'tokenFailedParsings')
+    const tokenStatus = readOwnDataProperty(genesis, 'tokenStatus')
     if (
       genesisTxid === MALFORMED_PROPERTY ||
       genesisTxid !== childTokenId ||
       inputs === MALFORMED_PROPERTY ||
-      !Array.isArray(inputs)
+      !Array.isArray(inputs) ||
+      tokenStatus !== 'TOKEN_STATUS_NORMAL'
+    ) {
+      return unverified('malformed-evidence')
+    }
+
+    const tokenEntriesValues = readDenseArray(tokenEntriesValue, MAX_TOKEN_ENTRIES)
+    const tokenFailedParsings = readDenseArray(tokenFailedParsingsValue, MAX_TOKEN_ENTRIES)
+    if (tokenEntriesValues === null || tokenFailedParsings === null || tokenFailedParsings.length > 0) {
+      return unverified('malformed-evidence')
+    }
+
+    const tokenEntries: ParsedTokenEntry[] = []
+    for (const tokenEntryValue of tokenEntriesValues) {
+      const tokenEntry = readTokenEntry(tokenEntryValue)
+      if (tokenEntry === null) {
+        return unverified('malformed-evidence')
+      }
+      tokenEntries.push(tokenEntry)
+    }
+
+    const childEntries = tokenEntries.filter((entry) => entry.tokenId === childTokenId)
+    if (childEntries.length !== 1) {
+      return unverified('malformed-evidence')
+    }
+
+    const childEntry = childEntries[0]
+    if (
+      childEntry === undefined ||
+      !isExactTokenType(childEntry.tokenType, NFT1_CHILD_TYPE) ||
+      childEntry.txType !== 'GENESIS' ||
+      childEntry.isInvalid ||
+      !isCanonicalTokenId(childEntry.groupTokenId)
     ) {
       return unverified('malformed-evidence')
     }
@@ -215,7 +312,31 @@ export async function extractNftCollectionEvidence(
     }
 
     const groupTokenId = readOwnDataProperty(groupToken, 'tokenId')
-    if (groupTokenId === MALFORMED_PROPERTY || !isCanonicalTokenId(groupTokenId)) {
+    const groupEntryIdx = readOwnDataProperty(groupToken, 'entryIdx')
+    const groupAtoms = readOwnDataProperty(groupToken, 'atoms')
+    const isMintBaton = readOwnDataProperty(groupToken, 'isMintBaton')
+    if (
+      groupTokenId === MALFORMED_PROPERTY ||
+      !isCanonicalTokenId(groupTokenId) ||
+      typeof groupEntryIdx !== 'number' ||
+      !Number.isSafeInteger(groupEntryIdx) ||
+      groupEntryIdx < 0 ||
+      typeof groupAtoms !== 'bigint' ||
+      groupAtoms !== 1n ||
+      isMintBaton !== false ||
+      childEntry.groupTokenId !== groupTokenId
+    ) {
+      return unverified('malformed-evidence')
+    }
+
+    const groupEntry = tokenEntries[groupEntryIdx]
+    if (
+      groupEntry === undefined ||
+      groupEntry.tokenId !== groupTokenId ||
+      !isExactTokenType(groupEntry.tokenType, NFT1_GROUP_TYPE) ||
+      groupEntry.txType !== 'NONE' ||
+      groupEntry.isInvalid
+    ) {
       return unverified('malformed-evidence')
     }
 
