@@ -1,9 +1,10 @@
 declare module 'multiformats' {
-  export class CID {
+  export interface CID {
     readonly version: 0 | 1
-
-    static parse(source: string): CID
-
     toString(): string
+  }
+
+  export const CID: {
+    parse(source: string): CID
   }
 }
