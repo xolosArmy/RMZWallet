@@ -33,10 +33,9 @@ or a replacement hash. The explicit `ipfs://` document URI is a separate field,
 validated with `multiformats` as a canonical CIDv0 or base32 CIDv1. A CID is
 never substituted for the SHA-256 document hash.
 
-The existing lockfile already pins `multiformats@9.9.0` through the WalletConnect
-dependency graph. This planner reuses that parser without changing package
-manifests; if that locked module disappears, tests and CLI module loading fail
-rather than falling back to permissive URI validation.
+The project declares and locks `multiformats@9.9.0` directly because the planner
+imports its CID parser. If that dependency disappears, tests and CLI module
+loading fail rather than falling back to permissive URI validation.
 
 Publishing those exact bytes and selecting the final URI are separate
 administrative actions. This tool performs no Pinata or IPFS upload.
