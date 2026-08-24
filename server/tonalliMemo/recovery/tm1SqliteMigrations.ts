@@ -28,11 +28,23 @@ type Tm1SqliteSchemaAttestation = Readonly<{
   indexColumns: Readonly<Record<string, readonly unknown[]>>
 }>
 
+type SqliteStatisticsTableAttestation = Readonly<{
+  object: SqliteSchemaObject
+  definition: SqliteTableDefinition
+}>
+
+type Tm1ExpectedV1Attestation = Readonly<{
+  authoritative: Tm1SqliteSchemaAttestation
+  statistics: readonly SqliteStatisticsTableAttestation[]
+}>
+
 const AUTHORITATIVE_TABLE_NAMES = Object.freeze([
   'tm1_store_metadata',
   'tm1_publications',
   'tm1_consumed_capabilities'
 ])
+
+const SQLITE_STATISTICS_TABLE_NAME = /^sqlite_stat[1-9][0-9]*$/
 
 const EXPECTED_V1_ATTESTATION = createExpectedV1Attestation()
 
@@ -113,79 +125,101 @@ export function verifyTm1SqliteSchemaV1(database: DatabaseSync): void {
     metadata[0].created_at < 0
   ) schemaFailure()
 
-  const actualAttestation = extractV1Attestation(
+  const actualObjects = readSchemaObjects(database)
+  const authoritativeObjects = verifyAndRemoveEngineStatistics(
     database,
-    EXPECTED_V1_ATTESTATION.objects
+    actualObjects
   )
+  const actualAttestation = extractV1Attestation(database, authoritativeObjects)
   if (
     JSON.stringify(actualAttestation) !==
-    JSON.stringify(EXPECTED_V1_ATTESTATION)
+    JSON.stringify(EXPECTED_V1_ATTESTATION.authoritative)
   ) schemaFailure()
 }
 
 /**
  * Builds the expected physical-schema evidence from the same canonical SQL
- * used by the v1 migration. The target must match the complete reference
- * catalog and its semantic PRAGMA projections. No unknown user table, index,
- * view or trigger is accepted.
+ * used by the v1 migration. ANALYZE on that pristine reference derives the
+ * only optional engine statistics tables. The authoritative catalog and every
+ * present statistics structure must match their semantic PRAGMA projections;
+ * no unknown user table, index, view or trigger is accepted.
  */
-function createExpectedV1Attestation(): Tm1SqliteSchemaAttestation {
+function createExpectedV1Attestation(): Tm1ExpectedV1Attestation {
   const reference = new DatabaseSync(':memory:', { allowExtension: false })
   try {
     reference.enableLoadExtension(false)
     reference.exec(TM1_SQLITE_SCHEMA_V1_SQL)
-    return extractV1Attestation(reference)
+    const authoritative = extractV1Attestation(reference)
+    reference.exec('ANALYZE')
+    const analyzedObjects = readSchemaObjects(reference)
+    const authoritativeNames = new Set(authoritative.objects.map(object => object.name))
+    const analyzedAuthoritative = analyzedObjects.filter(
+      object => authoritativeNames.has(object.name)
+    )
+    if (
+      JSON.stringify(analyzedAuthoritative) !==
+      JSON.stringify(authoritative.objects)
+    ) schemaFailure()
+    const statisticsObjects = analyzedObjects.filter(
+      object => !authoritativeNames.has(object.name)
+    )
+    const statistics = statisticsObjects.map(object => {
+      if (
+        object.type !== 'table' ||
+        object.tableName !== object.name ||
+        object.sql === null ||
+        !SQLITE_STATISTICS_TABLE_NAME.test(object.name)
+      ) schemaFailure()
+      return Object.freeze({
+        object,
+        definition: extractTableDefinition(reference, object.name)
+      })
+    })
+    if (new Set(statistics.map(entry => entry.object.name)).size !== statistics.length) {
+      schemaFailure()
+    }
+    return Object.freeze({
+      authoritative,
+      statistics: Object.freeze(statistics)
+    })
   } finally {
     reference.close()
   }
 }
 
+function verifyAndRemoveEngineStatistics(
+  database: DatabaseSync,
+  objects: readonly SqliteSchemaObject[]
+): readonly SqliteSchemaObject[] {
+  const expectedStatistics = new Map(
+    EXPECTED_V1_ATTESTATION.statistics.map(entry => [entry.object.name, entry])
+  )
+  const authoritative: SqliteSchemaObject[] = []
+  const observedStatistics = new Set<string>()
+  for (const object of objects) {
+    const expected = expectedStatistics.get(object.name)
+    if (expected === undefined) {
+      authoritative.push(object)
+      continue
+    }
+    if (
+      observedStatistics.has(object.name) ||
+      JSON.stringify(object) !== JSON.stringify(expected.object) ||
+      JSON.stringify(extractTableDefinition(database, object.name)) !==
+        JSON.stringify(expected.definition)
+    ) schemaFailure()
+    observedStatistics.add(object.name)
+  }
+  return Object.freeze(authoritative)
+}
+
 function extractV1Attestation(
   database: DatabaseSync,
-  expectedObjects?: readonly SqliteSchemaObject[]
+  objects: readonly SqliteSchemaObject[] = readSchemaObjects(database)
 ): Tm1SqliteSchemaAttestation {
-  const objects = database.prepare(`
-    SELECT type, name, tbl_name, sql
-    FROM sqlite_schema
-    WHERE type IN ('table', 'index', 'trigger', 'view')
-    ORDER BY type, name
-  `).all().map(row => Object.freeze({
-    type: requireString(row.type),
-    name: requireString(row.name),
-    tableName: requireString(row.tbl_name),
-    sql: requireNullableString(row.sql)
-  }))
-
-  if (
-    expectedObjects !== undefined &&
-    JSON.stringify(objects) !== JSON.stringify(expectedObjects)
-  ) schemaFailure()
-
   const tables = Object.fromEntries(AUTHORITATIVE_TABLE_NAMES.map(tableName => [
     tableName,
-    Object.freeze({
-      tableList: queryRows(database, `
-        SELECT name, type, ncol, wr, strict
-        FROM pragma_table_list
-        WHERE schema = 'main' AND name = ?
-        ORDER BY name
-      `, tableName),
-      columns: queryRows(database, `
-        SELECT cid, name, type, "notnull", dflt_value, pk, hidden
-        FROM pragma_table_xinfo(?)
-        ORDER BY cid
-      `, tableName),
-      foreignKeys: queryRows(database, `
-        SELECT id, seq, "table", "from", "to", on_update, on_delete, match
-        FROM pragma_foreign_key_list(?)
-        ORDER BY id, seq
-      `, tableName),
-      indexes: queryRows(database, `
-        SELECT name, "unique", origin, partial
-        FROM pragma_index_list(?)
-        ORDER BY name
-      `, tableName)
-    })
+    extractTableDefinition(database, tableName)
   ]))
 
   const indexNames = objects
@@ -205,6 +239,49 @@ function extractV1Attestation(
     objects: Object.freeze(objects),
     tables: Object.freeze(tables),
     indexColumns: Object.freeze(indexColumns)
+  })
+}
+
+function readSchemaObjects(database: DatabaseSync): readonly SqliteSchemaObject[] {
+  return Object.freeze(database.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_schema
+    WHERE type IN ('table', 'index', 'trigger', 'view')
+    ORDER BY type, name
+  `).all().map(row => Object.freeze({
+    type: requireString(row.type),
+    name: requireString(row.name),
+    tableName: requireString(row.tbl_name),
+    sql: requireNullableString(row.sql)
+  })))
+}
+
+function extractTableDefinition(
+  database: DatabaseSync,
+  tableName: string
+): SqliteTableDefinition {
+  return Object.freeze({
+    tableList: queryRows(database, `
+      SELECT name, type, ncol, wr, strict
+      FROM pragma_table_list
+      WHERE schema = 'main' AND name = ?
+      ORDER BY name
+    `, tableName),
+    columns: queryRows(database, `
+      SELECT cid, name, type, "notnull", dflt_value, pk, hidden
+      FROM pragma_table_xinfo(?)
+      ORDER BY cid
+    `, tableName),
+    foreignKeys: queryRows(database, `
+      SELECT id, seq, "table", "from", "to", on_update, on_delete, match
+      FROM pragma_foreign_key_list(?)
+      ORDER BY id, seq
+    `, tableName),
+    indexes: queryRows(database, `
+      SELECT name, "unique", origin, partial
+      FROM pragma_index_list(?)
+      ORDER BY name
+    `, tableName)
   })
 }
 

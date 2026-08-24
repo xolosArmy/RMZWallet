@@ -127,6 +127,76 @@ describe('TM1 SQLite real-file and process behavior', () => {
     raw.close()
   })
 
+  test('attests canonical DELETE mode with statistics before transitioning to WAL', async () => {
+    const { databasePath } = emptyPath()
+    createCanonicalDeleteDatabase(databasePath)
+    const maintenance = new DatabaseSync(databasePath, { allowExtension: false })
+    maintenance.exec('ANALYZE')
+    expect(readPragmaString(maintenance, 'journal_mode')).toBe('delete')
+    expect(readStatisticsObjects(maintenance).map(row => row.name))
+      .toContain('sqlite_stat1')
+    maintenance.close()
+    expect(databaseSidecars(databasePath)).toEqual([])
+
+    const store = openStore(databasePath)
+    expect(store.inspectDurability().journalMode).toBe('wal')
+    const record = preparedRecord({ publicationId: 'publication:analyzed-delete' })
+    await expect(store.create({ record })).resolves.toEqual(record)
+    await expect(store.load(record.publicationId)).resolves.toEqual(record)
+    store.close()
+
+    const raw = new DatabaseSync(databasePath, { allowExtension: false })
+    expect(inspectTm1SqliteSchema(raw)).toBe('v1')
+    expect(readPragmaString(raw, 'journal_mode')).toBe('wal')
+    raw.close()
+  })
+
+  test('keeps live and reopened stores usable across repeated ANALYZE maintenance', async () => {
+    const { databasePath } = emptyPath()
+    const first = outcomeUnknownRecord({
+      publicationId: 'publication:analyze-a',
+      signingCapabilityId: 'capability:sign:analyze-a',
+      broadcastCapabilityId: 'capability:broadcast:analyze-a'
+    })
+    const second = preparedRecord({ publicationId: 'publication:analyze-b' })
+    const third = preparedRecord({ publicationId: 'publication:analyze-c' })
+    const store = openStore(databasePath)
+    await store.create({ record: first })
+
+    const maintenance = new DatabaseSync(databasePath, { allowExtension: false })
+    maintenance.exec('ANALYZE')
+    const statisticsObjects = readStatisticsObjects(maintenance)
+    const initialStatistics = readStatisticsRows(maintenance)
+    expect(statisticsObjects).toContainEqual({
+      type: 'table',
+      name: 'sqlite_stat1',
+      tbl_name: 'sqlite_stat1',
+      sql: 'CREATE TABLE sqlite_stat1(tbl,idx,stat)'
+    })
+
+    await expect(store.load(first.publicationId)).resolves.toEqual(first)
+    await expect(store.listRecoverable()).resolves.toEqual([first])
+    await expect(store.create({ record: second })).resolves.toEqual(second)
+    maintenance.exec('ANALYZE')
+    const updatedStatistics = readStatisticsRows(maintenance)
+    expect(updatedStatistics).not.toEqual(initialStatistics)
+    await expect(store.listRecoverable()).resolves.toEqual([first, second])
+
+    maintenance.exec('PRAGMA optimize')
+    maintenance.exec('ANALYZE')
+    expect(readStatisticsObjects(maintenance)).toEqual(statisticsObjects)
+    maintenance.close()
+    await expect(store.load(second.publicationId)).resolves.toEqual(second)
+    store.close()
+
+    const reopened = openStore(databasePath)
+    await expect(reopened.load(first.publicationId)).resolves.toEqual(first)
+    await expect(reopened.load(second.publicationId)).resolves.toEqual(second)
+    await expect(reopened.create({ record: third })).resolves.toEqual(third)
+    await expect(reopened.listRecoverable()).resolves.toEqual([first, second, third])
+    reopened.close()
+  })
+
   test('initializes canonical v1 from a pre-existing empty file and reopens it', async () => {
     const { databasePath } = emptyPath()
     const descriptor = openSync(databasePath, 'wx', 0o600)
@@ -976,6 +1046,23 @@ function readPragmaInteger(database: DatabaseSync, pragma: string): number {
   const value = database.prepare(`PRAGMA ${pragma}`).get()?.[pragma]
   if (typeof value !== 'number') throw new Error('INVALID_TEST_PRAGMA')
   return value
+}
+
+function readStatisticsObjects(database: DatabaseSync): Record<string, unknown>[] {
+  return database.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_schema
+    WHERE name LIKE 'sqlite_stat%'
+    ORDER BY type, name
+  `).all().map(row => ({ ...row }))
+}
+
+function readStatisticsRows(database: DatabaseSync): Record<string, unknown>[] {
+  return database.prepare(`
+    SELECT tbl, idx, stat
+    FROM sqlite_stat1
+    ORDER BY tbl, idx
+  `).all().map(row => ({ ...row }))
 }
 
 type Tm1SqliteReadTestSeam = {
