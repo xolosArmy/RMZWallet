@@ -27,6 +27,8 @@ import {
 } from '../utils/ipfs'
 import { WALLET_REFRESH_EVENT, type WalletRefreshDetail } from '../utils/walletRefresh'
 import type { XolosLineage } from '../services/nftMetadata'
+import { NftVerificationBadge } from '../features/nftVerification/NftVerificationBadge'
+import { useNftVerification } from '../hooks/useNftVerification'
 
 const SLP_NFT1_GROUP = 129
 const FEE_PER_KB = 1200n
@@ -41,6 +43,33 @@ const estimateMintFeeSats = (inputCount = 2, outputCount = 4) => {
 
 const formatTokenId = (tokenId: string) => `${tokenId.slice(0, 6)}...${tokenId.slice(-6)}`
 
+function NftVerificationDetail({ nft, onClose }: { nft: NftAsset; onClose: () => void }) {
+  const verificationState = useNftVerification(nft.tokenId)
+
+  return (
+    <section
+      className="nft-verification-detail"
+      aria-label={`Verificación on-chain de ${nft.name}`}
+    >
+      <div className="nft-verification-detail__header">
+        <div>
+          <p className="card-kicker">Verificación on-chain</p>
+          <h2>{nft.name}</h2>
+        </div>
+        <NftVerificationBadge state={verificationState} />
+      </div>
+      <p className="muted nft-verification-detail__token">{nft.tokenId}</p>
+      <p className="muted">
+        El estado se obtiene exclusivamente del Genesis NFT1 observado por Chronik y del
+        clasificador canónico. La metadata no determina esta señal.
+      </p>
+      <button className="cta ghost" type="button" onClick={onClose}>
+        Cerrar detalle
+      </button>
+    </section>
+  )
+}
+
 function Nfts() {
   const { address, initialized, backupVerified, loading, error, refreshBalances, rescanWallet } = useWallet()
   const [activeTab, setActiveTab] = useState<'owned' | 'mint' | 'collection'>('owned')
@@ -49,6 +78,7 @@ function Nfts() {
   const [nftsError, setNftsError] = useState<string | null>(null)
   const [imageObjectUrls, setImageObjectUrls] = useState<Record<string, string>>({})
   const [rescanBusy, setRescanBusy] = useState(false)
+  const [selectedNftTokenId, setSelectedNftTokenId] = useState<string | null>(null)
 
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
@@ -76,6 +106,10 @@ function Nfts() {
   const [xecAvailableSats, setXecAvailableSats] = useState<bigint>(0n)
   const [parentTokenCopied, setParentTokenCopied] = useState(false)
   const didLogGateway = useRef(false)
+  const selectedNft = useMemo(
+    () => nfts.find((nft) => nft.tokenId === selectedNftTokenId) ?? null,
+    [nfts, selectedNftTokenId]
+  )
 
   useEffect(() => {
     if (!imageFile) {
@@ -401,6 +435,14 @@ function Nfts() {
             {!nftsLoading && nfts.length === 0 && <div className="muted">Aún no tienes NFTs en esta wallet.</div>}
             {/* Dev check: start app, open /nfts, verify token name/ticker render and Open on IPFS opens. */}
 
+            {selectedNft && (
+              <NftVerificationDetail
+                key={selectedNft.tokenId}
+                nft={selectedNft}
+                onClose={() => setSelectedNftTokenId(null)}
+              />
+            )}
+
             <div className="grid" style={{ marginTop: 12 }}>
               {nfts.map((nft) => (
                 <div className="card nft-card" key={nft.tokenId}>
@@ -466,6 +508,14 @@ function Nfts() {
                     )
                   })()}
                   <div className="actions" style={{ marginTop: 12 }}>
+                    <button
+                      className="cta primary"
+                      type="button"
+                      aria-pressed={selectedNftTokenId === nft.tokenId}
+                      onClick={() => setSelectedNftTokenId(nft.tokenId)}
+                    >
+                      Verificar linaje
+                    </button>
                     <Link className="cta outline" to={`/send-nft?tokenId=${nft.tokenId}`}>
                       Enviar
                     </Link>
