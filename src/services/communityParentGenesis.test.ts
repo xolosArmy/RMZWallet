@@ -1,21 +1,20 @@
 import { readFileSync } from 'node:fs'
 import { Address, parseSlp, slpGenesis, toHex } from 'ecash-lib'
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import {
   COMMUNITY_PARENT_DECIMALS,
+  COMMUNITY_PARENT_DOCUMENT_HASH,
   COMMUNITY_PARENT_DUST_SATS,
   COMMUNITY_PARENT_INITIAL_QUANTITY,
   COMMUNITY_PARENT_MINT_BATON_VOUT,
   COMMUNITY_PARENT_TOKEN_NAME,
   COMMUNITY_PARENT_TOKEN_TICKER,
   COMMUNITY_PARENT_TOKEN_TYPE,
+  assertCanonicalCommunityParentMetadata,
+  assertCommunityParentPlannerEnvironment,
   buildCommunityParentGenesisPlan,
-  executeCommunityParentGenesis,
   formatCommunityParentGenesisPreview,
-  isCommunityParentBroadcastEnabled,
-  revalidateCommunityParentFunding,
-  sha256MetadataBytes,
-  validateCommunityParentInitialQuantity
+  sha256MetadataBytes
 } from './communityParentGenesis'
 import type {
   CommunityParentFundingUtxo,
@@ -26,17 +25,16 @@ const FUNDING_ADDRESS = 'ecash:qq7qn90ev23ecastqmn8as00u8mcp4tzsspvt5dtlk'
 const TOKEN_ADDRESS = 'ecash:qplm2jhzuteklx9naquzwfe97tx3h8eu4gyq385tw8'
 const BATON_ADDRESS = 'ecash:qpluxjhhlxfjwsymf9nmctvsdrwzwygadsh2pq0ang'
 const CHANGE_ADDRESS = 'ecash:qpnku5pz7h29jkpga99py72gnrksaalzscrjnwnzvt'
-const DOCUMENT_URI = `ipfs://bafy${'a'.repeat(52)}`
+const CID_V0 = 'QmRmMkmm5Aouw9iEQ3APoab5DjhKkUVdLGT6iv9BwjVkao'
+const CID_V1 = 'bafybeibs45utqwgtmxascm272fnbkgq2n45pdwzl4nlnfvcl7ptfhoqs6q'
+const DOCUMENT_URI = `ipfs://${CID_V1}`
 const METADATA_BYTES = new Uint8Array(
   readFileSync(new URL('../../scripts/metadata/community-parent.json', import.meta.url))
 )
-const DOCUMENT_HASH = sha256MetadataBytes(METADATA_BYTES)
 const FUNDING_SCRIPT = toHex(Address.parse(FUNDING_ADDRESS).toScript().bytecode)
 
 const makeUtxo = (
-  params: Partial<CommunityParentFundingUtxo> & {
-    token?: unknown
-  } = {}
+  params: Partial<CommunityParentFundingUtxo> & { token?: unknown } = {}
 ): CommunityParentFundingUtxo => ({
   outpoint: params.outpoint ?? { txid: '11'.repeat(32), outIdx: 0 },
   sats: params.sats ?? 10_000n,
@@ -54,13 +52,6 @@ const makeConfig = (
   batonDestinationAddress: BATON_ADDRESS,
   changeAddress: CHANGE_ADDRESS,
   documentUri: DOCUMENT_URI,
-  documentHash: DOCUMENT_HASH,
-  metadataBytes: METADATA_BYTES,
-  tokenType: COMMUNITY_PARENT_TOKEN_TYPE,
-  tokenName: COMMUNITY_PARENT_TOKEN_NAME,
-  tokenTicker: COMMUNITY_PARENT_TOKEN_TICKER,
-  decimals: COMMUNITY_PARENT_DECIMALS,
-  initialQuantity: COMMUNITY_PARENT_INITIAL_QUANTITY,
   ...overrides
 })
 
@@ -73,31 +64,29 @@ const buildPlan = (params: {
     fundingUtxos: params.utxos ?? [makeUtxo()]
   })
 
-describe('community Parent SLP NFT1 Group semantics', () => {
-  it('builds the exact type-129 GENESIS with quantity output, retained baton, and existing dust policy', () => {
+describe('canonical community Parent SLP NFT1 Group semantics', () => {
+  it('builds the exact canonical type-129 GENESIS and fixed output layout', () => {
     const plan = buildPlan()
     const expectedOpReturn = slpGenesis(
-      plan.tokenType,
+      COMMUNITY_PARENT_TOKEN_TYPE,
       {
-        tokenTicker: plan.tokenTicker,
-        tokenName: plan.tokenName,
-        url: plan.documentUri,
-        hash: plan.documentHash,
-        decimals: plan.decimals
-      },
-      plan.initialQuantity,
-      plan.mintBatonVout
-    )
-    const decoded = parseSlp(expectedOpReturn)
-
-    expect(decoded).toEqual({
-      txType: 'GENESIS',
-      tokenType: 129,
-      genesisInfo: {
         tokenTicker: COMMUNITY_PARENT_TOKEN_TICKER,
         tokenName: COMMUNITY_PARENT_TOKEN_NAME,
         url: DOCUMENT_URI,
-        hash: DOCUMENT_HASH,
+        hash: COMMUNITY_PARENT_DOCUMENT_HASH,
+        decimals: COMMUNITY_PARENT_DECIMALS
+      },
+      COMMUNITY_PARENT_INITIAL_QUANTITY,
+      COMMUNITY_PARENT_MINT_BATON_VOUT
+    )
+    expect(parseSlp(expectedOpReturn)).toEqual({
+      txType: 'GENESIS',
+      tokenType: 129,
+      genesisInfo: {
+        tokenTicker: 'RMZCOMM',
+        tokenName: 'xolosArmy Community',
+        url: DOCUMENT_URI,
+        hash: COMMUNITY_PARENT_DOCUMENT_HASH,
         decimals: 0,
         mintVaultScripthash: undefined
       },
@@ -105,19 +94,26 @@ describe('community Parent SLP NFT1 Group semantics', () => {
       mintBatonOutIdx: 2
     })
     expect(plan.opReturnHex).toBe(toHex(expectedOpReturn.bytecode))
-    expect(plan.outputs.slice(0, 3)).toMatchObject([
-      { vout: 0, kind: 'slp-genesis', sats: 0n },
+    expect(plan.outputs.slice(0, 3)).toEqual([
+      {
+        vout: 0,
+        kind: 'slp-genesis',
+        sats: 0n,
+        scriptHex: plan.opReturnHex
+      },
       {
         vout: 1,
         kind: 'initial-group-quantity',
         sats: COMMUNITY_PARENT_DUST_SATS,
-        tokenAtoms: 1n,
-        address: TOKEN_ADDRESS
+        scriptHex: toHex(Address.parse(TOKEN_ADDRESS).toScript().bytecode),
+        address: TOKEN_ADDRESS,
+        tokenAtoms: 1n
       },
       {
         vout: 2,
         kind: 'mint-baton',
         sats: COMMUNITY_PARENT_DUST_SATS,
+        scriptHex: toHex(Address.parse(BATON_ADDRESS).toScript().bytecode),
         address: BATON_ADDRESS
       }
     ])
@@ -128,79 +124,65 @@ describe('community Parent SLP NFT1 Group semantics', () => {
     })
   })
 
-  it('documents that ecash-lib can encode zero atoms while this tool rejects zero as unsafe', () => {
-    const zeroGenesis = slpGenesis(
-      COMMUNITY_PARENT_TOKEN_TYPE,
-      {
-        tokenTicker: COMMUNITY_PARENT_TOKEN_TICKER,
-        tokenName: COMMUNITY_PARENT_TOKEN_NAME,
-        url: DOCUMENT_URI,
-        hash: DOCUMENT_HASH,
-        decimals: 0
-      },
-      0n,
-      COMMUNITY_PARENT_MINT_BATON_VOUT
-    )
-    expect(parseSlp(zeroGenesis)).toMatchObject({
-      txType: 'GENESIS',
-      tokenType: 129,
-      initialAtoms: 0n,
-      mintBatonOutIdx: 2
+  it.each([0n, 2n, 1000n, -1n, 1.5])(
+    'does not expose initial quantity %s as a configurable builder input',
+    (attemptedQuantity) => {
+      const hostileConfig = {
+        ...makeConfig(),
+        initialQuantity: attemptedQuantity
+      } as CommunityParentGenesisConfig
+      const plan = buildCommunityParentGenesisPlan({
+        config: hostileConfig,
+        fundingUtxos: [makeUtxo()]
+      })
+      expect(plan.initialQuantity).toBe(1n)
+      expect(plan.outputs[1].tokenAtoms).toBe(1n)
+    }
+  )
+
+  it('does not expose token type, decimals, name, ticker, hash, or baton index as inputs', () => {
+    const hostileConfig = {
+      ...makeConfig(),
+      tokenType: 1,
+      decimals: 9,
+      tokenName: 'Other',
+      tokenTicker: 'OTHER',
+      documentHash: '00'.repeat(32),
+      mintBatonVout: 9
+    } as CommunityParentGenesisConfig
+    const plan = buildCommunityParentGenesisPlan({
+      config: hostileConfig,
+      fundingUtxos: [makeUtxo()]
     })
-    expect(() => buildPlan({ config: { initialQuantity: 0n } })).toThrow(/between 1/)
-  })
-
-  it('rejects any token type other than SLP NFT1 Group 129', () => {
-    expect(() => buildPlan({ config: { tokenType: 1 } })).toThrow(/type 129/)
-    expect(() => buildPlan({ config: { tokenType: 65 } })).toThrow(/type 129/)
-  })
-
-  it('rejects non-zero decimals', () => {
-    expect(() => buildPlan({ config: { decimals: 1 } })).toThrow(/zero decimals/)
-  })
-
-  it.each([
-    -1n,
-    0n,
-    0,
-    1,
-    Number.NaN,
-    1.5,
-    '',
-    '0',
-    '01',
-    ' 1',
-    '1 ',
-    '1.0',
-    '1e3',
-    '18446744073709551616'
-  ])('rejects invalid or ambiguous initial quantity %s', (quantity) => {
-    expect(() => validateCommunityParentInitialQuantity(quantity)).toThrow()
-  })
-
-  it('accepts only explicit positive decimal strings or bigint quantities', () => {
-    expect(validateCommunityParentInitialQuantity('1')).toBe(1n)
-    expect(validateCommunityParentInitialQuantity(2n)).toBe(2n)
+    expect(plan).toMatchObject({
+      tokenType: 129,
+      decimals: 0,
+      tokenName: 'xolosArmy Community',
+      tokenTicker: 'RMZCOMM',
+      documentHash: COMMUNITY_PARENT_DOCUMENT_HASH,
+      mintBatonVout: 2
+    })
   })
 })
 
-describe('metadata and administrative parameters', () => {
-  it('binds the exact checked-in metadata bytes to the SLP document hash', () => {
-    const plan = buildPlan()
-    expect(plan.documentHash).toBe(DOCUMENT_HASH)
-    expect(plan.documentHash).toMatch(/^[0-9a-f]{64}$/)
+describe('canonical metadata and IPFS document URI', () => {
+  it('binds the exact checked-in bytes to the frozen document hash', () => {
+    expect(sha256MetadataBytes(METADATA_BYTES)).toBe(COMMUNITY_PARENT_DOCUMENT_HASH)
+    expect(() => assertCanonicalCommunityParentMetadata(METADATA_BYTES)).not.toThrow()
+    expect(buildPlan().documentHash).toBe(COMMUNITY_PARENT_DOCUMENT_HASH)
   })
 
-  it('rejects a missing or non-IPFS document URI', () => {
-    expect(() => buildPlan({ config: { documentUri: '' } })).toThrow(/ipfs/)
-    expect(() => buildPlan({ config: { documentUri: 'https://example.com/metadata.json' } })).toThrow(/ipfs/)
+  it('rejects a one-byte mutation even if a caller can recalculate its hash', () => {
+    const mutated = METADATA_BYTES.slice()
+    const marker = new TextEncoder().encode('Burn one pass')
+    const offset = Buffer.from(mutated).indexOf(Buffer.from(marker))
+    expect(offset).toBeGreaterThanOrEqual(0)
+    mutated[offset] = 'b'.charCodeAt(0)
+    expect(sha256MetadataBytes(mutated)).not.toBe(COMMUNITY_PARENT_DOCUMENT_HASH)
+    expect(() => assertCanonicalCommunityParentMetadata(mutated)).toThrow(/canonical/)
   })
 
-  it('rejects a metadata hash mismatch', () => {
-    expect(() => buildPlan({ config: { documentHash: '00'.repeat(32) } })).toThrow(/does not match/)
-  })
-
-  it('rejects metadata that claims a different verification posture', () => {
+  it('rejects metadata that changes the reviewed verification posture', () => {
     const hostile = new TextEncoder().encode(
       JSON.stringify({
         schema: 'xolosarmy-nft/1',
@@ -211,11 +193,24 @@ describe('metadata and administrative parameters', () => {
         }
       })
     )
-    expect(() =>
-      buildPlan({
-        config: { metadataBytes: hostile, documentHash: sha256MetadataBytes(hostile) }
-      })
-    ).toThrow(/descriptive, unverified/)
+    expect(() => assertCanonicalCommunityParentMetadata(hostile)).toThrow(/unverified/)
+  })
+
+  it.each([CID_V0, CID_V1])('accepts a canonical IPFS CID: %s', (cid) => {
+    expect(buildPlan({ config: { documentUri: `ipfs://${cid}` } }).documentUri).toBe(`ipfs://${cid}`)
+  })
+
+  it.each([
+    'ipfs://00000000000000000000',
+    'ipfs://not-a-cid',
+    'https://example.com/foo',
+    'ipfs://',
+    'ipfs://b%%%',
+    `ipfs://${CID_V1.toUpperCase()}`,
+    `ipfs://${CID_V1}/metadata.json`,
+    `ipfs://${CID_V1}?download=1`
+  ])('rejects a malformed or non-canonical IPFS URI: %s', (documentUri) => {
+    expect(() => buildPlan({ config: { documentUri } })).toThrow(/IPFS|ipfs/)
   })
 
   it('preserves distinct funding, token, baton, and change destinations', () => {
@@ -236,7 +231,7 @@ describe('metadata and administrative parameters', () => {
   })
 })
 
-describe('pure-XEC funding and revalidation', () => {
+describe('pure-XEC funding snapshot validation', () => {
   it.each([
     { protocol: 'SLP', tokenType: 1, atoms: 1n, isMintBaton: false },
     { protocol: 'SLP', tokenType: 65, atoms: 1n, isMintBaton: false },
@@ -247,7 +242,21 @@ describe('pure-XEC funding and revalidation', () => {
     expect(() => buildPlan({ utxos: [makeUtxo({ token })] })).toThrow(/Token-bearing UTXOs/)
   })
 
-  it('rejects funding not controlled by the explicit funding address', () => {
+  it('accepts the maximum uint32 outIdx and rejects values outside uint32', () => {
+    expect(buildPlan({
+      utxos: [makeUtxo({ outpoint: { txid: '11'.repeat(32), outIdx: 0xffffffff } })]
+    }).selectedInputs[0].outpoint.outIdx).toBe(0xffffffff)
+    for (const outIdx of [-1, 0x100000000, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+      expect(() => buildPlan({
+        utxos: [makeUtxo({ outpoint: { txid: '11'.repeat(32), outIdx } })]
+      })).toThrow(/outpoint/)
+    }
+  })
+
+  it('rejects malformed txids and funding not controlled by the funding address', () => {
+    expect(() => buildPlan({
+      utxos: [makeUtxo({ outpoint: { txid: 'AA'.repeat(32), outIdx: 0 } })]
+    })).toThrow(/outpoint/)
     const wrongScript = toHex(Address.parse(TOKEN_ADDRESS).toScript().bytecode)
     expect(() => buildPlan({ utxos: [makeUtxo({ outputScript: wrongScript })] })).toThrow(/not controlled/)
   })
@@ -256,104 +265,52 @@ describe('pure-XEC funding and revalidation', () => {
     expect(() => buildPlan({ utxos: [makeUtxo({ sats: 100n })] })).toThrow(/Insufficient/)
     const duplicate = makeUtxo()
     expect(() => buildPlan({ utxos: [duplicate, duplicate] })).toThrow(/Duplicate/)
-    expect(() =>
-      buildPlan({
-        utxos: [makeUtxo({ isCoinbase: true as never })]
-      })
-    ).toThrow(/Coinbase/)
-  })
-
-  it('fails closed if a selected UTXO disappears, changes amount, or gains a token annotation', () => {
-    const selected = [makeUtxo()]
-    expect(() => revalidateCommunityParentFunding(selected, [])).toThrow(/disappeared/)
-    expect(() =>
-      revalidateCommunityParentFunding(selected, [makeUtxo({ sats: 9_999n })])
-    ).toThrow(/amount changed/)
-    expect(() =>
-      revalidateCommunityParentFunding(selected, [makeUtxo({ token: { isMintBaton: true } })])
-    ).toThrow(/Token-bearing/)
-  })
-
-  it('accepts an exact fresh pure-XEC snapshot', () => {
-    const selected = [makeUtxo()]
-    expect(() => revalidateCommunityParentFunding(selected, [makeUtxo()])).not.toThrow()
+    expect(() => buildPlan({
+      utxos: [makeUtxo({ isCoinbase: true as never })]
+    })).toThrow(/Coinbase/)
   })
 })
 
-describe('dry-run and future broadcast gates', () => {
-  it.each([
-    {},
-    { BROADCAST: '1' },
-    { CONFIRM_COMMUNITY_PARENT_GENESIS: 'YES' },
-    { BROADCAST: 'true', CONFIRM_COMMUNITY_PARENT_GENESIS: 'YES' },
-    { BROADCAST: '1', CONFIRM_COMMUNITY_PARENT_GENESIS: 'yes' }
-  ])('keeps execution in dry-run unless both exact gates are present: %o', async (environment) => {
-    const plan = buildPlan()
-    const result = await executeCommunityParentGenesis({
-      plan,
-      environment,
-      signingSecretAvailable: false
-    })
-    expect(result).toEqual({ mode: 'dry-run', plan })
-  })
-
-  it('requires both exact broadcast gates', () => {
-    expect(isCommunityParentBroadcastEnabled({
+describe('planner-only capability boundary', () => {
+  it('accepts a normal offline environment and rejects either former broadcast flag', () => {
+    expect(() => assertCommunityParentPlannerEnvironment({})).not.toThrow()
+    expect(() => assertCommunityParentPlannerEnvironment({ BROADCAST: '1' })).toThrow(/not supported/)
+    expect(() => assertCommunityParentPlannerEnvironment({
+      CONFIRM_COMMUNITY_PARENT_GENESIS: 'YES'
+    })).toThrow(/not supported/)
+    expect(() => assertCommunityParentPlannerEnvironment({
       BROADCAST: '1',
       CONFIRM_COMMUNITY_PARENT_GENESIS: 'YES'
-    })).toBe(true)
-    expect(isCommunityParentBroadcastEnabled({ BROADCAST: '1' })).toBe(false)
-    expect(isCommunityParentBroadcastEnabled({ CONFIRM_COMMUNITY_PARENT_GENESIS: 'YES' })).toBe(false)
+    })).toThrow(/not supported/)
   })
 
-  it('fails closed before revalidation, signing, or broadcast when no signing secret is available', async () => {
-    const revalidateFunding = vi.fn()
-    const sign = vi.fn()
-    const broadcast = vi.fn()
-    await expect(
-      executeCommunityParentGenesis({
-        plan: buildPlan(),
-        environment: {
-          BROADCAST: '1',
-          CONFIRM_COMMUNITY_PARENT_GENESIS: 'YES'
-        },
-        signingSecretAvailable: false,
-        ports: { revalidateFunding, sign, broadcast }
-      })
-    ).rejects.toThrow(/no signing secret/)
-    expect(revalidateFunding).not.toHaveBeenCalled()
-    expect(sign).not.toHaveBeenCalled()
-    expect(broadcast).not.toHaveBeenCalled()
-  })
-
-  it('formats a complete safe preview without secret material', () => {
+  it('formats a complete offline preview without secret material', () => {
     const preview = formatCommunityParentGenesisPreview(buildPlan())
     expect(preview).toContain('mode: DRY_RUN')
     expect(preview).toContain('tokenType: 129 (SLP NFT1 Group)')
-    expect(preview).toContain(`documentHash: ${DOCUMENT_HASH}`)
+    expect(preview).toContain(`documentHash: ${COMMUNITY_PARENT_DOCUMENT_HASH}`)
     expect(preview).toContain('selectedPureXecInputs:')
     expect(preview).toContain('expectedOutputs:')
-    expect(preview).toContain('estimatedFeeSats:')
     expect(preview).toContain('broadcastExecuted: NO')
     expect(preview).not.toMatch(/WIF|mnemonic|privateKey|seed/i)
   })
-})
 
-describe('scope isolation', () => {
-  it('keeps the CLI offline by default and free of concrete Chronik, wallet, or Pinata wiring', () => {
+  it('keeps the CLI offline and validates the checked-in metadata before planning', () => {
     const cliSource = readFileSync(
       new URL('../../scripts/create-community-parent.ts', import.meta.url),
       'utf8'
     )
+    expect(cliSource).toContain('assertCanonicalCommunityParentMetadata(metadataBytes)')
+    expect(cliSource).toContain('assertCommunityParentPlannerEnvironment')
     expect(cliSource).not.toMatch(/getChronik|ChronikClient|broadcastTx|Pinata|mnemonic|privateKey|WIF|seed/)
-    expect(cliSource).toContain('signingSecretAvailable: false')
+    expect(cliSource).not.toMatch(/executeCommunityParentGenesis|signingSecretAvailable|ports:/)
+    expect(cliSource).not.toMatch(/process\.env\.COMMUNITY_PARENT_INITIAL_QUANTITY/)
   })
 
-  it('does not import collection policy, classifier, extractor, or UI into the builder', () => {
+  it('contains no signer, broadcaster, executor, live revalidation, policy, extractor, or UI capability', () => {
     const builderSource = readFileSync(new URL('./communityParentGenesis.ts', import.meta.url), 'utf8')
     expect(builderSource).not.toMatch(/NFT_COLLECTIONS|classifyCollection|nftEvidenceExtractor|React/)
-    expect(builderSource).toMatch(
-      /await params\.ports\.revalidateFunding\(\)[\s\S]+revalidateCommunityParentFunding[\s\S]+await params\.ports\.sign[\s\S]+await params\.ports\.broadcast/
-    )
+    expect(builderSource).not.toMatch(/executeCommunityParentGenesis|signingSecretAvailable|revalidateFunding/)
+    expect(builderSource).not.toMatch(/ports\.sign|ports\.broadcast|broadcastTx|TxBuilder|P2PKHSignatory/)
   })
 })

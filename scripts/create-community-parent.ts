@@ -1,14 +1,16 @@
 import { readFile } from 'node:fs/promises'
 import {
   COMMUNITY_PARENT_DECIMALS,
+  COMMUNITY_PARENT_DOCUMENT_HASH,
   COMMUNITY_PARENT_INITIAL_QUANTITY,
+  COMMUNITY_PARENT_MINT_BATON_VOUT,
   COMMUNITY_PARENT_TOKEN_NAME,
   COMMUNITY_PARENT_TOKEN_TICKER,
   COMMUNITY_PARENT_TOKEN_TYPE,
+  assertCanonicalCommunityParentMetadata,
+  assertCommunityParentPlannerEnvironment,
   buildCommunityParentGenesisPlan,
-  executeCommunityParentGenesis,
-  formatCommunityParentGenesisPreview,
-  sha256MetadataBytes
+  formatCommunityParentGenesisPreview
 } from '../src/services/communityParentGenesis'
 import type {
   CommunityParentFundingUtxo,
@@ -66,12 +68,17 @@ if (cliArgs.length !== 0) {
   throw new Error('This tool accepts no CLI arguments; secrets must never be supplied on the command line.')
 }
 
+assertCommunityParentPlannerEnvironment({
+  BROADCAST: process.env.BROADCAST,
+  CONFIRM_COMMUNITY_PARENT_GENESIS: process.env.CONFIRM_COMMUNITY_PARENT_GENESIS
+})
+
 const metadataBytes = new Uint8Array(
   await readFile(new URL('./metadata/community-parent.json', import.meta.url))
 )
+assertCanonicalCommunityParentMetadata(metadataBytes)
 const fundingUtxosPath = requireEnvironment('COMMUNITY_PARENT_UTXOS_FILE')
 const fundingUtxos = parseFundingUtxos(await readFile(fundingUtxosPath, 'utf8'))
-const documentHash = sha256MetadataBytes(metadataBytes)
 const plan = buildCommunityParentGenesisPlan({
   config: {
     network: parseNetwork(requireEnvironment('COMMUNITY_PARENT_NETWORK')),
@@ -79,28 +86,21 @@ const plan = buildCommunityParentGenesisPlan({
     tokenDestinationAddress: requireEnvironment('COMMUNITY_PARENT_TOKEN_ADDRESS'),
     batonDestinationAddress: requireEnvironment('COMMUNITY_PARENT_BATON_ADDRESS'),
     changeAddress: requireEnvironment('COMMUNITY_PARENT_CHANGE_ADDRESS'),
-    documentUri: requireEnvironment('COMMUNITY_PARENT_DOCUMENT_URI'),
-    documentHash,
-    metadataBytes,
-    tokenType: COMMUNITY_PARENT_TOKEN_TYPE,
-    tokenName: COMMUNITY_PARENT_TOKEN_NAME,
-    tokenTicker: COMMUNITY_PARENT_TOKEN_TICKER,
-    decimals: COMMUNITY_PARENT_DECIMALS,
-    initialQuantity:
-      process.env.COMMUNITY_PARENT_INITIAL_QUANTITY ??
-      COMMUNITY_PARENT_INITIAL_QUANTITY.toString()
+    documentUri: requireEnvironment('COMMUNITY_PARENT_DOCUMENT_URI')
   },
   fundingUtxos
 })
 
-console.log(formatCommunityParentGenesisPreview(plan))
+if (
+  plan.documentHash !== COMMUNITY_PARENT_DOCUMENT_HASH ||
+  plan.tokenType !== COMMUNITY_PARENT_TOKEN_TYPE ||
+  plan.tokenName !== COMMUNITY_PARENT_TOKEN_NAME ||
+  plan.tokenTicker !== COMMUNITY_PARENT_TOKEN_TICKER ||
+  plan.decimals !== COMMUNITY_PARENT_DECIMALS ||
+  plan.initialQuantity !== COMMUNITY_PARENT_INITIAL_QUANTITY ||
+  plan.mintBatonVout !== COMMUNITY_PARENT_MINT_BATON_VOUT
+) {
+  throw new Error('Planner returned a non-canonical Community Parent plan.')
+}
 
-await executeCommunityParentGenesis({
-  plan,
-  environment: {
-    BROADCAST: process.env.BROADCAST,
-    CONFIRM_COMMUNITY_PARENT_GENESIS: process.env.CONFIRM_COMMUNITY_PARENT_GENESIS
-  },
-  // This preparation-only PR deliberately wires no signing secret or broadcast port.
-  signingSecretAvailable: false
-})
+console.log(formatCommunityParentGenesisPreview(plan))

@@ -8,6 +8,7 @@ import {
   toHex
 } from 'ecash-lib'
 import type { GenesisInfo } from 'chronik-client'
+import { CID } from 'multiformats'
 import { FEE_RATE_SATS_PER_BYTE, XEC_DUST_SATS } from '../config/xecFees'
 
 export const COMMUNITY_PARENT_TOKEN_TYPE = 129
@@ -16,15 +17,16 @@ export const COMMUNITY_PARENT_INITIAL_QUANTITY = 1n
 export const COMMUNITY_PARENT_MINT_BATON_VOUT = 2
 export const COMMUNITY_PARENT_TOKEN_NAME = 'xolosArmy Community'
 export const COMMUNITY_PARENT_TOKEN_TICKER = 'RMZCOMM'
+export const COMMUNITY_PARENT_DOCUMENT_HASH =
+  '03cd44ce490769d5646b39c84b488d2894b2b6c4958b085f2cc906c1d36a09a6'
 export const COMMUNITY_PARENT_DUST_SATS = BigInt(XEC_DUST_SATS)
 
-const MAX_SLP_ATOMS = 0xffffffffffffffffn
 const MAX_STANDARD_OP_RETURN_BYTES = 223
 const P2PKH_SIGNED_INPUT_BYTES = 148
 const TX_FIXED_BYTES = 8
 const FEE_PER_KB = BigInt(Math.round(FEE_RATE_SATS_PER_BYTE * 1000))
 const CANONICAL_HEX_32 = /^[0-9a-f]{64}$/
-const DOCUMENT_URI = /^ipfs:\/\/[A-Za-z0-9]{20,120}$/
+const UINT32_MAX = 0xffffffff
 
 export type CommunityParentNetwork = 'mainnet' | 'testnet' | 'regtest'
 
@@ -46,13 +48,6 @@ export type CommunityParentGenesisConfig = {
   readonly batonDestinationAddress: string
   readonly changeAddress: string
   readonly documentUri: string
-  readonly documentHash: string
-  readonly metadataBytes: Uint8Array
-  readonly tokenType: number
-  readonly tokenName: string
-  readonly tokenTicker: string
-  readonly decimals: number
-  readonly initialQuantity: unknown
 }
 
 export type CommunityParentGenesisOutput = {
@@ -74,30 +69,20 @@ export type CommunityParentGenesisPlan = {
   readonly tokenName: typeof COMMUNITY_PARENT_TOKEN_NAME
   readonly tokenTicker: typeof COMMUNITY_PARENT_TOKEN_TICKER
   readonly decimals: typeof COMMUNITY_PARENT_DECIMALS
-  readonly initialQuantity: bigint
+  readonly initialQuantity: typeof COMMUNITY_PARENT_INITIAL_QUANTITY
   readonly mintBatonVout: typeof COMMUNITY_PARENT_MINT_BATON_VOUT
   readonly documentUri: string
-  readonly documentHash: string
+  readonly documentHash: typeof COMMUNITY_PARENT_DOCUMENT_HASH
   readonly selectedInputs: readonly CommunityParentFundingUtxo[]
   readonly outputs: readonly CommunityParentGenesisOutput[]
   readonly estimatedFeeSats: bigint
   readonly opReturnHex: string
 }
 
-export type CommunityParentExecutionEnvironment = Readonly<{
+export type CommunityParentPlannerEnvironment = Readonly<{
   BROADCAST?: string
   CONFIRM_COMMUNITY_PARENT_GENESIS?: string
 }>
-
-export type CommunityParentExecutionPorts = {
-  readonly revalidateFunding: () => Promise<readonly CommunityParentFundingUtxo[]>
-  readonly sign: (plan: CommunityParentGenesisPlan) => Promise<{ readonly rawTxHex: string }>
-  readonly broadcast: (rawTxHex: string) => Promise<{ readonly txid: string }>
-}
-
-export type CommunityParentExecutionResult =
-  | { readonly mode: 'dry-run'; readonly plan: CommunityParentGenesisPlan }
-  | { readonly mode: 'broadcast'; readonly txid: string }
 
 const compactSizeLength = (value: number): number => {
   if (value < 0xfd) return 1
@@ -171,19 +156,41 @@ const requireMetadataShape = (metadataBytes: Uint8Array): void => {
 export const sha256MetadataBytes = (metadataBytes: Uint8Array): string =>
   toHex(sha256(metadataBytes))
 
-export const validateCommunityParentInitialQuantity = (value: unknown): bigint => {
-  let quantity: bigint
-  if (typeof value === 'bigint') {
-    quantity = value
-  } else if (typeof value === 'string' && /^[1-9][0-9]*$/.test(value)) {
-    quantity = BigInt(value)
-  } else {
-    throw new Error('Initial quantity must be an unambiguous positive integer.')
+export const assertCanonicalCommunityParentMetadata = (metadataBytes: Uint8Array): void => {
+  requireMetadataShape(metadataBytes)
+  if (sha256MetadataBytes(metadataBytes) !== COMMUNITY_PARENT_DOCUMENT_HASH) {
+    throw new Error('Metadata bytes do not match the canonical Community Parent artifact.')
   }
-  if (quantity < 1n || quantity > MAX_SLP_ATOMS) {
-    throw new Error(`Initial quantity must be between 1 and ${MAX_SLP_ATOMS.toString()} atoms.`)
+}
+
+const validateDocumentUri = (documentUri: string): string => {
+  if (!documentUri.startsWith('ipfs://')) {
+    throw new Error('An explicit canonical ipfs:// document URI is required.')
   }
-  return quantity
+  const cidText = documentUri.slice('ipfs://'.length)
+  let cid: CID
+  try {
+    cid = CID.parse(cidText)
+  } catch {
+    throw new Error('Document URI must contain a structurally valid IPFS CIDv0 or CIDv1.')
+  }
+  if ((cid.version !== 0 && cid.version !== 1) || cid.toString() !== cidText) {
+    throw new Error('Document URI must use the canonical encoding of an IPFS CIDv0 or CIDv1.')
+  }
+  return `ipfs://${cid.toString()}`
+}
+
+export const assertCommunityParentPlannerEnvironment = (
+  environment: CommunityParentPlannerEnvironment
+): void => {
+  if (
+    environment.BROADCAST !== undefined ||
+    environment.CONFIRM_COMMUNITY_PARENT_GENESIS !== undefined
+  ) {
+    throw new Error(
+      'Broadcast is not supported by this planner. This command only produces an offline preview.'
+    )
+  }
 }
 
 const validateFundingUtxo = (
@@ -192,8 +199,9 @@ const validateFundingUtxo = (
 ): void => {
   if (
     !CANONICAL_HEX_32.test(utxo.outpoint.txid) ||
-    !Number.isSafeInteger(utxo.outpoint.outIdx) ||
-    utxo.outpoint.outIdx < 0
+    !Number.isInteger(utxo.outpoint.outIdx) ||
+    utxo.outpoint.outIdx < 0 ||
+    utxo.outpoint.outIdx > UINT32_MAX
   ) {
     throw new Error('Funding UTXO outpoint is malformed.')
   }
@@ -268,27 +276,7 @@ export const buildCommunityParentGenesisPlan = (params: {
   if (!(['mainnet', 'testnet', 'regtest'] as const).includes(config.network)) {
     throw new Error('Network must be explicitly set to mainnet, testnet, or regtest.')
   }
-  if (config.tokenType !== COMMUNITY_PARENT_TOKEN_TYPE) {
-    throw new Error('Community Parent must use SLP NFT1 Group token type 129.')
-  }
-  if (config.decimals !== COMMUNITY_PARENT_DECIMALS) {
-    throw new Error('Community Parent must use zero decimals.')
-  }
-  if (config.tokenName !== COMMUNITY_PARENT_TOKEN_NAME || config.tokenTicker !== COMMUNITY_PARENT_TOKEN_TICKER) {
-    throw new Error('Community Parent name or ticker does not match the reviewed administrative convention.')
-  }
-  if (!DOCUMENT_URI.test(config.documentUri)) {
-    throw new Error('An explicit canonical ipfs:// document URI is required.')
-  }
-  if (!CANONICAL_HEX_32.test(config.documentHash)) {
-    throw new Error('Document hash must be 32 canonical lowercase hex bytes.')
-  }
-  requireMetadataShape(config.metadataBytes)
-  const actualDocumentHash = sha256MetadataBytes(config.metadataBytes)
-  if (actualDocumentHash !== config.documentHash) {
-    throw new Error('Document hash does not match the exact metadata file bytes.')
-  }
-  const initialQuantity = validateCommunityParentInitialQuantity(config.initialQuantity)
+  const documentUri = validateDocumentUri(config.documentUri)
 
   const fundingAddress = validateAddress(config.fundingAddress, config.network, 'Funding address')
   const tokenAddress = validateAddress(config.tokenDestinationAddress, config.network, 'Token destination')
@@ -300,16 +288,16 @@ export const buildCommunityParentGenesisPlan = (params: {
   const changeScript = changeAddress.toScript()
 
   const genesisInfo: GenesisInfo = {
-    tokenTicker: config.tokenTicker,
-    tokenName: config.tokenName,
-    url: config.documentUri,
-    hash: config.documentHash,
-    decimals: config.decimals
+    tokenTicker: COMMUNITY_PARENT_TOKEN_TICKER,
+    tokenName: COMMUNITY_PARENT_TOKEN_NAME,
+    url: documentUri,
+    hash: COMMUNITY_PARENT_DOCUMENT_HASH,
+    decimals: COMMUNITY_PARENT_DECIMALS
   }
   const opReturn = slpGenesis(
-    config.tokenType,
+    COMMUNITY_PARENT_TOKEN_TYPE,
     genesisInfo,
-    initialQuantity,
+    COMMUNITY_PARENT_INITIAL_QUANTITY,
     COMMUNITY_PARENT_MINT_BATON_VOUT
   )
   if (opReturn.bytecode.length > MAX_STANDARD_OP_RETURN_BYTES) {
@@ -319,8 +307,12 @@ export const buildCommunityParentGenesisPlan = (params: {
   if (
     parsed?.txType !== 'GENESIS' ||
     parsed.tokenType !== COMMUNITY_PARENT_TOKEN_TYPE ||
+    parsed.genesisInfo.tokenTicker !== COMMUNITY_PARENT_TOKEN_TICKER ||
+    parsed.genesisInfo.tokenName !== COMMUNITY_PARENT_TOKEN_NAME ||
+    parsed.genesisInfo.url !== documentUri ||
+    parsed.genesisInfo.hash !== COMMUNITY_PARENT_DOCUMENT_HASH ||
     parsed.genesisInfo.decimals !== COMMUNITY_PARENT_DECIMALS ||
-    parsed.initialAtoms !== initialQuantity ||
+    parsed.initialAtoms !== COMMUNITY_PARENT_INITIAL_QUANTITY ||
     parsed.mintBatonOutIdx !== COMMUNITY_PARENT_MINT_BATON_VOUT
   ) {
     throw new Error('ecash-lib did not produce the required NFT1 Group GENESIS semantics.')
@@ -348,7 +340,7 @@ export const buildCommunityParentGenesisPlan = (params: {
       sats: COMMUNITY_PARENT_DUST_SATS,
       scriptHex: toHex(tokenScript.bytecode),
       address: tokenAddress.toString(),
-      tokenAtoms: initialQuantity
+      tokenAtoms: COMMUNITY_PARENT_INITIAL_QUANTITY
     },
     {
       vout: COMMUNITY_PARENT_MINT_BATON_VOUT,
@@ -378,68 +370,15 @@ export const buildCommunityParentGenesisPlan = (params: {
     tokenName: COMMUNITY_PARENT_TOKEN_NAME,
     tokenTicker: COMMUNITY_PARENT_TOKEN_TICKER,
     decimals: COMMUNITY_PARENT_DECIMALS,
-    initialQuantity,
+    initialQuantity: COMMUNITY_PARENT_INITIAL_QUANTITY,
     mintBatonVout: COMMUNITY_PARENT_MINT_BATON_VOUT,
-    documentUri: config.documentUri,
-    documentHash: config.documentHash,
+    documentUri,
+    documentHash: COMMUNITY_PARENT_DOCUMENT_HASH,
     selectedInputs: funding.selected,
     outputs,
     estimatedFeeSats: funding.fee,
     opReturnHex: toHex(opReturn.bytecode)
   }
-}
-
-export const isCommunityParentBroadcastEnabled = (
-  environment: CommunityParentExecutionEnvironment
-): boolean =>
-  environment.BROADCAST === '1' &&
-  environment.CONFIRM_COMMUNITY_PARENT_GENESIS === 'YES'
-
-export const revalidateCommunityParentFunding = (
-  selectedInputs: readonly CommunityParentFundingUtxo[],
-  freshCandidates: readonly CommunityParentFundingUtxo[]
-): void => {
-  const freshByOutpoint = new Map(
-    freshCandidates.map((utxo) => [`${utxo.outpoint.txid}:${utxo.outpoint.outIdx}`, utxo])
-  )
-  for (const selected of selectedInputs) {
-    const key = `${selected.outpoint.txid}:${selected.outpoint.outIdx}`
-    const fresh = freshByOutpoint.get(key)
-    if (!fresh) throw new Error(`Funding UTXO disappeared before signing: ${key}.`)
-    validateFundingUtxo(fresh, selected.outputScript)
-    if (fresh.sats !== selected.sats) {
-      throw new Error(`Funding UTXO amount changed before signing: ${key}.`)
-    }
-  }
-}
-
-export const executeCommunityParentGenesis = async (params: {
-  readonly plan: CommunityParentGenesisPlan
-  readonly environment: CommunityParentExecutionEnvironment
-  readonly signingSecretAvailable: boolean
-  readonly ports?: CommunityParentExecutionPorts
-}): Promise<CommunityParentExecutionResult> => {
-  if (!isCommunityParentBroadcastEnabled(params.environment)) {
-    return { mode: 'dry-run', plan: params.plan }
-  }
-  if (params.signingSecretAvailable !== true) {
-    throw new Error('Broadcast requested but no signing secret is available through an audited wallet integration.')
-  }
-  if (!params.ports) {
-    throw new Error('Broadcast requested but signing, revalidation, and broadcast ports are not configured.')
-  }
-
-  const freshFunding = await params.ports.revalidateFunding()
-  revalidateCommunityParentFunding(params.plan.selectedInputs, freshFunding)
-  const signed = await params.ports.sign(params.plan)
-  if (!/^[0-9a-f]+$/.test(signed.rawTxHex) || signed.rawTxHex.length % 2 !== 0) {
-    throw new Error('Signer returned malformed transaction bytes.')
-  }
-  const result = await params.ports.broadcast(signed.rawTxHex)
-  if (!CANONICAL_HEX_32.test(result.txid)) {
-    throw new Error('Broadcast port returned a malformed transaction ID.')
-  }
-  return { mode: 'broadcast', txid: result.txid }
 }
 
 export const formatCommunityParentGenesisPreview = (

@@ -1,19 +1,22 @@
 # Community Parent preparation tool
 
 `npx tsx scripts/create-community-parent.ts` prepares an offline preview for a future
-`SLP NFT1 Group` Genesis. It does not derive keys, sign, contact Chronik, upload
-metadata, or broadcast a transaction. The community trust-registry entry remains
-closed and is not changed by this tool.
+`SLP NFT1 Group` Genesis. Its capability level is limited to metadata validation,
+pure-XEC funding selection, canonical OP_RETURN construction, and an unsigned
+output plan. It never derives keys, signs, contacts Chronik, uploads metadata, or
+broadcasts a transaction. The community trust-registry entry remains closed and
+is not changed by this tool.
 
 ## Verified protocol choices
 
 - The installed `ecash-lib` 4.5.2 API is
   `slpGenesis(tokenType, genesisInfo, initialQuantity, mintBatonOutIdx?)`.
-- NFT1 Group uses SLP token type `129` and this tool requires `decimals = 0`.
+- NFT1 Group uses SLP token type `129` and this tool fixes `decimals = 0`.
 - `ecash-lib` can encode a zero initial quantity, but an NFT1 Child must consume
   a positive Group quantity. The tool therefore chooses the minimum immediately
   useful and conservative quantity, `1`, instead of `0` or the existing official
-  Parent's much larger issuance.
+  Parent's much larger issuance. Quantity `1` is an internal invariant and is
+  not configurable by the operator.
 - `vout 0` is the SLP Genesis, `vout 1` receives that one Group atom, and the
   retained mint baton is explicitly assigned to `vout 2`. `ecash-lib` rejects a
   baton index below `2`.
@@ -21,10 +24,19 @@ closed and is not changed by this tool.
 
 ## Metadata commitment
 
-The exact bytes checked in at `scripts/metadata/community-parent.json` are
-hashed with SHA-256. That 32-byte lowercase hex digest is passed to the SLP
-`GenesisInfo.hash` field. The explicit `ipfs://` document URI is a separate
-field; an IPFS CID is never substituted for the SHA-256 document hash.
+The exact bytes checked in at `scripts/metadata/community-parent.json` are bound
+to the frozen SHA-256 digest
+`03cd44ce490769d5646b39c84b488d2894b2b6c4958b085f2cc906c1d36a09a6`.
+The CLI hashes the file and aborts if any byte differs. The builder always uses
+that frozen digest in `GenesisInfo.hash`; callers cannot provide metadata bytes
+or a replacement hash. The explicit `ipfs://` document URI is a separate field,
+validated with `multiformats` as a canonical CIDv0 or base32 CIDv1. A CID is
+never substituted for the SHA-256 document hash.
+
+The existing lockfile already pins `multiformats@9.9.0` through the WalletConnect
+dependency graph. This planner reuses that parser without changing package
+manifests; if that locked module disappears, tests and CLI module loading fail
+rather than falling back to permissive URI validation.
 
 Publishing those exact bytes and selecting the final URI are separate
 administrative actions. This tool performs no Pinata or IPFS upload.
@@ -41,11 +53,11 @@ COMMUNITY_PARENT_BATON_ADDRESS=<network-matching P2PKH cashaddr>
 COMMUNITY_PARENT_CHANGE_ADDRESS=<network-matching P2PKH cashaddr>
 COMMUNITY_PARENT_DOCUMENT_URI=ipfs://<published CID>
 COMMUNITY_PARENT_UTXOS_FILE=/path/to/offline-utxos.json
-COMMUNITY_PARENT_INITIAL_QUANTITY=1
 ```
 
-The quantity variable is optional and defaults to `1`. The UTXO file must be a
-JSON array whose entries use decimal strings for satoshis:
+The quantity, token type, decimals, name, ticker, document hash, and baton index
+are not operator inputs. The UTXO file must be a JSON array whose entries use
+decimal strings for satoshis:
 
 ```json
 [
@@ -65,21 +77,21 @@ Any entry with a `token` annotation is rejected rather than filtered. The
 builder also rejects duplicate, coinbase, malformed, wrong-address, or
 insufficient funding.
 
-## Broadcast posture
+## Planner-only boundary
 
-Dry-run is the default. The reusable execution boundary requires both exact
-gates below before it can call injected revalidation, signing, and broadcast
-ports:
+This command only produces an offline preview/build artifact. The plan is not
+authorization to broadcast. It contains no executor, signer port, broadcaster
+port, wallet integration, or live Chronik revalidation.
+
+If either former execution flag is present, the command aborts explicitly:
 
 ```text
 BROADCAST=1
 CONFIRM_COMMUNITY_PARENT_GENESIS=YES
 ```
 
-The CLI in this PR deliberately injects none of those ports and reports that no
-signing secret is available, so even both gates cannot create or transmit the
-Parent. A later, separately reviewed integration must use the audited wallet,
-re-query every selected UTXO immediately before signing, and fail closed if any
-outpoint disappears, changes amount, or gains a token annotation.
+Actual creation of the Parent requires a separate, reviewed administrative
+execution step. That future work must use the audited wallet and re-query every
+selected UTXO immediately before signing; neither capability belongs to this PR.
 
 No WIF, mnemonic, seed, or private key is accepted as a CLI argument or printed.
