@@ -9,6 +9,11 @@ export type NftVerificationOutcome =
   | { readonly status: 'resolved'; readonly tier: CollectionTier }
   | { readonly status: 'error' }
 
+type ResolvedNftVerificationOutcome = Extract<
+  NftVerificationOutcome,
+  { readonly status: 'resolved' }
+>
+
 export type NftCollectionVerifier = (
   childTokenId: string
 ) => Promise<NftVerificationOutcome>
@@ -22,17 +27,36 @@ type NftEvidenceReaderFactory = () => NftEvidenceChronikReader
 
 const ERROR_OUTCOME: NftVerificationOutcome = Object.freeze({ status: 'error' })
 
+// Two sequential Chronik reads should normally finish well inside this interactive bound.
+export const NFT_VERIFICATION_TIMEOUT_MS = 10_000
+
+function withVerificationTimeout(
+  pipeline: Promise<NftVerificationOutcome>
+): Promise<NftVerificationOutcome> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<NftVerificationOutcome>((resolve) => {
+    timeoutHandle = setTimeout(() => resolve(ERROR_OUTCOME), NFT_VERIFICATION_TIMEOUT_MS)
+  })
+
+  return Promise.race([pipeline, timeout]).finally(() => {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle)
+    }
+  })
+}
+
 export function createNftVerificationService(
   readerFactory: NftEvidenceReaderFactory
 ): NftVerificationService {
-  const settled = new Map<string, NftVerificationOutcome>()
+  const settled = new Map<string, ResolvedNftVerificationOutcome>()
   const inFlight = new Map<string, Promise<NftVerificationOutcome>>()
   const keyVersions = new Map<string, number>()
   let globalVersion = 0
 
   const verify: NftCollectionVerifier = (childTokenId) => {
-    if (settled.has(childTokenId)) {
-      return Promise.resolve(settled.get(childTokenId) ?? ERROR_OUTCOME)
+    const cached = settled.get(childTokenId)
+    if (cached !== undefined) {
+      return Promise.resolve(cached)
     }
 
     const pending = inFlight.get(childTokenId)
@@ -42,7 +66,7 @@ export function createNftVerificationService(
 
     const requestGlobalVersion = globalVersion
     const requestKeyVersion = keyVersions.get(childTokenId) ?? 0
-    const operation = Promise.resolve().then(async () => {
+    const pipeline = Promise.resolve().then(async () => {
       let reader: NftEvidenceChronikReader | null = null
       const getReader = () => {
         reader ??= readerFactory()
@@ -58,18 +82,22 @@ export function createNftVerificationService(
       }
       return Object.freeze({ status: 'resolved', tier } as const)
     })
+    const operation = withVerificationTimeout(pipeline)
 
     inFlight.set(childTokenId, operation)
     void operation.then(
-      (tier) => {
-        if (inFlight.get(childTokenId) === operation) {
-          inFlight.delete(childTokenId)
+      (outcome) => {
+        if (inFlight.get(childTokenId) !== operation) {
+          return
         }
+
+        inFlight.delete(childTokenId)
         if (
+          outcome.status === 'resolved' &&
           globalVersion === requestGlobalVersion &&
           (keyVersions.get(childTokenId) ?? 0) === requestKeyVersion
         ) {
-          settled.set(childTokenId, tier)
+          settled.set(childTokenId, outcome)
         }
       },
       () => {

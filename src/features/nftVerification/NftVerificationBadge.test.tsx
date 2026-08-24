@@ -4,9 +4,10 @@ import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { useNftVerification } from '../../hooks/useNftVerification'
-import type {
-  NftCollectionVerifier,
-  NftVerificationOutcome
+import {
+  NFT_VERIFICATION_TIMEOUT_MS,
+  type NftCollectionVerifier,
+  type NftVerificationOutcome
 } from './nftVerification'
 import { NftVerificationBadge } from './NftVerificationBadge'
 
@@ -33,6 +34,7 @@ function VerificationHarness({
 
 afterEach(() => {
   cleanup()
+  vi.useRealTimers()
 })
 
 describe('NftVerificationBadge', () => {
@@ -167,6 +169,50 @@ describe('useNftVerification', () => {
 
     expect(screen.getByText('UNVERIFIED')).toBeTruthy()
     expect(screen.queryByText('VERIFIED LINEAGE')).toBeNull()
+  })
+
+  test('keeps a retry unknown when a timed-out prior attempt resolves official late', async () => {
+    vi.useFakeTimers()
+    const lateOfficial = deferred<NftVerificationOutcome>()
+    const verifier = vi
+      .fn<NftCollectionVerifier>()
+      .mockImplementationOnce(
+        () =>
+          Promise.race([
+            lateOfficial.promise,
+            new Promise<NftVerificationOutcome>((resolve) => {
+              setTimeout(
+                () => resolve({ status: 'error' }),
+                NFT_VERIFICATION_TIMEOUT_MS
+              )
+            })
+          ])
+      )
+      .mockResolvedValue({ status: 'resolved', tier: 'unknown' })
+    const childTokenId = 'd'.repeat(64)
+    const firstView = render(
+      <VerificationHarness childTokenId={childTokenId} verifier={verifier} />
+    )
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(NFT_VERIFICATION_TIMEOUT_MS)
+    })
+    expect(screen.getByText('Verification unavailable')).toBeTruthy()
+    firstView.unmount()
+
+    render(<VerificationHarness childTokenId={childTokenId} verifier={verifier} />)
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(screen.getByText('UNVERIFIED')).toBeTruthy()
+
+    await act(async () => {
+      lateOfficial.resolve({ status: 'resolved', tier: 'official' })
+      await lateOfficial.promise
+    })
+    expect(screen.getByText('UNVERIFIED')).toBeTruthy()
+    expect(screen.queryByText('VERIFIED LINEAGE')).toBeNull()
+    expect(verifier).toHaveBeenCalledTimes(2)
   })
 
   test('does not update state after the consumer unmounts', async () => {
