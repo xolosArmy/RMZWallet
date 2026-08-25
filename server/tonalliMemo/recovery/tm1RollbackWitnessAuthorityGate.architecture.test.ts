@@ -5,6 +5,14 @@ const gateSource = readFileSync(new URL(
   './tm1RollbackWitnessAuthorityGate.ts',
   import.meta.url
 ), 'utf8')
+const grantSource = readFileSync(new URL(
+  './tm1RollbackWitnessReservationGrant.ts',
+  import.meta.url
+), 'utf8')
+const storeSource = readFileSync(new URL(
+  './tm1SqlitePublicationRecoveryStore.ts',
+  import.meta.url
+), 'utf8')
 
 describe('TM1 rollback witness Gate A authority isolation', () => {
   test('keeps signing, transport, Chronik, React and runtime composition unreachable', () => {
@@ -24,5 +32,33 @@ describe('TM1 rollback witness Gate A authority isolation', () => {
       'establishTm1RollbackWitnessFreshness',
       'provisionTm1RollbackWitness'
     ])
+  })
+
+  test('keeps grant provenance private and rejects public structural branding', () => {
+    expect(grantSource).toContain('new WeakMap<object,')
+    expect(grantSource).toContain('new WeakSet<object>()')
+    expect(grantSource).not.toContain('Symbol.for(')
+    expect(grantSource).not.toMatch(/export const .*brand/i)
+    expect(grantSource).not.toMatch(/public.*token/i)
+  })
+
+  test('checks runtime grant provenance before opening the reserved SQLite write', () => {
+    const method = storeSource.slice(
+      storeSource.indexOf('commitReservedWitnessBinding('),
+      storeSource.indexOf('\n  close(): void')
+    )
+    expect(method.indexOf('withTm1RollbackWitnessReservationGrant(')).toBeGreaterThan(-1)
+    expect(method.indexOf("this.database.exec('BEGIN IMMEDIATE')"))
+      .toBeGreaterThan(method.indexOf('withTm1RollbackWitnessReservationGrant('))
+  })
+
+  test('keeps signing, transport and browser composition out of the grant module', () => {
+    expect(grantSource).not.toMatch(/RegtestP2pkhSigner/)
+    expect(grantSource).not.toMatch(/DeliveryTransport/)
+    expect(grantSource).not.toMatch(/Chronik/)
+    expect(grantSource).not.toMatch(/createTm1RegtestRuntime/)
+    expect(grantSource).not.toMatch(/from ['"]react/)
+    expect(grantSource).not.toMatch(/\.broadcast\s*\(/)
+    expect(grantSource).not.toMatch(/\.sign\s*\(/)
   })
 })

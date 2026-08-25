@@ -37,6 +37,11 @@ import {
   type Tm1RollbackWitnessRecord
 } from '../../../src/integrations/tonalliMemo/recovery/tm1RollbackWitness'
 import {
+  withTm1RollbackWitnessReservationGrant,
+  type Tm1RollbackWitnessReservationGrant,
+  type Tm1RollbackWitnessReservationGrantEvidence
+} from './tm1RollbackWitnessReservationGrant'
+import {
   initializeOrVerifyTm1SqliteSchema,
   inspectTm1SqliteSchema,
   verifyTm1SqliteSchema,
@@ -115,6 +120,7 @@ export type Tm1SqliteWitnessReservationCommit = Readonly<{
   expectedGeneration: number
   expectedLogicalRoot: string
   pendingRecord: Tm1RollbackWitnessRecord
+  grant: Tm1RollbackWitnessReservationGrant
 }>
 
 export class Tm1SqlitePublicationRecoveryStore
@@ -494,55 +500,58 @@ implements Tm1PublicationRecoveryStore {
   ): Tm1SqliteWitnessBinding {
     try {
       this.assertOpen()
-      const input = snapshotWitnessReservationCommit(inputValue)
-      this.database.exec('BEGIN IMMEDIATE')
-      try {
-        verifyTm1SqliteSchemaV2(this.database)
-        const current = this.readWitnessBinding()
-        this.assertLogicalRoot(current)
-        const pending = input.pendingRecord
-        if (
-          current.generation !== input.expectedGeneration ||
-          current.logicalRoot !== input.expectedLogicalRoot ||
-          pending.state !== 'pending' ||
-          pending.slotId !== current.slotId ||
-          pending.storeId !== current.storeId ||
-          pending.generation !== current.generation + 1
-        ) storeFailure()
-        const nextIdentity = Object.freeze({
-          slotId: current.slotId,
-          storeId: current.storeId,
-          generation: pending.generation
-        })
-        if (
-          computeTm1LogicalStateRoot(this.database, nextIdentity) !==
-          pending.logicalRoot
-        ) storeFailure()
-        const result = this.database.prepare(`
-          UPDATE tm1_witness_binding
-          SET generation = ?, logical_root = ?
-          WHERE singleton_id = 1 AND generation = ? AND logical_root = ?
-        `).run(
-          pending.generation,
-          pending.logicalRoot,
-          current.generation,
-          current.logicalRoot
-        )
-        if (!changesEqual(result.changes, 1)) storeFailure()
-        const committed = this.readWitnessBinding()
-        this.assertLogicalRoot(committed)
-        this.database.exec('COMMIT')
-        return committed
-      } catch (error) {
-        if (this.database.isTransaction) {
-          try {
-            this.database.exec('ROLLBACK')
-          } catch {
-            // The original binding failure remains authoritative.
+      const grant = readReservationGrant(inputValue)
+      return withTm1RollbackWitnessReservationGrant(grant, evidence => {
+        const input = snapshotWitnessReservationCommit(inputValue)
+        assertReservationFence(input, evidence)
+        this.database.exec('BEGIN IMMEDIATE')
+        try {
+          verifyTm1SqliteSchemaV2(this.database)
+          const current = this.readWitnessBinding()
+          this.assertLogicalRoot(current)
+          const pending = input.pendingRecord
+          if (
+            current.generation !== evidence.previousStableGeneration ||
+            current.logicalRoot !== evidence.previousStableLogicalRoot ||
+            current.slotId !== evidence.slotId ||
+            current.storeId !== evidence.storeId ||
+            pending.generation !== current.generation + 1
+          ) reservationFenceMismatch()
+          const nextIdentity = Object.freeze({
+            slotId: current.slotId,
+            storeId: current.storeId,
+            generation: pending.generation
+          })
+          if (
+            computeTm1LogicalStateRoot(this.database, nextIdentity) !==
+            pending.logicalRoot
+          ) reservationFenceMismatch()
+          const result = this.database.prepare(`
+            UPDATE tm1_witness_binding
+            SET generation = ?, logical_root = ?
+            WHERE singleton_id = 1 AND generation = ? AND logical_root = ?
+          `).run(
+            pending.generation,
+            pending.logicalRoot,
+            current.generation,
+            current.logicalRoot
+          )
+          if (!changesEqual(result.changes, 1)) reservationFenceMismatch()
+          const committed = this.readWitnessBinding()
+          this.assertLogicalRoot(committed)
+          this.database.exec('COMMIT')
+          return committed
+        } catch (error) {
+          if (this.database.isTransaction) {
+            try {
+              this.database.exec('ROLLBACK')
+            } catch {
+              // The original binding failure remains authoritative.
+            }
           }
+          throw error
         }
-        throw error
-      }
+      })
     } catch (error) {
       throw normalizeStoreBoundaryError(error)
     }
@@ -1029,7 +1038,7 @@ function snapshotWitnessReservationCommit(
   value: Tm1SqliteWitnessReservationCommit
 ): Tm1SqliteWitnessReservationCommit {
   const source = exactDataRecord(value, [
-    'expectedGeneration', 'expectedLogicalRoot', 'pendingRecord'
+    'expectedGeneration', 'expectedLogicalRoot', 'pendingRecord', 'grant'
   ])
   return Object.freeze({
     expectedGeneration: requireNonNegativeSafeInteger(
@@ -1040,8 +1049,54 @@ function snapshotWitnessReservationCommit(
     ),
     pendingRecord: parseTm1RollbackWitnessRecord(
       readDataProperty(source, 'pendingRecord')
-    )
+    ),
+    grant: readDataProperty(source, 'grant') as Tm1RollbackWitnessReservationGrant
   })
+}
+
+function readReservationGrant(value: unknown): unknown {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return reservationGrantRequired()
+  }
+  let descriptor: PropertyDescriptor | undefined
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(value, 'grant')
+  } catch {
+    return reservationGrantRequired()
+  }
+  if (descriptor === undefined || !('value' in descriptor)) {
+    return reservationGrantRequired()
+  }
+  return descriptor.value
+}
+
+function assertReservationFence(
+  input: Tm1SqliteWitnessReservationCommit,
+  evidence: Tm1RollbackWitnessReservationGrantEvidence
+): void {
+  if (
+    input.expectedGeneration !== evidence.previousStableGeneration ||
+    input.expectedLogicalRoot !== evidence.previousStableLogicalRoot ||
+    !sameWitnessRecord(input.pendingRecord, evidence.pendingRecord)
+  ) reservationFenceMismatch()
+}
+
+function sameWitnessRecord(
+  left: Tm1RollbackWitnessRecord,
+  right: Tm1RollbackWitnessRecord
+): boolean {
+  return left.protocol === right.protocol &&
+    left.protocolVersion === right.protocolVersion &&
+    left.slotId === right.slotId &&
+    left.storeId === right.storeId &&
+    left.generation === right.generation &&
+    left.logicalRoot === right.logicalRoot &&
+    left.previousStableReceiptHash === right.previousStableReceiptHash &&
+    left.operationId === right.operationId &&
+    left.state === right.state &&
+    left.witnessKeyId === right.witnessKeyId &&
+    left.receiptHash === right.receiptHash &&
+    left.authenticatedReceipt === right.authenticatedReceipt
 }
 
 function exactDataRecord(
@@ -1255,4 +1310,12 @@ function normalizeStoreBoundaryError(error: unknown): never {
 
 function storeFailure(): never {
   throw new Tm1PublicationRecoveryStoreError('RECOVERY_STORE_FAILED')
+}
+
+function reservationGrantRequired(): never {
+  throw new Tm1PublicationRecoveryStoreError('WITNESS_RESERVATION_GRANT_REQUIRED')
+}
+
+function reservationFenceMismatch(): never {
+  throw new Tm1PublicationRecoveryStoreError('WITNESS_RESERVATION_FENCE_MISMATCH')
 }

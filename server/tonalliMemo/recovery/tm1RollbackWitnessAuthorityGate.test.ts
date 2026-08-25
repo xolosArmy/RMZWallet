@@ -4,15 +4,17 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, test } from 'vitest'
 import { createTm1InMemoryRollbackWitness } from '../../../src/integrations/tonalliMemo/recovery/tm1InMemoryRollbackWitness'
 import {
-  parseTm1RollbackWitnessRecord,
   parseTm1RollbackWitnessSnapshot,
-  type Tm1RollbackWitness,
-  type Tm1RollbackWitnessSnapshot
+  type Tm1RollbackWitness
 } from '../../../src/integrations/tonalliMemo/recovery/tm1RollbackWitness'
 import {
   establishTm1RollbackWitnessFreshness,
   provisionTm1RollbackWitness
 } from './tm1RollbackWitnessAuthorityGate'
+import {
+  reserveTm1RollbackWitnessWithGrant,
+  type Tm1RollbackWitnessReservationOutcome
+} from './tm1RollbackWitnessReservationGrant'
 import {
   createTm1SqlitePublicationRecoveryStore,
   type Tm1SqlitePublicationRecoveryStore
@@ -123,11 +125,12 @@ describe('TM1 rollback witness authority gate', () => {
     const witness = createTm1InMemoryRollbackWitness()
     await provision(store, witness)
     const pending = await reserveNext(store, witness)
-    const beforeFinalizeReceipt = pending.pending!.receiptHash
+    const beforeFinalizeReceipt = pending.observation.pending.receiptHash
     store.commitReservedWitnessBinding({
       expectedGeneration: 0,
-      expectedLogicalRoot: pending.stable.logicalRoot,
-      pendingRecord: pending.pending!
+      expectedLogicalRoot: pending.observation.stable.logicalRoot,
+      pendingRecord: pending.observation.pending,
+      grant: pending.grant
     })
 
     const freshness = await establishTm1RollbackWitnessFreshness(
@@ -136,7 +139,7 @@ describe('TM1 rollback witness authority gate', () => {
     )
     expect(freshness).toMatchObject({
       generation: 1,
-      logicalRoot: pending.pending!.logicalRoot
+      logicalRoot: pending.observation.pending.logicalRoot
     })
     expect(freshness.stableReceiptHash).not.toBe(beforeFinalizeReceipt)
     expect(witness.inspect(SLOT)?.pending).toBeNull()
@@ -154,7 +157,10 @@ describe('TM1 rollback witness authority gate', () => {
       { store, witness },
       { slotId: SLOT }
     )).rejects.toMatchObject({ code: 'WITNESS_PENDING_QUARANTINE' })
-    expect(witness.inspect(SLOT)).toEqual(pending)
+    expect(witness.inspect(SLOT)).toEqual({
+      stable: pending.observation.stable,
+      pending: pending.observation.pending
+    })
     expect(store.inspectWitnessBinding()?.generation).toBe(0)
     store.close()
   })
@@ -170,8 +176,9 @@ describe('TM1 rollback witness authority gate', () => {
     const pending = await reserveNext(live, witness)
     live.commitReservedWitnessBinding({
       expectedGeneration: 0,
-      expectedLogicalRoot: pending.stable.logicalRoot,
-      pendingRecord: pending.pending!
+      expectedLogicalRoot: pending.observation.stable.logicalRoot,
+      pendingRecord: pending.observation.pending,
+      grant: pending.grant
     })
     await establishTm1RollbackWitnessFreshness(
       { store: live, witness },
@@ -190,16 +197,20 @@ describe('TM1 rollback witness authority gate', () => {
   test('rejects a coherent local DB ahead of stable witness without pending', async () => {
     const { store } = harness()
     const witness = createTm1InMemoryRollbackWitness()
-    const enrolled = await provision(store, witness)
-    const root1 = store.computeWitnessLogicalRoot(1)
+    await provision(store, witness)
+    const oldSnapshot = parseTm1RollbackWitnessSnapshot(
+      await witness.read({ slotId: SLOT })
+    )
+    const reserved = await reserveNext(store, witness)
     store.commitReservedWitnessBinding({
       expectedGeneration: 0,
-      expectedLogicalRoot: enrolled.logicalRoot,
-      pendingRecord: fabricatedPending(enrolled, root1)
+      expectedLogicalRoot: reserved.observation.stable.logicalRoot,
+      pendingRecord: reserved.observation.pending,
+      grant: reserved.grant
     })
 
     await expect(establishTm1RollbackWitnessFreshness(
-      { store, witness },
+      { store, witness: proxyWitness(witness, { read: async () => oldSnapshot }) },
       { slotId: SLOT }
     )).rejects.toMatchObject({ code: 'LOCAL_STATE_AHEAD_OF_WITNESS' })
     store.close()
@@ -208,29 +219,38 @@ describe('TM1 rollback witness authority gate', () => {
   test('quarantines a pending root that differs from the coherent committed DB', async () => {
     const { store } = harness()
     const witness = createTm1InMemoryRollbackWitness()
-    const enrolled = await provision(store, witness)
-    const localRoot1 = store.computeWitnessLogicalRoot(1)
+    await provision(store, witness)
+    const localReservation = await reserveNext(store, witness)
     store.commitReservedWitnessBinding({
       expectedGeneration: 0,
-      expectedLogicalRoot: enrolled.logicalRoot,
-      pendingRecord: fabricatedPending(enrolled, localRoot1)
+      expectedLogicalRoot: localReservation.observation.stable.logicalRoot,
+      pendingRecord: localReservation.observation.pending,
+      grant: localReservation.grant
     })
-    const stable = parseTm1RollbackWitnessSnapshot(
-      await witness.read({ slotId: SLOT })
+
+    const mismatchedWitness = createTm1InMemoryRollbackWitness()
+    const initialRoot = localReservation.observation.stable.logicalRoot
+    const mismatchedStable = parseTm1RollbackWitnessSnapshot(
+      await mismatchedWitness.enroll({
+        slotId: SLOT,
+        storeId: STORE,
+        logicalRoot: initialRoot,
+        operationId: 'operation:enroll:mismatch'
+      })
     ).stable
-    await witness.reserve({
+    await mismatchedWitness.reserve({
       slotId: SLOT,
       storeId: STORE,
       expectedStableGeneration: 0,
-      expectedStableLogicalRoot: stable.logicalRoot,
-      expectedStableReceiptHash: stable.receiptHash,
+      expectedStableLogicalRoot: mismatchedStable.logicalRoot,
+      expectedStableReceiptHash: mismatchedStable.receiptHash,
       nextGeneration: 1,
       nextLogicalRoot: 'd'.repeat(64),
       operationId: 'operation:mismatch'
     })
 
     await expect(establishTm1RollbackWitnessFreshness(
-      { store, witness },
+      { store, witness: mismatchedWitness },
       { slotId: SLOT }
     )).rejects.toMatchObject({ code: 'WITNESS_STATE_MISMATCH' })
     store.close()
@@ -272,8 +292,9 @@ describe('TM1 rollback witness authority gate', () => {
     const pending = await reserveNext(store, witness)
     store.commitReservedWitnessBinding({
       expectedGeneration: 0,
-      expectedLogicalRoot: pending.stable.logicalRoot,
-      pendingRecord: pending.pending!
+      expectedLogicalRoot: pending.observation.stable.logicalRoot,
+      pendingRecord: pending.observation.pending,
+      grant: pending.grant
     })
     await establishTm1RollbackWitnessFreshness({ store, witness }, { slotId: SLOT })
 
@@ -312,8 +333,8 @@ describe('TM1 rollback witness authority gate', () => {
       operationId: 'operation:controller-race'
     }
     const results = await Promise.allSettled([
-      witness.reserve(request),
-      witness.reserve(request)
+      reserveTm1RollbackWitnessWithGrant(witness, request),
+      reserveTm1RollbackWitnessWithGrant(witness, request)
     ])
     expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
     expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
@@ -354,10 +375,10 @@ async function provision(
 async function reserveNext(
   store: Tm1SqlitePublicationRecoveryStore,
   witness: Tm1RollbackWitness
-): Promise<Tm1RollbackWitnessSnapshot> {
+): Promise<Tm1RollbackWitnessReservationOutcome> {
   const current = parseTm1RollbackWitnessSnapshot(await witness.read({ slotId: SLOT }))
   const nextRoot = store.computeWitnessLogicalRoot(current.stable.generation + 1)
-  return parseTm1RollbackWitnessSnapshot(await witness.reserve({
+  return reserveTm1RollbackWitnessWithGrant(witness, {
     slotId: SLOT,
     storeId: STORE,
     expectedStableGeneration: current.stable.generation,
@@ -366,33 +387,6 @@ async function reserveNext(
     nextGeneration: current.stable.generation + 1,
     nextLogicalRoot: nextRoot,
     operationId: `operation:generation:${current.stable.generation + 1}`
-  }))
-}
-
-function fabricatedPending(
-  stable: Readonly<{
-    slotId: string
-    storeId: string
-    generation: number
-    logicalRoot: string
-    stableReceiptHash: string
-    witnessKeyId: string
-  }>,
-  logicalRoot: string
-) {
-  return parseTm1RollbackWitnessRecord({
-    protocol: 'tonalli.tm1-rollback-witness',
-    protocolVersion: 1,
-    slotId: stable.slotId,
-    storeId: stable.storeId,
-    generation: stable.generation + 1,
-    logicalRoot,
-    previousStableReceiptHash: stable.stableReceiptHash,
-    operationId: 'operation:fabricated-local-crash-state',
-    state: 'pending',
-    witnessKeyId: stable.witnessKeyId,
-    receiptHash: 'f'.repeat(64),
-    authenticatedReceipt: 'local-evidence-is-not-remote-authority'
   })
 }
 

@@ -6,11 +6,15 @@ import { afterEach, describe, expect, test } from 'vitest'
 import { createTm1InMemoryRollbackWitness } from '../../../src/integrations/tonalliMemo/recovery/tm1InMemoryRollbackWitness'
 import { parseTm1RollbackWitnessSnapshot } from '../../../src/integrations/tonalliMemo/recovery/tm1RollbackWitness'
 import { inspectTm1SqliteSchema } from './tm1SqliteMigrations'
+import { reserveTm1RollbackWitnessWithGrant } from './tm1RollbackWitnessReservationGrant'
 import {
   createTm1SqlitePublicationRecoveryStore,
   type Tm1SqlitePublicationRecoveryStore
 } from './tm1SqlitePublicationRecoveryStore'
 import {
+  HASH_B,
+  HASH_C,
+  absentObservationRecord,
   outcomeUnknownRecord,
   preparedRecord,
   signingConsumedRecord,
@@ -75,9 +79,51 @@ describe('TM1 SQLite rollback-witness binding and logical root', () => {
     const record = preparedRecord()
     await store.create({ record })
     enroll(store)
+    const signingPending = signingPendingRecord()
+    const outcomeUnknown = outcomeUnknownRecord()
+    const preDispatch = {
+      ...outcomeUnknown,
+      revision: outcomeUnknown.revision - 1,
+      phase: 'preDispatch' as const,
+      preDispatchStage: 'broadcastAuthorizationConsumed' as const,
+      dispatchIntent: null
+    }
+    const acknowledgement = {
+      submissionId: outcomeUnknown.dispatchIntent!.submissionId,
+      signedId: outcomeUnknown.signed!.signedId,
+      txid: HASH_B,
+      signedArtifactHash: HASH_C,
+      disposition: 'accepted' as const,
+      acknowledgedAt: outcomeUnknown.dispatchIntent!.committedAt
+    }
 
     await expect(store.create({
       record: preparedRecord({ publicationId: 'publication:two' })
+    })).rejects.toMatchObject({ code: 'ROLLBACK_WITNESS_REQUIRED' })
+    await expect(store.commitExecutionEvidence({
+      publicationId: record.publicationId,
+      expectedRevision: record.revision,
+      expectedOwnerEpoch: record.ownerEpoch,
+      nextRecord: signingPending,
+      newlyConsumedCapabilityIds: []
+    })).rejects.toMatchObject({ code: 'ROLLBACK_WITNESS_REQUIRED' })
+    await expect(store.commitDispatchIntent({
+      publicationId: preDispatch.publicationId,
+      expectedRevision: preDispatch.revision,
+      expectedOwnerEpoch: preDispatch.ownerEpoch,
+      nextRecord: outcomeUnknown
+    })).rejects.toMatchObject({ code: 'ROLLBACK_WITNESS_REQUIRED' })
+    await expect(store.commitTransportAcknowledgement({
+      publicationId: outcomeUnknown.publicationId,
+      expectedRevision: outcomeUnknown.revision,
+      expectedOwnerEpoch: outcomeUnknown.ownerEpoch,
+      acknowledgement
+    })).rejects.toMatchObject({ code: 'ROLLBACK_WITNESS_REQUIRED' })
+    await expect(store.commitRecoveryTransition({
+      publicationId: outcomeUnknown.publicationId,
+      expectedRevision: outcomeUnknown.revision,
+      expectedOwnerEpoch: outcomeUnknown.ownerEpoch,
+      nextRecord: absentObservationRecord(outcomeUnknown)
     })).rejects.toMatchObject({ code: 'ROLLBACK_WITNESS_REQUIRED' })
     await expect(store.claimOwnership({
       publicationId: record.publicationId,
@@ -187,7 +233,7 @@ describe('TM1 SQLite rollback-witness binding and logical root', () => {
     }))
     store.enrollWitnessBinding({ slotId: SLOT, storeId: STORE, logicalRoot: root0 })
     const root1 = store.computeWitnessLogicalRoot(1)
-    const reserved = parseTm1RollbackWitnessSnapshot(await witness.reserve({
+    const reserved = await reserveTm1RollbackWitnessWithGrant(witness, {
       slotId: SLOT,
       storeId: STORE,
       expectedStableGeneration: 0,
@@ -196,18 +242,22 @@ describe('TM1 SQLite rollback-witness binding and logical root', () => {
       nextGeneration: 1,
       nextLogicalRoot: root1,
       operationId: 'operation:advance'
-    }))
+    })
 
     expect(store.commitReservedWitnessBinding({
       expectedGeneration: 0,
       expectedLogicalRoot: root0,
-      pendingRecord: reserved.pending!
+      pendingRecord: reserved.observation.pending,
+      grant: reserved.grant
     })).toMatchObject({ generation: 1, logicalRoot: root1 })
     expect(() => store.commitReservedWitnessBinding({
       expectedGeneration: 0,
       expectedLogicalRoot: root0,
-      pendingRecord: reserved.pending!
-    })).toThrowError(expect.objectContaining({ code: 'RECOVERY_STORE_FAILED' }))
+      pendingRecord: reserved.observation.pending,
+      grant: reserved.grant
+    })).toThrowError(expect.objectContaining({
+      code: 'WITNESS_RESERVATION_FENCE_MISMATCH'
+    }))
     store.close()
   })
 

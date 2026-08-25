@@ -162,16 +162,35 @@ ambiguous window conservatively:
 
 1. **Remote reserve:** authenticate the stable witness head and perform a CAS
    from its exact generation/root/receipt to one `pending` successor containing
-   the proposed generation, root and operation identity.
+   the proposed generation, root and operation identity. Only the controller
+   that receives and authenticates this successful reserve response receives a
+   process-local reservation grant.
 2. **Local commit:** inside `BEGIN IMMEDIATE`, re-attest schema and identity,
    reverify the exact old generation/root, apply exactly the intended mutation,
    verify the proposed logical root and durably commit the new generation/root.
+   The exact, one-shot reservation grant is mandatory; an authentic pending
+   record observed through `read()` is insufficient.
 3. **Remote finalize:** finalize only the exact matching pending record. Only
    the resulting stable witness head can satisfy a later authority gate.
 
 Witness reserve or finalization failures never authorize the caller. No
 authority-bearing external side effect may run until the witness is stable. A
 timeout is an ambiguous failure and remains fail-closed.
+
+The reservation grant is a runtime bearer capability registered by module-
+private provenance state. It binds the slot, store, old stable
+generation/root/receipt, next generation/root, operation, pending receipt,
+witness key and protocol version. It is never serialized, cached or recreated
+from a pending record. A TypeScript lookalike has no authority. If the winner
+crashes before local commit, the grant is lost and the old-DB/pending state
+remains quarantined. After local commit, matching durable SQLite state plus an
+authenticated pending observation may authorize finalize-only recovery without
+the lost grant.
+
+Receipt material remains outside the canonical SQLite logical root. All grant
+bindings are known before local commit, while the new stable receipt exists
+only after finalize. Consequently the fencing mechanism introduces no
+root/receipt cycle and finalize does not mutate the just-rooted local state.
 
 ## Crash and mismatch matrix
 
@@ -222,6 +241,13 @@ Two database copies with the same store ID, including a copy opened from a
 different path, compete for one witness namespace. At most one fenced mutation
 may advance it. A copied database must not obtain a new witness namespace
 implicitly.
+
+Winning the remote CAS and merely observing its result are distinct. The CAS
+winner alone receives the non-serializable reservation grant needed by the
+pre-commit SQLite boundary. A losing controller may authenticate the winner's
+pending record for mismatch classification, but cannot convert that observation
+into local mutation authority. A matching already-committed database remains
+sufficient only for finalize-only crash recovery.
 
 ## Dispatch ordering after this gate is satisfied
 
@@ -315,6 +341,8 @@ contracts. It provides:
 - an attested SQLite v2 identity binding and canonical whole-store root;
 - explicit provisioning and ordinary-startup freshness gates;
 - fail-closed mismatch classification and matching-pending finalization;
+- a process-local, runtime-provenance reservation grant that fences the exact
+  pre-commit SQLite generation/root advance;
 - adversarial and architecture tests.
 
 Still required before operational authority is enabled are a real independent
