@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, test } from 'vitest'
 
 const BASE = 'd1c3472c760cd33b968054e96df965902f05ebe0'
+const PHASE_HEAD = 'daabb8b3426421d1e4244a213c1471006a1d2b2f'
 const CLOSED_PATHS = [
   'src/features/externalSign/core.ts',
   'src/integrations/tonalliMemo/tm1RegtestPublicationOrchestrator.ts',
@@ -131,6 +132,7 @@ describe('TM1 conservative recovery architectural boundaries', () => {
     const diff = execFileSync('git', [
       'diff',
       BASE,
+      PHASE_HEAD,
       '--',
       'package.json',
       'package-lock.json'

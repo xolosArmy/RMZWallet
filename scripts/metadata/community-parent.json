@@ -1,0 +1,11 @@
+{
+  "schema": "xolosarmy-nft/1",
+  "collection": {
+    "type": "community",
+    "verification": "unverified",
+    "name": "xolosArmy Community"
+  },
+  "name": "xolosArmy Community Mint Pass",
+  "description": "Mint Pass for the xolosArmy Community Collection. Burn one pass to mint one community NFT.",
+  "createdWith": "Tonalli Wallet"
+}
