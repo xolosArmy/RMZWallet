@@ -2,7 +2,8 @@
 
 ## Status
 
-**ARCHITECTURE DECISION REQUIRED. OPERATIONAL DISPATCH REMAINS DISABLED.**
+**REMOTE WITNESS MODEL APPROVED. IMPLEMENTATION GATE A PRESENT. OPERATIONAL
+DISPATCH REMAINS DISABLED.**
 
 This decision gate is based on RMZWallet commit
 `e5809a0426cdbcf89c352bd46703d7487239bf48`, tree
@@ -10,8 +11,9 @@ This decision gate is based on RMZWallet commit
 
 Phase 6-I-B correctly protects the internal consistency of the SQLite store,
 but it cannot detect restoration of an older, internally valid copy. Phase
-6-I-C must not connect transport authority until a checkpoint provider outside
-the SQLite rollback domain has been selected, implemented and verified.
+6-I-C must not connect transport authority until an independently persisted,
+authenticated remote witness outside both the SQLite rollback domain and the
+client's normal backup/restore domain is deployed and verified.
 
 This document makes no dispatch path reachable and changes no closed Phase
 6-B through Phase 6-H authority source.
@@ -73,14 +75,13 @@ This is useful only if deployment can prove that the checkpoint is outside the
 database backup/restore domain and cannot be rolled back with it. A convention
 such as a different pathname, directory or Unix account is not that proof.
 
-### Platform-backed secure monotonic storage — potentially acceptable
+### Platform-backed secure monotonic storage — deferred, not authoritative
 
-A TPM, secure element or OS facility could supply rollback-resistant monotonic
-state and machine binding. No such facility is currently selected, pinned or
-verified by this repository. TPM write endurance, provisioning, authorization,
-backup behavior and recovery procedures require deployment-specific evidence.
+A TPM, secure element or OS facility may be reconsidered only after concrete
+availability and semantics are demonstrated. No such facility is currently
+selected, pinned or verified by this repository.
 
-### Independent authenticated append-only witness — recommended model
+### Independent authenticated append-only witness — selected model
 
 An independently persisted witness can keep a monotonic checkpoint outside
 the host/filesystem restore domain. It introduces a new availability and trust
@@ -90,21 +91,23 @@ store/machine namespace binding and explicit failure semantics.
 
 ## Decision
 
-Phase 6-I-C will require a narrow **external monotonic witness** contract. The
-default configuration has no witness and must deny all authority-bearing
-durable mutations and all transport dispatch.
+Phase 6-I-C uses the **REMOTE_AUTHENTICATED_APPEND_ONLY_WITNESS** trust model
+through a narrow external witness contract. The default configuration has no
+witness and must deny all authority-bearing durable mutations and all
+transport dispatch.
 
-An implementation may enable authority only when its witness backend provides
-evidence that survives restoration of the SQLite persistence unit. Acceptable
-backend classes are:
+Authority may eventually be enabled only when an independently administered,
+authenticated append-only backend provides evidence that survives restoration
+of the SQLite persistence unit and the client host backup domain.
 
-- a verified platform-backed monotonic facility; or
-- an independently administered authenticated append-only witness outside the
-  host backup/restore domain.
+The Gate A implementation supplies the protocol, strict parsing, deterministic
+logical root, SQLite identity binding, startup/provisioning gate and a
+deterministic adversarial-test witness. It does not supply a production remote
+endpoint and therefore does not enable authority or dispatch by itself.
 
 A plain local file, same-filesystem journal or value stored in SQLite does not
-satisfy the production contract. No backend has been selected in this phase;
-that deployment trust decision requires review before implementation.
+satisfy the production contract. No production remote backend has yet been
+implemented or configured.
 
 If no acceptable backend is deployed, the strongest supported policy is:
 
@@ -116,31 +119,35 @@ If no acceptable backend is deployed, the strongest supported policy is:
 
 ## Checkpoint model
 
-The witness checkpoint must bind at least:
+The versioned witness record binds:
 
-- checkpoint format version;
-- stable random store ID;
-- deployment or machine namespace supplied by the witness;
+- witness protocol version;
+- canonical store ID;
+- authenticated client/witness slot ID;
 - monotonically increasing database generation;
-- canonical database root hash;
-- previous stable checkpoint hash;
-- unique mutation ID;
-- witness fencing token;
-- state: `pending` or `stable`.
+- canonical logical database root;
+- previous stable receipt hash;
+- unique operation ID;
+- state: `pending` or `stable`;
+- witness key/version ID;
+- authenticated receipt and its canonical hash.
 
 Timestamps may be retained for diagnostics but are not trusted monotonic
 evidence.
 
-The canonical database root must cover all authoritative logical state, not
-only one publication. At minimum it includes:
+The canonical database root covers all authoritative logical state, not only
+one publication. Gate A includes:
 
-- physical and domain schema versions;
-- store ID and generation;
-- every publication ID and canonical record digest in deterministic order;
-- every consumed-capability row in deterministic order.
+- root, physical-schema and witness-protocol versions;
+- canonical store ID, slot ID, generation and store creation metadata;
+- every publication ID, canonical record JSON and record digest in
+  deterministic order;
+- every complete consumed-capability row in deterministic order.
 
-The root field itself is excluded from its digest. The root calculation must
-run over one SQLite transaction snapshot. Selective replacement of an old row
+The root field and physical SQLite representation are excluded from its
+digest. The root calculation runs over one attested SQLite transaction
+snapshot. WAL/checkpoint layout, page order, `VACUUM` output and SQLite
+statistics therefore cannot change it. Selective replacement of an old row
 must therefore disagree with the externally anchored root even if that row is
 internally valid.
 
@@ -150,25 +157,20 @@ witness namespace must never be silently assigned a new identity.
 ## Atomicity protocol
 
 SQLite and the witness cannot participate in one native atomic commit. The
-protocol therefore uses an external prepare record and treats ambiguous
-windows conservatively:
+approved protocol therefore has three durable stages and treats every
+ambiguous window conservatively:
 
-1. acquire the controller's exclusive process lease and witness fencing token;
-2. load and validate the stable witness checkpoint;
-3. begin `BEGIN IMMEDIATE` and verify the exact matching database generation
-   and root;
-4. validate the requested closed-domain transition and compute generation
-   N+1 plus its complete post-state root;
-5. append/CAS a durable witness `pending` checkpoint from the exact stable N
-   checkpoint to the proposed N+1 checkpoint;
-6. commit the SQLite mutation, generation and root while the transaction and
-   fencing token remain current;
-7. finalize/CAS the witness checkpoint from `pending` to `stable`;
-8. only after stable finalization may the mutation return success or enable a
-   later external side effect.
+1. **Remote reserve:** authenticate the stable witness head and perform a CAS
+   from its exact generation/root/receipt to one `pending` successor containing
+   the proposed generation, root and operation identity.
+2. **Local commit:** inside `BEGIN IMMEDIATE`, re-attest schema and identity,
+   reverify the exact old generation/root, apply exactly the intended mutation,
+   verify the proposed logical root and durably commit the new generation/root.
+3. **Remote finalize:** finalize only the exact matching pending record. Only
+   the resulting stable witness head can satisfy a later authority gate.
 
-Witness prepare or finalization failures never authorize the caller. A witness
-call made while `BEGIN IMMEDIATE` is held must be bounded and cancellable, but a
+Witness reserve or finalization failures never authorize the caller. No
+authority-bearing external side effect may run until the witness is stable. A
 timeout is an ambiguous failure and remains fail-closed.
 
 ## Crash and mismatch matrix
@@ -303,20 +305,27 @@ Dispatch tests must additionally prove:
 All existing Phase 6-I-A and 6-I-B authority, browser-graph, closed-source and
 runtime gates remain mandatory.
 
-## Proposed implementation boundary after review
+## Gate A implementation boundary
 
-If this trust model is accepted, implementation should be additive and
-server-only around the closed store/controller contracts, for example:
+Gate A is additive and server-only around the closed store/controller
+contracts. It provides:
 
-- a Node-free external-witness port and checkpoint model;
-- a server-only anchored store decorator or coordinator;
-- canonical whole-store root calculation over one SQLite snapshot;
-- deployment-specific witness and controller-lease adapters;
-- failure-injection workers and architecture tests.
+- a Node-free external-witness port, strict record model and deterministic
+  test witness;
+- an attested SQLite v2 identity binding and canonical whole-store root;
+- explicit provisioning and ordinary-startup freshness gates;
+- fail-closed mismatch classification and matching-pending finalization;
+- adversarial and architecture tests.
+
+Still required before operational authority is enabled are a real independent
+authenticated witness adapter/service, deployment credential and slot
+provisioning, durable append-only/CAS evidence, service availability policy,
+and native-environment verification. Dispatch coordination remains a later,
+separately reviewed gate.
 
 The browser must receive only narrow application snapshots and commands. It
 must not receive the witness, SQLite connection, signer, transport, capability
 ledger or mutable controller internals.
 
-No source implementation, signer, transport, dispatch, rebroadcast, React or
-mainnet composition is authorized by this decision document.
+No signer, transport, dispatch, rebroadcast, React or mainnet composition is
+introduced by Gate A.
