@@ -112,16 +112,45 @@ CONFIRM_COMMUNITY_PARENT_GENESIS=YES
 CONFIRM_PLAN_SHA256=<the exact reviewed fingerprint>
 ```
 
-After the gates match, the executor fetches Chronik again, rebuilds the plan,
-and requires the fresh fingerprint to remain identical. It then lazily reads a
-32-byte lowercase hex signing secret only from
-`COMMUNITY_PARENT_SIGNING_SECRET_HEX`. The command accepts no CLI arguments,
-never prints or persists that value, and clears the decoded byte array after
-signing.
+If any execution gate is supplied, the CLI validates the complete mainnet
+configuration and immediately decodes a 32-byte lowercase hex signing secret
+only from `COMMUNITY_PARENT_SIGNING_SECRET_HEX`, before the first Chronik call.
+It derives the compressed public key and requires its P2PKH locking script to
+match the configured funding address. The command accepts no CLI arguments,
+never prints or persists the secret, and clears the decoded byte array after
+signing or on every earlier exit. A normal gate-free dry run does not request or
+decode a signing secret.
+
+The operational executor is mainnet-only. Before reading funding it queries the
+immutable Bitcoin ABC mainnet checkpoint at height `949200` and requires block
+hash
+`000000000000000098694560815190dba8bbe2f06c08a7c23837df3c4886cba2`.
+That value is pinned from
+[Bitcoin ABC source revision `c37387a4d25b0a2cf886e2010d0023dd078ca43a`](https://github.com/Bitcoin-ABC/bitcoin-abc/blob/c37387a4d25b0a2cf886e2010d0023dd078ca43a/src/networks/abc/checkpoints.cpp),
+`src/networks/abc/checkpoints.cpp` (Obolensky activation). Testnet, regtest,
+checkpoint mismatch, malformed block data, and transport errors fail before
+signing or broadcasting.
+
+After the gates match, the executor verifies the same checkpoint again, fetches
+Chronik UTXOs again, rebuilds the plan, and requires the fresh fingerprint to
+remain identical. It then reads every selected prevout through Chronik and
+requires its exact amount, locking script, and absence of a token annotation to
+match the signing key and fresh plan before invoking the signer.
 
 Before its single broadcast attempt, the executor validates the signed
-transaction locally and through Chronik `validateRawTx`. It checks the exact
-inputs, canonical SLP NFT1 Group OP_RETURN, quantity output, baton output,
-optional change, and fee guard. A transport error after the broadcast attempt is
-reported as ambiguous with the locally computed candidate txid; there is no
-automatic retry. A returned txid is never written to the trust registry.
+transaction locally and through Chronik `validateRawTx`. Local validation checks
+the exact inputs and outputs, requires every P2PKH scriptSig to be exactly two
+canonical pushes, requires sighash byte `0x41` (`ALL|FORKID`), binds the pushed
+compressed public key to every input locking script, and verifies every Schnorr
+signature over the exact input index and amount with `ecash-lib@4.5.2`. It also
+checks the actual serialized size and the minimum/maximum fee guards.
+
+Chronik `validateRawTx` is used only to validate token/indexing structure for
+the canonical SLP NFT1 Group Genesis. It is not treated as signature,
+mempool-policy, or consensus acceptance. With installed `chronik-client@3.7.0`,
+a decoded protobuf rejection from a working Chronik server is exposed only as
+the fixed `Failed getting /broadcast-tx:` error prefix and is reported as
+`broadcast-rejected`. Timeout, connection reset, failover, unknown errors, and
+hostile responses remain `broadcast-status-ambiguous`, with the locally computed
+candidate txid and no automatic retry. A returned txid is never written to the
+trust registry.

@@ -1,8 +1,21 @@
 import { readFileSync } from 'node:fs'
-import { Address, Script, Tx, toHex } from 'ecash-lib'
+import {
+  ALL_BIP143,
+  Address,
+  Ecc,
+  P2PKHSignatory,
+  Script,
+  Tx,
+  TxBuilder,
+  fromHex,
+  pushBytesOp,
+  shaRmd160,
+  toHex
+} from 'ecash-lib'
 import { describe, expect, it, vi } from 'vitest'
 import {
   COMMUNITY_PARENT_DOCUMENT_HASH,
+  COMMUNITY_PARENT_DUST_SATS,
   COMMUNITY_PARENT_INITIAL_QUANTITY,
   COMMUNITY_PARENT_MINT_BATON_VOUT,
   COMMUNITY_PARENT_TOKEN_NAME,
@@ -14,16 +27,24 @@ import type {
   CommunityParentNetwork
 } from './communityParentGenesis'
 import {
+  COMMUNITY_PARENT_EXECUTION_FEE_PER_KB,
+  ECASH_MAINNET_EXECUTION_CHECKPOINT,
+  classifyChronikClientV3BroadcastFailure,
   executeCommunityParentGenesis,
   formatCommunityParentExecutionPreview,
   prepareCommunityParentExecution
 } from './communityParentExecutor'
 import type {
   CommunityParentChronikReader,
-  CommunityParentExecutionCandidate
+  CommunityParentExecutionCandidate,
+  CommunityParentSigner
 } from './communityParentExecutor'
 
-const FUNDING_ADDRESS = 'ecash:qq7qn90ev23ecastqmn8as00u8mcp4tzsspvt5dtlk'
+/** Public deterministic key 1 fixture. Never use it for funds. */
+const FIXTURE_SECRET = Uint8Array.from([...new Uint8Array(31), 1])
+const FIXTURE_PUBLIC_KEY = new Ecc().derivePubkey(FIXTURE_SECRET)
+const FIXTURE_PUBLIC_KEY_HEX = toHex(FIXTURE_PUBLIC_KEY)
+const FUNDING_ADDRESS = 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
 const TOKEN_ADDRESS = 'ecash:qplm2jhzuteklx9naquzwfe97tx3h8eu4gyq385tw8'
 const BATON_ADDRESS = 'ecash:qpluxjhhlxfjwsymf9nmctvsdrwzwygadsh2pq0ang'
 const CHANGE_ADDRESS = 'ecash:qpnku5pz7h29jkpga99py72gnrksaalzscrjnwnzvt'
@@ -50,6 +71,15 @@ const liveResponse = (
   outputScript = FUNDING_SCRIPT
 ): unknown => ({ outputScript, utxos })
 
+const fundingTxFor = (utxo: LiveUtxo, outputScript = FUNDING_SCRIPT): unknown => {
+  const outputs = Array.from({ length: utxo.outpoint.outIdx + 1 }, () => ({
+    sats: 1n,
+    outputScript: toHex(Address.parse(TOKEN_ADDRESS).toScript().bytecode)
+  }))
+  outputs[utxo.outpoint.outIdx] = { sats: utxo.sats, outputScript }
+  return { txid: utxo.outpoint.txid, outputs }
+}
+
 const addressFor = (address: string, network: CommunityParentNetwork): string => {
   const prefix = network === 'mainnet' ? 'ecash' : network === 'testnet' ? 'ectest' : 'ecregtest'
   return Address.parse(address).withPrefix(prefix).toString()
@@ -70,19 +100,27 @@ const configFor = (
 
 class MockReader implements CommunityParentChronikReader {
   readonly endpointLabel = ENDPOINT
+  readonly blockCalls: number[] = []
   readonly addressCalls: string[] = []
   readonly validateCalls: Uint8Array[] = []
   readonly txCalls: string[] = []
   private readonly responses: unknown[]
+  blockImpl: (height: number) => Promise<unknown> = async (height) => ({
+    blockInfo: { height, hash: ECASH_MAINNET_EXECUTION_CHECKPOINT.hash }
+  })
   validateImpl: (rawTx: Uint8Array) => Promise<unknown> = async () => {
     throw new Error('validateRawTx mock not configured')
   }
-  txImpl: (txid: string) => Promise<unknown> = async () => {
-    throw new Error('tx mock not configured')
-  }
+  txImpl: (txid: string) => Promise<unknown> = async (txid) =>
+    fundingTxFor(liveUtxo({ outpoint: { txid, outIdx: 0 } }))
 
   constructor(...responses: unknown[]) {
     this.responses = responses.length === 0 ? [liveResponse()] : responses
+  }
+
+  async block(height: number): Promise<unknown> {
+    this.blockCalls.push(height)
+    return this.blockImpl(height)
   }
 
   async addressUtxos(address: string): Promise<unknown> {
@@ -104,15 +142,37 @@ class MockReader implements CommunityParentChronikReader {
 
 const signedBytesFor = (
   candidate: CommunityParentExecutionCandidate,
-  mutate?: (tx: Tx) => void
+  mutate?: (tx: Tx) => void,
+  inputSats?: (sats: bigint, index: number) => bigint
 ): Uint8Array => {
-  const tx = Tx.fromHex(candidate.unsignedTxHex)
-  tx.inputs.forEach((input, index) => {
-    input.script = new Script(Uint8Array.of(1, index + 1))
+  const signatory = P2PKHSignatory(FIXTURE_SECRET, FIXTURE_PUBLIC_KEY, ALL_BIP143)
+  const tx = new TxBuilder({
+    inputs: candidate.plan.selectedInputs.map((input, index) => ({
+      input: {
+        prevOut: input.outpoint,
+        signData: {
+          sats: inputSats?.(input.sats, index) ?? input.sats,
+          outputScript: new Script(fromHex(input.outputScript))
+        }
+      },
+      signatory
+    })),
+    outputs: candidate.plan.outputs.map((output) => ({
+      sats: output.sats,
+      script: new Script(fromHex(output.scriptHex))
+    }))
+  }).sign({
+    feePerKb: COMMUNITY_PARENT_EXECUTION_FEE_PER_KB,
+    dustSats: COMMUNITY_PARENT_DUST_SATS
   })
   mutate?.(tx)
   return tx.ser()
 }
+
+const signerWith = (
+  sign: CommunityParentSigner['sign'],
+  publicKeyHex = FIXTURE_PUBLIC_KEY_HEX
+): CommunityParentSigner => ({ publicKeyHex, sign })
 
 const chronikTxFor = (
   candidate: CommunityParentExecutionCandidate,
@@ -254,6 +314,181 @@ describe('canonical live planning and fingerprint', () => {
   })
 })
 
+describe('mainnet identity and signing-authority binding', () => {
+  it.each(['testnet', 'regtest'] as const)(
+    'rejects operational execution on %s before any Chronik, signing, or broadcast call',
+    async (network) => {
+      const reader = new MockReader()
+      const sign = vi.fn()
+      const broadcast = vi.fn()
+      await expect(executeCommunityParentGenesis({
+        config: configFor(network),
+        reader,
+        gates: {},
+        signer: signerWith(sign),
+        broadcaster: { broadcast }
+      })).rejects.toThrow(/restricted to mainnet/)
+      expect(reader.blockCalls).toHaveLength(0)
+      expect(reader.addressCalls).toHaveLength(0)
+      expect(sign).toHaveBeenCalledTimes(0)
+      expect(broadcast).toHaveBeenCalledTimes(0)
+    }
+  )
+
+  it('rejects a wrong configured key before the first Chronik call', async () => {
+    const preview = await prepareCommunityParentExecution({ config: configFor(), reader: new MockReader() })
+    const wrongSecret = Uint8Array.from([...new Uint8Array(31), 2])
+    const wrongPublicKeyHex = toHex(new Ecc().derivePubkey(wrongSecret))
+    const reader = new MockReader()
+    const sign = vi.fn()
+    const broadcast = vi.fn()
+    await expect(executeCommunityParentGenesis({
+      config: configFor(),
+      reader,
+      gates: authorizationFor(preview.fingerprint),
+      signer: signerWith(sign, wrongPublicKeyHex),
+      broadcaster: { broadcast }
+    })).rejects.toThrow(/does not control the funding address/)
+    expect(reader.blockCalls).toHaveLength(0)
+    expect(reader.addressCalls).toHaveLength(0)
+    expect(sign).toHaveBeenCalledTimes(0)
+    expect(broadcast).toHaveBeenCalledTimes(0)
+  })
+
+  it('rejects a funding address not controlled by the configured key before Chronik', async () => {
+    const reader = new MockReader()
+    const sign = vi.fn()
+    const broadcast = vi.fn()
+    await expect(executeCommunityParentGenesis({
+      config: configFor('mainnet', { fundingAddress: TOKEN_ADDRESS }),
+      reader,
+      gates: { BROADCAST: '1' },
+      signer: signerWith(sign),
+      broadcaster: { broadcast }
+    })).rejects.toThrow(/does not control the funding address/)
+    expect(reader.blockCalls).toHaveLength(0)
+    expect(reader.addressCalls).toHaveLength(0)
+    expect(sign).toHaveBeenCalledTimes(0)
+    expect(broadcast).toHaveBeenCalledTimes(0)
+  })
+
+  it.each(['', '04'.concat('11'.repeat(64)), '02'.concat('zz'.repeat(32))])(
+    'rejects malformed signer public key %j before Chronik',
+    async (publicKeyHex) => {
+      const reader = new MockReader()
+      const sign = vi.fn()
+      const broadcast = vi.fn()
+      await expect(executeCommunityParentGenesis({
+        config: configFor(),
+        reader,
+        gates: { BROADCAST: '1' },
+        signer: signerWith(sign, publicKeyHex),
+        broadcaster: { broadcast }
+      })).rejects.toThrow(/public key/)
+      expect(reader.blockCalls).toHaveLength(0)
+      expect(reader.addressCalls).toHaveLength(0)
+      expect(sign).toHaveBeenCalledTimes(0)
+      expect(broadcast).toHaveBeenCalledTimes(0)
+    }
+  )
+
+  it.each([
+    ['wrong hash', { blockInfo: { height: 949_200, hash: '00'.repeat(32) } }],
+    ['wrong height', { blockInfo: { height: 949_199, hash: ECASH_MAINNET_EXECUTION_CHECKPOINT.hash } }],
+    ['malformed response', { hash: ECASH_MAINNET_EXECUTION_CHECKPOINT.hash }],
+    ['hostile null', null]
+  ])('fails closed on a %s checkpoint response before UTXO reads', async (_label, response) => {
+    const reader = new MockReader()
+    reader.blockImpl = vi.fn(async () => response)
+    const sign = vi.fn()
+    const broadcast = vi.fn()
+    await expect(executeCommunityParentGenesis({
+      config: configFor(),
+      reader,
+      gates: {},
+      signer: signerWith(sign),
+      broadcaster: { broadcast }
+    })).rejects.toThrow(/checkpoint verification failed closed/)
+    expect(reader.addressCalls).toHaveLength(0)
+    expect(sign).toHaveBeenCalledTimes(0)
+    expect(broadcast).toHaveBeenCalledTimes(0)
+  })
+
+  it('fails closed on checkpoint transport failure before UTXO reads', async () => {
+    const reader = new MockReader()
+    reader.blockImpl = vi.fn(async () => { throw new Error('timeout') })
+    const sign = vi.fn()
+    const broadcast = vi.fn()
+    await expect(executeCommunityParentGenesis({
+      config: configFor(),
+      reader,
+      gates: {},
+      signer: signerWith(sign),
+      broadcaster: { broadcast }
+    })).rejects.toThrow(/checkpoint verification failed closed/)
+    expect(reader.addressCalls).toHaveLength(0)
+    expect(sign).toHaveBeenCalledTimes(0)
+    expect(broadcast).toHaveBeenCalledTimes(0)
+  })
+
+  it('revalidates the immutable checkpoint immediately before fresh planning', async () => {
+    const preview = await prepareCommunityParentExecution({ config: configFor(), reader: new MockReader() })
+    const reader = new MockReader()
+    reader.blockImpl = vi.fn(async () =>
+      reader.blockCalls.length === 1
+        ? { blockInfo: ECASH_MAINNET_EXECUTION_CHECKPOINT }
+        : { blockInfo: { ...ECASH_MAINNET_EXECUTION_CHECKPOINT, hash: '00'.repeat(32) } }
+    )
+    const sign = vi.fn()
+    const broadcast = vi.fn()
+    await expect(executeCommunityParentGenesis({
+      config: configFor(),
+      reader,
+      gates: authorizationFor(preview.fingerprint),
+      signer: signerWith(sign),
+      broadcaster: { broadcast }
+    })).rejects.toThrow(/checkpoint verification failed closed/)
+    expect(reader.blockCalls).toHaveLength(2)
+    expect(reader.addressCalls).toHaveLength(1)
+    expect(sign).toHaveBeenCalledTimes(0)
+    expect(broadcast).toHaveBeenCalledTimes(0)
+  })
+
+  it('revalidates every selected prevout against the signing key before sign()', async () => {
+    const first = liveUtxo({
+      outpoint: { txid: '11'.repeat(32), outIdx: 0 },
+      sats: 900n
+    })
+    const second = liveUtxo({
+      outpoint: { txid: '22'.repeat(32), outIdx: 0 },
+      sats: 900n
+    })
+    const response = liveResponse([first, second])
+    const preview = await prepareCommunityParentExecution({
+      config: configFor(),
+      reader: new MockReader(response)
+    })
+    expect(preview.plan.selectedInputs).toHaveLength(2)
+    const reader = new MockReader(response, response)
+    reader.txImpl = async (txid) =>
+      txid === first.outpoint.txid
+        ? fundingTxFor(first)
+        : fundingTxFor(second, toHex(Address.parse(TOKEN_ADDRESS).toScript().bytecode))
+    const sign = vi.fn()
+    const broadcast = vi.fn()
+    await expect(executeCommunityParentGenesis({
+      config: configFor(),
+      reader,
+      gates: authorizationFor(preview.fingerprint),
+      signer: signerWith(sign),
+      broadcaster: { broadcast }
+    })).rejects.toThrow(/ownership revalidation failed closed/)
+    expect(reader.txCalls).toEqual([first.outpoint.txid, second.outpoint.txid])
+    expect(sign).toHaveBeenCalledTimes(0)
+    expect(broadcast).toHaveBeenCalledTimes(0)
+  })
+})
+
 describe('live pure-XEC revalidation', () => {
   it.each([
     { tokenType: { protocol: 'SLP', number: 1 }, atoms: 1n, isMintBaton: false },
@@ -268,7 +503,7 @@ describe('live pure-XEC revalidation', () => {
       config: configFor(),
       reader: new MockReader(liveResponse([liveUtxo({ token })])),
       gates: {},
-      signer: { sign },
+      signer: signerWith(sign),
       broadcaster: { broadcast }
     })).rejects.toThrow()
     expect(sign).toHaveBeenCalledTimes(0)
@@ -308,7 +543,7 @@ describe('live pure-XEC revalidation', () => {
       config: configFor(),
       reader,
       gates: {},
-      signer: { sign },
+      signer: signerWith(sign),
       broadcaster: { broadcast }
     })).rejects.toThrow()
     expect(sign).toHaveBeenCalledTimes(0)
@@ -324,7 +559,7 @@ describe('live pure-XEC revalidation', () => {
       config: configFor(),
       reader,
       gates: {},
-      signer: { sign },
+      signer: signerWith(sign),
       broadcaster: { broadcast }
     })).rejects.toThrow(/failed closed/)
     expect(sign).toHaveBeenCalledTimes(0)
@@ -341,12 +576,13 @@ describe('three execution gates and immediate re-plan', () => {
       config: configFor(),
       reader,
       gates: {},
-      signer: { sign },
+      signer: signerWith(sign),
       broadcaster: { broadcast }
     })
     expect(result.status).toBe('dry-run')
     expect(sign).toHaveBeenCalledTimes(0)
     expect(broadcast).toHaveBeenCalledTimes(0)
+    expect(reader.blockCalls).toEqual([ECASH_MAINNET_EXECUTION_CHECKPOINT.height])
     expect(reader.addressCalls).toHaveLength(1)
   })
 
@@ -367,7 +603,7 @@ describe('three execution gates and immediate re-plan', () => {
       config: configFor(),
       reader: new MockReader(),
       gates,
-      signer: { sign },
+      signer: signerWith(sign),
       broadcaster: { broadcast }
     })).rejects.toThrow(/authorization|fingerprint/)
     expect(sign).toHaveBeenCalledTimes(0)
@@ -388,7 +624,7 @@ describe('three execution gates and immediate re-plan', () => {
       config: configFor(),
       reader: new MockReader(liveResponse(), changedResponse),
       gates: authorizationFor(preview.fingerprint),
-      signer: { sign },
+      signer: signerWith(sign),
       broadcaster: { broadcast }
     })).rejects.toThrow()
     expect(sign).toHaveBeenCalledTimes(0)
@@ -406,27 +642,37 @@ describe('signing, signed-tx verification, and broadcast', () => {
       return signedBytesFor(candidate)
     })
     reader.validateImpl = async (rawTx) => chronikTxFor(executionCandidate!, rawTx)
-    reader.txImpl = async () => chronikTxFor(executionCandidate!, signedBytesFor(executionCandidate!))
-    const broadcast = vi.fn(async (rawTx: Uint8Array) => ({ txid: Tx.deser(rawTx).txid() }))
+    reader.txImpl = async (txid) =>
+      txid === liveUtxo().outpoint.txid
+        ? fundingTxFor(liveUtxo())
+        : chronikTxFor(executionCandidate!, signedBytesFor(executionCandidate!))
+    const broadcast = vi.fn(async (rawTx: Uint8Array) => ({
+      status: 'accepted' as const,
+      txid: Tx.deser(rawTx).txid()
+    }))
     const order: string[] = []
     broadcast.mockImplementationOnce(async (rawTx: Uint8Array) => {
       order.push('broadcast')
-      return { txid: Tx.deser(rawTx).txid() }
+      return { status: 'accepted' as const, txid: Tx.deser(rawTx).txid() }
     })
     const result = await executeCommunityParentGenesis({
       config: configFor(),
       reader,
       gates: authorizationFor(preview.fingerprint),
-      signer: { sign },
+      signer: signerWith(sign),
       broadcaster: { broadcast },
       onSignedTxCandidate: () => order.push('txid-preview')
     })
     expect(result.status).toBe('broadcast-confirmed')
     expect(sign).toHaveBeenCalledTimes(1)
+    expect(reader.blockCalls).toEqual([
+      ECASH_MAINNET_EXECUTION_CHECKPOINT.height,
+      ECASH_MAINNET_EXECUTION_CHECKPOINT.height
+    ])
     expect(reader.addressCalls).toHaveLength(2)
     expect(reader.validateCalls).toHaveLength(1)
     expect(broadcast).toHaveBeenCalledTimes(1)
-    expect(reader.txCalls).toHaveLength(1)
+    expect(reader.txCalls).toHaveLength(2)
     expect(order).toEqual(['txid-preview', 'broadcast'])
   })
 
@@ -443,10 +689,118 @@ describe('signing, signed-tx verification, and broadcast', () => {
       config: configFor(),
       reader: new MockReader(liveResponse(), liveResponse()),
       gates: authorizationFor(preview.fingerprint),
-      signer: { sign: async (candidate) => signedBytesFor(candidate, mutate) },
+      signer: signerWith(async (candidate) => signedBytesFor(candidate, mutate)),
       broadcaster: { broadcast }
     })).rejects.toThrow(/Signed transaction/)
     expect(broadcast).toHaveBeenCalledTimes(0)
+  })
+
+  it.each([
+    ['empty scriptSig', (tx: Tx) => { tx.inputs[0]!.script = new Script() }],
+    ['malformed push encoding', (tx: Tx) => { tx.inputs[0]!.script = new Script(Uint8Array.of(0x4c)) }],
+    ['wrong sighash byte', (tx: Tx) => {
+      const bytes = tx.inputs[0]!.script!.bytecode.slice()
+      bytes[65] = 0x01
+      tx.inputs[0]!.script = new Script(bytes)
+    }],
+    ['corrupted Schnorr signature', (tx: Tx) => {
+      const bytes = tx.inputs[0]!.script!.bytecode.slice()
+      bytes[1] ^= 0x01
+      tx.inputs[0]!.script = new Script(bytes)
+    }],
+    ['wrong pushed public key', (tx: Tx) => {
+      const wrongSecret = Uint8Array.from([...new Uint8Array(31), 2])
+      const wrongPublicKey = new Ecc().derivePubkey(wrongSecret)
+      expect(toHex(Script.p2pkh(shaRmd160(wrongPublicKey)).bytecode)).not.toBe(FUNDING_SCRIPT)
+      const signature = tx.inputs[0]!.script!.bytecode.slice(1, 66)
+      tx.inputs[0]!.script = Script.fromOps([
+        pushBytesOp(signature),
+        pushBytesOp(wrongPublicKey)
+      ])
+    }]
+  ])('rejects a signer result with %s before broadcast', async (_label, mutate) => {
+    const preview = await prepareCommunityParentExecution({ config: configFor(), reader: new MockReader() })
+    const broadcast = vi.fn()
+    await expect(executeCommunityParentGenesis({
+      config: configFor(),
+      reader: new MockReader(liveResponse(), liveResponse()),
+      gates: authorizationFor(preview.fingerprint),
+      signer: signerWith(async (candidate) => signedBytesFor(candidate, mutate)),
+      broadcaster: { broadcast }
+    })).rejects.toThrow(/Signed transaction/)
+    expect(broadcast).toHaveBeenCalledTimes(0)
+  })
+
+  it('rejects a valid-looking signature made with the wrong input amount', async () => {
+    const preview = await prepareCommunityParentExecution({ config: configFor(), reader: new MockReader() })
+    const broadcast = vi.fn()
+    await expect(executeCommunityParentGenesis({
+      config: configFor(),
+      reader: new MockReader(liveResponse(), liveResponse()),
+      gates: authorizationFor(preview.fingerprint),
+      signer: signerWith(async (candidate) =>
+        signedBytesFor(candidate, undefined, (sats) => sats + 1n)
+      ),
+      broadcaster: { broadcast }
+    })).rejects.toThrow(/invalid Schnorr signature/)
+    expect(broadcast).toHaveBeenCalledTimes(0)
+  })
+
+  it('rejects a signature copied from another input and one invalid input among many', async () => {
+    const first = liveUtxo({ outpoint: { txid: '11'.repeat(32), outIdx: 0 }, sats: 900n })
+    const second = liveUtxo({ outpoint: { txid: '22'.repeat(32), outIdx: 0 }, sats: 900n })
+    const response = liveResponse([first, second])
+    const preview = await prepareCommunityParentExecution({
+      config: configFor(),
+      reader: new MockReader(response)
+    })
+    const reader = new MockReader(response, response)
+    reader.txImpl = async (txid) =>
+      fundingTxFor(txid === first.outpoint.txid ? first : second)
+    const broadcast = vi.fn()
+    await expect(executeCommunityParentGenesis({
+      config: configFor(),
+      reader,
+      gates: authorizationFor(preview.fingerprint),
+      signer: signerWith(async (candidate) => signedBytesFor(candidate, (tx) => {
+        tx.inputs[1]!.script = tx.inputs[0]!.script!.copy()
+      })),
+      broadcaster: { broadcast }
+    })).rejects.toThrow(/invalid Schnorr signature/)
+    expect(broadcast).toHaveBeenCalledTimes(0)
+  })
+
+  it('accepts only canonical two-push 0x41 Schnorr P2PKH scriptSigs', async () => {
+    const preview = await prepareCommunityParentExecution({ config: configFor(), reader: new MockReader() })
+    const reader = new MockReader(liveResponse(), liveResponse())
+    let candidate: CommunityParentExecutionCandidate | undefined
+    reader.validateImpl = async (rawTx) => chronikTxFor(candidate!, rawTx)
+    reader.txImpl = async (txid) =>
+      txid === liveUtxo().outpoint.txid
+        ? fundingTxFor(liveUtxo())
+        : chronikTxFor(candidate!, signedBytesFor(candidate!))
+    const broadcast = vi.fn(async (rawTx: Uint8Array) => ({
+      status: 'accepted' as const,
+      txid: Tx.deser(rawTx).txid()
+    }))
+    const result = await executeCommunityParentGenesis({
+      config: configFor(),
+      reader,
+      gates: authorizationFor(preview.fingerprint),
+      signer: signerWith(async (value) => {
+        candidate = value
+        const bytes = signedBytesFor(value)
+        const script = Tx.deser(bytes).inputs[0]!.script!.bytecode
+        expect(script).toHaveLength(100)
+        expect(script[0]).toBe(65)
+        expect(script[65]).toBe(0x41)
+        expect(script[66]).toBe(33)
+        return bytes
+      }),
+      broadcaster: { broadcast }
+    })
+    expect(result.status).toBe('broadcast-confirmed')
+    expect(broadcast).toHaveBeenCalledTimes(1)
   })
 
   it('fails closed when Chronik pre-broadcast validation rejects the signed tx', async () => {
@@ -458,7 +812,7 @@ describe('signing, signed-tx verification, and broadcast', () => {
       config: configFor(),
       reader,
       gates: authorizationFor(preview.fingerprint),
-      signer: { sign: async (candidate) => signedBytesFor(candidate) },
+      signer: signerWith(async (candidate) => signedBytesFor(candidate)),
       broadcaster: { broadcast }
     })).rejects.toThrow(/pre-broadcast/)
     expect(broadcast).toHaveBeenCalledTimes(0)
@@ -477,34 +831,61 @@ describe('signing, signed-tx verification, and broadcast', () => {
       config: configFor(),
       reader,
       gates: authorizationFor(preview.fingerprint),
-      signer: { sign: async (value) => {
+      signer: signerWith(async (value) => {
         candidate = value
         return signedBytesFor(value)
-      } },
+      }),
       broadcaster: { broadcast }
     })).rejects.toThrow(/failed closed/)
     expect(broadcast).toHaveBeenCalledTimes(0)
   })
 
-  it('reports one ambiguous broadcast attempt and never retries', async () => {
+  it.each([
+    ['timeout', new Error('timeout after submit')],
+    ['connection reset', Object.assign(new Error('reset after submit'), { code: 'ECONNRESET' })],
+    ['unknown thrown value', { unexpected: true }]
+  ])('reports one ambiguous broadcast attempt for %s and never retries', async (_label, failure) => {
     const preview = await prepareCommunityParentExecution({ config: configFor(), reader: new MockReader() })
     const reader = new MockReader(liveResponse(), liveResponse())
     let candidate: CommunityParentExecutionCandidate | undefined
     reader.validateImpl = async (rawTx) => chronikTxFor(candidate!, rawTx)
-    const broadcast = vi.fn(async () => { throw new Error('timeout after submit') })
+    const broadcast = vi.fn(async () => { throw failure })
     const result = await executeCommunityParentGenesis({
       config: configFor(),
       reader,
       gates: authorizationFor(preview.fingerprint),
-      signer: { sign: async (value) => {
+      signer: signerWith(async (value) => {
         candidate = value
         return signedBytesFor(value)
-      } },
+      }),
       broadcaster: { broadcast }
     })
     expect(result.status).toBe('broadcast-status-ambiguous')
     expect(broadcast).toHaveBeenCalledTimes(1)
-    expect(reader.txCalls).toHaveLength(0)
+    expect(reader.txCalls).toHaveLength(1)
+  })
+
+  it('distinguishes a definitive Chronik rejection from ambiguous transport', async () => {
+    const preview = await prepareCommunityParentExecution({ config: configFor(), reader: new MockReader() })
+    const reader = new MockReader(liveResponse(), liveResponse())
+    let candidate: CommunityParentExecutionCandidate | undefined
+    reader.validateImpl = async (rawTx) => chronikTxFor(candidate!, rawTx)
+    const broadcast = vi.fn(async () => ({ status: 'rejected' as const }))
+    const result = await executeCommunityParentGenesis({
+      config: configFor(),
+      reader,
+      gates: authorizationFor(preview.fingerprint),
+      signer: signerWith(async (value) => {
+        candidate = value
+        return signedBytesFor(value)
+      }),
+      broadcaster: { broadcast }
+    })
+    expect(result.status).toBe('broadcast-rejected')
+    if (result.status !== 'broadcast-rejected') throw new Error('Expected definitive rejection.')
+    expect(result.signedTxid).toMatch(/^[0-9a-f]{64}$/)
+    expect(broadcast).toHaveBeenCalledTimes(1)
+    expect(reader.txCalls).toHaveLength(1)
   })
 
   it('reports accepted/pending without inventing post-broadcast confirmation', async () => {
@@ -512,16 +893,22 @@ describe('signing, signed-tx verification, and broadcast', () => {
     const reader = new MockReader(liveResponse(), liveResponse())
     let candidate: CommunityParentExecutionCandidate | undefined
     reader.validateImpl = async (rawTx) => chronikTxFor(candidate!, rawTx)
-    reader.txImpl = async () => { throw new Error('not indexed yet') }
-    const broadcast = vi.fn(async (rawTx: Uint8Array) => ({ txid: Tx.deser(rawTx).txid() }))
+    reader.txImpl = async (txid) => {
+      if (txid === liveUtxo().outpoint.txid) return fundingTxFor(liveUtxo())
+      throw new Error('not indexed yet')
+    }
+    const broadcast = vi.fn(async (rawTx: Uint8Array) => ({
+      status: 'accepted' as const,
+      txid: Tx.deser(rawTx).txid()
+    }))
     const result = await executeCommunityParentGenesis({
       config: configFor(),
       reader,
       gates: authorizationFor(preview.fingerprint),
-      signer: { sign: async (value) => {
+      signer: signerWith(async (value) => {
         candidate = value
         return signedBytesFor(value)
-      } },
+      }),
       broadcaster: { broadcast }
     })
     expect(result.status).toBe('broadcast-accepted-chain-verification-pending')
@@ -530,6 +917,17 @@ describe('signing, signed-tx verification, and broadcast', () => {
 })
 
 describe('scope, API, and secret boundaries', () => {
+  it('classifies only the installed client\'s decoded Chronik rejection as definitive', () => {
+    expect(classifyChronikClientV3BroadcastFailure(
+      new Error('Failed getting /broadcast-tx: txn-mempool-conflict')
+    )).toBe('rejected')
+    expect(classifyChronikClientV3BroadcastFailure(new Error('timeout'))).toBe('ambiguous')
+    expect(classifyChronikClientV3BroadcastFailure(
+      Object.assign(new Error('socket reset'), { code: 'ECONNRESET' })
+    )).toBe('ambiguous')
+    expect(classifyChronikClientV3BroadcastFailure({ status: 500 })).toBe('ambiguous')
+  })
+
   it('obtains the plan from the canonical planner and exposes no arbitrary-plan executor API', () => {
     const source = readFileSync(new URL('./communityParentExecutor.ts', import.meta.url), 'utf8')
     expect(source).toContain('buildCommunityParentGenesisPlan({ config: params.config, fundingUtxos })')

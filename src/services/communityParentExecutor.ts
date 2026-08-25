@@ -1,11 +1,17 @@
 import {
+  ALL_BIP143,
   Address,
+  Ecc,
   Script,
   Tx,
+  UnsignedTx,
   calcTxFee,
   fromHex,
+  isPushOp,
   parseSlp,
   sha256,
+  sha256d,
+  shaRmd160,
   toHex
 } from 'ecash-lib'
 import { FEE_RATE_SATS_PER_BYTE } from '../config/xecFees'
@@ -18,6 +24,7 @@ import {
   COMMUNITY_PARENT_TOKEN_NAME,
   COMMUNITY_PARENT_TOKEN_TICKER,
   COMMUNITY_PARENT_TOKEN_TYPE,
+  assertCommunityParentGenesisConfig,
   buildCommunityParentGenesisPlan
 } from './communityParentGenesis'
 import type {
@@ -27,13 +34,26 @@ import type {
 } from './communityParentGenesis'
 
 const CANONICAL_TXID = /^[0-9a-f]{64}$/
+const CANONICAL_COMPRESSED_PUBLIC_KEY = /^(02|03)[0-9a-f]{64}$/
+const CHRONIK_V3_BROADCAST_REJECTION_PREFIX = 'Failed getting /broadcast-tx: '
 const UINT32_MAX = 0xffffffff
+const SCHNORR_SIGNATURE_BYTES = 64
 const P2PKH_SIGNED_INPUT_BYTES = 148
 const TX_FIXED_BYTES = 8
 const FEE_PER_KB = BigInt(Math.round(FEE_RATE_SATS_PER_BYTE * 1000))
 
 export const COMMUNITY_PARENT_EXECUTION_FEE_PER_KB = FEE_PER_KB
 export const COMMUNITY_PARENT_MAX_FEE_OVERPAY_SATS = COMMUNITY_PARENT_DUST_SATS - 1n
+
+/**
+ * Latest mainnet checkpoint published by Bitcoin ABC when this executor was
+ * reviewed. Source (pinned source revision c37387a4d25b0a2cf886e2010d0023dd078ca43a):
+ * src/networks/abc/checkpoints.cpp, "Obolensky activation".
+ */
+export const ECASH_MAINNET_EXECUTION_CHECKPOINT = Object.freeze({
+  height: 949_200,
+  hash: '000000000000000098694560815190dba8bbe2f06c08a7c23837df3c4886cba2'
+})
 
 export type CommunityParentExecutionGates = Readonly<{
   BROADCAST?: string
@@ -43,18 +63,43 @@ export type CommunityParentExecutionGates = Readonly<{
 
 export interface CommunityParentChronikReader {
   readonly endpointLabel: string
+  block(height: number): Promise<unknown>
   addressUtxos(address: string): Promise<unknown>
+  /**
+   * Chronik validateRawTx validates token/indexing structure. It is not a
+   * substitute for local signature, mempool-policy, or consensus validation.
+   */
   validateRawTx(rawTx: Uint8Array): Promise<unknown>
   tx(txid: string): Promise<unknown>
 }
 
 export interface CommunityParentSigner {
+  /** Canonical compressed secp256k1 public key derived from the signing secret. */
+  readonly publicKeyHex: string
   sign(candidate: CommunityParentExecutionCandidate): Promise<Uint8Array>
 }
 
+export type CommunityParentBroadcastOutcome =
+  | Readonly<{ status: 'accepted'; txid: string }>
+  | Readonly<{ status: 'rejected' }>
+
 export interface CommunityParentBroadcaster {
-  broadcast(rawTx: Uint8Array): Promise<unknown>
+  broadcast(rawTx: Uint8Array): Promise<CommunityParentBroadcastOutcome>
 }
+
+/**
+ * chronik-client@3.7.0 converts a decoded protobuf error from a working
+ * Chronik server into an Error with this fixed prefix and discards the HTTP
+ * status and protobuf structure. Transport/failover failures use other error
+ * shapes and remain ambiguous. Keep this compatibility shim at the adapter
+ * boundary until the installed client exposes structured broadcast errors.
+ */
+export const classifyChronikClientV3BroadcastFailure = (
+  error: unknown
+): 'rejected' | 'ambiguous' =>
+  error instanceof Error && error.message.startsWith(CHRONIK_V3_BROADCAST_REJECTION_PREFIX)
+    ? 'rejected'
+    : 'ambiguous'
 
 export type CommunityParentExecutionCandidate = Readonly<{
   plan: CommunityParentGenesisPlan
@@ -79,12 +124,120 @@ export type CommunityParentExecutionResult =
       candidate: CommunityParentExecutionCandidate
       signedTxid: string
     }>
+  | Readonly<{
+      status: 'broadcast-rejected'
+      candidate: CommunityParentExecutionCandidate
+      signedTxid: string
+    }>
 
 const asRecord = (value: unknown, label: string): Record<string, unknown> => {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${label} is malformed.`)
   }
   return value as Record<string, unknown>
+}
+
+const bytesEqual = (left: Uint8Array, right: Uint8Array): boolean =>
+  left.length === right.length && left.every((byte, index) => byte === right[index])
+
+const assertEndpointLabel: (endpointLabel: unknown) => asserts endpointLabel is string = (
+  endpointLabel
+) => {
+  if (
+    typeof endpointLabel !== 'string' ||
+    endpointLabel.length === 0 ||
+    endpointLabel.trim() !== endpointLabel ||
+    [...endpointLabel].some((character) => {
+      const code = character.charCodeAt(0)
+      return code <= 0x20 || code === 0x7f
+    })
+  ) {
+    throw new Error('Chronik endpoint label must be explicit.')
+  }
+}
+
+const assertMainnetExecutionConfig = (config: CommunityParentGenesisConfig): void => {
+  assertCommunityParentGenesisConfig(config)
+  if (config.network !== 'mainnet') {
+    throw new Error('Community Parent execution is restricted to mainnet.')
+  }
+}
+
+const signerFundingScriptHex = (
+  signer: CommunityParentSigner,
+  fundingAddress: string
+): string => {
+  if (!CANONICAL_COMPRESSED_PUBLIC_KEY.test(signer.publicKeyHex)) {
+    throw new Error('Signer public key must be canonical compressed secp256k1 hex.')
+  }
+  const publicKey = fromHex(signer.publicKeyHex)
+  const signerScriptHex = toHex(Script.p2pkh(shaRmd160(publicKey)).bytecode)
+  const fundingScriptHex = toHex(Address.parse(fundingAddress).toScript().bytecode)
+  if (signerScriptHex !== fundingScriptHex) {
+    throw new Error('The configured signing key does not control the funding address.')
+  }
+  return signerScriptHex
+}
+
+const assertCandidateControlledBySigner = (
+  candidate: CommunityParentExecutionCandidate,
+  signerScriptHex: string
+): void => {
+  if (
+    candidate.plan.selectedInputs.length === 0 ||
+    candidate.plan.selectedInputs.some((input) => input.outputScript !== signerScriptHex)
+  ) {
+    throw new Error('The configured signing key does not control every selected input.')
+  }
+}
+
+const assertSelectedInputPrevouts = async (
+  reader: CommunityParentChronikReader,
+  candidate: CommunityParentExecutionCandidate,
+  signerScriptHex: string
+): Promise<void> => {
+  try {
+    for (const input of candidate.plan.selectedInputs) {
+      const transaction = asRecord(
+        await reader.tx(input.outpoint.txid),
+        'Chronik funding transaction'
+      )
+      if (transaction.txid !== input.outpoint.txid || !Array.isArray(transaction.outputs)) {
+        throw new Error('Chronik funding transaction is malformed.')
+      }
+      const output = asRecord(
+        transaction.outputs[input.outpoint.outIdx],
+        'Chronik funding transaction output'
+      )
+      if (
+        output.sats !== input.sats ||
+        output.outputScript !== signerScriptHex ||
+        output.token !== undefined
+      ) {
+        throw new Error('Chronik funding prevout does not match the signing authority.')
+      }
+    }
+  } catch {
+    throw new Error('Chronik selected-input ownership revalidation failed closed.')
+  }
+}
+
+const assertMainnetCheckpoint = async (reader: CommunityParentChronikReader): Promise<void> => {
+  try {
+    const block = asRecord(
+      await reader.block(ECASH_MAINNET_EXECUTION_CHECKPOINT.height),
+      'Chronik checkpoint block'
+    )
+    const blockInfo = asRecord(block.blockInfo, 'Chronik checkpoint block info')
+    if (
+      blockInfo.height !== ECASH_MAINNET_EXECUTION_CHECKPOINT.height ||
+      blockInfo.hash !== ECASH_MAINNET_EXECUTION_CHECKPOINT.hash
+    ) {
+      throw new Error('Chronik endpoint is not serving the required eCash mainnet checkpoint.')
+    }
+  } catch {
+    throw new Error('Chronik mainnet checkpoint verification failed closed.')
+  }
 }
 
 const compactSizeLength = (value: number): number => {
@@ -329,17 +482,7 @@ export const prepareCommunityParentExecution = async (params: {
   readonly config: CommunityParentGenesisConfig
   readonly reader: CommunityParentChronikReader
 }): Promise<CommunityParentExecutionCandidate> => {
-  if (
-    typeof params.reader.endpointLabel !== 'string' ||
-    params.reader.endpointLabel.length === 0 ||
-    params.reader.endpointLabel.trim() !== params.reader.endpointLabel ||
-    [...params.reader.endpointLabel].some((character) => {
-      const code = character.charCodeAt(0)
-      return code <= 0x20 || code === 0x7f
-    })
-  ) {
-    throw new Error('Chronik endpoint label must be explicit.')
-  }
+  assertEndpointLabel(params.reader.endpointLabel)
   const fundingUtxos = await readLivePureXecFunding(params.config, params.reader)
   const plan = buildCommunityParentGenesisPlan({ config: params.config, fundingUtxos })
   assertCanonicalPlan(plan)
@@ -383,9 +526,15 @@ const assertExecutionGates = (
   return 'execute'
 }
 
+const hasExecutionIntent = (gates: CommunityParentExecutionGates): boolean =>
+  gates.BROADCAST !== undefined ||
+  gates.CONFIRM_COMMUNITY_PARENT_GENESIS !== undefined ||
+  gates.CONFIRM_PLAN_SHA256 !== undefined
+
 const assertSignedTxMatchesCandidate = (
   rawTx: Uint8Array,
-  candidate: CommunityParentExecutionCandidate
+  candidate: CommunityParentExecutionCandidate,
+  expectedPublicKeyHex: string
 ): Tx => {
   let tx: Tx
   try {
@@ -396,35 +545,33 @@ const assertSignedTxMatchesCandidate = (
   if (toHex(tx.ser()) !== toHex(rawTx)) {
     throw new Error('Signer returned non-canonical transaction bytes.')
   }
-  const unsigned = Tx.fromHex(candidate.unsignedTxHex)
+  const canonicalUnsignedTx = Tx.fromHex(candidate.unsignedTxHex)
   const txidHex = (txid: string | Uint8Array): string =>
     typeof txid === 'string' ? txid : toHex(txid.slice().reverse())
   if (
-    tx.version !== unsigned.version ||
-    tx.locktime !== unsigned.locktime ||
-    tx.inputs.length !== unsigned.inputs.length ||
-    tx.outputs.length !== unsigned.outputs.length
+    tx.version !== canonicalUnsignedTx.version ||
+    tx.locktime !== canonicalUnsignedTx.locktime ||
+    tx.inputs.length !== canonicalUnsignedTx.inputs.length ||
+    tx.outputs.length !== canonicalUnsignedTx.outputs.length
   ) {
     throw new Error('Signed transaction changed the canonical transaction shape.')
   }
   for (let index = 0; index < tx.inputs.length; index += 1) {
     const actual = tx.inputs[index]
-    const expected = unsigned.inputs[index]
+    const expected = canonicalUnsignedTx.inputs[index]
     if (
       actual === undefined ||
       expected === undefined ||
       txidHex(actual.prevOut.txid) !== txidHex(expected.prevOut.txid) ||
       actual.prevOut.outIdx !== expected.prevOut.outIdx ||
-      (actual.sequence ?? UINT32_MAX) !== (expected.sequence ?? UINT32_MAX) ||
-      actual.script === undefined ||
-      actual.script.bytecode.length === 0
+      (actual.sequence ?? UINT32_MAX) !== (expected.sequence ?? UINT32_MAX)
     ) {
       throw new Error('Signed transaction changed a canonical input.')
     }
   }
   for (let index = 0; index < tx.outputs.length; index += 1) {
     const actual = tx.outputs[index]
-    const expected = unsigned.outputs[index]
+    const expected = canonicalUnsignedTx.outputs[index]
     if (
       actual === undefined ||
       expected === undefined ||
@@ -434,6 +581,77 @@ const assertSignedTxMatchesCandidate = (
       throw new Error('Signed transaction changed a canonical output.')
     }
   }
+
+  const expectedPublicKey = fromHex(expectedPublicKeyHex)
+  const verificationTx = new Tx({
+    version: tx.version,
+    locktime: tx.locktime,
+    inputs: tx.inputs.map((input, index) => {
+      const expectedInput = candidate.plan.selectedInputs[index]
+      if (expectedInput === undefined) {
+        throw new Error('Signed transaction changed the canonical input count.')
+      }
+      return {
+        prevOut: input.prevOut,
+        script: input.script,
+        sequence: input.sequence,
+        signData: {
+          sats: expectedInput.sats,
+          outputScript: new Script(fromHex(expectedInput.outputScript))
+        }
+      }
+    }),
+    outputs: tx.outputs
+  })
+  const signatureUnsignedTx = UnsignedTx.fromTx(verificationTx)
+  const ecc = new Ecc()
+  verificationTx.inputs.forEach((input, index) => {
+    const expectedInput = candidate.plan.selectedInputs[index]
+    if (expectedInput === undefined) {
+      throw new Error('Signed transaction changed the canonical input count.')
+    }
+    let signatureWithHashType: Uint8Array
+    let publicKey: Uint8Array
+    try {
+      const operations = input.script?.ops()
+      const signaturePush = operations?.next()
+      const publicKeyPush = operations?.next()
+      if (
+        operations === undefined ||
+        !isPushOp(signaturePush) ||
+        !isPushOp(publicKeyPush) ||
+        operations.next() !== undefined ||
+        signaturePush.opcode !== SCHNORR_SIGNATURE_BYTES + 1 ||
+        signaturePush.data.length !== SCHNORR_SIGNATURE_BYTES + 1 ||
+        publicKeyPush.opcode !== 33 ||
+        publicKeyPush.data.length !== 33
+      ) {
+        throw new Error('non-canonical P2PKH scriptSig')
+      }
+      signatureWithHashType = signaturePush.data
+      publicKey = publicKeyPush.data
+    } catch {
+      throw new Error('Signed transaction contains a non-canonical P2PKH scriptSig.')
+    }
+    if (
+      signatureWithHashType[SCHNORR_SIGNATURE_BYTES] !== (ALL_BIP143.toInt() & 0xff) ||
+      !bytesEqual(publicKey, expectedPublicKey) ||
+      toHex(Script.p2pkh(shaRmd160(publicKey)).bytecode) !== expectedInput.outputScript
+    ) {
+      throw new Error('Signed transaction P2PKH authority or sighash policy is invalid.')
+    }
+    try {
+      const preimage = signatureUnsignedTx.inputAt(index).sigHashPreimage(ALL_BIP143)
+      ecc.schnorrVerify(
+        signatureWithHashType.slice(0, SCHNORR_SIGNATURE_BYTES),
+        sha256d(preimage.bytes),
+        publicKey
+      )
+    } catch {
+      throw new Error('Signed transaction contains an invalid Schnorr signature.')
+    }
+  })
+
   const fee = sumInputSats(candidate.plan) - tx.outputs.reduce((sum, output) => sum + output.sats, 0n)
   const minimumFee = calcTxFee(tx.serSize(), FEE_PER_KB)
   if (
@@ -579,35 +797,55 @@ export const executeCommunityParentGenesis = async (params: {
   readonly onPreview?: (preview: string) => void
   readonly onSignedTxCandidate?: (txid: string) => void
 }): Promise<CommunityParentExecutionResult> => {
+  assertMainnetExecutionConfig(params.config)
+  assertEndpointLabel(params.reader.endpointLabel)
+
+  let signerScriptHex: string | undefined
+  if (hasExecutionIntent(params.gates)) {
+    if (params.signer === undefined || params.broadcaster === undefined) {
+      throw new Error('Signing and broadcasting ports are required for execution authorization.')
+    }
+    signerScriptHex = signerFundingScriptHex(params.signer, params.config.fundingAddress)
+  }
+
+  await assertMainnetCheckpoint(params.reader)
   const previewCandidate = await prepareCommunityParentExecution({
     config: params.config,
     reader: params.reader
   })
+  if (signerScriptHex !== undefined) {
+    assertCandidateControlledBySigner(previewCandidate, signerScriptHex)
+  }
   params.onPreview?.(formatCommunityParentExecutionPreview(previewCandidate))
   if (assertExecutionGates(params.gates, previewCandidate.fingerprint) === 'dry-run') {
     return { status: 'dry-run', candidate: previewCandidate }
   }
-  if (params.signer === undefined || params.broadcaster === undefined) {
-    throw new Error('Signing and broadcasting ports are required only for authorized execution.')
+  const signer = params.signer
+  const broadcaster = params.broadcaster
+  if (signer === undefined || broadcaster === undefined || signerScriptHex === undefined) {
+    throw new Error('Signing and broadcasting ports are unavailable after authorization.')
   }
 
+  await assertMainnetCheckpoint(params.reader)
   const candidate = await prepareCommunityParentExecution({
     config: params.config,
     reader: params.reader
   })
+  assertCandidateControlledBySigner(candidate, signerScriptHex)
   if (
     candidate.fingerprint !== previewCandidate.fingerprint ||
     candidate.fingerprint !== params.gates.CONFIRM_PLAN_SHA256
   ) {
     throw new Error('Live re-plan changed after preview; signing is forbidden.')
   }
+  await assertSelectedInputPrevouts(params.reader, candidate, signerScriptHex)
 
-  const signerResult = await params.signer.sign(candidate)
+  const signerResult = await signer.sign(candidate)
   if (!(signerResult instanceof Uint8Array)) {
     throw new Error('Signer returned malformed transaction bytes.')
   }
   const signedBytes = signerResult.slice()
-  const signedTx = assertSignedTxMatchesCandidate(signedBytes, candidate)
+  const signedTx = assertSignedTxMatchesCandidate(signedBytes, candidate, signer.publicKeyHex)
   const signedTxid = signedTx.txid()
   params.onSignedTxCandidate?.(signedTxid)
 
@@ -619,19 +857,25 @@ export const executeCommunityParentGenesis = async (params: {
   }
   assertChronikTxMatchesCandidate(chronikPreflight, candidate, signedTxid)
 
-  let broadcastResponse: unknown
+  let broadcastResponse: CommunityParentBroadcastOutcome
   try {
-    broadcastResponse = await params.broadcaster.broadcast(signedBytes.slice())
+    broadcastResponse = await broadcaster.broadcast(signedBytes.slice())
   } catch {
     return { status: 'broadcast-status-ambiguous', candidate, signedTxid }
   }
-  let returnedTxid: unknown
+  let broadcastRecord: Record<string, unknown>
   try {
-    returnedTxid = asRecord(broadcastResponse, 'Chronik broadcast response').txid
+    broadcastRecord = asRecord(broadcastResponse, 'Chronik broadcast outcome')
   } catch {
     return { status: 'broadcast-status-ambiguous', candidate, signedTxid }
   }
-  if (returnedTxid !== signedTxid) {
+  if (broadcastRecord.status === 'rejected') {
+    return { status: 'broadcast-rejected', candidate, signedTxid }
+  }
+  if (broadcastRecord.status !== 'accepted' || typeof broadcastRecord.txid !== 'string') {
+    return { status: 'broadcast-status-ambiguous', candidate, signedTxid }
+  }
+  if (broadcastRecord.txid !== signedTxid) {
     throw new Error('Chronik returned a txid different from the signed transaction candidate.')
   }
 

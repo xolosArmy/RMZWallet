@@ -11,6 +11,7 @@ import {
 } from 'ecash-lib'
 import {
   COMMUNITY_PARENT_DUST_SATS,
+  assertCommunityParentGenesisConfig,
   assertCanonicalCommunityParentMetadata
 } from '../src/services/communityParentGenesis'
 import type {
@@ -19,9 +20,11 @@ import type {
 } from '../src/services/communityParentGenesis'
 import {
   COMMUNITY_PARENT_EXECUTION_FEE_PER_KB,
+  classifyChronikClientV3BroadcastFailure,
   executeCommunityParentGenesis
 } from '../src/services/communityParentExecutor'
 import type {
+  CommunityParentBroadcastOutcome,
   CommunityParentExecutionCandidate,
   CommunityParentSigner
 } from '../src/services/communityParentExecutor'
@@ -43,49 +46,88 @@ const parseNetwork = (value: string): CommunityParentNetwork => {
   return value
 }
 
-const createSigner = (): CommunityParentSigner => ({
-  sign: async (candidate: CommunityParentExecutionCandidate): Promise<Uint8Array> => {
-    const secretHex = process.env[SIGNING_SECRET_ENV]
-    delete process.env[SIGNING_SECRET_ENV]
-    if (typeof secretHex !== 'string' || !CANONICAL_SECRET_HEX.test(secretHex)) {
-      throw new Error(`${SIGNING_SECRET_ENV} must contain one canonical 32-byte hex signing secret.`)
-    }
-    const secret = fromHex(secretHex)
-    try {
-      const ecc = new Ecc()
-      if (!ecc.isValidSeckey(secret)) throw new Error('The supplied signing secret is invalid.')
-      const publicKey = ecc.derivePubkey(secret)
-      const fundingScript = Script.p2pkh(shaRmd160(publicKey))
-      const expectedFundingScript = candidate.plan.selectedInputs[0]?.outputScript
-      if (expectedFundingScript === undefined || toHex(fundingScript.bytecode) !== expectedFundingScript) {
-        throw new Error('The signing secret does not control the explicit funding address.')
-      }
-      const signatory = P2PKHSignatory(secret, publicKey, ALL_BIP143)
-      const builder = new TxBuilder({
-        inputs: candidate.plan.selectedInputs.map((input) => ({
-          input: {
-            prevOut: input.outpoint,
-            signData: {
-              sats: input.sats,
-              outputScript: fundingScript
-            }
-          },
-          signatory
-        })),
-        outputs: candidate.plan.outputs.map((output) => ({
-          sats: output.sats,
-          script: new Script(fromHex(output.scriptHex))
-        }))
-      })
-      return builder.sign({
-        feePerKb: COMMUNITY_PARENT_EXECUTION_FEE_PER_KB,
-        dustSats: COMMUNITY_PARENT_DUST_SATS
-      }).ser()
-    } finally {
+type DisposableCommunityParentSigner = CommunityParentSigner & Readonly<{
+  dispose(): void
+}>
+
+const createSigner = (): DisposableCommunityParentSigner => {
+  const secretHex = process.env[SIGNING_SECRET_ENV]
+  delete process.env[SIGNING_SECRET_ENV]
+  if (typeof secretHex !== 'string' || !CANONICAL_SECRET_HEX.test(secretHex)) {
+    throw new Error(`${SIGNING_SECRET_ENV} must contain one canonical 32-byte hex signing secret.`)
+  }
+  const secret = fromHex(secretHex)
+  const ecc = new Ecc()
+  let publicKey: Uint8Array
+  try {
+    if (!ecc.isValidSeckey(secret)) throw new Error('The supplied signing secret is invalid.')
+    publicKey = ecc.derivePubkey(secret)
+  } catch (error) {
+    secret.fill(0)
+    throw error
+  }
+  const fundingScript = Script.p2pkh(shaRmd160(publicKey))
+  let disposed = false
+  return {
+    publicKeyHex: toHex(publicKey),
+    dispose: (): void => {
       secret.fill(0)
+      disposed = true
+    },
+    sign: async (candidate: CommunityParentExecutionCandidate): Promise<Uint8Array> => {
+      if (disposed) throw new Error('The signing secret has already been cleared.')
+      if (
+        candidate.plan.selectedInputs.length === 0 ||
+        candidate.plan.selectedInputs.some(
+          (input) => input.outputScript !== toHex(fundingScript.bytecode)
+        )
+      ) {
+        throw new Error('The signing secret does not control every selected input.')
+      }
+      try {
+        const signatory = P2PKHSignatory(secret, publicKey, ALL_BIP143)
+        const builder = new TxBuilder({
+          inputs: candidate.plan.selectedInputs.map((input) => ({
+            input: {
+              prevOut: input.outpoint,
+              signData: {
+                sats: input.sats,
+                outputScript: fundingScript
+              }
+            },
+            signatory
+          })),
+          outputs: candidate.plan.outputs.map((output) => ({
+            sats: output.sats,
+            script: new Script(fromHex(output.scriptHex))
+          }))
+        })
+        return builder.sign({
+          feePerKb: COMMUNITY_PARENT_EXECUTION_FEE_PER_KB,
+          dustSats: COMMUNITY_PARENT_DUST_SATS
+        }).ser()
+      } finally {
+        secret.fill(0)
+        disposed = true
+      }
     }
   }
-})
+}
+
+const broadcastWithChronikSemantics = async (
+  chronik: ReturnType<typeof getChronik>,
+  rawTx: Uint8Array
+): Promise<CommunityParentBroadcastOutcome> => {
+  try {
+    const response = await chronik.broadcastTx(rawTx)
+    return { status: 'accepted', txid: response.txid }
+  } catch (error) {
+    if (classifyChronikClientV3BroadcastFailure(error) === 'rejected') {
+      return { status: 'rejected' }
+    }
+    throw error
+  }
+}
 
 const cliArgs = process.argv.slice(2)
 if (cliArgs.length !== 0) {
@@ -109,34 +151,46 @@ const config: CommunityParentGenesisConfig = {
 if (config.network !== 'mainnet') {
   throw new Error('The administrative CLI adapter is intentionally restricted to explicit mainnet.')
 }
+assertCommunityParentGenesisConfig(config)
+
+const gates = {
+  BROADCAST: process.env.BROADCAST,
+  CONFIRM_COMMUNITY_PARENT_GENESIS: process.env.CONFIRM_COMMUNITY_PARENT_GENESIS,
+  CONFIRM_PLAN_SHA256: process.env.CONFIRM_PLAN_SHA256
+}
+const executionIntent = Object.values(gates).some((value) => value !== undefined)
+const signer = executionIntent ? createSigner() : undefined
 
 const chronik = getChronik()
 const reader = {
   endpointLabel: getChronikUrls().join(','),
+  block: async (height: number): Promise<unknown> => chronik.block(height),
   addressUtxos: async (address: string): Promise<unknown> => chronik.address(address).utxos(),
   validateRawTx: async (rawTx: Uint8Array): Promise<unknown> => chronik.validateRawTx(rawTx),
   tx: async (txid: string): Promise<unknown> => chronik.tx(txid)
 }
 
-const result = await executeCommunityParentGenesis({
-  config,
-  reader,
-  gates: {
-    BROADCAST: process.env.BROADCAST,
-    CONFIRM_COMMUNITY_PARENT_GENESIS: process.env.CONFIRM_COMMUNITY_PARENT_GENESIS,
-    CONFIRM_PLAN_SHA256: process.env.CONFIRM_PLAN_SHA256
-  },
-  signer: createSigner(),
-  broadcaster: {
-    broadcast: async (rawTx: Uint8Array): Promise<unknown> => chronik.broadcastTx(rawTx)
-  },
-  onPreview: (preview) => console.log(preview),
-  onSignedTxCandidate: (txid) => console.log(`SIGNED TXID CANDIDATE: ${txid}`)
-})
+let result
+try {
+  result = await executeCommunityParentGenesis({
+    config,
+    reader,
+    gates,
+    signer,
+    broadcaster: executionIntent
+      ? { broadcast: async (rawTx) => broadcastWithChronikSemantics(chronik, rawTx) }
+      : undefined,
+    onPreview: (preview) => console.log(preview),
+    onSignedTxCandidate: (txid) => console.log(`SIGNED TXID CANDIDATE: ${txid}`)
+  })
+} finally {
+  signer?.dispose()
+}
 
 if (result.status === 'dry-run') {
   console.log('Execution status: DRY_RUN')
 } else {
   console.log(`Execution status: ${result.status}`)
   if (result.status === 'broadcast-status-ambiguous') process.exitCode = 2
+  if (result.status === 'broadcast-rejected') process.exitCode = 3
 }
