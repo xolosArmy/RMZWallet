@@ -528,6 +528,69 @@ textarea:focus-visible {
 .nft-inline { display: flex; align-items: center; gap: 16px; }
 .mint-cost { padding: 12px; border-radius: var(--radius-lg); background: rgba(249, 248, 246, 0.04); border: 1px solid var(--color-border); }
 
+.nft-verification-detail {
+  margin-top: 16px;
+  padding: 18px;
+  text-align: left;
+  border: 1px solid rgba(45, 180, 173, 0.28);
+  border-radius: var(--radius-lg);
+  background: rgba(45, 180, 173, 0.05);
+}
+
+.nft-verification-detail__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.nft-verification-detail__header h2 { margin: 0; }
+
+.nft-verification-detail__token {
+  overflow-wrap: anywhere;
+  font-family: 'JetBrains Mono', 'SFMono-Regular', monospace;
+  font-size: 0.78rem;
+}
+
+.nft-verification-badge {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  width: fit-content;
+  padding: 7px 11px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+.nft-verification-badge.is-loading {
+  color: #d9fffc;
+  border-color: rgba(45, 180, 173, 0.35);
+  background: rgba(45, 180, 173, 0.08);
+}
+
+.nft-verification-badge.is-official {
+  color: #dff8e9;
+  border-color: rgba(47, 191, 113, 0.5);
+  background: rgba(47, 191, 113, 0.13);
+}
+
+.nft-verification-badge.is-community {
+  color: var(--tonalli-solar-gold);
+  border-color: rgba(201, 158, 68, 0.42);
+  background: rgba(201, 158, 68, 0.1);
+}
+
+.nft-verification-badge.is-unknown,
+.nft-verification-badge.is-error {
+  color: var(--color-text-muted);
+  background: rgba(249, 248, 246, 0.04);
+}
+
 .tx-list { display: flex; flex-direction: column; gap: 14px; margin-top: 12px; }
 .tx-item { padding: 12px; border-radius: var(--radius-lg); border: 1px solid var(--color-border); background: rgba(249, 248, 246, 0.03); }
 .tx-meta { margin: 8px 0 0; }

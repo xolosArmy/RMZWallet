@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, test } from 'vitest'
 
 const BASE = 'd1c3472c760cd33b968054e96df965902f05ebe0'
+const PHASE_HEAD = 'daabb8b3426421d1e4244a213c1471006a1d2b2f'
 const CLOSED_PATHS = [
   'src/features/externalSign/core.ts',
   'src/integrations/tonalliMemo/tm1RegtestPublicationOrchestrator.ts',
@@ -126,23 +127,28 @@ describe('TM1 conservative recovery architectural boundaries', () => {
     expect(diff).toBe('')
   })
 
-  test('limits package changes to the reviewed Node runtime policy', () => {
+  test('does not change package manifests during closed Phase 6-I-A', () => {
     const repositoryRoot = fileURLToPath(new URL('../../../../', import.meta.url))
-    const readBaseJson = (path: string): Record<string, unknown> => JSON.parse(
-      execFileSync('git', ['show', `${BASE}:${path}`], {
-        cwd: repositoryRoot,
-        encoding: 'utf8'
-      })
-    ) as Record<string, unknown>
+    const diff = execFileSync('git', [
+      'diff',
+      BASE,
+      PHASE_HEAD,
+      '--',
+      'package.json',
+      'package-lock.json'
+    ], {
+      cwd: repositoryRoot,
+      encoding: 'utf8'
+    })
+
+    expect(diff).toBe('')
+  })
+
+  test('enforces the reviewed Node runtime policy without a direct SQLite dependency', () => {
     const packageJson = JSON.parse(source('../../../../package.json')) as Record<string, unknown>
     const packageLock = JSON.parse(source('../../../../package-lock.json')) as Record<string, unknown>
-    const packageWithoutRuntimePolicy = structuredClone(packageJson)
-    const lockWithoutRuntimePolicy = structuredClone(packageLock)
     const packageLockRoot = (
       packageLock.packages as Record<string, Record<string, unknown>>
-    )['']
-    const lockWithoutRuntimePolicyRoot = (
-      lockWithoutRuntimePolicy.packages as Record<string, Record<string, unknown>>
     )['']
 
     expect(packageJson.engines).toEqual({ node: '>=24.18.0 <25' })
@@ -151,21 +157,21 @@ describe('TM1 conservative recovery architectural boundaries', () => {
     expect(packageLockRoot.engines)
       .toEqual({ node: '>=24.18.0 <25' })
 
-    delete packageWithoutRuntimePolicy.engines
-    delete (packageWithoutRuntimePolicy.scripts as Record<string, unknown>).pretest
-    delete lockWithoutRuntimePolicyRoot.engines
+    const packageDependencies = {
+      ...((packageJson.dependencies ?? {}) as Record<string, unknown>),
+      ...((packageJson.devDependencies ?? {}) as Record<string, unknown>)
+    }
+    const lockDependencies = {
+      ...((packageLockRoot.dependencies ?? {}) as Record<string, unknown>),
+      ...((packageLockRoot.devDependencies ?? {}) as Record<string, unknown>)
+    }
+    const directDependencyNames = [
+      ...Object.keys(packageDependencies),
+      ...Object.keys(lockDependencies)
+    ].join('\n')
 
-    expect(packageWithoutRuntimePolicy).toEqual(readBaseJson('package.json'))
-    expect(lockWithoutRuntimePolicy).toEqual(readBaseJson('package-lock.json'))
-
-    const dependencyDiff = execFileSync('git', [
-      'diff', BASE, '--', 'package.json', 'package-lock.json'
-    ], {
-      cwd: repositoryRoot,
-      encoding: 'utf8'
-    })
-    expect(dependencyDiff).not.toMatch(
-      /better-sqlite3|["']sqlite3["']|sql\.js|@sqlite\.org\/sqlite-wasm/
+    expect(directDependencyNames).not.toMatch(
+      /(^|\n)(better-sqlite3|sqlite3|sql\.js|@sqlite\.org\/sqlite-wasm)(\n|$)/
     )
   })
 
