@@ -944,6 +944,14 @@ describe('scope, API, and secret boundaries', () => {
     expect(cli).not.toMatch(/console\.log\([^\n]*(secret|private|mnemonic|seed)/i)
   })
 
+  it('uses one explicit HTTPS Chronik origin without shared-client failover', () => {
+    const cli = readFileSync(new URL('../../scripts/broadcast-community-parent.ts', import.meta.url), 'utf8')
+    expect(cli).toContain("requireEnvironment('COMMUNITY_PARENT_CHRONIK_URL')")
+    expect(cli).toContain('new ChronikClient([chronikUrl])')
+    expect(cli).toContain("parsed.protocol !== 'https:'")
+    expect(cli).not.toMatch(/getChronik\(|getChronikUrls/)
+  })
+
   it('does not modify or import trust policy, metadata upload, UI, or NFT Child paths', () => {
     const source = readFileSync(new URL('./communityParentExecutor.ts', import.meta.url), 'utf8')
     const cli = readFileSync(new URL('../../scripts/broadcast-community-parent.ts', import.meta.url), 'utf8')

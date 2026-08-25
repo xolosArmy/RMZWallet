@@ -36,8 +36,6 @@ const parseChronikUrls = (configured: string | undefined, defaults: string[]): s
 const resolveChronikUrls = () =>
   parseChronikUrls(getEnv('VITE_CHRONIK_URL') || getEnv('CHRONIK_URL'), DEFAULT_CHRONIK_URLS)
 
-export const getChronikUrls = (): readonly string[] => [...resolveChronikUrls()]
-
 const resolveAgoraChronikUrls = () =>
   parseChronikUrls(
     getEnv('VITE_AGORA_CHRONIK_URL') || getEnv('AGORA_CHRONIK_URL'),

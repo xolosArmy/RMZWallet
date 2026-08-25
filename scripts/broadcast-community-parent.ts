@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import { ChronikClient } from 'chronik-client'
 import {
   ALL_BIP143,
   Ecc,
@@ -28,7 +29,6 @@ import type {
   CommunityParentExecutionCandidate,
   CommunityParentSigner
 } from '../src/services/communityParentExecutor'
-import { getChronik, getChronikUrls } from '../src/services/ChronikClient'
 
 const SIGNING_SECRET_ENV = 'COMMUNITY_PARENT_SIGNING_SECRET_HEX'
 const CANONICAL_SECRET_HEX = /^[0-9a-f]{64}$/
@@ -44,6 +44,27 @@ const parseNetwork = (value: string): CommunityParentNetwork => {
     throw new Error('COMMUNITY_PARENT_NETWORK must be mainnet, testnet, or regtest.')
   }
   return value
+}
+
+const parseDedicatedChronikUrl = (value: string): string => {
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new Error('COMMUNITY_PARENT_CHRONIK_URL must be one canonical HTTPS origin.')
+  }
+  if (
+    parsed.protocol !== 'https:' ||
+    parsed.username !== '' ||
+    parsed.password !== '' ||
+    parsed.pathname !== '/' ||
+    parsed.search !== '' ||
+    parsed.hash !== '' ||
+    value !== parsed.origin
+  ) {
+    throw new Error('COMMUNITY_PARENT_CHRONIK_URL must be one canonical HTTPS origin.')
+  }
+  return parsed.origin
 }
 
 type DisposableCommunityParentSigner = CommunityParentSigner & Readonly<{
@@ -115,7 +136,7 @@ const createSigner = (): DisposableCommunityParentSigner => {
 }
 
 const broadcastWithChronikSemantics = async (
-  chronik: ReturnType<typeof getChronik>,
+  chronik: ChronikClient,
   rawTx: Uint8Array
 ): Promise<CommunityParentBroadcastOutcome> => {
   try {
@@ -161,9 +182,10 @@ const gates = {
 const executionIntent = Object.values(gates).some((value) => value !== undefined)
 const signer = executionIntent ? createSigner() : undefined
 
-const chronik = getChronik()
+const chronikUrl = parseDedicatedChronikUrl(requireEnvironment('COMMUNITY_PARENT_CHRONIK_URL'))
+const chronik = new ChronikClient([chronikUrl])
 const reader = {
-  endpointLabel: getChronikUrls().join(','),
+  endpointLabel: chronikUrl,
   block: async (height: number): Promise<unknown> => chronik.block(height),
   addressUtxos: async (address: string): Promise<unknown> => chronik.address(address).utxos(),
   validateRawTx: async (rawTx: Uint8Array): Promise<unknown> => chronik.validateRawTx(rawTx),

@@ -99,10 +99,16 @@ No WIF, mnemonic, seed, or private key is accepted as a CLI argument or printed.
 
 `npx tsx scripts/broadcast-community-parent.ts` is a separate, mainnet-only
 administrative boundary. Its default invocation reads live UTXOs through the
-wallet's canonical Chronik configuration, calls the canonical planner, builds a
+single explicit HTTPS origin in `COMMUNITY_PARENT_CHRONIK_URL`, calls the canonical planner, builds a
 complete unsigned transaction, prints the exact endpoint, outputs, fee, change,
 and deterministic plan fingerprint, then stops with zero signing and zero
 broadcasting.
+
+The executor additionally requires one dedicated endpoint:
+
+```text
+COMMUNITY_PARENT_CHRONIK_URL=https://chronik.example
+```
 
 An execution requires all three exact gates:
 
@@ -130,6 +136,10 @@ That value is pinned from
 `src/networks/abc/checkpoints.cpp` (Obolensky activation). Testnet, regtest,
 checkpoint mismatch, malformed block data, and transport errors fail before
 signing or broadcasting.
+
+The administrative client is constructed with exactly that one origin and has
+no failover list. This prevents a checkpoint verified on one server from being
+followed by funding or broadcast calls routed silently to another server.
 
 After the gates match, the executor verifies the same checkpoint again, fetches
 Chronik UTXOs again, rebuilds the plan, and requires the fresh fingerprint to
