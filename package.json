@@ -3,8 +3,12 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=24.18.0 <25"
+  },
   "scripts": {
     "dev": "vite",
+    "pretest": "node scripts/assert-supported-node-runtime.mjs",
     "test": "vitest run --exclude src/services/slpNftTxBuilder.test.ts && npx tsx --test src/services/slpNftTxBuilder.test.ts",
     "typecheck": "tsc -b && tsc -p tsconfig.tm1-regtest-e2e.json",
     "build": "tsc -b && vite build",

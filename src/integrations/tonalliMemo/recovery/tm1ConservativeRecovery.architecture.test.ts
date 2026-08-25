@@ -127,7 +127,7 @@ describe('TM1 conservative recovery architectural boundaries', () => {
     expect(diff).toBe('')
   })
 
-  test('does not change package manifests or add an assumed persistence dependency', () => {
+  test('does not change package manifests during closed Phase 6-I-A', () => {
     const repositoryRoot = fileURLToPath(new URL('../../../../', import.meta.url))
     const diff = execFileSync('git', [
       'diff',
@@ -142,6 +142,37 @@ describe('TM1 conservative recovery architectural boundaries', () => {
     })
 
     expect(diff).toBe('')
+  })
+
+  test('enforces the reviewed Node runtime policy without a direct SQLite dependency', () => {
+    const packageJson = JSON.parse(source('../../../../package.json')) as Record<string, unknown>
+    const packageLock = JSON.parse(source('../../../../package-lock.json')) as Record<string, unknown>
+    const packageLockRoot = (
+      packageLock.packages as Record<string, Record<string, unknown>>
+    )['']
+
+    expect(packageJson.engines).toEqual({ node: '>=24.18.0 <25' })
+    expect((packageJson.scripts as Record<string, unknown>).pretest)
+      .toBe('node scripts/assert-supported-node-runtime.mjs')
+    expect(packageLockRoot.engines)
+      .toEqual({ node: '>=24.18.0 <25' })
+
+    const packageDependencies = {
+      ...((packageJson.dependencies ?? {}) as Record<string, unknown>),
+      ...((packageJson.devDependencies ?? {}) as Record<string, unknown>)
+    }
+    const lockDependencies = {
+      ...((packageLockRoot.dependencies ?? {}) as Record<string, unknown>),
+      ...((packageLockRoot.devDependencies ?? {}) as Record<string, unknown>)
+    }
+    const directDependencyNames = [
+      ...Object.keys(packageDependencies),
+      ...Object.keys(lockDependencies)
+    ].join('\n')
+
+    expect(directDependencyNames).not.toMatch(
+      /(^|\n)(better-sqlite3|sqlite3|sql\.js|@sqlite\.org\/sqlite-wasm)(\n|$)/
+    )
   })
 
   test('preserves the canonical Tonalli Core pin', () => {
