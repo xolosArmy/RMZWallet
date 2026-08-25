@@ -637,9 +637,11 @@ describe('signing, signed-tx verification, and broadcast', () => {
     const preview = await prepareCommunityParentExecution({ config: configFor(), reader: new MockReader() })
     const reader = new MockReader(liveResponse(), liveResponse())
     let executionCandidate: CommunityParentExecutionCandidate | undefined
+    let exactSignerBytes: Uint8Array | undefined
     const sign = vi.fn(async (candidate: CommunityParentExecutionCandidate) => {
       executionCandidate = candidate
-      return signedBytesFor(candidate)
+      exactSignerBytes = signedBytesFor(candidate)
+      return exactSignerBytes
     })
     reader.validateImpl = async (rawTx) => chronikTxFor(executionCandidate!, rawTx)
     reader.txImpl = async (txid) =>
@@ -664,6 +666,7 @@ describe('signing, signed-tx verification, and broadcast', () => {
       onSignedTxCandidate: () => order.push('txid-preview')
     })
     expect(result.status).toBe('broadcast-confirmed')
+    if (result.status !== 'broadcast-confirmed') throw new Error('Expected confirmed broadcast.')
     expect(sign).toHaveBeenCalledTimes(1)
     expect(reader.blockCalls).toEqual([
       ECASH_MAINNET_EXECUTION_CHECKPOINT.height,
@@ -672,6 +675,8 @@ describe('signing, signed-tx verification, and broadcast', () => {
     expect(reader.addressCalls).toHaveLength(2)
     expect(reader.validateCalls).toHaveLength(1)
     expect(broadcast).toHaveBeenCalledTimes(1)
+    expect(toHex(broadcast.mock.calls[0]![0])).toBe(toHex(exactSignerBytes!))
+    expect(Tx.deser(broadcast.mock.calls[0]![0]).txid()).toBe(result.signedTxid)
     expect(reader.txCalls).toHaveLength(2)
     expect(order).toEqual(['txid-preview', 'broadcast'])
   })
@@ -697,6 +702,9 @@ describe('signing, signed-tx verification, and broadcast', () => {
 
   it.each([
     ['empty scriptSig', (tx: Tx) => { tx.inputs[0]!.script = new Script() }],
+    ['two-byte synthetic scriptSig', (tx: Tx) => {
+      tx.inputs[0]!.script = new Script(Uint8Array.of(1, 1))
+    }],
     ['malformed push encoding', (tx: Tx) => { tx.inputs[0]!.script = new Script(Uint8Array.of(0x4c)) }],
     ['wrong sighash byte', (tx: Tx) => {
       const bytes = tx.inputs[0]!.script!.bytecode.slice()
