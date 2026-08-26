@@ -13,10 +13,15 @@ import {
 import {
   NFT_MINT_PLATFORM_FEE_SATS,
   NFT_MINT_PLATFORM_FEE_XEC,
-  NFT_RESCAN_STORAGE_KEY,
-  XOLOSARMY_NFT_PARENT_TOKEN_ID,
-  XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR
+  NFT_RESCAN_STORAGE_KEY
 } from '../config/nfts'
+import {
+  NFT_COLLECTION_TRUST_REGISTRY,
+  resolveNftCollectionParentTokenId,
+  resolveRegisteredNftCollection,
+  type CollectionId
+} from '../domain/nftCollections'
+import { countMintPassAtoms } from '../services/slpNftTxBuilder'
 import { XEC_DUST_SATS, XEC_SATS_PER_XEC } from '../config/xecFees'
 import {
   DEFAULT_IPFS_GATEWAY_BASE,
@@ -30,11 +35,15 @@ import type { XolosLineage } from '../services/nftMetadata'
 import { NftVerificationBadge } from '../features/nftVerification/NftVerificationBadge'
 import { useNftVerification } from '../hooks/useNftVerification'
 
-const SLP_NFT1_GROUP = 129
 const FEE_PER_KB = 1200n
 const P2PKH_INPUT_SIZE = 148
 const OUTPUT_SIZE = 34
 const TX_OVERHEAD = 10
+
+const COLLECTION_LABELS: Readonly<Record<CollectionId, string>> = Object.freeze({
+  official: 'Official / Xolos Ramírez',
+  community: 'xolosArmy Community'
+})
 
 const estimateMintFeeSats = (inputCount = 2, outputCount = 4) => {
   const txSize = TX_OVERHEAD + inputCount * P2PKH_INPUT_SIZE + outputCount * OUTPUT_SIZE
@@ -102,7 +111,11 @@ function Nfts() {
   const [mintTxid, setMintTxid] = useState<string | null>(null)
   const [mintTokenId, setMintTokenId] = useState<string | null>(null)
 
-  const [parentBalance, setParentBalance] = useState<bigint>(0n)
+  const [selectedCollectionId, setSelectedCollectionId] = useState<CollectionId | null>(null)
+  const [parentBalances, setParentBalances] = useState<Readonly<Record<CollectionId, bigint>>>({
+    official: 0n,
+    community: 0n
+  })
   const [xecAvailableSats, setXecAvailableSats] = useState<bigint>(0n)
   const [parentTokenCopied, setParentTokenCopied] = useState(false)
   const didLogGateway = useRef(false)
@@ -110,6 +123,16 @@ function Nfts() {
     () => nfts.find((nft) => nft.tokenId === selectedNftTokenId) ?? null,
     [nfts, selectedNftTokenId]
   )
+  const selectedParentTokenId = useMemo(
+    () =>
+      selectedCollectionId === null
+        ? null
+        : resolveNftCollectionParentTokenId(selectedCollectionId),
+    [selectedCollectionId]
+  )
+  const selectedCollectionLabel =
+    selectedCollectionId === null ? 'Sin seleccionar' : COLLECTION_LABELS[selectedCollectionId]
+  const parentBalance = selectedCollectionId === null ? 0n : parentBalances[selectedCollectionId]
 
   useEffect(() => {
     if (!imageFile) {
@@ -142,26 +165,25 @@ function Nfts() {
     if (!address) return
     try {
       const utxos = await getChronik().address(address).utxos()
-      let parentAtoms = 0n
       let xecSats = 0n
       for (const utxo of utxos.utxos) {
         if (!utxo.token) {
           xecSats += utxo.sats
-          continue
-        }
-        if (
-          utxo.token.tokenId === XOLOSARMY_NFT_PARENT_TOKEN_ID &&
-          utxo.token.tokenType.protocol === 'SLP' &&
-          utxo.token.tokenType.number === SLP_NFT1_GROUP &&
-          !utxo.token.isMintBaton
-        ) {
-          parentAtoms += utxo.token.atoms
         }
       }
-      setParentBalance(parentAtoms)
+      setParentBalances({
+        official: countMintPassAtoms(
+          utxos.utxos,
+          resolveNftCollectionParentTokenId('official')
+        ),
+        community: countMintPassAtoms(
+          utxos.utxos,
+          resolveNftCollectionParentTokenId('community')
+        )
+      })
       setXecAvailableSats(xecSats)
     } catch {
-      setParentBalance(0n)
+      setParentBalances({ official: 0n, community: 0n })
       setXecAvailableSats(0n)
     }
   }, [address])
@@ -262,9 +284,9 @@ function Nfts() {
   const hasEnoughXec = xecAvailableSats >= estimatedTotalSats
 
   const handleCopyParentTokenId = async () => {
-    if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) return
+    if (selectedParentTokenId === null) return
     try {
-      await navigator.clipboard.writeText(XOLOSARMY_NFT_PARENT_TOKEN_ID)
+      await navigator.clipboard.writeText(selectedParentTokenId)
       setParentTokenCopied(true)
       setTimeout(() => setParentTokenCopied(false), 1500)
     } catch (err) {
@@ -282,6 +304,11 @@ function Nfts() {
       setMintError('Completa el onboarding y el respaldo antes de mintear.')
       return
     }
+    if (selectedCollectionId === null) {
+      setMintError('Selecciona Official o Community antes de mintear.')
+      return
+    }
+    const collectionId = selectedCollectionId
     if (!name.trim()) {
       setMintError('Ingresa un nombre para el NFT.')
       return
@@ -295,7 +322,7 @@ function Nfts() {
       return
     }
     if (!hasParentToken) {
-      setMintError('Necesitas 1 Mint Pass (Parent Token) para mintear un NFT.')
+      setMintError(`Necesitas 1 Mint Pass de ${selectedCollectionLabel} para mintear un NFT.`)
       return
     }
     if (!hasEnoughXec) {
@@ -322,6 +349,7 @@ function Nfts() {
       const hasLineageData = Object.values(lineagePayload).some((value) => typeof value !== 'undefined')
 
       const result = await mintXolosarmyNftChild({
+        collectionId,
         name: name.trim(),
         description: description.trim(),
         imageFile,
@@ -360,11 +388,6 @@ function Nfts() {
     return (
       <div className="page">
         <TopBar />
-        {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR && (
-          <div className="error" style={{ marginBottom: 12 }}>
-            {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR}
-          </div>
-        )}
         <h1 className="section-title">NFTs</h1>
         <p className="muted">Configura tu wallet para mintear y mover NFTs.</p>
         <div className="actions">
@@ -379,18 +402,13 @@ function Nfts() {
   return (
     <div className="page">
       <TopBar />
-      {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR && (
-        <div className="error" style={{ marginBottom: 12 }}>
-          {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR}
-        </div>
-      )}
       <header className="section-header">
         <div>
           <p className="eyebrow">NFTs de linaje</p>
           <h1 className="section-title">NFTs de linaje y coleccionables</h1>
           <p className="muted">Crea, verifica y mueve NFTs desde tu wallet no custodial.</p>
         </div>
-        <div className="pill pill-ghost">Colección única</div>
+        <div className="pill pill-ghost">2 colecciones on-chain</div>
       </header>
 
       <div className="card">
@@ -531,21 +549,71 @@ function Nfts() {
 
         {activeTab === 'mint' && (
           <form onSubmit={handleMint} style={{ marginTop: 12 }}>
+            <fieldset className="card" style={{ marginBottom: 12 }} disabled={mintBusy}>
+              <legend className="card-kicker">Selecciona la colección</legend>
+              <label htmlFor="nftCollectionOfficial">
+                <input
+                  id="nftCollectionOfficial"
+                  type="radio"
+                  name="nftCollection"
+                  value="official"
+                  checked={selectedCollectionId === 'official'}
+                  onChange={() => {
+                    setSelectedCollectionId('official')
+                    setMintError(null)
+                    setMintTxid(null)
+                    setMintTokenId(null)
+                  }}
+                />{' '}
+                Official / Xolos Ramírez
+              </label>
+              <p className="muted" style={{ marginTop: 6 }}>
+                Colección oficial de linaje verificado por su ascendencia NFT1 on-chain.
+              </p>
+              <label htmlFor="nftCollectionCommunity" style={{ marginTop: 12, display: 'block' }}>
+                <input
+                  id="nftCollectionCommunity"
+                  type="radio"
+                  name="nftCollection"
+                  value="community"
+                  checked={selectedCollectionId === 'community'}
+                  onChange={() => {
+                    setSelectedCollectionId('community')
+                    setMintError(null)
+                    setMintTxid(null)
+                    setMintTokenId(null)
+                  }}
+                />{' '}
+                xolosArmy Community
+              </label>
+              <p className="muted" style={{ marginTop: 6 }}>
+                Colección comunitaria distinta. Un NFT Community no es automáticamente un NFT de
+                linaje Official de Xolos Ramírez.
+              </p>
+              <p className="muted" style={{ marginTop: 10 }}>
+                La metadata describe. La blockchain demuestra. La pertenencia depende del Parent
+                NFT1 consumido en el Genesis del Child.
+              </p>
+            </fieldset>
+
             <div className="card highlight" style={{ marginBottom: 12 }}>
-              <p className="card-kicker">Mint Pass</p>
+              <p className="card-kicker">Mint Pass · {selectedCollectionLabel}</p>
               <p>1 Mint Pass = 1 NFT · Al mintear se consume 1 Parent Token.</p>
-              {!hasParentToken && (
+              <div className="address-box" style={{ marginTop: 8 }}>
+                {selectedParentTokenId ?? 'Selecciona una colección'}
+              </div>
+              {selectedCollectionId !== null && !hasParentToken && (
                 <div className="error" style={{ marginTop: 8 }}>
-                  Necesitas 1 Mint Pass (Parent Token) para mintear.
+                  Necesitas 1 Mint Pass de {selectedCollectionLabel} para mintear.
                 </div>
               )}
-              {!hasParentToken && (
+              {selectedCollectionId !== null && !hasParentToken && (
                 <div className="actions" style={{ marginTop: 12 }}>
                   <Link
                     className="cta primary"
-                    to={`/dex?tokenId=${XOLOSARMY_NFT_PARENT_TOKEN_ID}&mode=mintpass`}
+                    to={`/dex?mode=mintpass&collectionId=${selectedCollectionId}`}
                   >
-                    Conseguir Mint Pass
+                    Conseguir Mint Pass de {selectedCollectionLabel}
                   </Link>
                 </div>
               )}
@@ -575,7 +643,16 @@ function Nfts() {
             />
 
             <div className="card" style={{ marginTop: 12 }}>
-              <p className="card-kicker">Lineage (opcional)</p>
+              <p className="card-kicker">
+                {selectedCollectionId === 'official'
+                  ? 'Lineage (opcional)'
+                  : 'Datos descriptivos (opcional)'}
+              </p>
+              {selectedCollectionId === 'community' && (
+                <p className="muted">
+                  Estos campos no convierten un NFT Community en Official ni establecen confianza.
+                </p>
+              )}
               <label htmlFor="nftEtapa">Etapa</label>
               <select
                 id="nftEtapa"
@@ -725,7 +802,30 @@ function Nfts() {
               </p>
             </div>
 
-            {!hasParentToken && <div className="error">Necesitas 1 Mint Pass (Parent Token) para mintear.</div>}
+            <div className="card" style={{ marginTop: 12 }} aria-label="Resumen antes de firmar">
+              <p className="card-kicker">Resumen antes de firmar</p>
+              <p>Colección: {selectedCollectionLabel}</p>
+              <p className="muted">Parent NFT1 Group que se consumirá:</p>
+              <div className="address-box">{selectedParentTokenId ?? 'Selecciona una colección'}</div>
+              <p className="muted" style={{ marginTop: 8 }}>
+                Mint Pass: exactamente 1 Group atom SLP NFT1 tipo 129.
+              </p>
+              <p className="muted">Resultado: NFT1 Child SLP tipo 65 ligado on-chain a ese Parent.</p>
+              <p className="muted">
+                Metadata: {name.trim() || 'Sin nombre'} · {description.trim() || 'Sin descripción'} ·{' '}
+                {imageFile?.name || 'Sin imagen'}
+              </p>
+              <p className="muted">
+                Plataforma: {NFT_MINT_PLATFORM_FEE_XEC.toLocaleString()} XEC · Red estimada:{' '}
+                {(Number(estimatedFeeSats) / XEC_SATS_PER_XEC).toFixed(2)} XEC
+              </p>
+            </div>
+
+            {selectedCollectionId !== null && !hasParentToken && (
+              <div className="error">
+                Necesitas 1 Mint Pass de {selectedCollectionLabel} para mintear.
+              </div>
+            )}
             {!hasEnoughXec && (
               <div className="error">No hay suficientes XEC para cubrir el fee de plataforma y red.</div>
             )}
@@ -734,7 +834,13 @@ function Nfts() {
               <button
                 className="cta primary"
                 type="submit"
-                disabled={!backupVerified || mintBusy || !hasParentToken || !hasEnoughXec}
+                disabled={
+                  !backupVerified ||
+                  mintBusy ||
+                  selectedCollectionId === null ||
+                  !hasParentToken ||
+                  !hasEnoughXec
+                }
               >
                 {mintBusy ? 'Subiendo y minteando...' : 'Subir a IPFS + Mintear'}
               </button>
@@ -755,25 +861,46 @@ function Nfts() {
         {activeTab === 'collection' && (
           <div style={{ marginTop: 12 }}>
             <div className="card" style={{ marginBottom: 12 }}>
-              <p className="card-kicker">Colección</p>
-              <h2>xolosArmy NFTs</h2>
-              <p className="muted">Colección vinculada a Tonalli Wallet.</p>
-            </div>
-            <div className="card">
-              <p className="muted">Parent Token ID</p>
-              <div className="address-box">{XOLOSARMY_NFT_PARENT_TOKEN_ID || 'Sin configurar'}</div>
-              <div className="actions" style={{ marginTop: 8 }}>
-                <button className="cta ghost" type="button" onClick={handleCopyParentTokenId}>
-                  {parentTokenCopied ? 'Token ID copiado' : 'Copiar Token ID'}
-                </button>
-              </div>
-              <p className="muted" style={{ marginTop: 12 }}>
-                Balance Mint Pass: {parentBalance.toString()}
-              </p>
-              <p className="muted" style={{ marginTop: 6 }}>
-                Cada minteo consume 1 Parent Token (Mint Pass).
+              <p className="card-kicker">Colecciones</p>
+              <h2>Official y Community</h2>
+              <p className="muted">
+                Son colecciones criptográficamente distintas. La metadata describe; la blockchain
+                demuestra su ascendencia NFT1.
               </p>
             </div>
+            {(Object.keys(NFT_COLLECTION_TRUST_REGISTRY) as CollectionId[]).map((collectionId) => {
+              const collection = resolveRegisteredNftCollection(collectionId)
+              return (
+                <div className="card" key={collectionId} style={{ marginBottom: 12 }}>
+                  <p className="card-kicker">{COLLECTION_LABELS[collectionId]}</p>
+                  <p className="muted">Parent Token ID</p>
+                  <div className="address-box">{collection.parentTokenId}</div>
+                  <p className="muted" style={{ marginTop: 12 }}>
+                    Balance Mint Pass: {parentBalances[collectionId].toString()}
+                  </p>
+                  <div className="actions" style={{ marginTop: 8 }}>
+                    <button
+                      className="cta primary"
+                      type="button"
+                      onClick={() => {
+                        setSelectedCollectionId(collectionId)
+                        setActiveTab('mint')
+                      }}
+                    >
+                      Seleccionar para mintear
+                    </button>
+                    {collectionId === selectedCollectionId && (
+                      <button className="cta ghost" type="button" onClick={handleCopyParentTokenId}>
+                        {parentTokenCopied ? 'Token ID copiado' : 'Copiar Token ID'}
+                      </button>
+                    )}
+                  </div>
+                  <p className="muted" style={{ marginTop: 6 }}>
+                    Cada minteo consume 1 Group atom de esta colección.
+                  </p>
+                </div>
+              )
+            })}
           </div>
         )}
       </div>

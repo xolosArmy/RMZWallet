@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { AgoraPartial } from 'ecash-agora'
 import { ALP_STANDARD, Address, Script, TxBuilder, calcTxFee } from 'ecash-lib'
@@ -7,11 +7,12 @@ import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { RMZ_ETOKEN_ID } from '../config/rmzToken'
 import { FIRMA_ALPHA_TOKEN_ID } from '../config/firmaAlpha'
+import { NFT_RESCAN_STORAGE_KEY } from '../config/nfts'
 import {
-  NFT_RESCAN_STORAGE_KEY,
-  XOLOSARMY_NFT_PARENT_TOKEN_ID,
-  XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR
-} from '../config/nfts'
+  isCollectionId,
+  resolveNftCollectionParentTokenId,
+  type CollectionId
+} from '../domain/nftCollections'
 import { getChronik } from '../services/ChronikClient'
 import { EXTENDED_GAP_LIMIT, type WalletSignatory, xolosWalletService } from '../services/XolosWalletService'
 import { fetchNftDetails, fetchOwnedNfts, type NftAsset } from '../services/nftService'
@@ -52,6 +53,11 @@ const OUTPUT_SIZE = 34
 const TX_OVERHEAD = 10
 
 const OFFER_STORAGE_KEY = 'tonalli_dex_offers'
+
+const MINT_PASS_COLLECTION_LABELS: Readonly<Record<CollectionId, string>> = Object.freeze({
+  official: 'Official / Xolos Ramírez',
+  community: 'xolosArmy Community'
+})
 
 const normalizeCashAddressOrNull = (value: string | null | undefined) => {
   if (!value) return null
@@ -98,6 +104,11 @@ function DEX() {
   const [rmzDecimals, setRmzDecimals] = useState<number | null>(null)
   const [dexTab, setDexTab] = useState<'firma' | 'maker' | 'taker' | 'nft' | 'mintpass'>('maker')
   const [searchParams] = useSearchParams()
+  const [mintPassCollectionId, setMintPassCollectionId] = useState<CollectionId>('official')
+  const mintPassParentTokenId = useMemo(
+    () => resolveNftCollectionParentTokenId(mintPassCollectionId),
+    [mintPassCollectionId]
+  )
   const debugEnabled = useMemo(() => searchParams.get('debug') === '1', [searchParams])
 
   const [sellAmount, setSellAmount] = useState('')
@@ -157,6 +168,32 @@ function DEX() {
   const [mintPassIssueBusy, setMintPassIssueBusy] = useState(false)
   const [mintPassIssueTxid, setMintPassIssueTxid] = useState<string | null>(null)
   const [savedOffers, setSavedOffers] = useState<SavedOffer[]>(() => loadSavedOffers())
+  const mintPassOfferRequestEpochRef = useRef(0)
+  const mintPassCollectionRef = useRef<CollectionId>('official')
+
+  const selectMintPassCollection = useCallback((collectionId: CollectionId) => {
+    resolveNftCollectionParentTokenId(collectionId)
+    mintPassOfferRequestEpochRef.current += 1
+    mintPassCollectionRef.current = collectionId
+    setMintPassCollectionId(collectionId)
+    setMintPassOfferSummary(null)
+    setMintPassOfferIdInput('')
+    setMintPassOfferLoading(false)
+    setMintPassBuyTxid(null)
+    setMintPassSellTxid(null)
+    setMintPassSellOfferId(null)
+    setMintPassAdminState(null)
+    setMintPassIssuePreview(null)
+    setMintPassIssueTxid(null)
+    setMintPassError(null)
+    setMintPassAdminError(null)
+  }, [])
+
+  const invalidateMintPassOfferRequests = useCallback(() => {
+    mintPassOfferRequestEpochRef.current += 1
+    setMintPassOfferSummary(null)
+    setMintPassOfferLoading(false)
+  }, [])
 
   useEffect(() => {
     if (initialized) {
@@ -192,8 +229,16 @@ function DEX() {
       setDexTab('firma')
       return
     }
-    if (mode === 'mintpass' && tokenId === XOLOSARMY_NFT_PARENT_TOKEN_ID) {
-      setDexTab('mintpass')
+    if (mode === 'mintpass') {
+      const collectionId = searchParams.get('collectionId')
+      if (isCollectionId(collectionId)) {
+        setDexTab('mintpass')
+        selectMintPassCollection(collectionId)
+      } else {
+        invalidateMintPassOfferRequests()
+        setDexTab('maker')
+        setMintPassError('Selecciona una colección NFT registrada para operar Mint Pass.')
+      }
       return
     }
 
@@ -203,7 +248,7 @@ function DEX() {
       setNftTokenIdInput(nftTokenId)
       setNftSellTokenId(nftTokenId)
     }
-  }, [searchParams])
+  }, [invalidateMintPassOfferRequests, searchParams, selectMintPassCollection])
 
   useEffect(() => {
     let active = true
@@ -279,7 +324,13 @@ function DEX() {
   }, [])
 
   const savedNftOffers = useMemo(() => savedOffers.filter((offer) => offer.kind === 'nft'), [savedOffers])
-  const savedMintPassOffers = useMemo(() => savedOffers.filter((offer) => offer.kind === 'mintpass'), [savedOffers])
+  const savedMintPassOffers = useMemo(
+    () =>
+      savedOffers.filter(
+        (offer) => offer.kind === 'mintpass' && offer.tokenId === mintPassParentTokenId
+      ),
+    [mintPassParentTokenId, savedOffers]
+  )
 
   const markNftRescanPending = useCallback(() => {
     if (typeof window === 'undefined') return
@@ -288,14 +339,14 @@ function DEX() {
 
 
   const refreshMintPassAdminState = useCallback(async () => {
-    if (!address || !XOLOSARMY_NFT_PARENT_TOKEN_ID || !isMintPassAdminAddress) {
+    if (!address || !isMintPassAdminAddress) {
       setMintPassAdminState(null)
       setMintPassAdminError(null)
       return
     }
     setMintPassAdminLoading(true)
     try {
-      const state = await getMintPassAdminState({ address, parentTokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID })
+      const state = await getMintPassAdminState({ address, parentTokenId: mintPassParentTokenId })
       setMintPassAdminState(state)
       setMintPassAdminError(null)
     } catch (err) {
@@ -304,7 +355,7 @@ function DEX() {
     } finally {
       setMintPassAdminLoading(false)
     }
-  }, [address, isMintPassAdminAddress])
+  }, [address, isMintPassAdminAddress, mintPassParentTokenId])
 
   useEffect(() => {
     if (address && !mintPassIssueDestination) {
@@ -320,7 +371,7 @@ function DEX() {
   useEffect(() => {
     let active = true
     const loadPreview = async () => {
-      if (!showMintPassAdmin || !address || !XOLOSARMY_NFT_PARENT_TOKEN_ID || !mintPassIssueDestination.trim()) {
+      if (!showMintPassAdmin || !address || !mintPassIssueDestination.trim()) {
         setMintPassIssuePreview(null)
         setMintPassIssuePreviewError(null)
         return
@@ -330,7 +381,7 @@ function DEX() {
         const preview = await mintSlpNft1GroupPasses({
           wallet: xolosWalletService,
           address,
-          parentTokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+          parentTokenId: mintPassParentTokenId,
           quantity: mintPassIssueQty,
           mintDestinationAddress: mintPassIssueDestination,
           batonDestinationAddress: mintPassIssueBatonDestination,
@@ -358,6 +409,7 @@ function DEX() {
     mintPassIssueBatonDestination,
     mintPassIssueDestination,
     mintPassIssueQty,
+    mintPassParentTokenId,
     showMintPassAdmin
   ])
 
@@ -830,11 +882,6 @@ function DEX() {
       return
     }
 
-    if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) {
-      setMintPassError('No se configuró el token padre para Mint Pass.')
-      return
-    }
-
     let tokenAmount: bigint
     try {
       tokenAmount = parseDecimalToAtoms(mintPassSellAmount, 0)
@@ -872,7 +919,7 @@ function DEX() {
     try {
       const receiveXecSats = pricePerUnitSats * tokenAmount
       const { txid, offerId } = await createSellOfferToken({
-        tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        tokenId: mintPassParentTokenId,
         tokenAtoms: tokenAmount,
         askXecSats: receiveXecSats,
         payoutAddress: xecAddress,
@@ -882,7 +929,7 @@ function DEX() {
       setMintPassSellOfferId(offerId)
       saveOffer({
         offerId,
-        tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        tokenId: mintPassParentTokenId,
         kind: 'mintpass',
         createdAt: Date.now(),
         askXec: mintPassSellPrice
@@ -899,7 +946,7 @@ function DEX() {
         version: 1,
         offerId,
         txid,
-        tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        tokenId: mintPassParentTokenId,
         kind: 'mintpass',
         priceXec,
         seller: xecAddress,
@@ -915,7 +962,7 @@ function DEX() {
         'txid=',
         txid,
         'tokenId=',
-        XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        mintPassParentTokenId,
         'priceXec=',
         priceXec
       )
@@ -977,14 +1024,29 @@ function DEX() {
       return
     }
 
+    const requestedCollectionId = mintPassCollectionRef.current
+    const requestedParentTokenId = resolveNftCollectionParentTokenId(requestedCollectionId)
+    const requestEpoch = mintPassOfferRequestEpochRef.current + 1
+    mintPassOfferRequestEpochRef.current = requestEpoch
+    const ownsCurrentRequest = () =>
+      mintPassOfferRequestEpochRef.current === requestEpoch &&
+      mintPassCollectionRef.current === requestedCollectionId &&
+      resolveNftCollectionParentTokenId(mintPassCollectionRef.current) === requestedParentTokenId
+
     setMintPassOfferLoading(true)
     try {
-      const result = await loadOfferById({ offerId, tokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID })
-      setMintPassOfferSummary(result.summary)
+      const result = await loadOfferById({ offerId, tokenId: requestedParentTokenId })
+      if (ownsCurrentRequest()) {
+        setMintPassOfferSummary(result.summary)
+      }
     } catch (err) {
-      setMintPassError((err as Error).message || 'No pudimos cargar esta oferta de Mint Pass.')
+      if (ownsCurrentRequest()) {
+        setMintPassError((err as Error).message || 'No pudimos cargar esta oferta de Mint Pass.')
+      }
     } finally {
-      setMintPassOfferLoading(false)
+      if (ownsCurrentRequest()) {
+        setMintPassOfferLoading(false)
+      }
     }
   }
 
@@ -998,13 +1060,23 @@ function DEX() {
       return
     }
 
+    const expectedCollectionId = mintPassCollectionRef.current
+    const expectedParentTokenId = resolveNftCollectionParentTokenId(expectedCollectionId)
+    if (mintPassOfferSummary.tokenId !== expectedParentTokenId) {
+      mintPassOfferRequestEpochRef.current += 1
+      setMintPassOfferSummary(null)
+      setMintPassError('La oferta cargada no corresponde a la colección seleccionada.')
+      return
+    }
+
     setMintPassError(null)
     setMintPassBuyTxid(null)
     setMintPassBuyBusy(true)
     try {
       const { txid } = await acceptOfferById({
         offerId: mintPassOfferSummary.offerId,
-        wallet: xolosWalletService
+        wallet: xolosWalletService,
+        expectedCollectionId
       })
       setMintPassBuyTxid(txid)
       await refreshBalances()
@@ -1022,8 +1094,10 @@ function DEX() {
       setMintPassAdminError('Debes completar el onboarding y respaldar tu seed antes de emitir Mint Pass.')
       return
     }
-    if (!showMintPassAdmin || !XOLOSARMY_NFT_PARENT_TOKEN_ID) {
-      setMintPassAdminError('Chronik no confirma que esta wallet posea el mint baton del Parent oficial.')
+    if (!showMintPassAdmin) {
+      setMintPassAdminError(
+        `Chronik no confirma que esta wallet posea el mint baton de ${MINT_PASS_COLLECTION_LABELS[mintPassCollectionId]}.`
+      )
       return
     }
     if (mintPassIssueBusy) return
@@ -1040,7 +1114,7 @@ function DEX() {
       const result = await mintSlpNft1GroupPasses({
         wallet: xolosWalletService,
         address,
-        parentTokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+        parentTokenId: mintPassParentTokenId,
         quantity: mintPassIssueQty,
         mintDestinationAddress: mintPassIssueDestination,
         batonDestinationAddress: mintPassIssueBatonDestination,
@@ -1076,11 +1150,6 @@ function DEX() {
     return (
       <div className="page">
         <TopBar />
-        {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR && (
-          <div className="error" style={{ marginBottom: 12 }}>
-            {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR}
-          </div>
-        )}
         <h1 className="section-title">Bienvenido</h1>
         <p className="muted">Configura tu billetera para ver tus saldos.</p>
         <div className="actions">
@@ -1109,11 +1178,6 @@ function DEX() {
   return (
     <div className="page">
       <TopBar />
-      {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR && (
-        <div className="error" style={{ marginBottom: 12 }}>
-          {XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR}
-        </div>
-      )}
       <div className="card">
         <p className="muted">DEX (Phase 1)</p>
         <div className="muted" style={{ marginTop: 8 }}>
@@ -1468,11 +1532,48 @@ function DEX() {
 
         {dexTab === 'mintpass' && (
           <div style={{ marginTop: 16 }}>
+            <fieldset
+              className="card"
+              style={{ marginBottom: 12 }}
+              disabled={
+                mintPassOfferLoading ||
+                mintPassBuyBusy ||
+                mintPassSellBusy ||
+                mintPassIssuePreviewBusy ||
+                mintPassIssueBusy
+              }
+            >
+              <legend className="card-kicker">Colección del Mint Pass</legend>
+              {(Object.keys(MINT_PASS_COLLECTION_LABELS) as CollectionId[]).map((collectionId) => (
+                <label
+                  htmlFor={`mintPassCollection-${collectionId}`}
+                  key={collectionId}
+                  style={{ display: 'block', marginTop: collectionId === 'official' ? 0 : 10 }}
+                >
+                  <input
+                    id={`mintPassCollection-${collectionId}`}
+                    type="radio"
+                    name="mintPassCollection"
+                    value={collectionId}
+                    checked={mintPassCollectionId === collectionId}
+                    onChange={() => selectMintPassCollection(collectionId)}
+                  />{' '}
+                  {MINT_PASS_COLLECTION_LABELS[collectionId]}
+                </label>
+              ))}
+              <p className="muted" style={{ marginTop: 10 }}>
+                Las ofertas y el mint baton se validan únicamente contra el Parent canónico de la
+                colección seleccionada. No existe fallback entre Official y Community.
+              </p>
+            </fieldset>
+
             <div className="card" style={{ marginBottom: 12 }}>
-              <p className="card-kicker">Mint Pass (Parent Token)</p>
+              <p className="card-kicker">
+                Mint Pass · {MINT_PASS_COLLECTION_LABELS[mintPassCollectionId]}
+              </p>
               <p className="muted">Para comprar Mint Pass necesitas un Offer ID compartido.</p>
               <div className="address-box" style={{ marginTop: 12 }}>
-                {XOLOSARMY_NFT_PARENT_TOKEN_ID || 'Sin configurar'}
+                {mintPassParentTokenId}
               </div>
             </div>
 
@@ -1529,7 +1630,7 @@ function DEX() {
               <form onSubmit={handleIssueMintPasses} className="card" style={{ marginBottom: 12 }}>
                 <p className="card-kicker">Emitir nuevos Mint Pass</p>
                 <label htmlFor="mintPassParentTokenId">Parent Token ID</label>
-                <input id="mintPassParentTokenId" value={XOLOSARMY_NFT_PARENT_TOKEN_ID} readOnly />
+                <input id="mintPassParentTokenId" value={mintPassParentTokenId} readOnly />
 
                 <label htmlFor="mintPassBatonOutpoint" style={{ marginTop: 12 }}>
                   Mint baton actual

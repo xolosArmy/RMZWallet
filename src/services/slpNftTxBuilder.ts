@@ -15,9 +15,12 @@ import type { GenesisInfo, ScriptUtxo } from 'chronik-client'
 import { XEC_DUST_SATS } from '../config/xecFees'
 import {
   NFT_MINT_FEE_RECEIVER_ADDRESS,
-  NFT_MINT_PLATFORM_FEE_SATS,
-  XOLOSARMY_NFT_PARENT_TOKEN_ID
+  NFT_MINT_PLATFORM_FEE_SATS
 } from '../config/nfts'
+import {
+  resolveNftCollectionParentTokenId,
+  type CollectionId
+} from '../domain/nftCollections'
 import { getChronik } from './ChronikClient'
 import type { WalletSignatory } from './XolosWalletService'
 
@@ -43,6 +46,23 @@ type MintPassChronik = {
     utxos: () => Promise<{ utxos: ScriptUtxo[] }>
   }
   broadcastTx: (rawTx: Uint8Array | string) => Promise<{ txid: string }>
+}
+
+export type NftMintPassChronikReader = Pick<MintPassChronik, 'address'>
+
+export type NftChildMintPassSelection = {
+  readonly kind: 'exact' | 'fanout'
+  readonly parentTokenId: string
+  readonly utxo: ScriptUtxo
+}
+
+export type NftChildMintPassExpectation = {
+  readonly kind: NftChildMintPassSelection['kind']
+  readonly parentTokenId: string
+  readonly outpoint: {
+    readonly txid: string
+    readonly outIdx: number
+  }
 }
 
 export type MintPassBatonInfo = {
@@ -128,12 +148,116 @@ const resolveAddressScript = (address: string) => Script.fromAddress(Address.par
 
 const normalizeCashAddress = (address: string) => Address.parse(address).cash().toString()
 
-const isSlpToken = (utxo: ScriptUtxo, tokenId: string, tokenType: number) =>
-  utxo.token &&
-  utxo.token.tokenId === tokenId &&
-  utxo.token.tokenType.protocol === 'SLP' &&
-  utxo.token.tokenType.number === tokenType &&
-  !utxo.token.isMintBaton
+const isSlpToken = (utxo: ScriptUtxo, tokenId: string, tokenType: number) => {
+  try {
+    return Boolean(
+      utxo &&
+        typeof utxo === 'object' &&
+        utxo.token &&
+        utxo.token.tokenId === tokenId &&
+        utxo.token.tokenType.protocol === 'SLP' &&
+        utxo.token.tokenType.number === tokenType &&
+        !utxo.token.isMintBaton
+    )
+  } catch {
+    return false
+  }
+}
+
+const CANONICAL_TOKEN_ID_PATTERN = /^[0-9a-f]{64}$/
+
+const isSpendableNft1GroupToken = (utxo: ScriptUtxo, parentTokenId: string): boolean => {
+  try {
+    return Boolean(
+      utxo &&
+        typeof utxo === 'object' &&
+        utxo.isCoinbase === false &&
+        typeof utxo.sats === 'bigint' &&
+        utxo.sats > 0n &&
+        utxo.outpoint &&
+        CANONICAL_TOKEN_ID_PATTERN.test(utxo.outpoint.txid) &&
+        Number.isInteger(utxo.outpoint.outIdx) &&
+        utxo.outpoint.outIdx >= 0 &&
+        utxo.token &&
+        utxo.token.tokenId === parentTokenId &&
+        utxo.token.tokenType.protocol === 'SLP' &&
+        utxo.token.tokenType.type === 'SLP_TOKEN_TYPE_NFT1_GROUP' &&
+        utxo.token.tokenType.number === SLP_NFT1_GROUP &&
+        utxo.token.isMintBaton === false &&
+        typeof utxo.token.atoms === 'bigint' &&
+        utxo.token.atoms >= 1n
+    )
+  } catch {
+    return false
+  }
+}
+
+export const selectNftChildMintPass = (
+  utxos: readonly ScriptUtxo[],
+  collectionId: CollectionId
+): NftChildMintPassSelection | null => {
+  const parentTokenId = resolveNftCollectionParentTokenId(collectionId)
+  const exact = utxos.find(
+    (utxo) => isSpendableNft1GroupToken(utxo, parentTokenId) && utxo.token?.atoms === 1n
+  )
+  if (exact) {
+    return { kind: 'exact', parentTokenId, utxo: exact }
+  }
+
+  const fanout = utxos.find(
+    (utxo) => isSpendableNft1GroupToken(utxo, parentTokenId) && (utxo.token?.atoms ?? 0n) > 1n
+  )
+  return fanout ? { kind: 'fanout', parentTokenId, utxo: fanout } : null
+}
+
+export const snapshotNftChildMintPass = (
+  selection: NftChildMintPassSelection
+): NftChildMintPassExpectation =>
+  Object.freeze({
+    kind: selection.kind,
+    parentTokenId: selection.parentTokenId,
+    outpoint: Object.freeze({ ...selection.utxo.outpoint })
+  })
+
+const selectExpectedNftChildMintPass = (
+  utxos: readonly ScriptUtxo[],
+  collectionId: CollectionId,
+  expected: NftChildMintPassExpectation
+): NftChildMintPassSelection | null => {
+  const canonicalParentTokenId = resolveNftCollectionParentTokenId(collectionId)
+  if (expected.parentTokenId !== canonicalParentTokenId) return null
+  if (
+    !CANONICAL_TOKEN_ID_PATTERN.test(expected.outpoint.txid) ||
+    !Number.isInteger(expected.outpoint.outIdx) ||
+    expected.outpoint.outIdx < 0
+  ) {
+    return null
+  }
+
+  const candidate = utxos.find(
+    (utxo) =>
+      utxo?.outpoint?.txid === expected.outpoint.txid &&
+      utxo.outpoint.outIdx === expected.outpoint.outIdx
+  )
+  if (!candidate) return null
+
+  const selection = selectNftChildMintPass([candidate], collectionId)
+  return selection?.kind === expected.kind ? selection : null
+}
+
+export const assertNftChildMintPassAvailable = async (params: {
+  address: string
+  collectionId: CollectionId
+  chronik?: NftMintPassChronikReader
+}): Promise<NftChildMintPassSelection> => {
+  const chronik = params.chronik ?? getChronik()
+  const response = await chronik.address(params.address).utxos()
+  const selection = selectNftChildMintPass(response.utxos, params.collectionId)
+  if (!selection) {
+    throw new Error('Necesitas al menos 1 Mint Pass de la colección seleccionada para mintear.')
+  }
+  return selection
+}
 
 
 export const validateMintPassQuantity = (quantity: number | string | bigint): bigint => {
@@ -167,14 +291,16 @@ export const isSlpNft1GroupMintBaton = (utxo: ScriptUtxo, parentTokenId: string)
 export const findSlpNft1GroupMintBaton = (utxos: ScriptUtxo[], parentTokenId: string): ScriptUtxo => {
   const batons = utxos.filter((utxo) => isSlpNft1GroupMintBaton(utxo, parentTokenId))
   if (batons.length !== 1) {
-    throw new Error(`Se esperaba exactamente un mint baton del Parent oficial; encontrados: ${batons.length}.`)
+    throw new Error(
+      `Se esperaba exactamente un mint baton del Parent seleccionado; encontrados: ${batons.length}.`
+    )
   }
   return batons[0]
 }
 
-export const countMintPassAtoms = (utxos: ScriptUtxo[], parentTokenId: string): bigint =>
+export const countMintPassAtoms = (utxos: readonly ScriptUtxo[], parentTokenId: string): bigint =>
   utxos.reduce((sum, utxo) => {
-    if (!isSlpToken(utxo, parentTokenId, SLP_NFT1_GROUP)) return sum
+    if (!isSpendableNft1GroupToken(utxo, parentTokenId)) return sum
     return sum + (utxo.token?.atoms ?? 0n)
   }, 0n)
 
@@ -197,15 +323,6 @@ export const getMintPassAdminState = async (params: {
     baton: batons.length === 1 ? toBatonInfo(batons[0]) : null,
     mintPassBalance
   }
-}
-
-// Basado en Cashtab: getNftChildGenesisInput para asegurar burning de 1 parent por NFT child.
-const selectParentMintInput = (utxos: ScriptUtxo[], parentTokenId: string) => {
-  return utxos.find((utxo) => isSlpToken(utxo, parentTokenId, SLP_NFT1_GROUP) && utxo.token?.atoms === 1n)
-}
-
-const selectParentFanoutInput = (utxos: ScriptUtxo[], parentTokenId: string) => {
-  return utxos.find((utxo) => isSlpToken(utxo, parentTokenId, SLP_NFT1_GROUP) && (utxo.token?.atoms ?? 0n) > 1n)
 }
 
 const createParentFanoutTx = async (params: {
@@ -261,42 +378,54 @@ export const mintNftChildGenesis = async (params: {
   address: string
   keyInfo: { privateKeyHex: string; publicKeyHex: string }
   genesisInfo: GenesisInfo
+  collectionId: CollectionId
+  expectedMintPass: NftChildMintPassExpectation
 }): Promise<{ txid: string }> => {
-  if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) {
-    throw new Error('Falta configurar el token padre para NFTs en el entorno.')
-  }
+  const parentTokenId = resolveNftCollectionParentTokenId(params.collectionId)
   if (!NFT_MINT_FEE_RECEIVER_ADDRESS) {
     throw new Error('Falta configurar la dirección treasury para el fee de minteo.')
   }
 
   const chronik = getChronik()
   const addressScript = resolveAddressScript(params.address)
-  const signer = P2PKHSignatory(fromHex(params.keyInfo.privateKeyHex), fromHex(params.keyInfo.publicKeyHex), ALL_BIP143)
 
   const utxoResponse = await chronik.address(params.address).utxos()
   let allUtxos = utxoResponse.utxos
 
-  let parentInput = selectParentMintInput(allUtxos, XOLOSARMY_NFT_PARENT_TOKEN_ID)
-  if (!parentInput) {
-    const fanoutCandidate = selectParentFanoutInput(allUtxos, XOLOSARMY_NFT_PARENT_TOKEN_ID)
-    if (!fanoutCandidate) {
-      throw new Error('Necesitas al menos 1 token padre para mintear un NFT.')
-    }
+  let mintPassSelection = selectExpectedNftChildMintPass(
+    allUtxos,
+    params.collectionId,
+    params.expectedMintPass
+  )
+  if (!mintPassSelection) {
+    throw new Error('El Mint Pass validado cambió antes de construir el minteo.')
+  }
+
+  if (mintPassSelection.kind === 'fanout') {
     await createParentFanoutTx({
       address: params.address,
       keyInfo: params.keyInfo,
-      parentTokenId: XOLOSARMY_NFT_PARENT_TOKEN_ID,
-      parentUtxo: fanoutCandidate
+      parentTokenId,
+      parentUtxo: mintPassSelection.utxo
     })
 
     const refreshed = await chronik.address(params.address).utxos()
     allUtxos = refreshed.utxos
-    parentInput = selectParentMintInput(allUtxos, XOLOSARMY_NFT_PARENT_TOKEN_ID)
+    mintPassSelection = selectNftChildMintPass(allUtxos, params.collectionId)
+    if (!mintPassSelection || mintPassSelection.kind !== 'exact') {
+      throw new Error('Necesitas al menos 1 token padre para mintear un NFT.')
+    }
   }
 
-  if (!parentInput) {
+  if (mintPassSelection.kind !== 'exact') {
     throw new Error('No pudimos preparar un UTXO de 1 token padre para el minteo.')
   }
+  const parentInput = mintPassSelection.utxo
+  const signer = P2PKHSignatory(
+    fromHex(params.keyInfo.privateKeyHex),
+    fromHex(params.keyInfo.publicKeyHex),
+    ALL_BIP143
+  )
 
   const opReturn = slpGenesis(SLP_NFT1_CHILD, params.genesisInfo, NFT_CHILD_GENESIS_AMOUNT, undefined)
 

@@ -4,6 +4,10 @@ import type { ScriptUtxo, Tx } from 'chronik-client'
 import { getChronik } from './ChronikClient'
 import type { WalletSignatory, XolosWalletService } from './XolosWalletService'
 import { XEC_DUST_SATS } from '../config/xecFees'
+import {
+  resolveNftCollectionParentTokenId,
+  type CollectionId
+} from '../domain/nftCollections'
 
 const SLP_NFT1_CHILD = 65
 const FEE_PER_KB = 1200n
@@ -387,8 +391,16 @@ export const acceptOfferById = async (params: {
   offerId: string
   wallet: XolosWalletService
   desiredAtoms?: bigint
+  expectedCollectionId?: CollectionId
 }): Promise<{ txid: string }> => {
-  const { offer } = await loadOfferById({ offerId: params.offerId })
+  const expectedTokenId =
+    params.expectedCollectionId === undefined
+      ? undefined
+      : resolveNftCollectionParentTokenId(params.expectedCollectionId)
+  const { offer } = await loadOfferById({
+    offerId: params.offerId,
+    tokenId: expectedTokenId
+  })
   assertOneshotDesiredAtoms(params.desiredAtoms, offer.token.atoms)
   const signer = params.wallet.getSignatory()
   const recipientScript = Script.fromAddress(Address.parse(signer.address).cash().toString())
