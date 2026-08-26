@@ -8,7 +8,7 @@ export type RegisteredCollection = {
   readonly parentTokenId: string | null
 }
 
-export const NFT_COLLECTION_TRUST_REGISTRY_VERSION = 1 as const
+export const NFT_COLLECTION_TRUST_REGISTRY_VERSION = 2 as const
 
 export const NFT_COLLECTION_TRUST_REGISTRY = Object.freeze({
   official: Object.freeze({

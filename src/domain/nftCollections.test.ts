@@ -36,7 +36,7 @@ const communityEvidence = (): VerifiedEvidence => ({
 
 describe('NFT collection trust registry', () => {
   test('pins distinct official and community trust anchors in source', () => {
-    expect(NFT_COLLECTION_TRUST_REGISTRY_VERSION).toBe(1)
+    expect(NFT_COLLECTION_TRUST_REGISTRY_VERSION).toBe(2)
     expect(NFT_COLLECTION_TRUST_REGISTRY).toEqual({
       official: {
         id: 'official',
@@ -211,7 +211,7 @@ describe('buildNftCollectionMetadata', () => {
       collection: {
         id: 'official',
         parentTokenId: OFFICIAL_PARENT_TOKEN_ID,
-        registryVersion: 1
+        registryVersion: 2
       }
     })
     expect(metadata.attributes).not.toBe(attributes)
@@ -230,7 +230,7 @@ describe('buildNftCollectionMetadata', () => {
     expect(metadata.collection).toEqual({
       id: 'community',
       parentTokenId: COMMUNITY_PARENT_TOKEN_ID,
-      registryVersion: 1
+      registryVersion: 2
     })
     expect(
       classifyCollection({
