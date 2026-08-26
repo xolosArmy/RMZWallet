@@ -6,6 +6,9 @@ import {
   NFT_COLLECTION_TRUST_REGISTRY_VERSION,
   buildNftCollectionMetadata,
   classifyCollection,
+  isCollectionId,
+  resolveNftCollectionParentTokenId,
+  resolveRegisteredNftCollection,
   type OnChainNftCollectionEvidence
 } from './nftCollections'
 
@@ -62,6 +65,40 @@ describe('NFT collection trust registry', () => {
 
     expect(source).not.toMatch(/VITE_|import\.meta\.env|process\.env/)
   })
+
+  test('ignores a hostile legacy Parent environment value', () => {
+    const previous = process.env.VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID
+    process.env.VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID = OTHER_GROUP_TOKEN_ID
+    try {
+      expect(resolveNftCollectionParentTokenId('official')).toBe(OFFICIAL_PARENT_TOKEN_ID)
+      expect(resolveNftCollectionParentTokenId('community')).toBe(COMMUNITY_PARENT_TOKEN_ID)
+    } finally {
+      if (previous === undefined) {
+        delete process.env.VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID
+      } else {
+        process.env.VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID = previous
+      }
+    }
+  })
+
+  test('resolves only typed, registered collections to canonical Parents', () => {
+    expect(resolveRegisteredNftCollection('official')).toBe(NFT_COLLECTION_TRUST_REGISTRY.official)
+    expect(resolveRegisteredNftCollection('community')).toBe(NFT_COLLECTION_TRUST_REGISTRY.community)
+    expect(resolveNftCollectionParentTokenId('official')).toBe(OFFICIAL_PARENT_TOKEN_ID)
+    expect(resolveNftCollectionParentTokenId('community')).toBe(COMMUNITY_PARENT_TOKEN_ID)
+    expect(isCollectionId('official')).toBe(true)
+    expect(isCollectionId('community')).toBe(true)
+  })
+
+  test.each([null, undefined, '', 'Official', 'unknown', OTHER_GROUP_TOKEN_ID, {}, []])(
+    'fails closed for an arbitrary runtime collection selector: %j',
+    (collectionId) => {
+      expect(isCollectionId(collectionId)).toBe(false)
+      expect(() =>
+        resolveRegisteredNftCollection(collectionId as 'official')
+      ).toThrow('Colección NFT no registrada.')
+    }
+  )
 })
 
 describe('classifyCollection', () => {
@@ -240,7 +277,7 @@ describe('buildNftCollectionMetadata', () => {
     ).toBe('unknown')
   })
 
-  test('remains disconnected from the current minter, metadata service and UI', () => {
+  test('keeps classification policy and on-chain evidence out of the mint path', () => {
     const productionFiles = [
       '../config/nfts.ts',
       '../services/nftMetadata.ts',
@@ -250,7 +287,7 @@ describe('buildNftCollectionMetadata', () => {
 
     for (const productionFile of productionFiles) {
       const source = readFileSync(new URL(productionFile, import.meta.url), 'utf8')
-      expect(source).not.toMatch(/domain\/nftCollections|buildNftCollectionMetadata|classifyCollection/)
+      expect(source).not.toMatch(/buildNftCollectionMetadata|classifyCollection|OnChainNftCollectionEvidence/)
     }
   })
 })

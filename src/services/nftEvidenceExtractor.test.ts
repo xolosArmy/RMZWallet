@@ -13,6 +13,8 @@ const GROUP_TOKEN_ID = '2'.repeat(64)
 const UNKNOWN_GROUP_TOKEN_ID = '3'.repeat(64)
 const OFFICIAL_PARENT_TOKEN_ID =
   'bf8e0b5cd60fe4d6354c662b28542e0f3c3d69941eb039426d65bcdb7fe9f48c'
+const COMMUNITY_PARENT_TOKEN_ID =
+  'd6ff881413733a1a6407fa5e1e86537e5fc9f48246bae89b732ca7044993e57a'
 
 type ChronikReaderIsCompatible = Pick<ChronikClient, 'token' | 'tx'> extends NftEvidenceChronikReader
   ? true
@@ -496,6 +498,18 @@ describe('read-only evidence pipeline with collection policy', () => {
 
     expect(evidence.kind).toBe('verified-nft1-child-genesis')
     expect(classifyCollection(evidence)).toBe('official')
+  })
+
+  test('Case 1b: the classifier recognizes the Community Parent from valid chain evidence', async () => {
+    const evidence = await evidenceForGroup(COMMUNITY_PARENT_TOKEN_ID)
+
+    expect(evidence).toMatchObject({
+      kind: 'verified-nft1-child-genesis',
+      groupTokenId: COMMUNITY_PARENT_TOKEN_ID,
+      childTokenType: 65,
+      groupTokenType: 129
+    })
+    expect(classifyCollection(evidence)).toBe('community')
   })
 
   test('Case 2: an unknown valid Parent remains verified evidence but classifies unknown', async () => {

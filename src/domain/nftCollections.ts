@@ -8,6 +8,8 @@ export type RegisteredCollection = {
   readonly parentTokenId: string | null
 }
 
+const CANONICAL_TOKEN_ID_PATTERN = /^[0-9a-f]{64}$/
+
 export const NFT_COLLECTION_TRUST_REGISTRY_VERSION = 2 as const
 
 export const NFT_COLLECTION_TRUST_REGISTRY = Object.freeze({
@@ -22,6 +24,34 @@ export const NFT_COLLECTION_TRUST_REGISTRY = Object.freeze({
     parentTokenId: 'd6ff881413733a1a6407fa5e1e86537e5fc9f48246bae89b732ca7044993e57a'
   })
 }) satisfies Readonly<Record<CollectionId, RegisteredCollection>>
+
+export function isCollectionId(value: unknown): value is CollectionId {
+  return value === 'official' || value === 'community'
+}
+
+export function resolveRegisteredNftCollection(collectionId: CollectionId): RegisteredCollection {
+  if (!isCollectionId(collectionId)) {
+    throw new Error('Colección NFT no registrada.')
+  }
+
+  const collection = NFT_COLLECTION_TRUST_REGISTRY[collectionId]
+  if (
+    collection.parentTokenId === null ||
+    !CANONICAL_TOKEN_ID_PATTERN.test(collection.parentTokenId)
+  ) {
+    throw new Error('La colección NFT no tiene un Parent canónico activo.')
+  }
+
+  return collection
+}
+
+export function resolveNftCollectionParentTokenId(collectionId: CollectionId): string {
+  const parentTokenId = resolveRegisteredNftCollection(collectionId).parentTokenId
+  if (parentTokenId === null) {
+    throw new Error('La colección NFT no tiene un Parent canónico activo.')
+  }
+  return parentTokenId
+}
 
 export type OnChainNftCollectionEvidence =
   | {
@@ -40,8 +70,6 @@ export type OnChainNftCollectionEvidence =
         | 'invalid-group-type'
         | 'malformed-evidence'
     }
-
-const CANONICAL_TOKEN_ID_PATTERN = /^[0-9a-f]{64}$/
 
 export function classifyCollection(evidence: OnChainNftCollectionEvidence): CollectionTier {
   try {

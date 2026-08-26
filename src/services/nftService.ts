@@ -3,8 +3,15 @@ import { getChronik } from './ChronikClient'
 import { uploadFileToPinata, uploadJsonToPinata } from './pinata'
 import { buildXolosarmyNftMetadata } from './nftMetadata'
 import type { XolosLineage } from './nftMetadata'
-import { mintNftChildGenesis, sendNftChild } from './slpNftTxBuilder'
-import { XOLOSARMY_NFT_PARENT_TOKEN_ID } from '../config/nfts'
+import {
+  assertNftChildMintPassAvailable,
+  mintNftChildGenesis,
+  sendNftChild
+} from './slpNftTxBuilder'
+import {
+  resolveNftCollectionParentTokenId,
+  type CollectionId
+} from '../domain/nftCollections'
 import { xolosWalletService } from './XolosWalletService'
 import { ipfsToCid, ipfsToGatewayUrl } from '../utils/ipfs'
 
@@ -141,20 +148,23 @@ const isNftChildUtxo = (utxo: ScriptUtxo) => {
 }
 
 export const mintXolosarmyNftChild = async (params: {
+  collectionId: CollectionId
   name: string
   description: string
   imageFile: File
   externalUrl?: string
   lineage?: XolosLineage
 }): Promise<{ childTokenId: string; txid: string; metadataCid: string }> => {
-  const signer = xolosWalletService.getSignatory()
-  const address = signer.address
-  if (!XOLOSARMY_NFT_PARENT_TOKEN_ID) {
-    throw new Error('Falta configurar el token padre de la colección.')
+  const parentTokenId = resolveNftCollectionParentTokenId(params.collectionId)
+  const address = xolosWalletService.getAddress()
+  if (!address) {
+    throw new Error('WALLET_LOCKED')
   }
+  await assertNftChildMintPassAvailable({ address, collectionId: params.collectionId })
 
   const imageResult = await uploadFileToPinata(params.imageFile)
   const metadata = buildXolosarmyNftMetadata({
+    collectionId: params.collectionId,
     name: params.name,
     description: params.description,
     imageCid: imageResult.cid,
@@ -175,6 +185,10 @@ export const mintXolosarmyNftChild = async (params: {
     decimals: 0
   }
 
+  const signer = xolosWalletService.getSignatory()
+  if (signer.address !== address) {
+    throw new Error('La cuenta activa cambió durante la preparación del minteo.')
+  }
   const { txid } = await xolosWalletService.withPrivateKey((privateKey) =>
     mintNftChildGenesis({
       address,
@@ -182,13 +196,14 @@ export const mintXolosarmyNftChild = async (params: {
         privateKeyHex: bytesToHex(privateKey),
         publicKeyHex: signer.publicKeyHex
       },
-      genesisInfo
+      genesisInfo,
+      collectionId: params.collectionId
     })
   )
 
   cacheTokenId(txid)
   cacheMetadata(txid, metadata, metadataResult.cid)
-  cacheParent(txid, XOLOSARMY_NFT_PARENT_TOKEN_ID)
+  cacheParent(txid, parentTokenId)
 
   return { childTokenId: txid, txid, metadataCid: metadataResult.cid }
 }
