@@ -59,7 +59,9 @@ Query-string requests, extra or duplicate fragment parameters, arbitrary origins
 }
 ```
 
-`issuedAt` and `expiresAt` are safe-integer Unix seconds. The request lifetime cannot exceed 300 seconds, expired requests fail closed, and excessive clock skew is rejected. The fragment is removed with `history.replaceState` only after both request validation and active-wallet resolution succeed. No request or result is persisted.
+`issuedAt` and `expiresAt` are safe-integer Unix seconds. The request lifetime cannot exceed 300 seconds, expired requests fail closed, and excessive clock skew is rejected. Immediately after strict request validation, Tonalli keeps the parsed request only in page memory, removes the fragment with `history.replaceState`, and requires both the hash and query to be empty before it reads or activates the wallet. No request or result is persisted.
+
+If the existing encrypted wallet is not active in the new tab, the route can pause while the user unlocks that same stored wallet. It never offers wallet creation, restoration, WalletConnect, or an alternate signer. Full activation must produce a lowercase canonical eCash P2PKH address derived from its valid on-curve compressed secp256k1 public key before the existing second confirmation appears. Wallet identity-changing operations are serialized within the tab's wallet service. The stored ciphertext and profile metadata are checked before and after activation so a concurrent storage replacement fails closed, and rollback does not overwrite a detected replacement. A failed H3B activation restores the complete pre-attempt in-memory identity state. A derivation `choice-required` result stops safely and must be resolved through Tonalli's ordinary activation flow before starting a fresh request. The original expiration remains authoritative throughout unlocking and is never extended.
 
 ## Reviewed payment requirement
 
@@ -143,7 +145,7 @@ Gate H3C will later define the cross-repository request and proof-return bridge.
 
 ## Security and replay boundary
 
-The H3B route calls only `getX402ActiveAccount()` and `signX402AuthorizationMessage(message)`. Private keys remain inside the wallet service. The route performs no fetch, balance lookup, UTXO selection, transaction construction, resource retry, blockchain read, or broadcast.
+The H3B route uses the wallet service's boolean stored-wallet check, dedicated full-activation boundary, `getX402ActiveAccount()`, and `signX402AuthorizationMessage(message)`. Private keys, ciphertext, and mnemonic material remain inside the wallet service. Canonical full activation can perform read-only Chronik UTXO queries; missing profile metadata can additionally perform read-only UTXO and history discovery. H3B performs no UTXO selection, transaction construction or signing, `PAYMENT-SIGNATURE` construction, protected-resource retry, settlement, or blockchain broadcast.
 
 The short-lived challenge binds the dry-run artifact, but H3B does not claim global or server-backed replay prevention. A later payment gate must add authoritative single-use challenge handling before any payment protocol can rely on this artifact.
 
@@ -161,4 +163,4 @@ This pull request does not enable or deploy it. After merge and an independent r
 VITE_X402_H3B_ENABLED=true
 ```
 
-For manual validation, use a fresh short-lived canonical request from the reviewed origin, unlock Tonalli through its ordinary onboarding flow, open the fragment URL, verify every displayed field, and exercise Reject and Sign separately. Confirm that signing requires a click, the callback is only a link, the URL fragment is cleared after readiness, no network request occurs, and the returned proof verifies as a message signature over the exact documented canonical message. Do not send funds to the fixture address.
+For manual validation, start with an existing encrypted wallet in a fresh locked Tonalli tab and use a fresh short-lived canonical request from the reviewed origin. Confirm that the request fragment disappears before password entry, the password unlocks only that existing wallet, and no signing card appears until full activation succeeds. Then verify every displayed field and exercise Reject and Sign separately. Confirm that signing requires a second click, the callback is only a link, activation performs only the documented read-only wallet queries, and the returned proof verifies as a message signature over the exact documented canonical message. Do not send funds to the fixture address.
