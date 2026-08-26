@@ -56,6 +56,15 @@ export type NftChildMintPassSelection = {
   readonly utxo: ScriptUtxo
 }
 
+export type NftChildMintPassExpectation = {
+  readonly kind: NftChildMintPassSelection['kind']
+  readonly parentTokenId: string
+  readonly outpoint: {
+    readonly txid: string
+    readonly outIdx: number
+  }
+}
+
 export type MintPassBatonInfo = {
   outpoint: string
   txid: string
@@ -201,6 +210,41 @@ export const selectNftChildMintPass = (
   return fanout ? { kind: 'fanout', parentTokenId, utxo: fanout } : null
 }
 
+export const snapshotNftChildMintPass = (
+  selection: NftChildMintPassSelection
+): NftChildMintPassExpectation =>
+  Object.freeze({
+    kind: selection.kind,
+    parentTokenId: selection.parentTokenId,
+    outpoint: Object.freeze({ ...selection.utxo.outpoint })
+  })
+
+const selectExpectedNftChildMintPass = (
+  utxos: readonly ScriptUtxo[],
+  collectionId: CollectionId,
+  expected: NftChildMintPassExpectation
+): NftChildMintPassSelection | null => {
+  const canonicalParentTokenId = resolveNftCollectionParentTokenId(collectionId)
+  if (expected.parentTokenId !== canonicalParentTokenId) return null
+  if (
+    !CANONICAL_TOKEN_ID_PATTERN.test(expected.outpoint.txid) ||
+    !Number.isInteger(expected.outpoint.outIdx) ||
+    expected.outpoint.outIdx < 0
+  ) {
+    return null
+  }
+
+  const candidate = utxos.find(
+    (utxo) =>
+      utxo?.outpoint?.txid === expected.outpoint.txid &&
+      utxo.outpoint.outIdx === expected.outpoint.outIdx
+  )
+  if (!candidate) return null
+
+  const selection = selectNftChildMintPass([candidate], collectionId)
+  return selection?.kind === expected.kind ? selection : null
+}
+
 export const assertNftChildMintPassAvailable = async (params: {
   address: string
   collectionId: CollectionId
@@ -335,6 +379,7 @@ export const mintNftChildGenesis = async (params: {
   keyInfo: { privateKeyHex: string; publicKeyHex: string }
   genesisInfo: GenesisInfo
   collectionId: CollectionId
+  expectedMintPass: NftChildMintPassExpectation
 }): Promise<{ txid: string }> => {
   const parentTokenId = resolveNftCollectionParentTokenId(params.collectionId)
   if (!NFT_MINT_FEE_RECEIVER_ADDRESS) {
@@ -347,9 +392,13 @@ export const mintNftChildGenesis = async (params: {
   const utxoResponse = await chronik.address(params.address).utxos()
   let allUtxos = utxoResponse.utxos
 
-  let mintPassSelection = selectNftChildMintPass(allUtxos, params.collectionId)
+  let mintPassSelection = selectExpectedNftChildMintPass(
+    allUtxos,
+    params.collectionId,
+    params.expectedMintPass
+  )
   if (!mintPassSelection) {
-    throw new Error('Necesitas al menos 1 Mint Pass de la colección seleccionada para mintear.')
+    throw new Error('El Mint Pass validado cambió antes de construir el minteo.')
   }
 
   if (mintPassSelection.kind === 'fanout') {

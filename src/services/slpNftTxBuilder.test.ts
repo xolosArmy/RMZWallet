@@ -12,6 +12,7 @@ import {
   findSlpNft1GroupMintBaton,
   mintSlpNft1GroupPasses,
   selectNftChildMintPass,
+  snapshotNftChildMintPass,
   validateMintPassQuantity
 } from './slpNftTxBuilder'
 
@@ -222,6 +223,20 @@ describe('NFT Child collection Mint Pass selection', () => {
   it('selects only the canonical Group atom for the explicit collection', () => {
     assert.equal(selectNftChildMintPass([communityPass, officialPass], 'official')?.utxo, officialPass)
     assert.equal(selectNftChildMintPass([officialPass, communityPass], 'community')?.utxo, communityPass)
+  })
+
+  it('freezes the exact canonical Parent and outpoint selected before secret access', () => {
+    const selection = selectNftChildMintPass([communityPass], 'community')
+    assert.ok(selection)
+
+    const snapshot = snapshotNftChildMintPass(selection)
+    assert.deepEqual(snapshot, {
+      kind: 'exact',
+      parentTokenId: communityParent,
+      outpoint: { txid: TXID_B, outIdx: 1 }
+    })
+    assert.equal(Object.isFrozen(snapshot), true)
+    assert.equal(Object.isFrozen(snapshot.outpoint), true)
   })
 
   it('never falls back across Official and Community', () => {

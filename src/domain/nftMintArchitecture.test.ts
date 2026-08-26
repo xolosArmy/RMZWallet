@@ -29,7 +29,7 @@ describe('public NFT mint collection architecture', () => {
 
     expect(route).toMatch(/collectionId,\s*name:/)
     expect(service).toMatch(/collectionId: CollectionId/)
-    expect(service).toMatch(/mintNftChildGenesis\(\{[\s\S]*collectionId: params\.collectionId/)
+    expect(service).toMatch(/mintNftChildGenesis\(\{[\s\S]*collectionId,[\s\S]*expectedMintPass/)
     expect(metadata).toMatch(/collectionId: CollectionId/)
     expect(builder).toMatch(/mintNftChildGenesis = async \(params: \{[\s\S]*collectionId: CollectionId/)
     expect(builder).toMatch(/resolveNftCollectionParentTokenId\(params\.collectionId\)/)
@@ -43,7 +43,9 @@ describe('public NFT mint collection architecture', () => {
     expect(dex).toMatch(/searchParams\.get\('collectionId'\)/)
     expect(dex).toMatch(/isCollectionId\(collectionId\)/)
     expect(dex).toMatch(/resolveNftCollectionParentTokenId\(mintPassCollectionId\)/)
-    expect(dex).toMatch(/loadOfferById\(\{ offerId, tokenId: mintPassParentTokenId \}\)/)
+    expect(dex).toMatch(/loadOfferById\(\{ offerId, tokenId: requestedParentTokenId \}\)/)
+    expect(dex).toMatch(/expectedCollectionId/)
+    expect(dex).toMatch(/mintPassOfferRequestEpochRef/)
     expect(dex).not.toMatch(/mode === 'mintpass'[^\n]*tokenId/)
   })
 

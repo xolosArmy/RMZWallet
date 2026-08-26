@@ -6,6 +6,7 @@ import type { XolosLineage } from './nftMetadata'
 import {
   assertNftChildMintPassAvailable,
   mintNftChildGenesis,
+  snapshotNftChildMintPass,
   sendNftChild
 } from './slpNftTxBuilder'
 import {
@@ -155,16 +156,17 @@ export const mintXolosarmyNftChild = async (params: {
   externalUrl?: string
   lineage?: XolosLineage
 }): Promise<{ childTokenId: string; txid: string; metadataCid: string }> => {
-  const parentTokenId = resolveNftCollectionParentTokenId(params.collectionId)
+  const collectionId = params.collectionId
+  const parentTokenId = resolveNftCollectionParentTokenId(collectionId)
   const address = xolosWalletService.getAddress()
   if (!address) {
     throw new Error('WALLET_LOCKED')
   }
-  await assertNftChildMintPassAvailable({ address, collectionId: params.collectionId })
+  await assertNftChildMintPassAvailable({ address, collectionId })
 
   const imageResult = await uploadFileToPinata(params.imageFile)
   const metadata = buildXolosarmyNftMetadata({
-    collectionId: params.collectionId,
+    collectionId,
     name: params.name,
     description: params.description,
     imageCid: imageResult.cid,
@@ -185,6 +187,12 @@ export const mintXolosarmyNftChild = async (params: {
     decimals: 0
   }
 
+  const freshMintPass = await assertNftChildMintPassAvailable({ address, collectionId })
+  if (freshMintPass.parentTokenId !== parentTokenId) {
+    throw new Error('El Parent canónico cambió durante la preparación del minteo.')
+  }
+  const expectedMintPass = snapshotNftChildMintPass(freshMintPass)
+
   const signer = xolosWalletService.getSignatory()
   if (signer.address !== address) {
     throw new Error('La cuenta activa cambió durante la preparación del minteo.')
@@ -197,7 +205,8 @@ export const mintXolosarmyNftChild = async (params: {
         publicKeyHex: signer.publicKeyHex
       },
       genesisInfo,
-      collectionId: params.collectionId
+      collectionId,
+      expectedMintPass
     })
   )
 

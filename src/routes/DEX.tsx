@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { AgoraPartial } from 'ecash-agora'
 import { ALP_STANDARD, Address, Script, TxBuilder, calcTxFee } from 'ecash-lib'
@@ -168,6 +168,32 @@ function DEX() {
   const [mintPassIssueBusy, setMintPassIssueBusy] = useState(false)
   const [mintPassIssueTxid, setMintPassIssueTxid] = useState<string | null>(null)
   const [savedOffers, setSavedOffers] = useState<SavedOffer[]>(() => loadSavedOffers())
+  const mintPassOfferRequestEpochRef = useRef(0)
+  const mintPassCollectionRef = useRef<CollectionId>('official')
+
+  const selectMintPassCollection = useCallback((collectionId: CollectionId) => {
+    resolveNftCollectionParentTokenId(collectionId)
+    mintPassOfferRequestEpochRef.current += 1
+    mintPassCollectionRef.current = collectionId
+    setMintPassCollectionId(collectionId)
+    setMintPassOfferSummary(null)
+    setMintPassOfferIdInput('')
+    setMintPassOfferLoading(false)
+    setMintPassBuyTxid(null)
+    setMintPassSellTxid(null)
+    setMintPassSellOfferId(null)
+    setMintPassAdminState(null)
+    setMintPassIssuePreview(null)
+    setMintPassIssueTxid(null)
+    setMintPassError(null)
+    setMintPassAdminError(null)
+  }, [])
+
+  const invalidateMintPassOfferRequests = useCallback(() => {
+    mintPassOfferRequestEpochRef.current += 1
+    setMintPassOfferSummary(null)
+    setMintPassOfferLoading(false)
+  }, [])
 
   useEffect(() => {
     if (initialized) {
@@ -207,17 +233,9 @@ function DEX() {
       const collectionId = searchParams.get('collectionId')
       if (isCollectionId(collectionId)) {
         setDexTab('mintpass')
-        setMintPassCollectionId(collectionId)
-        setMintPassOfferSummary(null)
-        setMintPassOfferIdInput('')
-        setMintPassBuyTxid(null)
-        setMintPassSellTxid(null)
-        setMintPassSellOfferId(null)
-        setMintPassAdminState(null)
-        setMintPassIssuePreview(null)
-        setMintPassIssueTxid(null)
-        setMintPassError(null)
+        selectMintPassCollection(collectionId)
       } else {
+        invalidateMintPassOfferRequests()
         setDexTab('maker')
         setMintPassError('Selecciona una colección NFT registrada para operar Mint Pass.')
       }
@@ -230,7 +248,7 @@ function DEX() {
       setNftTokenIdInput(nftTokenId)
       setNftSellTokenId(nftTokenId)
     }
-  }, [searchParams])
+  }, [invalidateMintPassOfferRequests, searchParams, selectMintPassCollection])
 
   useEffect(() => {
     let active = true
@@ -1006,14 +1024,29 @@ function DEX() {
       return
     }
 
+    const requestedCollectionId = mintPassCollectionRef.current
+    const requestedParentTokenId = resolveNftCollectionParentTokenId(requestedCollectionId)
+    const requestEpoch = mintPassOfferRequestEpochRef.current + 1
+    mintPassOfferRequestEpochRef.current = requestEpoch
+    const ownsCurrentRequest = () =>
+      mintPassOfferRequestEpochRef.current === requestEpoch &&
+      mintPassCollectionRef.current === requestedCollectionId &&
+      resolveNftCollectionParentTokenId(mintPassCollectionRef.current) === requestedParentTokenId
+
     setMintPassOfferLoading(true)
     try {
-      const result = await loadOfferById({ offerId, tokenId: mintPassParentTokenId })
-      setMintPassOfferSummary(result.summary)
+      const result = await loadOfferById({ offerId, tokenId: requestedParentTokenId })
+      if (ownsCurrentRequest()) {
+        setMintPassOfferSummary(result.summary)
+      }
     } catch (err) {
-      setMintPassError((err as Error).message || 'No pudimos cargar esta oferta de Mint Pass.')
+      if (ownsCurrentRequest()) {
+        setMintPassError((err as Error).message || 'No pudimos cargar esta oferta de Mint Pass.')
+      }
     } finally {
-      setMintPassOfferLoading(false)
+      if (ownsCurrentRequest()) {
+        setMintPassOfferLoading(false)
+      }
     }
   }
 
@@ -1027,13 +1060,23 @@ function DEX() {
       return
     }
 
+    const expectedCollectionId = mintPassCollectionRef.current
+    const expectedParentTokenId = resolveNftCollectionParentTokenId(expectedCollectionId)
+    if (mintPassOfferSummary.tokenId !== expectedParentTokenId) {
+      mintPassOfferRequestEpochRef.current += 1
+      setMintPassOfferSummary(null)
+      setMintPassError('La oferta cargada no corresponde a la colección seleccionada.')
+      return
+    }
+
     setMintPassError(null)
     setMintPassBuyTxid(null)
     setMintPassBuyBusy(true)
     try {
       const { txid } = await acceptOfferById({
         offerId: mintPassOfferSummary.offerId,
-        wallet: xolosWalletService
+        wallet: xolosWalletService,
+        expectedCollectionId
       })
       setMintPassBuyTxid(txid)
       await refreshBalances()
@@ -1513,19 +1556,7 @@ function DEX() {
                     name="mintPassCollection"
                     value={collectionId}
                     checked={mintPassCollectionId === collectionId}
-                    onChange={() => {
-                      setMintPassCollectionId(collectionId)
-                      setMintPassOfferSummary(null)
-                      setMintPassOfferIdInput('')
-                      setMintPassBuyTxid(null)
-                      setMintPassSellTxid(null)
-                      setMintPassSellOfferId(null)
-                      setMintPassAdminState(null)
-                      setMintPassIssuePreview(null)
-                      setMintPassIssueTxid(null)
-                      setMintPassError(null)
-                      setMintPassAdminError(null)
-                    }}
+                    onChange={() => selectMintPassCollection(collectionId)}
                   />{' '}
                   {MINT_PASS_COLLECTION_LABELS[collectionId]}
                 </label>
