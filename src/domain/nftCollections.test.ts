@@ -11,6 +11,8 @@ import {
 
 const OFFICIAL_PARENT_TOKEN_ID =
   'bf8e0b5cd60fe4d6354c662b28542e0f3c3d69941eb039426d65bcdb7fe9f48c'
+const COMMUNITY_PARENT_TOKEN_ID =
+  'd6ff881413733a1a6407fa5e1e86537e5fc9f48246bae89b732ca7044993e57a'
 const CHILD_TOKEN_ID = 'a'.repeat(64)
 const OTHER_GROUP_TOKEN_ID = 'b'.repeat(64)
 
@@ -27,8 +29,13 @@ const officialEvidence = (): VerifiedEvidence => ({
   groupTokenType: 129
 })
 
+const communityEvidence = (): VerifiedEvidence => ({
+  ...officialEvidence(),
+  groupTokenId: COMMUNITY_PARENT_TOKEN_ID
+})
+
 describe('NFT collection trust registry', () => {
-  test('pins the official trust anchor in source and keeps community closed', () => {
+  test('pins distinct official and community trust anchors in source', () => {
     expect(NFT_COLLECTION_TRUST_REGISTRY_VERSION).toBe(1)
     expect(NFT_COLLECTION_TRUST_REGISTRY).toEqual({
       official: {
@@ -39,9 +46,12 @@ describe('NFT collection trust registry', () => {
       community: {
         id: 'community',
         tier: 'community',
-        parentTokenId: null
+        parentTokenId: COMMUNITY_PARENT_TOKEN_ID
       }
     })
+    expect(NFT_COLLECTION_TRUST_REGISTRY.official.parentTokenId).not.toBe(
+      NFT_COLLECTION_TRUST_REGISTRY.community.parentTokenId
+    )
     expect(Object.isFrozen(NFT_COLLECTION_TRUST_REGISTRY)).toBe(true)
     expect(Object.isFrozen(NFT_COLLECTION_TRUST_REGISTRY.official)).toBe(true)
     expect(Object.isFrozen(NFT_COLLECTION_TRUST_REGISTRY.community)).toBe(true)
@@ -55,12 +65,38 @@ describe('NFT collection trust registry', () => {
 })
 
 describe('classifyCollection', () => {
+  test('classifies exact verified community Child evidence as community', () => {
+    expect(classifyCollection(communityEvidence())).toBe('community')
+  })
+
+  test('keeps the official Parent classified as official', () => {
+    expect(classifyCollection(officialEvidence())).toBe('official')
+  })
+
   test('Test A: metadata claims cannot override a different on-chain Group ID', () => {
     const adversarialFixture = {
       metadata: {
         name: 'Xolos Ramírez Official',
         verification: 'verified',
         parentTokenId: OFFICIAL_PARENT_TOKEN_ID
+      },
+      evidence: {
+        ...officialEvidence(),
+        groupTokenId: OTHER_GROUP_TOKEN_ID
+      } satisfies OnChainNftCollectionEvidence
+    }
+
+    expect(classifyCollection(adversarialFixture.evidence)).toBe('unknown')
+  })
+
+  test.each(['official', 'community'])('metadata impersonating %s cannot affect classification', (tier) => {
+    const adversarialFixture = {
+      metadata: {
+        name: tier === 'official' ? 'Xolos Ramírez Official' : 'xolosArmy Community',
+        ticker: tier === 'official' ? 'XOLOSNFT' : 'RMZCOMM',
+        verification: 'verified',
+        parentTokenId:
+          tier === 'official' ? OFFICIAL_PARENT_TOKEN_ID : COMMUNITY_PARENT_TOKEN_ID
       },
       evidence: {
         ...officialEvidence(),
@@ -141,7 +177,7 @@ describe('classifyCollection', () => {
     expect(classifyCollection(hostileEvidence)).toBe('unknown')
   })
 
-  test('cannot classify community while its trust anchor is null', () => {
+  test('returns unknown for an arbitrary unregistered Group token', () => {
     expect(
       classifyCollection({
         ...officialEvidence(),
@@ -183,7 +219,7 @@ describe('buildNftCollectionMetadata', () => {
     expect('verification' in metadata).toBe(false)
   })
 
-  test('keeps future community metadata explicitly closed with a null parent', () => {
+  test('builds community metadata from the registered Parent without affecting classification', () => {
     const metadata = buildNftCollectionMetadata({
       collectionId: 'community',
       name: 'Future community collection',
@@ -193,9 +229,15 @@ describe('buildNftCollectionMetadata', () => {
 
     expect(metadata.collection).toEqual({
       id: 'community',
-      parentTokenId: null,
+      parentTokenId: COMMUNITY_PARENT_TOKEN_ID,
       registryVersion: 1
     })
+    expect(
+      classifyCollection({
+        ...officialEvidence(),
+        groupTokenId: OTHER_GROUP_TOKEN_ID
+      })
+    ).toBe('unknown')
   })
 
   test('remains disconnected from the current minter, metadata service and UI', () => {

@@ -19,7 +19,7 @@ export const NFT_COLLECTION_TRUST_REGISTRY = Object.freeze({
   community: Object.freeze({
     id: 'community',
     tier: 'community',
-    parentTokenId: null
+    parentTokenId: 'd6ff881413733a1a6407fa5e1e86537e5fc9f48246bae89b732ca7044993e57a'
   })
 }) satisfies Readonly<Record<CollectionId, RegisteredCollection>>
 
