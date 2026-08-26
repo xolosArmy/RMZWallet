@@ -1,11 +1,33 @@
-# Community Parent preparation tool
+# Community Parent tooling and confirmed anchor
 
-`npx tsx scripts/create-community-parent.ts` prepares an offline preview for a future
-`SLP NFT1 Group` Genesis. Its capability level is limited to metadata validation,
-pure-XEC funding selection, canonical OP_RETURN construction, and an unsigned
-output plan. It never derives keys, signs, contacts Chronik, uploads metadata, or
-broadcasts a transaction. The community trust-registry entry remains closed and
-is not changed by this tool.
+The Community Parent Genesis has been created and confirmed on eCash mainnet.
+Its canonical Token ID and Community collection trust anchor is
+`d6ff881413733a1a6407fa5e1e86537e5fc9f48246bae89b732ca7044993e57a`.
+Chronik reports `TOKEN_STATUS_NORMAL`, protocol `SLP`, token type
+`SLP_TOKEN_TYPE_NFT1_GROUP` (`129`), `txType: GENESIS`, and `isInvalid: false`.
+Genesis `vout 1` contains exactly one Group atom, and the mint baton at `vout 2`
+is controlled by the administrative wallet. The transaction was confirmed at
+block height `964005` with block hash
+`00000000000000002b7be127bcd600849fd79669d0367e06bb148553aa36d1a2`.
+
+The canonical metadata is 339 bytes with SHA-256
+`03cd44ce490769d5646b39c84b488d2894b2b6c4958b085f2cc906c1d36a09a6`
+and is published as
+`ipfs://bafkreiadzvcm4sihnhkwi2zzzbfurdjisszlnrevrmef6lgja3a5g2qjuy`.
+
+The trust registry recognizes Community membership only from verified on-chain
+NFT1 ancestry. Metadata, names, tickers, IPFS content, and declarative
+verification fields cannot independently establish trust. The official and
+Community collections remain cryptographically separate.
+
+**La metadata describe. La blockchain demuestra.**
+
+`npx tsx scripts/create-community-parent.ts` prepares an offline reconstruction
+preview of an `SLP NFT1 Group` Genesis. Its capability level is limited to
+metadata validation, pure-XEC funding selection, canonical OP_RETURN
+construction, and an unsigned output plan. It never derives keys, signs,
+contacts Chronik, uploads metadata, or broadcasts a transaction. The tool does
+not modify the trust registry.
 
 ## Verified protocol choices
 
@@ -89,9 +111,10 @@ BROADCAST=1
 CONFIRM_COMMUNITY_PARENT_GENESIS=YES
 ```
 
-Actual creation of the Parent requires the separately reviewed administrative
+The confirmed Parent was created through the separately reviewed administrative
 executor described below. Neither execution capability belongs to the planner
-or changes this planner-only command.
+or changes this planner-only command. This document does not authorize creating
+another Parent or rerunning the executor.
 
 No WIF, mnemonic, seed, or private key is accepted as a CLI argument or printed.
 
