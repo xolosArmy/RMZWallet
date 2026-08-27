@@ -24,6 +24,7 @@ declare module 'ecash-agora' {
     static approximateParams(params: AgoraPartialParams): AgoraPartial
     constructor(params: AgoraPartialParams)
     adPushdata(): Uint8Array
+    adScript(): { bytecode: Uint8Array }
     offeredAtoms(): bigint
     minAcceptedAtoms(): bigint
     script(): { bytecode: Uint8Array }
@@ -49,6 +50,7 @@ declare module 'ecash-agora' {
     enforcedOutputs: { sats: bigint; script: Script }[]
   }
 
+  export const AgoraPartialAdSignatory: (sk: Uint8Array) => unknown
   export const AgoraOneshotAdSignatory: (sk: Uint8Array) => unknown
   export const parseAgoraTx: (tx: unknown) => {
     type: 'ONESHOT'
