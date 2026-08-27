@@ -9,7 +9,7 @@ import {
   type MintPassPublicOffer
 } from '../../../services/mintPassPartialMarket'
 
-const FEATURED_OFFER_ID = '22a702dc6e22b626bc2e0252b5c0f40573f9b52eb10a736edce015ba1e69d26d:1'
+const FEATURED_OFFER_ID = '7aaba8ad2d7c1e73aba7913407966242709346c0e8dfbe38f918731fac03d065:1'
 
 const COLLECTION_LABELS: Readonly<Record<CollectionId, string>> = Object.freeze({
   official: 'Official / Xolos Ramírez',
