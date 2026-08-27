@@ -24,10 +24,10 @@ declare module 'ecash-agora' {
     static approximateParams(params: AgoraPartialParams): AgoraPartial
     constructor(params: AgoraPartialParams)
     adPushdata(): Uint8Array
-    adScript(): { bytecode: Uint8Array }
+    adScript(): Script
     offeredAtoms(): bigint
     minAcceptedAtoms(): bigint
-    script(): { bytecode: Uint8Array }
+    script(): Script
     prepareAcceptedAtoms(atoms: bigint): bigint
     preventUnacceptableRemainder(atoms: bigint): void
     askedSats(atoms: bigint): bigint
@@ -44,8 +44,8 @@ declare module 'ecash-agora' {
   export class AgoraOneshot {
     static COVENANT_VARIANT: string
     constructor(params: Record<string, unknown>)
-    script(): { bytecode: Uint8Array }
-    adScript(): { bytecode: Uint8Array }
+    script(): Script
+    adScript(): Script
     askedSats(): bigint
     enforcedOutputs: { sats: bigint; script: Script }[]
   }
