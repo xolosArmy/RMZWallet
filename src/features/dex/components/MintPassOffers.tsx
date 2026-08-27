@@ -124,7 +124,11 @@ export default function MintPassOffers() {
 
     setPublishing(true)
     try {
-      const result = await createMintPassPartialOffer({ sellCollectionId, quantity, unitPriceXecSats } as never)
+      const result = await createMintPassPartialOffer({
+        collectionId: sellCollectionId,
+        quantity,
+        unitPriceXecSats
+      })
       setPublishedOfferId(result.offerId)
       await refreshBalances()
       await sleep(800)
