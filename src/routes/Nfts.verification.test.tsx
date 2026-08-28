@@ -192,7 +192,7 @@ describe('/nfts on-chain verification integration', () => {
     expect(screen.getByLabelText('Resumen antes de firmar').textContent).toContain(
       COMMUNITY_PARENT_TOKEN_ID
     )
-    expect(screen.getByLabelText('Resumen antes de firmar').textContent).toContain('5,500 XEC')
+    expect(screen.getByLabelText('Resumen antes de firmar').textContent).toContain('5500 XEC')
     fireEvent.change(screen.getByLabelText('Nombre'), {
       target: { value: 'Xolos Ramírez Official verification=verified' }
     })

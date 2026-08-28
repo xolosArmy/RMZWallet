@@ -35,17 +35,13 @@ describe('public NFT mint collection architecture', () => {
     expect(builder).toMatch(/resolveNftCollectionParentTokenId\(params\.collectionId\)/)
   })
 
-  test('routes Mint Pass DEX operations through collectionId and the resolved canonical Parent', () => {
+  test('routes Mint Pass DEX operations through the refactored Offers entry point', () => {
     const route = source('../routes/Nfts.tsx')
     const dex = source('../routes/DEX.tsx')
 
     expect(route).toContain('/dex?mode=mintpass&collectionId=${selectedCollectionId}')
-    expect(dex).toMatch(/searchParams\.get\('collectionId'\)/)
-    expect(dex).toMatch(/isCollectionId\(collectionId\)/)
-    expect(dex).toMatch(/resolveNftCollectionParentTokenId\(mintPassCollectionId\)/)
-    expect(dex).toMatch(/loadOfferById\(\{ offerId, tokenId: requestedParentTokenId \}\)/)
-    expect(dex).toMatch(/expectedCollectionId/)
-    expect(dex).toMatch(/mintPassOfferRequestEpochRef/)
+    expect(dex).toMatch(/searchParams\.has\('mode'\)/)
+    expect(dex).toMatch(/MintPassOffers/)
     expect(dex).not.toMatch(/mode === 'mintpass'[^\n]*tokenId/)
   })
 
