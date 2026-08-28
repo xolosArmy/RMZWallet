@@ -1,4 +1,7 @@
-import { XOLOSARMY_NFT_PARENT_TOKEN_ID } from '../config/nfts'
+import {
+  resolveNftCollectionParentTokenId,
+  type CollectionId
+} from '../domain/nftCollections'
 import { ipfsToGatewayUrl } from '../utils/ipfs'
 
 export type XolosLineage = {
@@ -18,6 +21,7 @@ export type XolosLineage = {
 }
 
 export type XolosarmyMetadataParams = {
+  collectionId: CollectionId
   name: string
   description: string
   imageCid: string
@@ -72,6 +76,7 @@ const appendLineageTraits = (attributes: Array<Record<string, unknown>>, lineage
 }
 
 export const buildXolosarmyNftMetadata = ({
+  collectionId,
   name,
   description,
   imageCid,
@@ -79,19 +84,21 @@ export const buildXolosarmyNftMetadata = ({
   attributes = [],
   lineage
 }: XolosarmyMetadataParams) => {
+  const parentTokenId = resolveNftCollectionParentTokenId(collectionId)
   const lineageMetadata = buildLineageMetadata(lineage)
+  const collection =
+    collectionId === 'official'
+      ? { name: 'xolosArmy NFTs', family: 'Xolos Ramírez' }
+      : { name: 'xolosArmy Community', family: 'xolosArmy Community' }
   const metadata = {
     name,
     description,
     image: `ipfs://${imageCid}`,
     external_url: externalUrl,
-    collection: {
-      name: 'xolosArmy NFTs',
-      family: 'Xolos Ramírez'
-    },
+    collection,
     attributes: appendLineageTraits(attributes, lineageMetadata),
     lineage: lineageMetadata,
-    parent: XOLOSARMY_NFT_PARENT_TOKEN_ID,
+    parent: parentTokenId,
     app: 'Tonalli Wallet',
     schema_version: lineageMetadata ? '1.1.0' : undefined
   }

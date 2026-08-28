@@ -180,6 +180,19 @@ const validateDocumentUri = (documentUri: string): string => {
   return `ipfs://${cid.toString()}`
 }
 
+export const assertCommunityParentGenesisConfig = (
+  config: CommunityParentGenesisConfig
+): void => {
+  if (!(['mainnet', 'testnet', 'regtest'] as const).includes(config.network)) {
+    throw new Error('Network must be explicitly set to mainnet, testnet, or regtest.')
+  }
+  validateDocumentUri(config.documentUri)
+  validateAddress(config.fundingAddress, config.network, 'Funding address')
+  validateAddress(config.tokenDestinationAddress, config.network, 'Token destination')
+  validateAddress(config.batonDestinationAddress, config.network, 'Baton destination')
+  validateAddress(config.changeAddress, config.network, 'Change address')
+}
+
 export const assertCommunityParentPlannerEnvironment = (
   environment: CommunityParentPlannerEnvironment
 ): void => {
@@ -273,9 +286,7 @@ export const buildCommunityParentGenesisPlan = (params: {
   readonly fundingUtxos: readonly CommunityParentFundingUtxo[]
 }): CommunityParentGenesisPlan => {
   const config = params.config
-  if (!(['mainnet', 'testnet', 'regtest'] as const).includes(config.network)) {
-    throw new Error('Network must be explicitly set to mainnet, testnet, or regtest.')
-  }
+  assertCommunityParentGenesisConfig(config)
   const documentUri = validateDocumentUri(config.documentUri)
 
   const fundingAddress = validateAddress(config.fundingAddress, config.network, 'Funding address')
