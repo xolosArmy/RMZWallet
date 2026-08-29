@@ -33,40 +33,17 @@ import {
   type Tm1RecoveryStoreTransportAcknowledgementCommit
 } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
 import {
-  parseTm1RollbackWitnessRecord,
-  type Tm1RollbackWitnessRecord
-} from '../../../src/integrations/tonalliMemo/recovery/tm1RollbackWitness'
-import {
-  withTm1RollbackWitnessReservationGrant,
-  type Tm1RollbackWitnessReservationGrant,
-  type Tm1RollbackWitnessReservationGrantEvidence
-} from './tm1RollbackWitnessReservationGrant'
-import {
   initializeOrVerifyTm1SqliteSchema,
-  inspectTm1SqliteSchema,
-  verifyTm1SqliteSchema,
-  verifyTm1SqliteSchemaV1,
-  verifyTm1SqliteSchemaV2
+  verifyTm1SqliteSchemaV1
 } from './tm1SqliteMigrations'
+import { encodeTm1SqliteIdentifierKey } from './tm1SqliteIdentifierKey'
 import {
-  decodeTm1SqliteIdentifierKey,
-  encodeTm1SqliteIdentifierKey
-} from './tm1SqliteIdentifierKey'
-import {
-  TM1_LOGICAL_STATE_ROOT_SCHEMA_VERSION,
-  TM1_SQLITE_SCHEMA_V2_METADATA_SQL,
-  TM1_SQLITE_WITNESS_BINDING_SQL,
-  TM1_SQLITE_WITNESS_SCHEMA_VERSION,
   canonicalizeTm1RecoveryRecord,
-  computeTm1LogicalStateRoot,
   consumedCapabilityEvidenceRows,
-  parseTm1SqliteWitnessBinding,
   sha256Hex,
   type Tm1CanonicalRecoveryRecord,
   type Tm1SqliteCapabilityEvidenceRow,
-  type Tm1SqlitePublicationMirrors,
-  type Tm1SqliteWitnessBinding,
-  type Tm1SqliteWitnessIdentity
+  type Tm1SqlitePublicationMirrors
 } from './tm1SqliteSchema'
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000
@@ -110,19 +87,6 @@ export type Tm1SqliteDurabilityState = Readonly<{
   busyTimeoutMs: number
 }>
 
-export type Tm1SqliteWitnessEnrollment = Readonly<{
-  slotId: string
-  storeId: string
-  logicalRoot: string
-}>
-
-export type Tm1SqliteWitnessReservationCommit = Readonly<{
-  expectedGeneration: number
-  expectedLogicalRoot: string
-  pendingRecord: Tm1RollbackWitnessRecord
-  grant: Tm1RollbackWitnessReservationGrant
-}>
-
 export class Tm1SqlitePublicationRecoveryStore
 implements Tm1PublicationRecoveryStore {
   private readonly database: DatabaseSync
@@ -153,14 +117,11 @@ implements Tm1PublicationRecoveryStore {
       requestWalMode(database, bindings.busyTimeoutMs)
       if (readPragmaString(database, 'journal_mode') !== 'wal') storeFailure()
       database.exec('PRAGMA synchronous = FULL')
-      verifyTm1SqliteSchema(database)
+      verifyTm1SqliteSchemaV1(database)
 
       this.database = database
       this.busyTimeoutMs = bindings.busyTimeoutMs
       this.inspectDurability()
-      if (inspectTm1SqliteSchema(database) === 'v2') {
-        this.inspectWitnessBinding()
-      }
     } catch (error) {
       if (database?.isOpen) {
         try {
@@ -208,7 +169,6 @@ implements Tm1PublicationRecoveryStore {
       this.assertOpen()
       const canonical = canonicalizeTm1RecoveryRecord(readInputRecord(input))
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
         if (this.selectPublicationRow(canonical.record.publicationId) !== undefined) {
           throw new Tm1PublicationRecoveryStoreError('DUPLICATE_PUBLICATION_ID')
         }
@@ -228,7 +188,6 @@ implements Tm1PublicationRecoveryStore {
       const next = canonicalizeTm1RecoveryRecord(readInputRecord(input))
       const declaredCapabilityIds = snapshotIdentifierList(input.newlyConsumedCapabilityIds)
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
         const current = this.currentForMutation(expected)
         assertTm1ExecutionEvidenceTransition(current, next.record)
         const previousIds = new Set(
@@ -259,7 +218,6 @@ implements Tm1PublicationRecoveryStore {
       const expected = snapshotExpectedVersion(input)
       const next = canonicalizeTm1RecoveryRecord(readInputRecord(input))
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
         const current = this.currentForMutation(expected)
         assertTm1DispatchIntentTransition(current, next.record)
         this.updatePublication(next, expected)
@@ -280,7 +238,6 @@ implements Tm1PublicationRecoveryStore {
         parseTm1TransportAcknowledgementCommitEvidence(input.acknowledgement)
       const acknowledgement = snapshotUnknown(parsedAcknowledgement)
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
         const current = this.currentForMutation(expected)
         const nextRecord = createTm1TransportAcknowledgedRecord(current, acknowledgement)
         assertTm1TransportAcknowledgementTransition(current, nextRecord)
@@ -299,7 +256,6 @@ implements Tm1PublicationRecoveryStore {
       const expected = snapshotExpectedVersion(input)
       const next = canonicalizeTm1RecoveryRecord(readInputRecord(input))
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
         const current = this.currentForMutation(expected)
         assertTm1RecoveryTransition(current, next.record)
         this.updatePublication(next, expected)
@@ -316,7 +272,6 @@ implements Tm1PublicationRecoveryStore {
       const expected = snapshotExpectedVersion(input)
       const nextOwnerEpoch = requireNonNegativeSafeInteger(input.nextOwnerEpoch)
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
         const current = this.currentForMutation(expected)
         if (nextOwnerEpoch <= current.ownerEpoch) {
           throw new Tm1PublicationRecoveryStoreError('STALE_OWNER_EPOCH')
@@ -370,193 +325,6 @@ implements Tm1PublicationRecoveryStore {
     }
   }
 
-  /** Returns null for a legacy, not-yet-enrolled v1 store. */
-  inspectWitnessBinding(): Tm1SqliteWitnessBinding | null {
-    try {
-      this.assertOpen()
-      return this.withReadSnapshot(() => {
-        if (inspectTm1SqliteSchema(this.database) === 'v1') return null
-        const binding = this.readWitnessBinding()
-        this.assertLogicalRoot(binding)
-        return binding
-      })
-    } catch (error) {
-      throw normalizeStoreBoundaryError(error)
-    }
-  }
-
-  /** Computes the proposed generation-zero root without mutating a v1 store. */
-  computeEnrollmentLogicalRoot(
-    identityValue: Omit<Tm1SqliteWitnessIdentity, 'generation'>
-  ): string {
-    try {
-      this.assertOpen()
-      const identity = snapshotWitnessIdentity({ ...identityValue, generation: 0 })
-      return this.withReadSnapshot(() => {
-        if (inspectTm1SqliteSchema(this.database) !== 'v1') storeFailure()
-        return computeTm1LogicalStateRoot(this.database, identity)
-      })
-    } catch (error) {
-      throw normalizeStoreBoundaryError(error)
-    }
-  }
-
-  /** Computes a candidate root for the same enrolled identity at a generation. */
-  computeWitnessLogicalRoot(generationValue: number): string {
-    try {
-      this.assertOpen()
-      const generation = requireNonNegativeSafeInteger(generationValue)
-      return this.withReadSnapshot(() => {
-        if (inspectTm1SqliteSchema(this.database) !== 'v2') storeFailure()
-        const current = this.readWitnessBinding()
-        this.assertLogicalRoot(current)
-        return computeTm1LogicalStateRoot(this.database, Object.freeze({
-          slotId: current.slotId,
-          storeId: current.storeId,
-          generation
-        }))
-      })
-    } catch (error) {
-      throw normalizeStoreBoundaryError(error)
-    }
-  }
-
-  /**
-   * Explicit provisioning-only migration. Ordinary startup never calls this.
-   * The caller must first authenticate a matching remote enrollment record.
-   */
-  enrollWitnessBinding(inputValue: Tm1SqliteWitnessEnrollment): Tm1SqliteWitnessBinding {
-    try {
-      this.assertOpen()
-      const input = snapshotWitnessEnrollment(inputValue)
-      this.database.exec('BEGIN IMMEDIATE')
-      try {
-        verifyTm1SqliteSchemaV1(this.database)
-        const identity = Object.freeze({
-          slotId: input.slotId,
-          storeId: input.storeId,
-          generation: 0
-        })
-        if (computeTm1LogicalStateRoot(this.database, identity) !== input.logicalRoot) {
-          storeFailure()
-        }
-        const metadata = this.database.prepare(`
-          SELECT created_at
-          FROM tm1_store_metadata
-          WHERE singleton_id = 1
-        `).get()
-        const createdAt = requireNonNegativeSafeInteger(metadata?.created_at)
-        this.database.exec('DROP TABLE tm1_store_metadata')
-        this.database.exec(TM1_SQLITE_SCHEMA_V2_METADATA_SQL)
-        this.database.exec(TM1_SQLITE_WITNESS_BINDING_SQL)
-        this.database.prepare(`
-          INSERT INTO tm1_store_metadata (
-            singleton_id, physical_schema_version, created_at
-          ) VALUES (1, ?, ?)
-        `).run(TM1_SQLITE_WITNESS_SCHEMA_VERSION, createdAt)
-        this.database.prepare(`
-          INSERT INTO tm1_witness_binding (
-            singleton_id,
-            witness_protocol_version,
-            logical_root_schema_version,
-            slot_id,
-            store_id,
-            generation,
-            logical_root
-          ) VALUES (1, 1, ?, ?, ?, 0, ?)
-        `).run(
-          TM1_LOGICAL_STATE_ROOT_SCHEMA_VERSION,
-          encodeTm1SqliteIdentifierKey(input.slotId),
-          input.storeId,
-          input.logicalRoot
-        )
-        this.database.exec(`PRAGMA user_version = ${TM1_SQLITE_WITNESS_SCHEMA_VERSION}`)
-        verifyTm1SqliteSchemaV2(this.database)
-        const binding = this.readWitnessBinding()
-        this.assertLogicalRoot(binding)
-        this.database.exec('COMMIT')
-        return binding
-      } catch (error) {
-        if (this.database.isTransaction) {
-          try {
-            this.database.exec('ROLLBACK')
-          } catch {
-            // The original migration failure remains authoritative.
-          }
-        }
-        throw error
-      }
-    } catch (error) {
-      throw normalizeStoreBoundaryError(error)
-    }
-  }
-
-  /**
-   * Persists only a previously reserved witness generation. The record is
-   * evidence, not authority; startup must still authenticate it remotely.
-   */
-  commitReservedWitnessBinding(
-    inputValue: Tm1SqliteWitnessReservationCommit
-  ): Tm1SqliteWitnessBinding {
-    try {
-      this.assertOpen()
-      const grant = readReservationGrant(inputValue)
-      return withTm1RollbackWitnessReservationGrant(grant, evidence => {
-        const input = snapshotWitnessReservationCommit(inputValue)
-        assertReservationFence(input, evidence)
-        this.database.exec('BEGIN IMMEDIATE')
-        try {
-          verifyTm1SqliteSchemaV2(this.database)
-          const current = this.readWitnessBinding()
-          this.assertLogicalRoot(current)
-          const pending = input.pendingRecord
-          if (
-            current.generation !== evidence.previousStableGeneration ||
-            current.logicalRoot !== evidence.previousStableLogicalRoot ||
-            current.slotId !== evidence.slotId ||
-            current.storeId !== evidence.storeId ||
-            pending.generation !== current.generation + 1
-          ) reservationFenceMismatch()
-          const nextIdentity = Object.freeze({
-            slotId: current.slotId,
-            storeId: current.storeId,
-            generation: pending.generation
-          })
-          if (
-            computeTm1LogicalStateRoot(this.database, nextIdentity) !==
-            pending.logicalRoot
-          ) reservationFenceMismatch()
-          const result = this.database.prepare(`
-            UPDATE tm1_witness_binding
-            SET generation = ?, logical_root = ?
-            WHERE singleton_id = 1 AND generation = ? AND logical_root = ?
-          `).run(
-            pending.generation,
-            pending.logicalRoot,
-            current.generation,
-            current.logicalRoot
-          )
-          if (!changesEqual(result.changes, 1)) reservationFenceMismatch()
-          const committed = this.readWitnessBinding()
-          this.assertLogicalRoot(committed)
-          this.database.exec('COMMIT')
-          return committed
-        } catch (error) {
-          if (this.database.isTransaction) {
-            try {
-              this.database.exec('ROLLBACK')
-            } catch {
-              // The original binding failure remains authoritative.
-            }
-          }
-          throw error
-        }
-      })
-    } catch (error) {
-      throw normalizeStoreBoundaryError(error)
-    }
-  }
-
   close(): void {
     if (this.closed) return
     try {
@@ -575,14 +343,14 @@ implements Tm1PublicationRecoveryStore {
     if (this.database.isTransaction) {
       // Full attestation per operation is an intentional conservative choice:
       // it binds authoritative reads to the caller-owned snapshot too.
-      verifyTm1SqliteSchema(this.database)
+      verifyTm1SqliteSchemaV1(this.database)
       return operation()
     }
 
     this.database.exec('BEGIN')
     try {
       // Establish and attest the same snapshot used by all hydration queries.
-      verifyTm1SqliteSchema(this.database)
+      verifyTm1SqliteSchemaV1(this.database)
       const result = operation()
       this.database.exec('COMMIT')
       return result
@@ -602,7 +370,7 @@ implements Tm1PublicationRecoveryStore {
     this.database.exec('BEGIN IMMEDIATE')
     try {
       // The reserved write lock closes the DDL TOCTOU after attestation.
-      verifyTm1SqliteSchema(this.database)
+      verifyTm1SqliteSchemaV1(this.database)
       const result = operation()
       this.database.exec('COMMIT')
       return result
@@ -633,41 +401,6 @@ implements Tm1PublicationRecoveryStore {
       throw new Tm1PublicationRecoveryStoreError('STALE_OWNER_EPOCH')
     }
     return current
-  }
-
-  private assertLegacyMutationAllowed(): void {
-    if (inspectTm1SqliteSchema(this.database) !== 'v1') {
-      throw new Tm1PublicationRecoveryStoreError('ROLLBACK_WITNESS_REQUIRED')
-    }
-  }
-
-  private readWitnessBinding(): Tm1SqliteWitnessBinding {
-    const rows = this.database.prepare(`
-      SELECT
-        witness_protocol_version,
-        logical_root_schema_version,
-        slot_id,
-        store_id,
-        generation,
-        logical_root
-      FROM tm1_witness_binding
-      WHERE singleton_id = 1
-    `).all()
-    if (rows.length !== 1) storeFailure()
-    return parseTm1SqliteWitnessBinding({
-      witnessProtocolVersion: rows[0].witness_protocol_version,
-      logicalRootSchemaVersion: rows[0].logical_root_schema_version,
-      slotId: decodeWitnessSlotId(rows[0].slot_id),
-      storeId: rows[0].store_id,
-      generation: rows[0].generation,
-      logicalRoot: rows[0].logical_root
-    })
-  }
-
-  private assertLogicalRoot(binding: Tm1SqliteWitnessBinding): void {
-    if (computeTm1LogicalStateRoot(this.database, binding) !== binding.logicalRoot) {
-      storeFailure()
-    }
   }
 
   private selectPublicationRow(
@@ -1012,142 +745,6 @@ function snapshotExpectedVersion(
   })
 }
 
-function snapshotWitnessIdentity(
-  value: Tm1SqliteWitnessIdentity
-): Tm1SqliteWitnessIdentity {
-  const source = exactDataRecord(value, ['slotId', 'storeId', 'generation'])
-  return Object.freeze({
-    slotId: requirePublicationId(readDataProperty(source, 'slotId')),
-    storeId: requireStoreId(readDataProperty(source, 'storeId')),
-    generation: requireNonNegativeSafeInteger(readDataProperty(source, 'generation'))
-  })
-}
-
-function snapshotWitnessEnrollment(
-  value: Tm1SqliteWitnessEnrollment
-): Tm1SqliteWitnessEnrollment {
-  const source = exactDataRecord(value, ['slotId', 'storeId', 'logicalRoot'])
-  return Object.freeze({
-    slotId: requirePublicationId(readDataProperty(source, 'slotId')),
-    storeId: requireStoreId(readDataProperty(source, 'storeId')),
-    logicalRoot: requireCanonicalHash(readDataProperty(source, 'logicalRoot'))
-  })
-}
-
-function snapshotWitnessReservationCommit(
-  value: Tm1SqliteWitnessReservationCommit
-): Tm1SqliteWitnessReservationCommit {
-  const source = exactDataRecord(value, [
-    'expectedGeneration', 'expectedLogicalRoot', 'pendingRecord', 'grant'
-  ])
-  return Object.freeze({
-    expectedGeneration: requireNonNegativeSafeInteger(
-      readDataProperty(source, 'expectedGeneration')
-    ),
-    expectedLogicalRoot: requireCanonicalHash(
-      readDataProperty(source, 'expectedLogicalRoot')
-    ),
-    pendingRecord: parseTm1RollbackWitnessRecord(
-      readDataProperty(source, 'pendingRecord')
-    ),
-    grant: readDataProperty(source, 'grant') as Tm1RollbackWitnessReservationGrant
-  })
-}
-
-function readReservationGrant(value: unknown): unknown {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return reservationGrantRequired()
-  }
-  let descriptor: PropertyDescriptor | undefined
-  try {
-    descriptor = Object.getOwnPropertyDescriptor(value, 'grant')
-  } catch {
-    return reservationGrantRequired()
-  }
-  if (descriptor === undefined || !('value' in descriptor)) {
-    return reservationGrantRequired()
-  }
-  return descriptor.value
-}
-
-function assertReservationFence(
-  input: Tm1SqliteWitnessReservationCommit,
-  evidence: Tm1RollbackWitnessReservationGrantEvidence
-): void {
-  if (
-    input.expectedGeneration !== evidence.previousStableGeneration ||
-    input.expectedLogicalRoot !== evidence.previousStableLogicalRoot ||
-    !sameWitnessRecord(input.pendingRecord, evidence.pendingRecord)
-  ) reservationFenceMismatch()
-}
-
-function sameWitnessRecord(
-  left: Tm1RollbackWitnessRecord,
-  right: Tm1RollbackWitnessRecord
-): boolean {
-  return left.protocol === right.protocol &&
-    left.protocolVersion === right.protocolVersion &&
-    left.slotId === right.slotId &&
-    left.storeId === right.storeId &&
-    left.generation === right.generation &&
-    left.logicalRoot === right.logicalRoot &&
-    left.previousStableReceiptHash === right.previousStableReceiptHash &&
-    left.operationId === right.operationId &&
-    left.state === right.state &&
-    left.witnessKeyId === right.witnessKeyId &&
-    left.receiptHash === right.receiptHash &&
-    left.authenticatedReceipt === right.authenticatedReceipt
-}
-
-function exactDataRecord(
-  value: unknown,
-  expectedKeys: readonly string[]
-): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return storeFailure()
-  }
-  let prototype: object | null
-  let keys: readonly PropertyKey[]
-  try {
-    prototype = Object.getPrototypeOf(value)
-    keys = Reflect.ownKeys(value)
-  } catch {
-    return storeFailure()
-  }
-  if (
-    prototype !== Object.prototype && prototype !== null ||
-    keys.length !== expectedKeys.length ||
-    keys.some(key => typeof key !== 'string' || !expectedKeys.includes(key)) ||
-    expectedKeys.some(key => !keys.includes(key))
-  ) return storeFailure()
-  return value as Record<string, unknown>
-}
-
-function readDataProperty(source: Record<string, unknown>, key: string): unknown {
-  let descriptor: PropertyDescriptor | undefined
-  try {
-    descriptor = Object.getOwnPropertyDescriptor(source, key)
-  } catch {
-    return storeFailure()
-  }
-  if (descriptor === undefined || !('value' in descriptor)) return storeFailure()
-  return descriptor.value
-}
-
-function decodeWitnessSlotId(value: unknown): string {
-  try {
-    return requirePublicationId(decodeTm1SqliteIdentifierKey(value))
-  } catch {
-    return storeFailure()
-  }
-}
-
-function requireStoreId(value: unknown): string {
-  const result = requireString(value)
-  if (!/^tm1-store:v1:[0-9a-f]{64}$/.test(result)) return storeFailure()
-  return result
-}
-
 function readInputRecord(input: { readonly nextRecord?: unknown; readonly record?: unknown }): unknown {
   if (!input || typeof input !== 'object') storeFailure()
   if ('nextRecord' in input) return input.nextRecord
@@ -1310,12 +907,4 @@ function normalizeStoreBoundaryError(error: unknown): never {
 
 function storeFailure(): never {
   throw new Tm1PublicationRecoveryStoreError('RECOVERY_STORE_FAILED')
-}
-
-function reservationGrantRequired(): never {
-  throw new Tm1PublicationRecoveryStoreError('WITNESS_RESERVATION_GRANT_REQUIRED')
-}
-
-function reservationFenceMismatch(): never {
-  throw new Tm1PublicationRecoveryStoreError('WITNESS_RESERVATION_FENCE_MISMATCH')
 }

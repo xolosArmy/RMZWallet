@@ -3,12 +3,10 @@ import { Tm1PublicationRecoveryStoreError } from '../../../src/integrations/tona
 import {
   TM1_SQLITE_APPLICATION_ID,
   TM1_SQLITE_PHYSICAL_SCHEMA_VERSION,
-  TM1_SQLITE_SCHEMA_V1_SQL,
-  TM1_SQLITE_SCHEMA_V2_SQL,
-  TM1_SQLITE_WITNESS_SCHEMA_VERSION
+  TM1_SQLITE_SCHEMA_V1_SQL
 } from './tm1SqliteSchema'
 
-export type Tm1SqliteSchemaState = 'empty' | 'v1' | 'v2'
+export type Tm1SqliteSchemaState = 'empty' | 'v1'
 
 type SqliteSchemaObject = Readonly<{
   type: string
@@ -35,31 +33,20 @@ type SqliteStatisticsTableAttestation = Readonly<{
   definition: SqliteTableDefinition
 }>
 
-type Tm1ExpectedAttestation = Readonly<{
+type Tm1ExpectedV1Attestation = Readonly<{
   authoritative: Tm1SqliteSchemaAttestation
   statistics: readonly SqliteStatisticsTableAttestation[]
 }>
 
-const V1_AUTHORITATIVE_TABLE_NAMES = Object.freeze([
+const AUTHORITATIVE_TABLE_NAMES = Object.freeze([
   'tm1_store_metadata',
   'tm1_publications',
   'tm1_consumed_capabilities'
 ])
-const V2_AUTHORITATIVE_TABLE_NAMES = Object.freeze([
-  ...V1_AUTHORITATIVE_TABLE_NAMES,
-  'tm1_witness_binding'
-])
 
 const SQLITE_STATISTICS_TABLE_NAME = /^sqlite_stat[1-9][0-9]*$/
 
-const EXPECTED_V1_ATTESTATION = createExpectedAttestation(
-  TM1_SQLITE_SCHEMA_V1_SQL,
-  V1_AUTHORITATIVE_TABLE_NAMES
-)
-const EXPECTED_V2_ATTESTATION = createExpectedAttestation(
-  TM1_SQLITE_SCHEMA_V2_SQL,
-  V2_AUTHORITATIVE_TABLE_NAMES
-)
+const EXPECTED_V1_ATTESTATION = createExpectedV1Attestation()
 
 export function inspectTm1SqliteSchema(
   database: DatabaseSync
@@ -77,13 +64,6 @@ export function inspectTm1SqliteSchema(
   ) {
     verifyTm1SqliteSchemaV1(database)
     return 'v1'
-  }
-  if (
-    userVersion === TM1_SQLITE_WITNESS_SCHEMA_VERSION &&
-    applicationId === TM1_SQLITE_APPLICATION_ID
-  ) {
-    verifyTm1SqliteSchemaV2(database)
-    return 'v2'
   }
   return schemaFailure()
 }
@@ -123,20 +103,7 @@ export function initializeOrVerifyTm1SqliteSchema(
     }
     throw error
   }
-  verifyTm1SqliteSchema(database)
-}
-
-export function verifyTm1SqliteSchema(database: DatabaseSync): void {
-  const version = readPragmaInteger(database, 'user_version')
-  if (version === TM1_SQLITE_PHYSICAL_SCHEMA_VERSION) {
-    verifyTm1SqliteSchemaV1(database)
-    return
-  }
-  if (version === TM1_SQLITE_WITNESS_SCHEMA_VERSION) {
-    verifyTm1SqliteSchemaV2(database)
-    return
-  }
-  schemaFailure()
+  verifyTm1SqliteSchemaV1(database)
 }
 
 export function verifyTm1SqliteSchemaV1(database: DatabaseSync): void {
@@ -161,60 +128,12 @@ export function verifyTm1SqliteSchemaV1(database: DatabaseSync): void {
   const actualObjects = readSchemaObjects(database)
   const authoritativeObjects = verifyAndRemoveEngineStatistics(
     database,
-    actualObjects,
-    EXPECTED_V1_ATTESTATION
+    actualObjects
   )
-  const actualAttestation = extractAttestation(
-    database,
-    V1_AUTHORITATIVE_TABLE_NAMES,
-    authoritativeObjects
-  )
+  const actualAttestation = extractV1Attestation(database, authoritativeObjects)
   if (
     JSON.stringify(actualAttestation) !==
     JSON.stringify(EXPECTED_V1_ATTESTATION.authoritative)
-  ) schemaFailure()
-}
-
-export function verifyTm1SqliteSchemaV2(database: DatabaseSync): void {
-  if (
-    readPragmaInteger(database, 'user_version') !== TM1_SQLITE_WITNESS_SCHEMA_VERSION ||
-    readPragmaInteger(database, 'application_id') !== TM1_SQLITE_APPLICATION_ID
-  ) schemaFailure()
-
-  const metadata = database.prepare(`
-    SELECT physical_schema_version, created_at
-    FROM tm1_store_metadata
-    WHERE singleton_id = 1
-  `).all()
-  const binding = database.prepare(`
-    SELECT singleton_id
-    FROM tm1_witness_binding
-    WHERE singleton_id = 1
-  `).all()
-  if (
-    metadata.length !== 1 ||
-    metadata[0].physical_schema_version !== TM1_SQLITE_WITNESS_SCHEMA_VERSION ||
-    typeof metadata[0].created_at !== 'number' ||
-    !Number.isSafeInteger(metadata[0].created_at) ||
-    metadata[0].created_at < 0 ||
-    binding.length !== 1 ||
-    binding[0].singleton_id !== 1
-  ) schemaFailure()
-
-  const actualObjects = readSchemaObjects(database)
-  const authoritativeObjects = verifyAndRemoveEngineStatistics(
-    database,
-    actualObjects,
-    EXPECTED_V2_ATTESTATION
-  )
-  const actualAttestation = extractAttestation(
-    database,
-    V2_AUTHORITATIVE_TABLE_NAMES,
-    authoritativeObjects
-  )
-  if (
-    JSON.stringify(actualAttestation) !==
-    JSON.stringify(EXPECTED_V2_ATTESTATION.authoritative)
   ) schemaFailure()
 }
 
@@ -225,15 +144,12 @@ export function verifyTm1SqliteSchemaV2(database: DatabaseSync): void {
  * present statistics structure must match their semantic PRAGMA projections;
  * no unknown user table, index, view or trigger is accepted.
  */
-function createExpectedAttestation(
-  schemaSql: string,
-  tableNames: readonly string[]
-): Tm1ExpectedAttestation {
+function createExpectedV1Attestation(): Tm1ExpectedV1Attestation {
   const reference = new DatabaseSync(':memory:', { allowExtension: false })
   try {
     reference.enableLoadExtension(false)
-    reference.exec(schemaSql)
-    const authoritative = extractAttestation(reference, tableNames)
+    reference.exec(TM1_SQLITE_SCHEMA_V1_SQL)
+    const authoritative = extractV1Attestation(reference)
     reference.exec('ANALYZE')
     const analyzedObjects = readSchemaObjects(reference)
     const authoritativeNames = new Set(authoritative.objects.map(object => object.name))
@@ -273,11 +189,10 @@ function createExpectedAttestation(
 
 function verifyAndRemoveEngineStatistics(
   database: DatabaseSync,
-  objects: readonly SqliteSchemaObject[],
-  expectedAttestation: Tm1ExpectedAttestation
+  objects: readonly SqliteSchemaObject[]
 ): readonly SqliteSchemaObject[] {
   const expectedStatistics = new Map(
-    expectedAttestation.statistics.map(entry => [entry.object.name, entry])
+    EXPECTED_V1_ATTESTATION.statistics.map(entry => [entry.object.name, entry])
   )
   const authoritative: SqliteSchemaObject[] = []
   const observedStatistics = new Set<string>()
@@ -298,12 +213,11 @@ function verifyAndRemoveEngineStatistics(
   return Object.freeze(authoritative)
 }
 
-function extractAttestation(
+function extractV1Attestation(
   database: DatabaseSync,
-  tableNames: readonly string[],
   objects: readonly SqliteSchemaObject[] = readSchemaObjects(database)
 ): Tm1SqliteSchemaAttestation {
-  const tables = Object.fromEntries(tableNames.map(tableName => [
+  const tables = Object.fromEntries(AUTHORITATIVE_TABLE_NAMES.map(tableName => [
     tableName,
     extractTableDefinition(database, tableName)
   ]))
