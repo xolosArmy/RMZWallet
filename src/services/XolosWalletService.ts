@@ -1,7 +1,18 @@
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
 import { generateMnemonic } from '@scure/bip39'
 import { wordlist } from '@scure/bip39/wordlists/english.js'
-import { ALL_BIP143, P2PKHSignatory, Script, TxBuilder, fromHex, signMsg, toHex } from 'ecash-lib'
+import {
+  ALL_BIP143,
+  Address,
+  Ecc,
+  P2PKHSignatory,
+  Script,
+  TxBuilder,
+  fromHex,
+  shaRmd160,
+  signMsg,
+  toHex
+} from 'ecash-lib'
 import { AgoraOneshotAdSignatory } from 'ecash-agora'
 import type { ScriptUtxo } from 'chronik-client'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
@@ -15,6 +26,7 @@ import {
 } from '../config/xecFees'
 import { getChronik } from './ChronikClient'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
+import type { DecryptPasswordResult } from './crypto'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
 import type {
   MinimalXecWallet,
@@ -227,6 +239,68 @@ export interface X402WalletAccount {
   publicKey: string
 }
 
+const X402_PUBLIC_KEY_VALIDATION_TWEAKS = Object.freeze([
+  fromHex(`${'00'.repeat(31)}01`),
+  fromHex(`${'00'.repeat(31)}02`)
+])
+
+export const isCanonicalX402WalletAccount = (
+  account: X402WalletAccount | null
+): account is X402WalletAccount => {
+  if (
+    account === null ||
+    account.address !== account.address.trim() ||
+    account.address !== account.address.toLowerCase() ||
+    !/^(02|03)[0-9a-f]{64}$/u.test(account.publicKey)
+  ) {
+    return false
+  }
+
+  try {
+    const parsedAddress = Address.fromCashAddress(account.address)
+    if (
+      parsedAddress.encoding !== 'cashaddr' ||
+      parsedAddress.prefix !== 'ecash' ||
+      parsedAddress.type !== 'p2pkh'
+    ) {
+      return false
+    }
+
+    const publicKey = fromHex(account.publicKey)
+    const ecc = new Ecc()
+    const isOnCurve = X402_PUBLIC_KEY_VALIDATION_TWEAKS.some((tweak) => {
+      try {
+        return ecc.pubkeyAdd(publicKey, tweak).length === 33
+      } catch {
+        return false
+      }
+    })
+    return isOnCurve && Address.p2pkh(shaRmd160(publicKey)).toString() === account.address
+  } catch {
+    return false
+  }
+}
+
+export type X402StoredWalletActivationResult = Readonly<
+  | {
+    status: 'active'
+    account: Readonly<X402WalletAccount>
+  }
+  | {
+    status: 'choice-required'
+  }
+>
+
+export class X402StoredWalletActivationError extends Error {
+  readonly reason: 'unlock-failed' | 'activation-failed'
+
+  constructor(reason: 'unlock-failed' | 'activation-failed') {
+    super('X402_STORED_WALLET_ACTIVATION_FAILED')
+    this.name = 'X402StoredWalletActivationError'
+    this.reason = reason
+  }
+}
+
 export interface X402AuthorizationSignature {
   signature: string
   publicKey: string
@@ -331,6 +405,7 @@ export class XolosWalletService {
   private hdAddressCache: FirmaInputOwner[] = []
   private activeProfileId: DerivationProfileId = DEFAULT_NEW_WALLET_PROFILE_ID
   private activeAccountState: AccountPublicState | null = null
+  private walletActivationInFlight = false
   private rmzDecimals: number | null = null
   private rmzDecimalsPromise: Promise<number> | null = null
   private pendingAliasReservationExcludedTxids: string[] = []
@@ -349,6 +424,16 @@ export class XolosWalletService {
       XolosWalletService.instance = new XolosWalletService()
     }
     return XolosWalletService.instance
+  }
+
+  private tryAcquireWalletActivation(): boolean {
+    if (this.walletActivationInFlight) return false
+    this.walletActivationInFlight = true
+    return true
+  }
+
+  private releaseWalletActivation(): void {
+    this.walletActivationInFlight = false
   }
 
   private buildWallet(profileId: DerivationProfileId) {
@@ -623,21 +708,28 @@ export class XolosWalletService {
   }
 
   async createNewWallet(): Promise<string> {
-    const mnemonic = generateMnemonic(wordlist, 128)
-    this.buildWallet(DEFAULT_NEW_WALLET_PROFILE_ID)
-    const wallet = this.wallet as MinimalXecWallet
-    await wallet.walletInfoPromise
-    this.decryptedMnemonic = mnemonic
-    this.activeAccountState = deriveAccountPublicState(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
-    this.bindMinimalWalletToCanonicalProfile(mnemonic)
-    await wallet.initialize()
-    this.isReady = true
-    this.encryptedMnemonic = null
-    this.scanCache = null
-    this.scanPromise = null
-    this.scanPromiseGapLimit = null
-    this.ensureHdAddressCache(this.getEffectiveGapLimit())
-    return this.decryptedMnemonic || ''
+    if (!this.tryAcquireWalletActivation()) {
+      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
+    }
+    try {
+      const mnemonic = generateMnemonic(wordlist, 128)
+      this.buildWallet(DEFAULT_NEW_WALLET_PROFILE_ID)
+      const wallet = this.wallet as MinimalXecWallet
+      await wallet.walletInfoPromise
+      this.decryptedMnemonic = mnemonic
+      this.activeAccountState = deriveAccountPublicState(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
+      this.bindMinimalWalletToCanonicalProfile(mnemonic)
+      await wallet.initialize()
+      this.isReady = true
+      this.encryptedMnemonic = null
+      this.scanCache = null
+      this.scanPromise = null
+      this.scanPromiseGapLimit = null
+      this.ensureHdAddressCache(this.getEffectiveGapLimit())
+      return this.decryptedMnemonic || ''
+    } finally {
+      this.releaseWalletActivation()
+    }
   }
 
   async detectDerivationProfiles(mnemonic: string): Promise<DerivationDiscovery> {
@@ -656,63 +748,91 @@ export class XolosWalletService {
     mnemonic: string,
     selectedProfileId?: DerivationProfileId
   ): Promise<WalletRestoreResult> {
-    const normalizedMnemonic = mnemonic.trim()
-    const detection = await this.detectDerivationProfiles(normalizedMnemonic)
+    if (!this.tryAcquireWalletActivation()) {
+      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
+    }
+    try {
+      const normalizedMnemonic = mnemonic.trim()
+      const detection = await this.detectDerivationProfiles(normalizedMnemonic)
 
-    if (detection.kind === 'choice-required' && selectedProfileId === undefined) {
+      if (detection.kind === 'choice-required' && selectedProfileId === undefined) {
+        return Object.freeze({
+          status: 'choice-required',
+          detection,
+          notice: 'Encontramos actividad en varios engines asociados a esta seed. Elige cuál quieres abrir.'
+        })
+      }
+
+      const resolvedProfileId = selectedProfileId ?? detection.selectedProfileId
+      if (!isDerivationProfileId(resolvedProfileId)) {
+        throw new Error('No se pudo resolver un perfil de derivación válido.')
+      }
+      if (
+        detection.kind === 'choice-required' &&
+        !detection.profiles[resolvedProfileId].hasActivity
+      ) {
+        throw new Error('El perfil solicitado no contiene actividad detectada para esta seed.')
+      }
+      if (
+        detection.kind === 'selected' &&
+        detection.selectedProfileId !== resolvedProfileId
+      ) {
+        throw new Error('El perfil solicitado no coincide con la actividad detectada para esta seed.')
+      }
+
+      await this.activateMnemonic(normalizedMnemonic, resolvedProfileId)
+      const notice = resolvedProfileId === ECASH_STANDARD_PROFILE_ID
+        ? detection.reason === 'empty'
+          ? 'No se encontró actividad previa. Se utilizará el perfil compatible con eCash/Cashtab.'
+          : 'Se encontró una wallet compatible con eCash/Cashtab.'
+        : resolvedProfileId === TONALLI_LEGACY_PROFILE_ID
+          ? 'Se encontró una wallet Tonalli con derivación criptográfica histórica.'
+          : 'Se encontró una wallet de la ventana transitoria eCash Standard 899.'
+
       return Object.freeze({
-        status: 'choice-required',
+        status: 'restored',
         detection,
-        notice: 'Encontramos actividad en varios engines asociados a esta seed. Elige cuál quieres abrir.'
+        selectedProfileId: resolvedProfileId,
+        notice
       })
+    } finally {
+      this.releaseWalletActivation()
     }
-
-    const resolvedProfileId = selectedProfileId ?? detection.selectedProfileId
-    if (!isDerivationProfileId(resolvedProfileId)) {
-      throw new Error('No se pudo resolver un perfil de derivación válido.')
-    }
-    if (
-      detection.kind === 'choice-required' &&
-      !detection.profiles[resolvedProfileId].hasActivity
-    ) {
-      throw new Error('El perfil solicitado no contiene actividad detectada para esta seed.')
-    }
-    if (
-      detection.kind === 'selected' &&
-      detection.selectedProfileId !== resolvedProfileId
-    ) {
-      throw new Error('El perfil solicitado no coincide con la actividad detectada para esta seed.')
-    }
-
-    await this.activateMnemonic(normalizedMnemonic, resolvedProfileId)
-    const notice = resolvedProfileId === ECASH_STANDARD_PROFILE_ID
-      ? detection.reason === 'empty'
-        ? 'No se encontró actividad previa. Se utilizará el perfil compatible con eCash/Cashtab.'
-        : 'Se encontró una wallet compatible con eCash/Cashtab.'
-      : resolvedProfileId === TONALLI_LEGACY_PROFILE_ID
-        ? 'Se encontró una wallet Tonalli con derivación criptográfica histórica.'
-        : 'Se encontró una wallet de la ventana transitoria eCash Standard 899.'
-
-    return Object.freeze({
-      status: 'restored',
-      detection,
-      selectedProfileId: resolvedProfileId,
-      notice
-    })
   }
 
   async loadFromStorage(
     password: string,
     selectedProfileId?: DerivationProfileId
   ): Promise<WalletLoadResult> {
+    if (!this.tryAcquireWalletActivation()) {
+      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
+    }
+    try {
+      const { plainText, migratedCipherText } = await this.decryptStoredMnemonic(password)
+      this.persistMigratedStoredMnemonic(migratedCipherText)
+      return await this.activateDecryptedStoredMnemonic(plainText, selectedProfileId)
+    } finally {
+      this.releaseWalletActivation()
+    }
+  }
+
+  private async decryptStoredMnemonic(password: string): Promise<DecryptPasswordResult> {
     if (!this.encryptedMnemonic) {
       throw new Error('No existe una semilla cifrada en este dispositivo.')
     }
-    const { plainText, migratedCipherText } = await decryptWithPassword(this.encryptedMnemonic, password)
-    if (migratedCipherText) {
-      localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
-      this.encryptedMnemonic = migratedCipherText
-    }
+    return decryptWithPassword(this.encryptedMnemonic, password)
+  }
+
+  private persistMigratedStoredMnemonic(migratedCipherText: string | null): void {
+    if (!migratedCipherText) return
+    localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
+    this.encryptedMnemonic = migratedCipherText
+  }
+
+  private async activateDecryptedStoredMnemonic(
+    plainText: string,
+    selectedProfileId?: DerivationProfileId
+  ): Promise<WalletLoadResult> {
     const storedMetadata = parseStoredDerivationProfileMetadata(
       typeof window === 'undefined' ? null : localStorage.getItem(DERIVATION_PROFILE_STORAGE_KEY)
     )
@@ -751,51 +871,226 @@ export class XolosWalletService {
   }
 
   async unlockEncryptedWallet(password: string): Promise<void> {
-    if (!this.encryptedMnemonic) {
-      throw new Error('No existe una semilla cifrada en este dispositivo.')
+    if (!this.tryAcquireWalletActivation()) {
+      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
     }
-    const { plainText, migratedCipherText } = await decryptWithPassword(this.encryptedMnemonic, password)
-    if (migratedCipherText) {
-      localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
-      this.encryptedMnemonic = migratedCipherText
+    try {
+      const { plainText, migratedCipherText } = await this.decryptStoredMnemonic(password)
+      this.persistMigratedStoredMnemonic(migratedCipherText)
+      this.decryptedMnemonic = plainText
+    } finally {
+      this.releaseWalletActivation()
     }
-    this.decryptedMnemonic = plainText
+  }
+
+  hasEncryptedWalletOnDevice(): boolean {
+    try {
+      const storedCiphertext = typeof window === 'undefined'
+        ? this.encryptedMnemonic
+        : localStorage.getItem(STORAGE_KEY_MNEMONIC)
+      return storedCiphertext !== null && storedCiphertext === this.encryptedMnemonic
+    } catch {
+      return false
+    }
+  }
+
+  async activateStoredWalletForX402(
+    password: string
+  ): Promise<X402StoredWalletActivationResult> {
+    if (!this.tryAcquireWalletActivation()) {
+      throw new X402StoredWalletActivationError('activation-failed')
+    }
+
+    const previousState = {
+      wallet: this.wallet,
+      isReady: this.isReady,
+      decryptedMnemonic: this.decryptedMnemonic,
+      scanCache: this.scanCache,
+      scanPromise: this.scanPromise,
+      scanPromiseGapLimit: this.scanPromiseGapLimit,
+      hdAddressCache: this.hdAddressCache,
+      activeProfileId: this.activeProfileId,
+      activeAccountState: this.activeAccountState
+    }
+    let previousProfileMetadata: string | null | undefined
+    let previousStoredCiphertext: string | null | undefined
+    let expectedStoredCiphertextAfterActivation: string | null | undefined
+    let expectedProfileMetadataAfterActivation: string | null | undefined
+    let committed = false
+
+    try {
+      try {
+        if (typeof window === 'undefined') {
+          previousProfileMetadata = undefined
+          previousStoredCiphertext = this.encryptedMnemonic
+        } else {
+          previousProfileMetadata = localStorage.getItem(DERIVATION_PROFILE_STORAGE_KEY)
+          previousStoredCiphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
+        }
+        if (
+          previousStoredCiphertext === null ||
+          previousStoredCiphertext !== this.encryptedMnemonic
+        ) {
+          throw new Error('X402_STORED_WALLET_CHANGED')
+        }
+      } catch {
+        throw new X402StoredWalletActivationError('activation-failed')
+      }
+
+      let decrypted: DecryptPasswordResult
+      try {
+        decrypted = await this.decryptStoredMnemonic(password)
+      } catch {
+        throw new X402StoredWalletActivationError('unlock-failed')
+      }
+
+      let result: WalletLoadResult
+      try {
+        if (
+          typeof window !== 'undefined' &&
+          (
+            localStorage.getItem(STORAGE_KEY_MNEMONIC) !== previousStoredCiphertext ||
+            localStorage.getItem(DERIVATION_PROFILE_STORAGE_KEY) !== previousProfileMetadata
+          )
+        ) {
+          throw new Error('X402_STORED_WALLET_CHANGED')
+        }
+        expectedStoredCiphertextAfterActivation =
+          decrypted.migratedCipherText ?? previousStoredCiphertext
+        this.persistMigratedStoredMnemonic(decrypted.migratedCipherText)
+        result = await this.activateDecryptedStoredMnemonic(decrypted.plainText)
+
+        expectedProfileMetadataAfterActivation =
+          result.status === 'loaded' &&
+          parseStoredDerivationProfileMetadata(previousProfileMetadata ?? null) === null
+            ? serializeStoredDerivationProfileMetadata(this.activeProfileId)
+            : previousProfileMetadata
+        if (
+          typeof window !== 'undefined' &&
+          (
+            localStorage.getItem(STORAGE_KEY_MNEMONIC) !==
+              expectedStoredCiphertextAfterActivation ||
+            localStorage.getItem(DERIVATION_PROFILE_STORAGE_KEY) !==
+              expectedProfileMetadataAfterActivation
+          )
+        ) {
+          throw new Error('X402_STORED_WALLET_CHANGED')
+        }
+      } catch {
+        throw new X402StoredWalletActivationError('activation-failed')
+      }
+
+      if (result.status === 'choice-required') {
+        return Object.freeze({ status: 'choice-required' })
+      }
+
+      let account: X402WalletAccount | null
+      try {
+        account = this.getX402ActiveAccount()
+      } catch {
+        throw new X402StoredWalletActivationError('activation-failed')
+      }
+      if (!isCanonicalX402WalletAccount(account)) {
+        throw new X402StoredWalletActivationError('activation-failed')
+      }
+
+      committed = true
+      return Object.freeze({
+        status: 'active',
+        account: Object.freeze({ ...account })
+      })
+    } finally {
+      try {
+        if (!committed) {
+          this.wallet = previousState.wallet
+          this.isReady = previousState.isReady
+          this.decryptedMnemonic = previousState.decryptedMnemonic
+          this.scanCache = previousState.scanCache
+          this.scanPromise = previousState.scanPromise
+          this.scanPromiseGapLimit = previousState.scanPromiseGapLimit
+          this.hdAddressCache = previousState.hdAddressCache
+          this.activeProfileId = previousState.activeProfileId
+          this.activeAccountState = previousState.activeAccountState
+
+          if (previousProfileMetadata !== undefined && typeof window !== 'undefined') {
+            try {
+              const currentProfileMetadata = localStorage.getItem(
+                DERIVATION_PROFILE_STORAGE_KEY
+              )
+              const rollbackComparison = expectedProfileMetadataAfterActivation ??
+                previousProfileMetadata
+              const currentStoredCiphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
+              const expectedStoredCiphertext = expectedStoredCiphertextAfterActivation ??
+                previousStoredCiphertext
+              if (
+                currentProfileMetadata === rollbackComparison &&
+                currentStoredCiphertext === expectedStoredCiphertext
+              ) {
+                if (previousProfileMetadata === null) {
+                  localStorage.removeItem(DERIVATION_PROFILE_STORAGE_KEY)
+                } else {
+                  localStorage.setItem(DERIVATION_PROFILE_STORAGE_KEY, previousProfileMetadata)
+                }
+              }
+            } catch {
+              // In-memory rollback remains authoritative if storage becomes unavailable.
+            }
+          }
+        }
+      } finally {
+        this.releaseWalletActivation()
+      }
+    }
   }
 
   async encryptAndStoreMnemonic(password: string): Promise<void> {
-    let mnemonic = this.decryptedMnemonic
-
-    const walletMnemonic = this.wallet?.mnemonic || this.wallet?.walletInfo?.mnemonic
-    if (!mnemonic && walletMnemonic) {
-      mnemonic = walletMnemonic
-      this.decryptedMnemonic = mnemonic
+    if (!this.tryAcquireWalletActivation()) {
+      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
     }
+    try {
+      let mnemonic = this.decryptedMnemonic
 
-    if (!mnemonic) {
-      throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
+      const walletMnemonic = this.wallet?.mnemonic || this.wallet?.walletInfo?.mnemonic
+      if (!mnemonic && walletMnemonic) {
+        mnemonic = walletMnemonic
+        this.decryptedMnemonic = mnemonic
+      }
+
+      if (!mnemonic) {
+        throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
+      }
+
+      const cipherText = await encryptWithPassword(mnemonic, password)
+      localStorage.setItem(STORAGE_KEY_MNEMONIC, cipherText)
+      this.encryptedMnemonic = cipherText
+      this.persistActiveProfile()
+    } finally {
+      this.releaseWalletActivation()
     }
-
-    const cipherText = await encryptWithPassword(mnemonic, password)
-    localStorage.setItem(STORAGE_KEY_MNEMONIC, cipherText)
-    this.encryptedMnemonic = cipherText
-    this.persistActiveProfile()
   }
 
   clearStoredWallet(): void {
-    localStorage.removeItem(STORAGE_KEY_MNEMONIC)
-    localStorage.removeItem(DERIVATION_PROFILE_STORAGE_KEY)
-    this.encryptedMnemonic = null
-    this.decryptedMnemonic = null
-    this.wallet = null
-    this.isReady = false
-    this.scanCache = null
-    this.scanPromise = null
-    this.scanPromiseGapLimit = null
-    this.hdAddressCache = []
-    this.activeProfileId = DEFAULT_NEW_WALLET_PROFILE_ID
-    this.activeAccountState = null
-    this.rmzDecimals = null
-    this.rmzDecimalsPromise = null
+    if (!this.tryAcquireWalletActivation()) {
+      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
+    }
+    try {
+      localStorage.removeItem(STORAGE_KEY_MNEMONIC)
+      localStorage.removeItem(DERIVATION_PROFILE_STORAGE_KEY)
+      this.encryptedMnemonic = null
+      this.decryptedMnemonic = null
+      this.wallet = null
+      this.isReady = false
+      this.scanCache = null
+      this.scanPromise = null
+      this.scanPromiseGapLimit = null
+      this.hdAddressCache = []
+      this.activeProfileId = DEFAULT_NEW_WALLET_PROFILE_ID
+      this.activeAccountState = null
+      this.rmzDecimals = null
+      this.rmzDecimalsPromise = null
+    } finally {
+      this.releaseWalletActivation()
+    }
   }
 
   private getEffectiveGapLimit(): number {

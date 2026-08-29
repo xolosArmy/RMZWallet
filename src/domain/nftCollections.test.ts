@@ -6,11 +6,16 @@ import {
   NFT_COLLECTION_TRUST_REGISTRY_VERSION,
   buildNftCollectionMetadata,
   classifyCollection,
+  isCollectionId,
+  resolveNftCollectionParentTokenId,
+  resolveRegisteredNftCollection,
   type OnChainNftCollectionEvidence
 } from './nftCollections'
 
 const OFFICIAL_PARENT_TOKEN_ID =
   'bf8e0b5cd60fe4d6354c662b28542e0f3c3d69941eb039426d65bcdb7fe9f48c'
+const COMMUNITY_PARENT_TOKEN_ID =
+  'd6ff881413733a1a6407fa5e1e86537e5fc9f48246bae89b732ca7044993e57a'
 const CHILD_TOKEN_ID = 'a'.repeat(64)
 const OTHER_GROUP_TOKEN_ID = 'b'.repeat(64)
 
@@ -27,9 +32,14 @@ const officialEvidence = (): VerifiedEvidence => ({
   groupTokenType: 129
 })
 
+const communityEvidence = (): VerifiedEvidence => ({
+  ...officialEvidence(),
+  groupTokenId: COMMUNITY_PARENT_TOKEN_ID
+})
+
 describe('NFT collection trust registry', () => {
-  test('pins the official trust anchor in source and keeps community closed', () => {
-    expect(NFT_COLLECTION_TRUST_REGISTRY_VERSION).toBe(1)
+  test('pins distinct official and community trust anchors in source', () => {
+    expect(NFT_COLLECTION_TRUST_REGISTRY_VERSION).toBe(2)
     expect(NFT_COLLECTION_TRUST_REGISTRY).toEqual({
       official: {
         id: 'official',
@@ -39,9 +49,12 @@ describe('NFT collection trust registry', () => {
       community: {
         id: 'community',
         tier: 'community',
-        parentTokenId: null
+        parentTokenId: COMMUNITY_PARENT_TOKEN_ID
       }
     })
+    expect(NFT_COLLECTION_TRUST_REGISTRY.official.parentTokenId).not.toBe(
+      NFT_COLLECTION_TRUST_REGISTRY.community.parentTokenId
+    )
     expect(Object.isFrozen(NFT_COLLECTION_TRUST_REGISTRY)).toBe(true)
     expect(Object.isFrozen(NFT_COLLECTION_TRUST_REGISTRY.official)).toBe(true)
     expect(Object.isFrozen(NFT_COLLECTION_TRUST_REGISTRY.community)).toBe(true)
@@ -52,15 +65,75 @@ describe('NFT collection trust registry', () => {
 
     expect(source).not.toMatch(/VITE_|import\.meta\.env|process\.env/)
   })
+
+  test('ignores a hostile legacy Parent environment value', () => {
+    const previous = process.env.VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID
+    process.env.VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID = OTHER_GROUP_TOKEN_ID
+    try {
+      expect(resolveNftCollectionParentTokenId('official')).toBe(OFFICIAL_PARENT_TOKEN_ID)
+      expect(resolveNftCollectionParentTokenId('community')).toBe(COMMUNITY_PARENT_TOKEN_ID)
+    } finally {
+      if (previous === undefined) {
+        delete process.env.VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID
+      } else {
+        process.env.VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID = previous
+      }
+    }
+  })
+
+  test('resolves only typed, registered collections to canonical Parents', () => {
+    expect(resolveRegisteredNftCollection('official')).toBe(NFT_COLLECTION_TRUST_REGISTRY.official)
+    expect(resolveRegisteredNftCollection('community')).toBe(NFT_COLLECTION_TRUST_REGISTRY.community)
+    expect(resolveNftCollectionParentTokenId('official')).toBe(OFFICIAL_PARENT_TOKEN_ID)
+    expect(resolveNftCollectionParentTokenId('community')).toBe(COMMUNITY_PARENT_TOKEN_ID)
+    expect(isCollectionId('official')).toBe(true)
+    expect(isCollectionId('community')).toBe(true)
+  })
+
+  test.each([null, undefined, '', 'Official', 'unknown', OTHER_GROUP_TOKEN_ID, {}, []])(
+    'fails closed for an arbitrary runtime collection selector: %j',
+    (collectionId) => {
+      expect(isCollectionId(collectionId)).toBe(false)
+      expect(() =>
+        resolveRegisteredNftCollection(collectionId as 'official')
+      ).toThrow('Colección NFT no registrada.')
+    }
+  )
 })
 
 describe('classifyCollection', () => {
+  test('classifies exact verified community Child evidence as community', () => {
+    expect(classifyCollection(communityEvidence())).toBe('community')
+  })
+
+  test('keeps the official Parent classified as official', () => {
+    expect(classifyCollection(officialEvidence())).toBe('official')
+  })
+
   test('Test A: metadata claims cannot override a different on-chain Group ID', () => {
     const adversarialFixture = {
       metadata: {
         name: 'Xolos Ramírez Official',
         verification: 'verified',
         parentTokenId: OFFICIAL_PARENT_TOKEN_ID
+      },
+      evidence: {
+        ...officialEvidence(),
+        groupTokenId: OTHER_GROUP_TOKEN_ID
+      } satisfies OnChainNftCollectionEvidence
+    }
+
+    expect(classifyCollection(adversarialFixture.evidence)).toBe('unknown')
+  })
+
+  test.each(['official', 'community'])('metadata impersonating %s cannot affect classification', (tier) => {
+    const adversarialFixture = {
+      metadata: {
+        name: tier === 'official' ? 'Xolos Ramírez Official' : 'xolosArmy Community',
+        ticker: tier === 'official' ? 'XOLOSNFT' : 'RMZCOMM',
+        verification: 'verified',
+        parentTokenId:
+          tier === 'official' ? OFFICIAL_PARENT_TOKEN_ID : COMMUNITY_PARENT_TOKEN_ID
       },
       evidence: {
         ...officialEvidence(),
@@ -141,7 +214,7 @@ describe('classifyCollection', () => {
     expect(classifyCollection(hostileEvidence)).toBe('unknown')
   })
 
-  test('cannot classify community while its trust anchor is null', () => {
+  test('returns unknown for an arbitrary unregistered Group token', () => {
     expect(
       classifyCollection({
         ...officialEvidence(),
@@ -175,7 +248,7 @@ describe('buildNftCollectionMetadata', () => {
       collection: {
         id: 'official',
         parentTokenId: OFFICIAL_PARENT_TOKEN_ID,
-        registryVersion: 1
+        registryVersion: 2
       }
     })
     expect(metadata.attributes).not.toBe(attributes)
@@ -183,7 +256,7 @@ describe('buildNftCollectionMetadata', () => {
     expect('verification' in metadata).toBe(false)
   })
 
-  test('keeps future community metadata explicitly closed with a null parent', () => {
+  test('builds community metadata from the registered Parent without affecting classification', () => {
     const metadata = buildNftCollectionMetadata({
       collectionId: 'community',
       name: 'Future community collection',
@@ -193,12 +266,18 @@ describe('buildNftCollectionMetadata', () => {
 
     expect(metadata.collection).toEqual({
       id: 'community',
-      parentTokenId: null,
-      registryVersion: 1
+      parentTokenId: COMMUNITY_PARENT_TOKEN_ID,
+      registryVersion: 2
     })
+    expect(
+      classifyCollection({
+        ...officialEvidence(),
+        groupTokenId: OTHER_GROUP_TOKEN_ID
+      })
+    ).toBe('unknown')
   })
 
-  test('remains disconnected from the current minter, metadata service and UI', () => {
+  test('keeps classification policy and on-chain evidence out of the mint path', () => {
     const productionFiles = [
       '../config/nfts.ts',
       '../services/nftMetadata.ts',
@@ -208,7 +287,7 @@ describe('buildNftCollectionMetadata', () => {
 
     for (const productionFile of productionFiles) {
       const source = readFileSync(new URL(productionFile, import.meta.url), 'utf8')
-      expect(source).not.toMatch(/domain\/nftCollections|buildNftCollectionMetadata|classifyCollection/)
+      expect(source).not.toMatch(/buildNftCollectionMetadata|classifyCollection|OnChainNftCollectionEvidence/)
     }
   })
 })

@@ -124,9 +124,11 @@ describe('Tonalli mobile navigation v3', () => {
   test('layout hides navigation for Tonalli Connect routes', () => {
     expect(isMobileBottomNavHidden('/connect')).toBe(true)
     expect(isMobileBottomNavHidden('/connect/sign-message')).toBe(true)
+    expect(isMobileBottomNavHidden('/connect/x402-authorize')).toBe(true)
 
     expect(renderLayout('/connect')).not.toContain('Navegación principal')
     expect(renderLayout('/connect/sign-message')).not.toContain('Navegación principal')
+    expect(renderLayout('/connect/x402-authorize')).not.toContain('Navegación principal')
   })
 
   test('DesktopNavigation shows five destinations with expected links', () => {
@@ -180,6 +182,7 @@ describe('Tonalli mobile navigation v3', () => {
     expect(renderAt('/external-sign', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
     expect(renderAt('/connect', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
     expect(renderAt('/connect/sign-message', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
+    expect(renderAt('/connect/x402-authorize', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')
 
     walletState.initialized = false
     expect(renderAt('/', <DesktopNavigation />)).not.toContain('Navegación principal de escritorio')

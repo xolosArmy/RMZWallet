@@ -1,11 +1,33 @@
-# Community Parent preparation tool
+# Community Parent tooling and confirmed anchor
 
-`npx tsx scripts/create-community-parent.ts` prepares an offline preview for a future
-`SLP NFT1 Group` Genesis. Its capability level is limited to metadata validation,
-pure-XEC funding selection, canonical OP_RETURN construction, and an unsigned
-output plan. It never derives keys, signs, contacts Chronik, uploads metadata, or
-broadcasts a transaction. The community trust-registry entry remains closed and
-is not changed by this tool.
+The Community Parent Genesis has been created and confirmed on eCash mainnet.
+Its canonical Token ID and Community collection trust anchor is
+`d6ff881413733a1a6407fa5e1e86537e5fc9f48246bae89b732ca7044993e57a`.
+Chronik reports `TOKEN_STATUS_NORMAL`, protocol `SLP`, token type
+`SLP_TOKEN_TYPE_NFT1_GROUP` (`129`), `txType: GENESIS`, and `isInvalid: false`.
+Genesis `vout 1` contains exactly one Group atom, and the mint baton at `vout 2`
+is controlled by the administrative wallet. The transaction was confirmed at
+block height `964005` with block hash
+`00000000000000002b7be127bcd600849fd79669d0367e06bb148553aa36d1a2`.
+
+The canonical metadata is 339 bytes with SHA-256
+`03cd44ce490769d5646b39c84b488d2894b2b6c4958b085f2cc906c1d36a09a6`
+and is published as
+`ipfs://bafkreiadzvcm4sihnhkwi2zzzbfurdjisszlnrevrmef6lgja3a5g2qjuy`.
+
+The trust registry recognizes Community membership only from verified on-chain
+NFT1 ancestry. Metadata, names, tickers, IPFS content, and declarative
+verification fields cannot independently establish trust. The official and
+Community collections remain cryptographically separate.
+
+**La metadata describe. La blockchain demuestra.**
+
+`npx tsx scripts/create-community-parent.ts` prepares an offline reconstruction
+preview of an `SLP NFT1 Group` Genesis. Its capability level is limited to
+metadata validation, pure-XEC funding selection, canonical OP_RETURN
+construction, and an unsigned output plan. It never derives keys, signs,
+contacts Chronik, uploads metadata, or broadcasts a transaction. The tool does
+not modify the trust registry.
 
 ## Verified protocol choices
 
@@ -89,8 +111,79 @@ BROADCAST=1
 CONFIRM_COMMUNITY_PARENT_GENESIS=YES
 ```
 
-Actual creation of the Parent requires a separate, reviewed administrative
-execution step. That future work must use the audited wallet and re-query every
-selected UTXO immediately before signing; neither capability belongs to this PR.
+The confirmed Parent was created through the separately reviewed administrative
+executor described below. Neither execution capability belongs to the planner
+or changes this planner-only command. This document does not authorize creating
+another Parent or rerunning the executor.
 
 No WIF, mnemonic, seed, or private key is accepted as a CLI argument or printed.
+
+## Guarded administrative executor
+
+`npx tsx scripts/broadcast-community-parent.ts` is a separate, mainnet-only
+administrative boundary. Its default invocation reads live UTXOs through the
+single explicit HTTPS origin in `COMMUNITY_PARENT_CHRONIK_URL`, calls the canonical planner, builds a
+complete unsigned transaction, prints the exact endpoint, outputs, fee, change,
+and deterministic plan fingerprint, then stops with zero signing and zero
+broadcasting.
+
+The executor additionally requires one dedicated endpoint:
+
+```text
+COMMUNITY_PARENT_CHRONIK_URL=https://chronik.example
+```
+
+An execution requires all three exact gates:
+
+```text
+BROADCAST=1
+CONFIRM_COMMUNITY_PARENT_GENESIS=YES
+CONFIRM_PLAN_SHA256=<the exact reviewed fingerprint>
+```
+
+If any execution gate is supplied, the CLI validates the complete mainnet
+configuration and immediately decodes a 32-byte lowercase hex signing secret
+only from `COMMUNITY_PARENT_SIGNING_SECRET_HEX`, before the first Chronik call.
+It derives the compressed public key and requires its P2PKH locking script to
+match the configured funding address. The command accepts no CLI arguments,
+never prints or persists the secret, and clears the decoded byte array after
+signing or on every earlier exit. A normal gate-free dry run does not request or
+decode a signing secret.
+
+The operational executor is mainnet-only. Before reading funding it queries the
+immutable Bitcoin ABC mainnet checkpoint at height `949200` and requires block
+hash
+`000000000000000098694560815190dba8bbe2f06c08a7c23837df3c4886cba2`.
+That value is pinned from
+[Bitcoin ABC source revision `c37387a4d25b0a2cf886e2010d0023dd078ca43a`](https://github.com/Bitcoin-ABC/bitcoin-abc/blob/c37387a4d25b0a2cf886e2010d0023dd078ca43a/src/networks/abc/checkpoints.cpp),
+`src/networks/abc/checkpoints.cpp` (Obolensky activation). Testnet, regtest,
+checkpoint mismatch, malformed block data, and transport errors fail before
+signing or broadcasting.
+
+The administrative client is constructed with exactly that one origin and has
+no failover list. This prevents a checkpoint verified on one server from being
+followed by funding or broadcast calls routed silently to another server.
+
+After the gates match, the executor verifies the same checkpoint again, fetches
+Chronik UTXOs again, rebuilds the plan, and requires the fresh fingerprint to
+remain identical. It then reads every selected prevout through Chronik and
+requires its exact amount, locking script, and absence of a token annotation to
+match the signing key and fresh plan before invoking the signer.
+
+Before its single broadcast attempt, the executor validates the signed
+transaction locally and through Chronik `validateRawTx`. Local validation checks
+the exact inputs and outputs, requires every P2PKH scriptSig to be exactly two
+canonical pushes, requires sighash byte `0x41` (`ALL|FORKID`), binds the pushed
+compressed public key to every input locking script, and verifies every Schnorr
+signature over the exact input index and amount with `ecash-lib@4.5.2`. It also
+checks the actual serialized size and the minimum/maximum fee guards.
+
+Chronik `validateRawTx` is used only to validate token/indexing structure for
+the canonical SLP NFT1 Group Genesis. It is not treated as signature,
+mempool-policy, or consensus acceptance. With installed `chronik-client@3.7.0`,
+a decoded protobuf rejection from a working Chronik server is exposed only as
+the fixed `Failed getting /broadcast-tx:` error prefix and is reported as
+`broadcast-rejected`. Timeout, connection reset, failover, unknown errors, and
+hostile responses remain `broadcast-status-ambiguous`, with the locally computed
+candidate txid and no automatic retry. A returned txid is never written to the
+trust registry.
