@@ -9,6 +9,9 @@ export type Tm1PublicationRecoveryStoreErrorCode =
   | 'PUBLICATION_NOT_FOUND'
   | 'RECOVERY_STORE_FAILED'
   | 'REVISION_MISMATCH'
+  | 'ROLLBACK_WITNESS_REQUIRED'
+  | 'WITNESS_RESERVATION_FENCE_MISMATCH'
+  | 'WITNESS_RESERVATION_GRANT_REQUIRED'
   | 'STALE_OWNER_EPOCH'
 
 export class Tm1PublicationRecoveryStoreError extends Error {
