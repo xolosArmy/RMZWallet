@@ -34,6 +34,7 @@ import {
 } from './tm1SqliteSchema'
 import { encodeTm1SqliteIdentifierKey } from './tm1SqliteIdentifierKey'
 import {
+  allowLegacyMutationInPhysicalStoreTest,
   outcomeUnknownRecord,
   preparedRecord,
   signingConsumedRecord,
@@ -926,11 +927,13 @@ function openStore(
   databasePath: string,
   busyTimeoutMs?: number
 ): Tm1SqlitePublicationRecoveryStore {
-  return createTm1SqlitePublicationRecoveryStore({
+  const store = createTm1SqlitePublicationRecoveryStore({
     databasePath,
     ...(busyTimeoutMs === undefined ? {} : { busyTimeoutMs }),
     now: () => 1_000
   })
+  allowLegacyMutationInPhysicalStoreTest(store)
+  return store
 }
 
 type UnrelatedDatabaseSnapshot = Readonly<{

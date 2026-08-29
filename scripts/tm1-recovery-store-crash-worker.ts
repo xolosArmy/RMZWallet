@@ -5,6 +5,7 @@ import {
   type Tm1PublicationRecoveryRecord
 } from '../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryModel'
 import { createTm1SqlitePublicationRecoveryStore } from '../server/tonalliMemo/recovery/tm1SqlitePublicationRecoveryStore'
+import { allowLegacyMutationInPhysicalStoreTest } from '../server/tonalliMemo/recovery/tm1SqliteTestFixtures'
 
 const [, , mode, databasePath, argument] = process.argv
 
@@ -63,6 +64,7 @@ async function createAndHold(path: string, payloadPath: string): Promise<void> {
     databasePath: path,
     now: () => 1_000
   })
+  allowLegacyMutationInPhysicalStoreTest(store)
   await store.create({ record })
   send({ status: 'after-commit', publicationId: record.publicationId })
   keepAlive()
@@ -83,6 +85,7 @@ async function staleRecovery(path: string, publicationId: string): Promise<void>
     databasePath: path,
     now: () => 1_000
   })
+  allowLegacyMutationInPhysicalStoreTest(store)
   const current = await store.load(publicationId) as Tm1PublicationRecoveryRecord | null
   if (current === null || current.phase !== 'outcomeUnknown' || current.dispatchIntent === null) {
     fail('INVALID_RECOVERY_STATE')

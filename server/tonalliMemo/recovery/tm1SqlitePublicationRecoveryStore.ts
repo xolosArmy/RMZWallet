@@ -208,7 +208,7 @@ implements Tm1PublicationRecoveryStore {
       this.assertOpen()
       const canonical = canonicalizeTm1RecoveryRecord(readInputRecord(input))
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
+        this.rejectLegacyMutation()
         if (this.selectPublicationRow(canonical.record.publicationId) !== undefined) {
           throw new Tm1PublicationRecoveryStoreError('DUPLICATE_PUBLICATION_ID')
         }
@@ -228,7 +228,7 @@ implements Tm1PublicationRecoveryStore {
       const next = canonicalizeTm1RecoveryRecord(readInputRecord(input))
       const declaredCapabilityIds = snapshotIdentifierList(input.newlyConsumedCapabilityIds)
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
+        this.rejectLegacyMutation()
         const current = this.currentForMutation(expected)
         assertTm1ExecutionEvidenceTransition(current, next.record)
         const previousIds = new Set(
@@ -259,7 +259,7 @@ implements Tm1PublicationRecoveryStore {
       const expected = snapshotExpectedVersion(input)
       const next = canonicalizeTm1RecoveryRecord(readInputRecord(input))
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
+        this.rejectLegacyMutation()
         const current = this.currentForMutation(expected)
         assertTm1DispatchIntentTransition(current, next.record)
         this.updatePublication(next, expected)
@@ -280,7 +280,7 @@ implements Tm1PublicationRecoveryStore {
         parseTm1TransportAcknowledgementCommitEvidence(input.acknowledgement)
       const acknowledgement = snapshotUnknown(parsedAcknowledgement)
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
+        this.rejectLegacyMutation()
         const current = this.currentForMutation(expected)
         const nextRecord = createTm1TransportAcknowledgedRecord(current, acknowledgement)
         assertTm1TransportAcknowledgementTransition(current, nextRecord)
@@ -299,7 +299,7 @@ implements Tm1PublicationRecoveryStore {
       const expected = snapshotExpectedVersion(input)
       const next = canonicalizeTm1RecoveryRecord(readInputRecord(input))
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
+        this.rejectLegacyMutation()
         const current = this.currentForMutation(expected)
         assertTm1RecoveryTransition(current, next.record)
         this.updatePublication(next, expected)
@@ -316,7 +316,7 @@ implements Tm1PublicationRecoveryStore {
       const expected = snapshotExpectedVersion(input)
       const nextOwnerEpoch = requireNonNegativeSafeInteger(input.nextOwnerEpoch)
       return this.withImmediateTransaction(() => {
-        this.assertLegacyMutationAllowed()
+        this.rejectLegacyMutation()
         const current = this.currentForMutation(expected)
         if (nextOwnerEpoch <= current.ownerEpoch) {
           throw new Tm1PublicationRecoveryStoreError('STALE_OWNER_EPOCH')
@@ -635,10 +635,9 @@ implements Tm1PublicationRecoveryStore {
     return current
   }
 
-  private assertLegacyMutationAllowed(): void {
-    if (inspectTm1SqliteSchema(this.database) !== 'v1') {
-      throw new Tm1PublicationRecoveryStoreError('ROLLBACK_WITNESS_REQUIRED')
-    }
+  private rejectLegacyMutation(): never {
+    // Physical schema version and missing witness metadata are not authority.
+    throw new Tm1PublicationRecoveryStoreError('ROLLBACK_WITNESS_REQUIRED')
   }
 
   private readWitnessBinding(): Tm1SqliteWitnessBinding {

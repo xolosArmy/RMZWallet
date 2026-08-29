@@ -14,9 +14,11 @@ import {
 import {
   HASH_B,
   HASH_C,
+  allowLegacyMutationInPhysicalStoreTest,
   absentObservationRecord,
   outcomeUnknownRecord,
   preparedRecord,
+  restoreLegacyMutationGuardAfterTestSetup,
   signingConsumedRecord,
   signingPendingRecord
 } from './tm1SqliteTestFixtures'
@@ -79,6 +81,7 @@ describe('TM1 SQLite rollback-witness binding and logical root', () => {
     const record = preparedRecord()
     await store.create({ record })
     enroll(store)
+    restoreLegacyMutationGuardAfterTestSetup(store)
     const signingPending = signingPendingRecord()
     const outcomeUnknown = outcomeUnknownRecord()
     const preDispatch = {
@@ -291,10 +294,12 @@ function harness(): {
 }
 
 function openStore(databasePath: string): Tm1SqlitePublicationRecoveryStore {
-  return createTm1SqlitePublicationRecoveryStore({
+  const store = createTm1SqlitePublicationRecoveryStore({
     databasePath,
     now: () => 1_000
   })
+  allowLegacyMutationInPhysicalStoreTest(store)
+  return store
 }
 
 function enroll(store: Tm1SqlitePublicationRecoveryStore): void {
