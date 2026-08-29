@@ -4,16 +4,10 @@ import {
   type Tm1PublicationRecoveryRecord
 } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryModel'
 import { Tm1PublicationRecoveryStoreError } from '../../../src/integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
-import {
-  decodeTm1SqliteIdentifierKey,
-  encodeTm1SqliteIdentifierKey
-} from './tm1SqliteIdentifierKey'
+import { encodeTm1SqliteIdentifierKey } from './tm1SqliteIdentifierKey'
 
 export const TM1_SQLITE_PHYSICAL_SCHEMA_VERSION = 1
-export const TM1_SQLITE_WITNESS_SCHEMA_VERSION = 2
 export const TM1_SQLITE_APPLICATION_ID = 0x544d3131
-export const TM1_LOGICAL_STATE_ROOT_SCHEMA = 'tonalli.tm1-logical-state-root'
-export const TM1_LOGICAL_STATE_ROOT_SCHEMA_VERSION = 1
 
 /**
  * Identifier-bearing TEXT columns below are physical storage keys, never raw
@@ -132,53 +126,6 @@ CREATE INDEX tm1_consumed_capabilities_publication_idx
   ON tm1_consumed_capabilities(publication_id, kind);
 `
 
-export const TM1_SQLITE_SCHEMA_V2_METADATA_SQL = `
-CREATE TABLE tm1_store_metadata (
-  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-  physical_schema_version INTEGER NOT NULL CHECK (physical_schema_version = 2),
-  created_at INTEGER NOT NULL CHECK (created_at >= 0)
-) STRICT;
-`
-
-export const TM1_SQLITE_WITNESS_BINDING_SQL = `
-CREATE TABLE tm1_witness_binding (
-  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-  witness_protocol_version INTEGER NOT NULL CHECK (witness_protocol_version = 1),
-  logical_root_schema_version INTEGER NOT NULL CHECK (logical_root_schema_version = 1),
-  slot_id TEXT NOT NULL CHECK (${physicalIdentifierKeyCheck('slot_id')}),
-  store_id TEXT NOT NULL CHECK (
-    length(store_id) = 77 AND
-    substr(store_id, 1, 13) = 'tm1-store:v1:' AND
-    substr(store_id, 14) NOT GLOB '*[^0-9a-f]*'
-  ),
-  generation INTEGER NOT NULL CHECK (generation >= 0),
-  logical_root TEXT NOT NULL CHECK (
-    length(logical_root) = 64 AND logical_root NOT GLOB '*[^0-9a-f]*'
-  )
-) STRICT;
-`
-
-/** Canonical fresh-install schema used to attest an explicitly enrolled store. */
-export const TM1_SQLITE_SCHEMA_V2_SQL =
-  TM1_SQLITE_SCHEMA_V1_SQL.replace(
-    'physical_schema_version INTEGER NOT NULL CHECK (physical_schema_version = 1)',
-    'physical_schema_version INTEGER NOT NULL CHECK (physical_schema_version = 2)'
-  ) + TM1_SQLITE_WITNESS_BINDING_SQL
-
-export type Tm1SqliteWitnessIdentity = Readonly<{
-  slotId: string
-  storeId: string
-  generation: number
-}>
-
-export type Tm1SqliteWitnessBinding = Readonly<
-  Tm1SqliteWitnessIdentity & {
-    witnessProtocolVersion: 1
-    logicalRootSchemaVersion: 1
-    logicalRoot: string
-  }
->
-
 function physicalIdentifierKeyCheck(column: string): string {
   return `length(${column}) BETWEEN 8 AND 1028 AND ` +
     `substr(${column}, 1, 4) = 'u16:' AND ` +
@@ -259,108 +206,6 @@ export function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex')
 }
 
-/**
- * Computes the canonical logical authority root from one coherent, already
- * attested SQLite transaction. Raw database bytes, WAL layout, page order,
- * VACUUM output and SQLite statistics are intentionally excluded.
- */
-export function computeTm1LogicalStateRoot(
-  database: import('node:sqlite').DatabaseSync,
-  identity: Tm1SqliteWitnessIdentity
-): string {
-  const metadata = database.prepare(`
-    SELECT created_at
-    FROM tm1_store_metadata
-    WHERE singleton_id = 1
-  `).all()
-  if (
-    metadata.length !== 1 ||
-    !Number.isSafeInteger(metadata[0].created_at) ||
-    (metadata[0].created_at as number) < 0 ||
-    !Number.isSafeInteger(identity.generation) ||
-    identity.generation < 0
-  ) canonicalFailure()
-
-  const publications = database.prepare(`
-    SELECT publication_id, record_json, record_sha256
-    FROM tm1_publications
-    ORDER BY publication_id
-  `).all().map(row => Object.freeze({
-    publicationId: decodeIdentifier(row.publication_id),
-    recordJson: requireCanonicalJsonString(row.record_json),
-    recordSha256: requireHash(row.record_sha256)
-  }))
-  for (const publication of publications) {
-    if (sha256Hex(publication.recordJson) !== publication.recordSha256) canonicalFailure()
-  }
-
-  const capabilities = database.prepare(`
-    SELECT
-      capability_id,
-      publication_id,
-      kind,
-      operation_id,
-      content_hash,
-      consumed_at,
-      expires_at,
-      prepared_id,
-      binding_hash,
-      signed_id,
-      txid,
-      signed_artifact_hash
-    FROM tm1_consumed_capabilities
-    ORDER BY capability_id
-  `).all().map(row => Object.freeze({
-    capabilityId: decodeIdentifier(row.capability_id),
-    publicationId: decodeIdentifier(row.publication_id),
-    kind: requireString(row.kind),
-    operationId: decodeIdentifier(row.operation_id),
-    contentHash: requireString(row.content_hash),
-    consumedAt: requireNonNegativeSafeInteger(row.consumed_at),
-    expiresAt: requireNonNegativeSafeInteger(row.expires_at),
-    preparedId: decodeNullableIdentifier(row.prepared_id),
-    bindingHash: requireNullableString(row.binding_hash),
-    signedId: decodeNullableIdentifier(row.signed_id),
-    txid: requireNullableString(row.txid),
-    signedArtifactHash: requireNullableString(row.signed_artifact_hash)
-  }))
-
-  const logicalState = Object.freeze({
-    schema: TM1_LOGICAL_STATE_ROOT_SCHEMA,
-    schemaVersion: TM1_LOGICAL_STATE_ROOT_SCHEMA_VERSION,
-    witnessProtocolVersion: 1,
-    physicalSchemaVersion: TM1_SQLITE_WITNESS_SCHEMA_VERSION,
-    storeId: requireStoreId(identity.storeId),
-    slotId: requireIdentifier(identity.slotId),
-    generation: identity.generation,
-    createdAt: metadata[0].created_at as number,
-    publications: Object.freeze(publications),
-    consumedCapabilities: Object.freeze(capabilities)
-  })
-  return sha256Hex(encodeCanonicalJson(logicalState))
-}
-
-export function parseTm1SqliteWitnessBinding(
-  value: unknown
-): Tm1SqliteWitnessBinding {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    canonicalFailure()
-  }
-  const source = value as Record<string, unknown>
-  if (
-    source.witnessProtocolVersion !== 1 ||
-    source.logicalRootSchemaVersion !== 1
-  ) canonicalFailure()
-  return Object.freeze({
-    witnessProtocolVersion: 1,
-    logicalRootSchemaVersion: 1,
-    slotId: requireIdentifier(source.slotId),
-    storeId: requireStoreId(source.storeId),
-    generation: requireNonNegativeSafeInteger(source.generation),
-    logicalRoot: requireHash(source.logicalRoot)
-  })
-}
-
 export function consumedCapabilityEvidenceRows(
   record: Tm1PublicationRecoveryRecord
 ): readonly Tm1SqliteCapabilityEvidenceRow[] {
@@ -434,7 +279,7 @@ function encodeNullableIdentifier(value: string | null): string | null {
   return value === null ? null : encodeTm1SqliteIdentifierKey(value)
 }
 
-export function encodeCanonicalJson(value: unknown): string {
+function encodeCanonicalJson(value: unknown): string {
   if (value === null) return 'null'
   if (typeof value === 'string' || typeof value === 'boolean') {
     return JSON.stringify(value)
@@ -455,67 +300,6 @@ export function encodeCanonicalJson(value: unknown): string {
       .join(',')}}`
   }
   return canonicalFailure()
-}
-
-function decodeIdentifier(value: unknown): string {
-  try {
-    return decodeTm1SqliteIdentifierKey(value)
-  } catch {
-    return canonicalFailure()
-  }
-}
-
-function decodeNullableIdentifier(value: unknown): string | null {
-  return value === null ? null : decodeIdentifier(value)
-}
-
-function requireCanonicalJsonString(value: unknown): string {
-  const result = requireString(value)
-  let decoded: unknown
-  try {
-    decoded = JSON.parse(result)
-  } catch {
-    return canonicalFailure()
-  }
-  if (encodeCanonicalJson(decoded) !== result) canonicalFailure()
-  return result
-}
-
-function requireIdentifier(value: unknown): string {
-  const result = requireString(value)
-  if (
-    result.length === 0 ||
-    result.length > 256 ||
-    result.trim() !== result ||
-    result.includes('\0')
-  ) canonicalFailure()
-  return result
-}
-
-function requireStoreId(value: unknown): string {
-  const result = requireString(value)
-  if (!/^tm1-store:v1:[0-9a-f]{64}$/.test(result)) canonicalFailure()
-  return result
-}
-
-function requireHash(value: unknown): string {
-  const result = requireString(value)
-  if (!/^[0-9a-f]{64}$/.test(result)) canonicalFailure()
-  return result
-}
-
-function requireString(value: unknown): string {
-  if (typeof value !== 'string') canonicalFailure()
-  return value
-}
-
-function requireNullableString(value: unknown): string | null {
-  return value === null ? null : requireString(value)
-}
-
-function requireNonNegativeSafeInteger(value: unknown): number {
-  if (!Number.isSafeInteger(value) || (value as number) < 0) canonicalFailure()
-  return value as number
 }
 
 function canonicalFailure(): never {
