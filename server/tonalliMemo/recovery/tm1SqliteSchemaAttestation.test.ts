@@ -13,7 +13,10 @@ import {
   TM1_SQLITE_PHYSICAL_SCHEMA_VERSION,
   TM1_SQLITE_SCHEMA_V1_SQL
 } from './tm1SqliteSchema'
-import { preparedRecord } from './tm1SqliteTestFixtures'
+import {
+  allowLegacyMutationInPhysicalStoreTest,
+  preparedRecord
+} from './tm1SqliteTestFixtures'
 
 const temporaryDirectories: string[] = []
 
@@ -321,10 +324,12 @@ function mutateSchemaCatalog(
 }
 
 function openStore(databasePath: string): Tm1SqlitePublicationRecoveryStore {
-  return createTm1SqlitePublicationRecoveryStore({
+  const store = createTm1SqlitePublicationRecoveryStore({
     databasePath,
     now: () => 1_000
   })
+  allowLegacyMutationInPhysicalStoreTest(store)
+  return store
 }
 
 function expectOpenToFail(databasePath: string): void {

@@ -19,6 +19,7 @@ import {
 import {
   HASH_B,
   HASH_C,
+  allowLegacyMutationInPhysicalStoreTest,
   absentObservationRecord,
   abandonedRecord,
   broadcastConsumedRecord,
@@ -838,11 +839,13 @@ function openStore(
   databasePath: string,
   busyTimeoutMs?: number
 ): Tm1SqlitePublicationRecoveryStore {
-  return createTm1SqlitePublicationRecoveryStore({
+  const store = createTm1SqlitePublicationRecoveryStore({
     databasePath,
     ...(busyTimeoutMs === undefined ? {} : { busyTimeoutMs }),
     now: () => 1_000
   })
+  allowLegacyMutationInPhysicalStoreTest(store)
+  return store
 }
 
 function acknowledgementFor(

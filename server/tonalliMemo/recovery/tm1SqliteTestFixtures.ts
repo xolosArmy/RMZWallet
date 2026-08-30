@@ -11,6 +11,21 @@ export const HASH_B = 'b'.repeat(64)
 export const HASH_C = 'c'.repeat(64)
 export const HASH_D = 'd'.repeat(64)
 
+/**
+ * Test-only seam for the pre-Gate-A physical-store regression corpus.
+ * Security tests use unmodified stores, and production exposes no bypass.
+ */
+export function allowLegacyMutationInPhysicalStoreTest(store: object): void {
+  Object.defineProperty(store, 'rejectLegacyMutation', {
+    configurable: true,
+    value: () => undefined
+  })
+}
+
+export function restoreLegacyMutationGuardAfterTestSetup(store: object): void {
+  Reflect.deleteProperty(store, 'rejectLegacyMutation')
+}
+
 export type Tm1RecoveryFixtureOptions = Readonly<{
   publicationId?: string
   signingCapabilityId?: string
