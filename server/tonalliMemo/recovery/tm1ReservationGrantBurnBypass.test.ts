@@ -369,6 +369,123 @@ describe('TM1 P1-2 ReservationGrant burn-before-operate', () => {
     second.close()
   })
 
+  test('prepare reentry of the exact grant is rejected and burns after outer prepare succeeds', async () => {
+    const { store } = harness()
+    const witness = createTm1InMemoryRollbackWitness()
+    await provision(store, witness)
+    const outcome = await reserveGrant(store, witness, 'operation:p1-3-prepare-reentry')
+    const entries: string[] = []
+
+    const result = withTm1RollbackWitnessReservationGrant(
+      outcome.grant,
+      () => {
+        entries.push('outer-prepare')
+        expect(() => withTm1RollbackWitnessReservationGrant(
+          outcome.grant,
+          () => {
+            entries.push('nested-prepare')
+          },
+          () => {
+            entries.push('nested-operate')
+            return 'nested-authority'
+          }
+        )).toThrowError(expect.objectContaining({
+          code: 'WITNESS_RESERVATION_FENCE_MISMATCH'
+        }))
+      },
+      evidence => {
+        entries.push('outer-operate')
+        return evidence.nextGeneration
+      }
+    )
+    expect(result).toBe(1)
+    expect(entries).toEqual(['outer-prepare', 'outer-operate'])
+    expect(() => withTm1RollbackWitnessReservationGrant(
+      outcome.grant,
+      () => {
+        entries.push('later-prepare')
+      },
+      () => {
+        entries.push('later-operate')
+        return 'later'
+      }
+    )).toThrowError(expect.objectContaining({
+      code: 'WITNESS_RESERVATION_FENCE_MISMATCH'
+    }))
+    expect(() => store.commitReservedWitnessBinding(exactCommitInput(outcome)))
+      .toThrowError(expect.objectContaining({
+        code: 'WITNESS_RESERVATION_FENCE_MISMATCH'
+      }))
+    expect(entries).toEqual(['outer-prepare', 'outer-operate'])
+    store.close()
+  })
+
+  test('prepare fence mismatch before nested operate leaves the exact grant retryable', async () => {
+    const { store } = harness()
+    const witness = createTm1InMemoryRollbackWitness()
+    await provision(store, witness)
+    const outcome = await reserveGrant(store, witness, 'operation:p1-3-prepare-fence-retry')
+    const entries: string[] = []
+
+    expect(() => withTm1RollbackWitnessReservationGrant(
+      outcome.grant,
+      () => {
+        entries.push('prepare')
+        throw new Tm1PublicationRecoveryStoreError('WITNESS_RESERVATION_FENCE_MISMATCH')
+      },
+      () => {
+        entries.push('operate')
+        return 'must-not-run'
+      }
+    )).toThrowError(expect.objectContaining({
+      code: 'WITNESS_RESERVATION_FENCE_MISMATCH'
+    }))
+    expect(entries).toEqual(['prepare'])
+    expect(store.commitReservedWitnessBinding(exactCommitInput(outcome)))
+      .toMatchObject({ generation: 1 })
+    store.close()
+  })
+
+  test('prepare generic error burns the exact grant before operate', async () => {
+    const { store } = harness()
+    const witness = createTm1InMemoryRollbackWitness()
+    await provision(store, witness)
+    const outcome = await reserveGrant(store, witness, 'operation:p1-3-prepare-generic-burn')
+    const entries: string[] = []
+
+    expect(() => withTm1RollbackWitnessReservationGrant(
+      outcome.grant,
+      () => {
+        entries.push('prepare')
+        throw new Error('injected prepare failure')
+      },
+      () => {
+        entries.push('operate')
+        return 'must-not-run'
+      }
+    )).toThrowError('injected prepare failure')
+    expect(entries).toEqual(['prepare'])
+    expect(() => withTm1RollbackWitnessReservationGrant(
+      outcome.grant,
+      () => {
+        entries.push('later-prepare')
+      },
+      () => {
+        entries.push('later-operate')
+        return 'later'
+      }
+    )).toThrowError(expect.objectContaining({
+      code: 'WITNESS_RESERVATION_FENCE_MISMATCH'
+    }))
+    expect(() => store.commitReservedWitnessBinding(exactCommitInput(outcome)))
+      .toThrowError(expect.objectContaining({
+        code: 'WITNESS_RESERVATION_FENCE_MISMATCH'
+      }))
+    expect(entries).toEqual(['prepare'])
+    expect(store.inspectWitnessBinding()?.generation).toBe(0)
+    store.close()
+  })
+
   test('wrong caller expected generation is rejected before burn', async () => {
     const { store } = harness()
     const witness = createTm1InMemoryRollbackWitness()

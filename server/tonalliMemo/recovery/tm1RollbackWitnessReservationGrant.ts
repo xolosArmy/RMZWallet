@@ -57,6 +57,7 @@ export type Tm1RollbackWitnessReservationGrantEvidence = Readonly<{
 
 const grantEvidence = new WeakMap<object, Tm1RollbackWitnessReservationGrantEvidence>()
 const consumedGrants = new WeakSet<object>()
+const inFlightGrants = new WeakSet<object>()
 
 /**
  * Wins one authenticated remote reserve CAS and issues its process-local
@@ -130,9 +131,10 @@ export async function reserveTm1RollbackWitnessWithGrant(
 /**
  * Store-only capability consumption boundary.
  *
- * Non-authoritative prepare remains retryable. After successful prepare
- * the exact grant is burned, then operate runs. BEGIN/COMMIT/rollback
- * failure cannot restore the CAS-winning bearer.
+ * Same-grant reentry is excluded while prepare runs. A fence-mismatch
+ * prepare remains retryable. Any other prepare failure, and every
+ * successful prepare, burns the exact grant before operate.
+ * BEGIN/COMMIT/rollback failure cannot restore the CAS-winning bearer.
  */
 export function withTm1RollbackWitnessReservationGrant<T>(
   grantValue: unknown,
@@ -142,14 +144,33 @@ export function withTm1RollbackWitnessReservationGrant<T>(
   if (grantValue === null || typeof grantValue !== 'object') grantRequired()
   const evidence = grantEvidence.get(grantValue)
   if (evidence === undefined) grantRequired()
-  if (consumedGrants.has(grantValue) || !grantStillMatches(grantValue, evidence)) {
+  if (
+    consumedGrants.has(grantValue) ||
+    inFlightGrants.has(grantValue) ||
+    !grantStillMatches(grantValue, evidence)
+  ) {
     fenceMismatch()
   }
   if (typeof prepare !== 'function' || typeof operate !== 'function') {
     fenceMismatch()
   }
-  prepare(evidence)
+  inFlightGrants.add(grantValue)
+  try {
+    prepare(evidence)
+  } catch (error) {
+    if (
+      error instanceof Tm1PublicationRecoveryStoreError &&
+      error.code === 'WITNESS_RESERVATION_FENCE_MISMATCH'
+    ) {
+      inFlightGrants.delete(grantValue)
+      throw error
+    }
+    consumedGrants.add(grantValue)
+    inFlightGrants.delete(grantValue)
+    throw error
+  }
   consumedGrants.add(grantValue)
+  inFlightGrants.delete(grantValue)
   return operate(evidence)
 }
 
