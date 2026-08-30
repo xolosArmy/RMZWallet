@@ -34,7 +34,8 @@ export const hiddenWalletNavigationPaths = [
   '/backup',
   '/external-sign',
   '/connect',
-  '/connect/sign-message'
+  '/connect/sign-message',
+  '/connect/x402-authorize'
 ] as const
 
 export function isWalletNavigationHidden(pathname: string) {
@@ -43,6 +44,7 @@ export function isWalletNavigationHidden(pathname: string) {
     pathname === '/external-sign' ||
     pathname === '/connect' ||
     pathname === '/connect/sign-message' ||
+    pathname === '/connect/x402-authorize' ||
     pathname === '/onboarding' ||
     pathname.startsWith('/onboarding/')
   )

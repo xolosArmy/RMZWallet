@@ -28,7 +28,7 @@ Configura estas variables en Vercel o tu entorno local:
 
 - `VITE_PINATA_JWT` (recomendado) o `VITE_PINATA_API_KEY` + `VITE_PINATA_SECRET`
 - `VITE_PINATA_GATEWAY` (opcional) para render de imágenes IPFS
-- `VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID` (token padre NFT1 Group)
+- `VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID` (solo scripts operativos legacy; el minter público ignora este valor y usa el trust registry canónico)
 - `VITE_NFT_MINT_FEE_RECEIVER_ADDRESS` (tesorería para el fee de minteo)
 - `VITE_WALLETCONNECT_PROJECT_ID` (principal, requerido para WalletConnect v2)
 - `VITE_WC_PROJECT_ID` (legacy compatible; fallback si falta la principal)

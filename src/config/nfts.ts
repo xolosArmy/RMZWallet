@@ -1,4 +1,6 @@
-const DEFAULT_PARENT = 'bf8e0b5cd60fe4d6354c662b28542e0f3c3d69941eb039426d65bcdb7fe9f48c'
+import { resolveNftCollectionParentTokenId } from '../domain/nftCollections'
+
+const DEFAULT_PARENT = resolveNftCollectionParentTokenId('official')
 const DEFAULT_FEE_ADDR = 'ecash:qq7qn90ev23ecastqmn8as00u8mcp4tzsspvt5dtlk'
 
 type ViteEnv = Record<string, string | undefined> & { DEV?: boolean }
@@ -18,6 +20,10 @@ function getEnv(name: string): string | undefined {
 const resolvedParentTokenId = getEnv('VITE_XOLOSARMY_NFT_PARENT_TOKEN_ID') || DEFAULT_PARENT
 const isValidTokenId = (tokenId: string) => /^[0-9a-fA-F]{64}$/.test(tokenId)
 
+/**
+ * @deprecated Legacy operational scripts only. Public NFT minting resolves its
+ * Parent from the canonical domain registry and must not import this value.
+ */
 export const XOLOSARMY_NFT_PARENT_TOKEN_ID = resolvedParentTokenId
 export const XOLOSARMY_NFT_PARENT_TOKEN_ID_ERROR =
   ((import.meta as unknown as { env?: ViteEnv }).env?.DEV ?? false) &&
