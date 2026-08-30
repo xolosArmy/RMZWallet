@@ -501,57 +501,65 @@ implements Tm1PublicationRecoveryStore {
     try {
       this.assertOpen()
       const grant = readReservationGrant(inputValue)
-      return withTm1RollbackWitnessReservationGrant(grant, evidence => {
-        const input = snapshotWitnessReservationCommit(inputValue)
-        assertReservationFence(input, evidence)
-        this.database.exec('BEGIN IMMEDIATE')
-        try {
-          verifyTm1SqliteSchemaV2(this.database)
-          const current = this.readWitnessBinding()
-          this.assertLogicalRoot(current)
-          const pending = input.pendingRecord
-          if (
-            current.generation !== evidence.previousStableGeneration ||
-            current.logicalRoot !== evidence.previousStableLogicalRoot ||
-            current.slotId !== evidence.slotId ||
-            current.storeId !== evidence.storeId ||
-            pending.generation !== current.generation + 1
-          ) reservationFenceMismatch()
-          const nextIdentity = Object.freeze({
-            slotId: current.slotId,
-            storeId: current.storeId,
-            generation: pending.generation
-          })
-          if (
-            computeTm1LogicalStateRoot(this.database, nextIdentity) !==
-            pending.logicalRoot
-          ) reservationFenceMismatch()
-          const result = this.database.prepare(`
-            UPDATE tm1_witness_binding
-            SET generation = ?, logical_root = ?
-            WHERE singleton_id = 1 AND generation = ? AND logical_root = ?
-          `).run(
-            pending.generation,
-            pending.logicalRoot,
-            current.generation,
-            current.logicalRoot
-          )
-          if (!changesEqual(result.changes, 1)) reservationFenceMismatch()
-          const committed = this.readWitnessBinding()
-          this.assertLogicalRoot(committed)
-          this.database.exec('COMMIT')
-          return committed
-        } catch (error) {
-          if (this.database.isTransaction) {
-            try {
-              this.database.exec('ROLLBACK')
-            } catch {
-              // The original binding failure remains authoritative.
+      let preparedInput: Tm1SqliteWitnessReservationCommit | null = null
+      return withTm1RollbackWitnessReservationGrant(
+        grant,
+        evidence => {
+          preparedInput = snapshotWitnessReservationCommit(inputValue)
+          assertReservationFence(preparedInput, evidence)
+        },
+        evidence => {
+          const input = preparedInput
+          if (input === null) reservationFenceMismatch()
+          this.database.exec('BEGIN IMMEDIATE')
+          try {
+            verifyTm1SqliteSchemaV2(this.database)
+            const current = this.readWitnessBinding()
+            this.assertLogicalRoot(current)
+            const pending = input.pendingRecord
+            if (
+              current.generation !== evidence.previousStableGeneration ||
+              current.logicalRoot !== evidence.previousStableLogicalRoot ||
+              current.slotId !== evidence.slotId ||
+              current.storeId !== evidence.storeId ||
+              pending.generation !== current.generation + 1
+            ) reservationFenceMismatch()
+            const nextIdentity = Object.freeze({
+              slotId: current.slotId,
+              storeId: current.storeId,
+              generation: pending.generation
+            })
+            if (
+              computeTm1LogicalStateRoot(this.database, nextIdentity) !==
+              pending.logicalRoot
+            ) reservationFenceMismatch()
+            const result = this.database.prepare(`
+              UPDATE tm1_witness_binding
+              SET generation = ?, logical_root = ?
+              WHERE singleton_id = 1 AND generation = ? AND logical_root = ?
+            `).run(
+              pending.generation,
+              pending.logicalRoot,
+              current.generation,
+              current.logicalRoot
+            )
+            if (!changesEqual(result.changes, 1)) reservationFenceMismatch()
+            const committed = this.readWitnessBinding()
+            this.assertLogicalRoot(committed)
+            this.database.exec('COMMIT')
+            return committed
+          } catch (error) {
+            if (this.database.isTransaction) {
+              try {
+                this.database.exec('ROLLBACK')
+              } catch {
+                // The original binding failure remains authoritative.
+              }
             }
+            throw error
           }
-          throw error
         }
-      })
+      )
     } catch (error) {
       throw normalizeStoreBoundaryError(error)
     }

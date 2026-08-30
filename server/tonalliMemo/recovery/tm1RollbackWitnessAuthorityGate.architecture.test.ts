@@ -48,8 +48,26 @@ describe('TM1 rollback witness Gate A authority isolation', () => {
       storeSource.indexOf('\n  close(): void')
     )
     expect(method.indexOf('withTm1RollbackWitnessReservationGrant(')).toBeGreaterThan(-1)
+    expect(method.indexOf('assertReservationFence(')).toBeGreaterThan(-1)
     expect(method.indexOf("this.database.exec('BEGIN IMMEDIATE')"))
       .toBeGreaterThan(method.indexOf('withTm1RollbackWitnessReservationGrant('))
+    expect(method.indexOf("this.database.exec('BEGIN IMMEDIATE')"))
+      .toBeGreaterThan(method.indexOf('assertReservationFence('))
+  })
+
+  test('consumes the reservation grant before the authority-bearing operate callback', () => {
+    const fn = grantSource.slice(
+      grantSource.indexOf('export function withTm1RollbackWitnessReservationGrant'),
+      grantSource.indexOf('\nfunction snapshotWitness(')
+    )
+    const prepareIndex = fn.indexOf('prepare(evidence)')
+    const consumeIndex = fn.indexOf('consumedGrants.add(grantValue)')
+    const operateIndex = fn.indexOf('return operate(evidence)')
+    expect(prepareIndex).toBeGreaterThan(-1)
+    expect(consumeIndex).toBeGreaterThan(prepareIndex)
+    expect(operateIndex).toBeGreaterThan(consumeIndex)
+    expect(grantSource).not.toContain('consumedGrants.delete')
+    expect(fn).not.toMatch(/const result = (operate|operation)\(/)
   })
 
   test('keeps signing, transport and browser composition out of the grant module', () => {

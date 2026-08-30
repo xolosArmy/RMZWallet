@@ -127,10 +127,17 @@ export async function reserveTm1RollbackWitnessWithGrant(
   })
 }
 
-/** Store-only capability consumption boundary. */
+/**
+ * Store-only capability consumption boundary.
+ *
+ * Non-authoritative prepare remains retryable. After successful prepare
+ * the exact grant is burned, then operate runs. BEGIN/COMMIT/rollback
+ * failure cannot restore the CAS-winning bearer.
+ */
 export function withTm1RollbackWitnessReservationGrant<T>(
   grantValue: unknown,
-  operation: (evidence: Tm1RollbackWitnessReservationGrantEvidence) => T
+  prepare: (evidence: Tm1RollbackWitnessReservationGrantEvidence) => void,
+  operate: (evidence: Tm1RollbackWitnessReservationGrantEvidence) => T
 ): T {
   if (grantValue === null || typeof grantValue !== 'object') grantRequired()
   const evidence = grantEvidence.get(grantValue)
@@ -138,9 +145,12 @@ export function withTm1RollbackWitnessReservationGrant<T>(
   if (consumedGrants.has(grantValue) || !grantStillMatches(grantValue, evidence)) {
     fenceMismatch()
   }
-  const result = operation(evidence)
+  if (typeof prepare !== 'function' || typeof operate !== 'function') {
+    fenceMismatch()
+  }
+  prepare(evidence)
   consumedGrants.add(grantValue)
-  return result
+  return operate(evidence)
 }
 
 function snapshotWitness(value: Tm1RollbackWitness): Readonly<{
