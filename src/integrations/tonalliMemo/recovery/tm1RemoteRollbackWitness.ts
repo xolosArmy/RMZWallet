@@ -273,6 +273,7 @@ async function decodeResponse(
   if (isSuccessEnvelope(parsed)) {
     return parsed.result
   }
+  if (parsed === null) unavailable()
   if (operation === 'verifyRecord') unverifiable()
   return parsed
 }

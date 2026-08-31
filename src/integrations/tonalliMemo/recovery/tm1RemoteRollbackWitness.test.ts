@@ -191,6 +191,27 @@ describe('TM1 remote rollback-witness adapter', () => {
       .rejects.toMatchObject({ code: 'WITNESS_UNAVAILABLE' })
   })
 
+  test('bare JSON null on read is not never-enrolled', async () => {
+    const witness = createTm1RemoteRollbackWitness({
+      endpointUrl: ENDPOINT,
+      fetch: async () => new Response('null', {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    })
+    await expect(witness.read({ slotId: SLOT })).rejects.toMatchObject({
+      code: expect.stringMatching(/^(WITNESS_UNAVAILABLE|WITNESS_UNVERIFIABLE)$/)
+    })
+  })
+
+  test('success envelope result null on read is never-enrolled', async () => {
+    const witness = createTm1RemoteRollbackWitness({
+      endpointUrl: ENDPOINT,
+      fetch: async () => jsonResponse(success(null))
+    })
+    await expect(witness.read({ slotId: SLOT })).resolves.toBeNull()
+  })
+
   test('well-formed JSON that is not a snapshot is returned as unknown', async () => {
     const witness = createTm1RemoteRollbackWitness({
       endpointUrl: ENDPOINT,
