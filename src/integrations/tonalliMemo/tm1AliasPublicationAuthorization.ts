@@ -1,4 +1,4 @@
-import { isValidEcashAddress, toXecAlias } from '../../utils/alias'
+import { canonicalizeEcashAddress, toXecAlias } from '../../utils/alias'
 
 export const TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL =
   'tonalli.tm1-alias-publication-authorization'
@@ -35,18 +35,36 @@ export class Tm1AliasPublicationAuthorizationError extends Error {
   }
 }
 
+export type Tm1AliasPublicationAuthorizationLedger = Readonly<{
+  consumedProofs: Set<string>
+  latestBlockHeightByAlias: Map<string, number>
+}>
+
+/**
+ * Process-local replay/stale ledger. It is not durable: a crash loses it.
+ * It is not a publication store and grants no transport capability.
+ */
+export function createTm1InMemoryAliasPublicationAuthorizationLedger():
+  Tm1AliasPublicationAuthorizationLedger {
+  return Object.freeze({
+    consumedProofs: new Set<string>(),
+    latestBlockHeightByAlias: new Map<string, number>()
+  })
+}
+
 /**
  * Fail-closed publication authorization from confirmed .xec ownership evidence.
  * It is not a signer, transport, or broadcast capability.
  */
 export class Tm1AliasPublicationAuthorizer {
-  private readonly consumedProofs = new Set<string>()
-  private readonly latestBlockHeightByAlias = new Map<string, number>()
+  private readonly ledger: Tm1AliasPublicationAuthorizationLedger
 
-  private constructor() {}
+  private constructor(ledger: Tm1AliasPublicationAuthorizationLedger) {
+    this.ledger = ledger
+  }
 
-  static create(): Tm1AliasPublicationAuthorizer {
-    return new Tm1AliasPublicationAuthorizer()
+  static create(ledger: Tm1AliasPublicationAuthorizationLedger): Tm1AliasPublicationAuthorizer {
+    return new Tm1AliasPublicationAuthorizer(ledger)
   }
 
   issue(requestValue: unknown): Tm1AliasPublicationAuthorization {
@@ -65,12 +83,12 @@ export class Tm1AliasPublicationAuthorizer {
       if (request.now === undefined) fail('ALIAS_PROOF_UNVERIFIABLE')
       if (request.now >= evidence.expiresAt) fail('ALIAS_PROOF_EXPIRED')
     }
-    const previousHeight = this.latestBlockHeightByAlias.get(request.alias)
+    const previousHeight = this.ledger.latestBlockHeightByAlias.get(request.alias)
     if (previousHeight !== undefined && evidence.blockHeight < previousHeight) {
       fail('ALIAS_PROOF_STALE')
     }
     const proofKey = `${request.alias}\0${evidence.txid}`
-    if (this.consumedProofs.has(proofKey)) fail('ALIAS_PROOF_REPLAYED')
+    if (this.ledger.consumedProofs.has(proofKey)) fail('ALIAS_PROOF_REPLAYED')
 
     const authorization = Object.freeze({
       protocol: TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL,
@@ -88,14 +106,16 @@ export class Tm1AliasPublicationAuthorizer {
       ].join(':')
     }) satisfies Tm1AliasPublicationAuthorization
 
-    this.consumedProofs.add(proofKey)
-    this.latestBlockHeightByAlias.set(request.alias, evidence.blockHeight)
+    this.ledger.consumedProofs.add(proofKey)
+    this.ledger.latestBlockHeightByAlias.set(request.alias, evidence.blockHeight)
     return authorization
   }
 }
 
-export function createTm1AliasPublicationAuthorizer(): Tm1AliasPublicationAuthorizer {
-  return Tm1AliasPublicationAuthorizer.create()
+export function createTm1AliasPublicationAuthorizer(
+  ledgerValue: unknown
+): Tm1AliasPublicationAuthorizer {
+  return Tm1AliasPublicationAuthorizer.create(parseLedger(ledgerValue))
 }
 
 export function parseTm1AliasPublicationAuthorization(
@@ -223,10 +243,23 @@ function requireAlias(value: unknown): string {
 }
 
 function requireOwnerAddress(value: unknown): string {
-  if (typeof value !== 'string' || value.trim() !== value || !isValidEcashAddress(value)) {
+  if (typeof value !== 'string') invalidInput()
+  const canonical = canonicalizeEcashAddress(value)
+  if (canonical === null) invalidInput()
+  return canonical
+}
+
+function parseLedger(value: unknown): Tm1AliasPublicationAuthorizationLedger {
+  const source = exactRecord(value, ['consumedProofs', 'latestBlockHeightByAlias'])
+  const consumedProofs = dataValue(source, 'consumedProofs')
+  const latestBlockHeightByAlias = dataValue(source, 'latestBlockHeightByAlias')
+  if (!(consumedProofs instanceof Set) || !(latestBlockHeightByAlias instanceof Map)) {
     invalidInput()
   }
-  return value
+  return Object.freeze({
+    consumedProofs,
+    latestBlockHeightByAlias
+  })
 }
 
 function requireTxid(value: unknown): string {
