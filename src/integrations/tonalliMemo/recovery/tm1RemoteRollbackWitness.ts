@@ -56,10 +56,15 @@ export class Tm1RemoteRollbackWitness implements Tm1RollbackWitness {
   private readonly timeoutMs: number
   private readonly fetchImpl: typeof fetch
 
-  constructor(config: FrozenConfig) {
+  private constructor(configValue: unknown) {
+    const config = parseConfig(configValue)
     this.endpointUrl = config.endpointUrl
     this.timeoutMs = config.timeoutMs
     this.fetchImpl = config.fetch
+  }
+
+  static create(configValue: unknown): Tm1RemoteRollbackWitness {
+    return new Tm1RemoteRollbackWitness(configValue)
   }
 
   async read(input: Tm1RollbackWitnessRead): Promise<unknown | null> {
@@ -157,7 +162,7 @@ export class Tm1RemoteRollbackWitness implements Tm1RollbackWitness {
 export function createTm1RemoteRollbackWitness(
   configValue: unknown
 ): Tm1RemoteRollbackWitness {
-  return new Tm1RemoteRollbackWitness(parseConfig(configValue))
+  return Tm1RemoteRollbackWitness.create(configValue)
 }
 
 /**

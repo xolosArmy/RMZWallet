@@ -7,6 +7,7 @@ import {
 import {
   TM1_REMOTE_ROLLBACK_WITNESS_HTTP_PROTOCOL,
   TM1_REMOTE_ROLLBACK_WITNESS_HTTP_PROTOCOL_VERSION,
+  Tm1RemoteRollbackWitness,
   createTm1RemoteRollbackWitness,
   createTm1RemoteRollbackWitnessFromEnv,
   type Tm1RemoteRollbackWitnessHttpOperation
@@ -43,6 +44,24 @@ describe('TM1 remote rollback-witness adapter', () => {
     }
     expect(() => createTm1RemoteRollbackWitnessFromEnv({}))
       .toThrowError(expect.objectContaining({ code: 'WITNESS_NOT_CONFIGURED' }))
+  })
+
+  test('direct construction cannot bypass parseConfig', () => {
+    const invalid: unknown[] = [
+      { endpointUrl: 'http://evil.example' },
+      { endpointUrl: ENDPOINT, timeoutMs: 0 },
+      { endpointUrl: '' },
+      { endpointUrl: 'https://user:pass@witness.example' },
+      { endpointUrl: 'https://witness.example?x=1' },
+      { endpointUrl: 'https://witness.example#frag' },
+      { endpointUrl: ENDPOINT, extra: true }
+    ]
+    type RuntimeCtor = new (config: unknown) => Tm1RemoteRollbackWitness
+    const Ctor = Tm1RemoteRollbackWitness as unknown as RuntimeCtor
+    for (const config of invalid) {
+      expect(() => new Ctor(config))
+        .toThrowError(expect.objectContaining({ code: 'WITNESS_NOT_CONFIGURED' }))
+    }
   })
 
   test('does not substitute the in-memory witness when env is empty', () => {
