@@ -99,6 +99,28 @@ describe('TM1 remote rollback-witness adapter', () => {
     }).read({ slotId: SLOT })).rejects.toMatchObject({ code: 'WITNESS_UNAVAILABLE' })
   })
 
+  test('reader.cancel() AbortError on hanging-body abort is not unhandled', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const timeoutMs = 40
+      const witness = createTm1RemoteRollbackWitness({
+        endpointUrl: ENDPOINT,
+        timeoutMs,
+        fetch: async () => hangingResponse()
+      })
+      await expect(witness.read({ slotId: SLOT }))
+        .rejects.toMatchObject({ code: 'WITNESS_UNAVAILABLE' })
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  }, 1_000)
+
   test('timeout still applies while decoding a hanging response body', async () => {
     const timeoutMs = 40
     const witness = createTm1RemoteRollbackWitness({
@@ -383,6 +405,9 @@ function hangingResponse(): Response {
   return new Response(new ReadableStream<Uint8Array>({
     start () {
       // Never enqueue or close: body decode must be aborted by timeout or caller.
+    },
+    cancel () {
+      return Promise.reject(new DOMException('Aborted', 'AbortError'))
     }
   }), {
     status: 200,

@@ -288,7 +288,7 @@ async function readLimitedBody(
   let received = 0
   const parts: string[] = []
   const abortRead = (): void => {
-    void reader.cancel()
+    void cancelReader(reader)
   }
   if (signal.aborted) {
     abortRead()
@@ -304,7 +304,7 @@ async function readLimitedBody(
       if (value === undefined || value.byteLength === 0) continue
       received += value.byteLength
       if (received > MAX_RESPONSE_BYTES) {
-        await reader.cancel()
+        await cancelReader(reader)
         unavailable()
       }
       parts.push(decoder.decode(value, { stream: true }))
@@ -373,6 +373,12 @@ function dataValue(source: object, key: string): unknown {
 
 function notConfigured(): never {
   throw new Tm1RollbackWitnessError('WITNESS_NOT_CONFIGURED')
+}
+
+function cancelReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): Promise<void> {
+  return reader.cancel().then(() => undefined, () => undefined)
 }
 
 function unavailable(): never {
