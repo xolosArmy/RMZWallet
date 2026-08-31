@@ -126,9 +126,8 @@ export class Tm1RemoteRollbackWitness implements Tm1RollbackWitness {
       controller.abort()
     }
     signal?.addEventListener('abort', onAbort, { once: true })
-    let response: Response
     try {
-      response = await this.fetchImpl(operationUrl(this.endpointUrl, operation), {
+      const response = await this.fetchImpl(operationUrl(this.endpointUrl, operation), {
         method: 'POST',
         credentials: 'omit',
         redirect: 'error',
@@ -144,14 +143,14 @@ export class Tm1RemoteRollbackWitness implements Tm1RollbackWitness {
           payload
         }))
       })
-    } catch {
+      return await decodeResponse(response, operation, controller.signal)
+    } catch (error) {
+      if (error instanceof Tm1RollbackWitnessError) throw error
       unavailable()
     } finally {
       clearTimeout(timer)
       signal?.removeEventListener('abort', onAbort)
     }
-    if (signal?.aborted) unavailable()
-    return decodeResponse(response, operation)
   }
 }
 
@@ -256,19 +255,11 @@ function operationUrl(
 
 async function decodeResponse(
   response: Response,
-  operation: Tm1RemoteRollbackWitnessHttpOperation
+  operation: Tm1RemoteRollbackWitnessHttpOperation,
+  signal: AbortSignal
 ): Promise<unknown> {
-  let body: string
-  try {
-    body = await response.text()
-  } catch {
-    unavailable()
-  }
-  if (body.length > MAX_RESPONSE_BYTES) unavailable()
-  if (body.length === 0) {
-    if (!response.ok) unavailable()
-    unverifiable()
-  }
+  const body = await readLimitedBody(response, signal)
+  if (body.length === 0) unavailable()
   let parsed: unknown
   try {
     parsed = JSON.parse(body) as unknown
@@ -284,6 +275,48 @@ async function decodeResponse(
   }
   if (operation === 'verifyRecord') unverifiable()
   return parsed
+}
+
+async function readLimitedBody(
+  response: Response,
+  signal: AbortSignal
+): Promise<string> {
+  const stream = response.body
+  if (stream === null) return ''
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let received = 0
+  const parts: string[] = []
+  const abortRead = (): void => {
+    void reader.cancel()
+  }
+  if (signal.aborted) {
+    abortRead()
+    unavailable()
+  }
+  signal.addEventListener('abort', abortRead, { once: true })
+  try {
+    while (true) {
+      if (signal.aborted) unavailable()
+      const { done, value } = await reader.read()
+      if (signal.aborted) unavailable()
+      if (done) break
+      if (value === undefined || value.byteLength === 0) continue
+      received += value.byteLength
+      if (received > MAX_RESPONSE_BYTES) {
+        await reader.cancel()
+        unavailable()
+      }
+      parts.push(decoder.decode(value, { stream: true }))
+    }
+    parts.push(decoder.decode())
+    return parts.join('')
+  } catch (error) {
+    if (error instanceof Tm1RollbackWitnessError) throw error
+    unavailable()
+  } finally {
+    signal.removeEventListener('abort', abortRead)
+  }
 }
 
 function isSuccessEnvelope(value: unknown): value is Readonly<{

@@ -99,6 +99,76 @@ describe('TM1 remote rollback-witness adapter', () => {
     }).read({ slotId: SLOT })).rejects.toMatchObject({ code: 'WITNESS_UNAVAILABLE' })
   })
 
+  test('timeout still applies while decoding a hanging response body', async () => {
+    const timeoutMs = 40
+    const witness = createTm1RemoteRollbackWitness({
+      endpointUrl: ENDPOINT,
+      timeoutMs,
+      fetch: async () => hangingResponse()
+    })
+    const started = Date.now()
+    await expect(witness.read({ slotId: SLOT }))
+      .rejects.toMatchObject({ code: 'WITNESS_UNAVAILABLE' })
+    expect(Date.now() - started).toBeLessThan(timeoutMs + 250)
+  }, 1_000)
+
+  test('caller abort still aborts hanging body decode', async () => {
+    const abort = new AbortController()
+    const witness = createTm1RemoteRollbackWitness({
+      endpointUrl: ENDPOINT,
+      timeoutMs: 8_000,
+      fetch: async () => hangingResponse()
+    })
+    const pending = witness.read({ slotId: SLOT, signal: abort.signal })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    abort.abort()
+    await expect(pending).rejects.toMatchObject({ code: 'WITNESS_UNAVAILABLE' })
+  }, 1_000)
+
+  test('oversized body is rejected before the whole payload is buffered', async () => {
+    const maxBytes = 65_536
+    const chunkSize = 4_096
+    let pulled = 0
+    let cancelled = false
+    const stream = new ReadableStream<Uint8Array>({
+      pull (controller) {
+        if (pulled >= maxBytes * 3) {
+          controller.close()
+          return
+        }
+        pulled += chunkSize
+        controller.enqueue(new Uint8Array(chunkSize).fill(0x61))
+      },
+      cancel () {
+        cancelled = true
+      }
+    })
+    const witness = createTm1RemoteRollbackWitness({
+      endpointUrl: ENDPOINT,
+      fetch: async () => new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    })
+    await expect(witness.read({ slotId: SLOT }))
+      .rejects.toMatchObject({ code: 'WITNESS_UNAVAILABLE' })
+    expect(cancelled).toBe(true)
+    expect(pulled).toBeLessThan(maxBytes * 3)
+    expect(pulled).toBeLessThanOrEqual(maxBytes + chunkSize * 2)
+  })
+
+  test('HTTP 200 empty body is WITNESS_UNAVAILABLE', async () => {
+    const witness = createTm1RemoteRollbackWitness({
+      endpointUrl: ENDPOINT,
+      fetch: async () => new Response('', {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    })
+    await expect(witness.read({ slotId: SLOT }))
+      .rejects.toMatchObject({ code: 'WITNESS_UNAVAILABLE' })
+  })
+
   test('well-formed JSON that is not a snapshot is returned as unknown', async () => {
     const witness = createTm1RemoteRollbackWitness({
       endpointUrl: ENDPOINT,
@@ -305,6 +375,17 @@ function failure(error: string) {
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
+    headers: { 'content-type': 'application/json' }
+  })
+}
+
+function hangingResponse(): Response {
+  return new Response(new ReadableStream<Uint8Array>({
+    start () {
+      // Never enqueue or close: body decode must be aborted by timeout or caller.
+    }
+  }), {
+    status: 200,
     headers: { 'content-type': 'application/json' }
   })
 }
