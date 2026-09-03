@@ -26,7 +26,7 @@ jobs:
         with:
           repository: xolosarmy/tonalli-memo
           path: .tonalli-memo-temp
-          ref: main
+          ref: feat/canonical-tm1-protocol
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -45,10 +45,14 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           rm -rf .tonalli-memo-temp
 
-      - name: Install dependencies
+      - name: Stage canonical protocol package
         run: |
-          npm install ./tonalli-memo-protocol.tgz --no-save
-          npm ci || npm install
+          mkdir -p node_modules/@xolosarmy/tonalli-memo-protocol
+          tar -xzf "$GITHUB_WORKSPACE/tonalli-memo-protocol.tgz" --strip-components=1 -C node_modules/@xolosarmy/tonalli-memo-protocol
+          rm "$GITHUB_WORKSPACE/tonalli-memo-protocol.tgz"
+
+      - name: Install dependencies
+        run: npm install
 
       - name: Typecheck
         run: npm run typecheck
