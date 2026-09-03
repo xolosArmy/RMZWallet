@@ -1,3 +1,12 @@
+import {
+  MAX_TM1_EVENT_DATA_BYTES,
+  TM1_POST_EVENT_TYPE,
+  TM1_VERSION,
+  encodeTm1Post,
+  parseTm1Output,
+  type ParsedTm1Post
+} from '@xolosarmy/tonalli-memo-protocol'
+
 export const TM1_DRAFT_02_CANDIDATE_SCHEMA = 'tonalli.tm1-candidate'
 export const TM1_DRAFT_02_CANDIDATE_ARTIFACT_VERSION = 1
 export const TM1_DRAFT_02_CANDIDATE_ENVIRONMENT = 'deterministic-regtest-fixture'
@@ -8,9 +17,6 @@ export const TM1_DRAFT_02_LOCKTIME = 0
 export const TM1_DRAFT_02_SEQUENCE = 0xffffffff
 
 const EFFECTIVE_CONTENT_DOMAIN = 'TONALLI\u0000TM1-DRAFT-02-CANDIDATE\u0000'
-const TM1_LOKAD_ID_HEX = '544d4d00'
-const TM1_VERSION = 0x01
-const TM1_POST_EVENT = 0x01
 const UINT32_MAX = 0xffffffff
 const UINT64_MAX = 0xffffffffffffffffn
 
@@ -329,56 +335,43 @@ export function revalidateTm1Draft02Candidate(
   }
 }
 
-function assertTm1PostScript(scriptHex: string): void {
-  const bytes = hexToBytes(scriptHex)
-  let offset = 0
-  if (bytes[offset] !== 0x6a) throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
-  offset += 1
-
-  const firstPush = readMinimalPush(bytes, offset)
-  offset = firstPush.nextOffset
-  if (bytesToHex(firstPush.data) !== TM1_LOKAD_ID_HEX) {
-    throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
-  }
-
-  const secondPush = readMinimalPush(bytes, offset)
-  offset = secondPush.nextOffset
-  if (offset !== bytes.length || secondPush.data.length < 3) {
-    throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
-  }
-  if (
-    secondPush.data[0] !== TM1_VERSION ||
-    secondPush.data[1] !== TM1_POST_EVENT ||
-    secondPush.data[2] !== TM1_DRAFT_02_AUTHOR_INPUT_INDEX
-  ) {
+export function validateTm1CanonicalScript(
+  scriptHex: string,
+  expectedAuthorInputIndex = TM1_DRAFT_02_AUTHOR_INPUT_INDEX
+): ParsedTm1Post {
+  try {
+    const parsed = parseTm1Output({
+      valueSats: 0n,
+      script: hexToBytes(scriptHex)
+    })
+    if (parsed.version !== TM1_VERSION) {
+      throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
+    }
+    if (parsed.eventTypeCode !== TM1_POST_EVENT_TYPE) {
+      throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
+    }
+    if (parsed.authorInputIndex !== expectedAuthorInputIndex) {
+      throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
+    }
+    if (parsed.eventDataBytes.length === 0 || parsed.eventDataBytes.length > MAX_TM1_EVENT_DATA_BYTES) {
+      throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
+    }
+    const reencoded = encodeTm1Post({
+      eventData: parsed.eventDataBytes,
+      authorInputIndex: parsed.authorInputIndex
+    })
+    if (reencoded.scriptHex !== scriptHex.toLowerCase()) {
+      throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
+    }
+    return parsed
+  } catch (error) {
+    if (error instanceof Tm1Draft02CandidateError) throw error
     throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
   }
 }
 
-function readMinimalPush(bytes: Uint8Array, offset: number): Readonly<{ data: Uint8Array; nextOffset: number }> {
-  const opcode = bytes[offset]
-  if (opcode == null) throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
-
-  let length: number
-  let headerBytes: number
-  if (opcode <= 75) {
-    length = opcode
-    headerBytes = 1
-  } else if (opcode === 0x4c) {
-    const pushedLength = bytes[offset + 1]
-    if (pushedLength == null || pushedLength <= 75) {
-      throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
-    }
-    length = pushedLength
-    headerBytes = 2
-  } else {
-    throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
-  }
-
-  const start = offset + headerBytes
-  const end = start + length
-  if (end > bytes.length) throw new Tm1Draft02CandidateError('INVALID_TM1_OUTPUT')
-  return Object.freeze({ data: bytes.slice(start, end), nextOffset: end })
+function assertTm1PostScript(scriptHex: string): void {
+  validateTm1CanonicalScript(scriptHex, TM1_DRAFT_02_AUTHOR_INPUT_INDEX)
 }
 
 function normalizeTxid(value: string): string {
@@ -428,10 +421,6 @@ function hexToBytes(hex: string): Uint8Array {
     bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16)
   }
   return bytes
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
 class CanonicalWriter {

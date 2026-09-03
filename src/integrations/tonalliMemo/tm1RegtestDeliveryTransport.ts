@@ -4,6 +4,7 @@ import {
   isPushOp,
   toHex
 } from 'ecash-lib'
+import { parseTm1Output } from '@xolosarmy/tonalli-memo-protocol'
 import {
   TM1_DRAFT_02_CANDIDATE_ENVIRONMENT,
   TM1_DRAFT_02_SIGHASH_POLICY
@@ -181,11 +182,27 @@ function auditRegtestSignedArtifact(artifact: RegtestSignedTransaction): string 
   if (transaction.inputs.length !== artifact.inputCount) {
     fail('INPUT_COUNT_MISMATCH')
   }
+  let isTm1Valid = false
+  try {
+    const tm1Output = transaction.outputs[0]
+    if (tm1Output?.script) {
+      const parsed = parseTm1Output({
+        valueSats: tm1Output.sats,
+        script: tm1Output.script.bytecode
+      })
+      if (parsed.version === 1 && parsed.eventTypeCode === 1) {
+        isTm1Valid = true
+      }
+    }
+  } catch {
+    isTm1Valid = false
+  }
+
   if (
     transaction.inputs.length === 0 ||
     transaction.outputs.length !== 2 ||
     transaction.outputs[0]?.sats !== 0n ||
-    !transaction.outputs[0]?.script.toHex().startsWith('6a04544d4d00') ||
+    !isTm1Valid ||
     transaction.outputs[1]?.script.toHex() !== TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX
   ) {
     fail('INVALID_FIXTURE_TRANSACTION')
