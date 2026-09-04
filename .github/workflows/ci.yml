@@ -45,14 +45,22 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           rm -rf .tonalli-memo-temp
 
-      - name: Stage canonical protocol package
+      - name: Start ephemeral registry for canonical protocol package
         run: |
-          mkdir -p node_modules/@xolosarmy/tonalli-memo-protocol
-          tar -xzf "$GITHUB_WORKSPACE/tonalli-memo-protocol.tgz" --strip-components=1 -C node_modules/@xolosarmy/tonalli-memo-protocol
-          rm "$GITHUB_WORKSPACE/tonalli-memo-protocol.tgz"
+          node scripts/ci-ephemeral-registry.mjs "$GITHUB_WORKSPACE/tonalli-memo-protocol.tgz" &
+          echo "EPHEMERAL_REG_PID=$!" >> $GITHUB_ENV
+          sleep 1
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install dependencies via npm ci
+        run: npm ci --registry=http://127.0.0.1:4873 --no-audit
+
+      - name: Stop ephemeral registry
+        if: always()
+        run: |
+          if [ -n "$EPHEMERAL_REG_PID" ]; then
+            kill "$EPHEMERAL_REG_PID" || true
+          fi
+          rm -f "$GITHUB_WORKSPACE/tonalli-memo-protocol.tgz"
 
       - name: Typecheck
         run: npm run typecheck
