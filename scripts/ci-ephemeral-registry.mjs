@@ -1,3 +1,12 @@
+/**
+ * TEMPORARY PRE-PUBLISH CI INFRASTRUCTURE:
+ * This ephemeral registry proxy is strictly for pre-publication validation of PR2
+ * before @xolosarmy/tonalli-memo-protocol@0.2.0 is published on npmjs.com.
+ *
+ * DO NOT MERGE TO MAIN:
+ * Once PR1 of tonalli-memo is published to npmjs.com, this script and its workflow
+ * reference will be deleted, allowing RMZWallet to run standard unproxied `npm ci`.
+ */
 import http from 'node:http';
 import fs from 'node:fs';
 import https from 'node:https';

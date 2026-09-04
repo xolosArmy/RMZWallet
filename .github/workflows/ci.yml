@@ -35,9 +35,12 @@ jobs:
           run_install: false
 
       - name: Build canonical protocol package
+        # NOTE: Temporary pre-publish staging for PR validation.
+        # Once @xolosarmy/tonalli-memo-protocol@0.2.0 is published on npmjs.com,
+        # this step and ephemeral registry are removed so CI runs pure `npm ci`.
         run: |
           cd .tonalli-memo-temp
-          pnpm install --frozen-lockfile || pnpm install
+          pnpm install --frozen-lockfile
           pnpm --filter @xolosarmy/tonalli-memo-protocol build
           cd packages/protocol
           PROTOCOL_TARBALL=$(npm pack)
