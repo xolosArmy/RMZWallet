@@ -20,50 +20,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
-
-      - name: Checkout tonalli-memo for canonical protocol package
-        uses: actions/checkout@v4
-        with:
-          repository: xolosarmy/tonalli-memo
-          path: .tonalli-memo-temp
-          ref: feat/canonical-tm1-protocol
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.4
-          run_install: false
-
-      - name: Build canonical protocol package
-        # NOTE: Temporary pre-publish staging for PR validation.
-        # Once @xolosarmy/tonalli-memo-protocol@0.2.0 is published on npmjs.com,
-        # this step and ephemeral registry are removed so CI runs pure `npm ci`.
-        run: |
-          cd .tonalli-memo-temp
-          pnpm install --frozen-lockfile
-          pnpm --filter @xolosarmy/tonalli-memo-protocol build
-          cd packages/protocol
-          PROTOCOL_TARBALL=$(npm pack)
-          mv "$PROTOCOL_TARBALL" "$GITHUB_WORKSPACE/tonalli-memo-protocol.tgz"
-          cd "$GITHUB_WORKSPACE"
-          rm -rf .tonalli-memo-temp
-
-      - name: Start ephemeral registry for canonical protocol package
-        run: |
-          node scripts/ci-ephemeral-registry.mjs "$GITHUB_WORKSPACE/tonalli-memo-protocol.tgz" &
-          echo "EPHEMERAL_REG_PID=$!" >> $GITHUB_ENV
-          sleep 1
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@xolosarmy'
 
       - name: Install dependencies via npm ci
-        run: npm ci --registry=http://127.0.0.1:4873 --no-audit
-
-      - name: Stop ephemeral registry
-        if: always()
-        run: |
-          if [ -n "$EPHEMERAL_REG_PID" ]; then
-            kill "$EPHEMERAL_REG_PID" || true
-          fi
-          rm -f "$GITHUB_WORKSPACE/tonalli-memo-protocol.tgz"
+        run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Typecheck
         run: npm run typecheck
