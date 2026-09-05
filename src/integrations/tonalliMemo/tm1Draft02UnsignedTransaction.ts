@@ -6,6 +6,7 @@ import {
   TM1_DRAFT_02_SIGHASH_POLICY,
   createTm1Draft02Candidate,
   encodeTm1Draft02CandidateEffectiveContent,
+  validateTm1CanonicalScript,
   type Tm1Draft02Candidate
 } from './tm1Draft02Candidate'
 
@@ -240,6 +241,22 @@ export function auditTm1Draft02UnsignedTransaction(input: Readonly<{
   })
 
   if (transaction.outputs[0]?.scriptHex !== candidate.outputs[0].scriptHex) fail('TM1_OUTPUT_MISMATCH')
+  try {
+    const tm1Output = validateTm1CanonicalScript(
+      transaction.outputs[0].scriptHex,
+      candidate.authorInputIndex
+    )
+    if (
+      tm1Output.version !== 1 ||
+      tm1Output.eventTypeCode !== 1 ||
+      tm1Output.authorInputIndex !== candidate.authorInputIndex ||
+      tm1Output.eventDataBytes.length === 0
+    ) {
+      fail('TM1_OUTPUT_MISMATCH')
+    }
+  } catch {
+    fail('TM1_OUTPUT_MISMATCH')
+  }
   if (
     transaction.outputs[1]?.scriptHex !== candidate.authorLockingScriptHex ||
     transaction.outputs[1]?.sats !== candidate.outputs[1].sats

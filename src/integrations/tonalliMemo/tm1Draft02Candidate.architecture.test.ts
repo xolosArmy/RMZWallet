@@ -9,7 +9,11 @@ const runtimeSource = readFileSync(
 
 describe('TM1 Draft 0.2 candidate architectural boundary', () => {
   it('has no imports or dependencies on wallet, network, keys, signing or delivery', () => {
-    expect(runtimeSource).not.toMatch(/^\s*import\s/m)
+    const imports = [...runtimeSource.matchAll(/(?:^|\n)\s*import[\s\S]*?from\s+['"]([^'"]+)['"]/g)].map((m) => m[1])
+    expect(imports.length).toBeGreaterThan(0)
+    for (const specifier of imports) {
+      expect(specifier).toBe('@xolosarmy/tonalli-memo-protocol')
+    }
     expect(runtimeSource).not.toMatch(/Chronik|getChronik|XolosWalletService|WalletContext|useWallet/)
     expect(runtimeSource).not.toMatch(/privateKey|mnemonic|signatory|P2PKHSignatory|TxBuilder|signTxBuilder/)
     expect(runtimeSource).not.toMatch(/broadcastTx|broadcastTxs|WalletConnect|externalSign|UniversalAuthorization/)
