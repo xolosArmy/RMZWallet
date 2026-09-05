@@ -57,9 +57,10 @@ describe('TM1 alias publication authorization isolation', () => {
     )
     expect(imports.sort()).toEqual([
       '../../utils/alias',
-      './tm1AliasPublicationAuthorizationError',
-      './tm1AliasVerifiedOwnershipMint'
+      './tm1AliasOwnershipVerificationPort',
+      './tm1AliasPublicationAuthorizationError'
     ])
+    expect(runtime).not.toMatch(/mintTm1VerifiedAliasOwnershipToken|mintVerifiedAliasOwnershipToken/)
   })
 
   test('records that caller-supplied evidence is not sufficient to enable publication', () => {
@@ -130,7 +131,9 @@ describe('TM1 alias publication authorization isolation', () => {
   })
 
   test('expiry uses captured Date.now and rejects caller now', () => {
-    const production = runtime.slice(0, runtime.indexOf('if (import.meta.vitest)'))
+    const production = runtime.includes('if (import.meta.vitest)')
+      ? runtime.slice(0, runtime.indexOf('if (import.meta.vitest)'))
+      : runtime
     const issue = production.slice(
       production.indexOf('\n  issue('),
       production.indexOf('export function createTm1AliasPublicationAuthorizer')
@@ -148,11 +151,12 @@ describe('TM1 alias publication authorization isolation', () => {
   })
 
   test('verified snapshot preserves expiresAt when present and omits it when absent', () => {
-    const mintRuntime = source('./tm1AliasVerifiedOwnershipMint.ts')
-    const mint = mintRuntime.slice(
-      mintRuntime.indexOf('export function mintTm1VerifiedAliasOwnershipToken'),
-      mintRuntime.indexOf('export function lookupTm1VerifiedAliasOwnershipToken')
+    const portRuntime = source('./tm1AliasOwnershipVerificationPort.ts')
+    const mint = portRuntime.slice(
+      portRuntime.indexOf('function mintVerifiedAliasOwnershipToken'),
+      portRuntime.indexOf('export function lookupTm1VerifiedAliasOwnershipToken')
     )
+    expect(mint).not.toMatch(/^export /m)
     const reconstruct = runtime.slice(
       runtime.indexOf('const evidence = verifiedSnapshot === undefined'),
       runtime.indexOf('verified: verifiedSnapshot !== undefined')

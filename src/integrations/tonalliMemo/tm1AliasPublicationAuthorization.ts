@@ -1,13 +1,9 @@
-/// <reference types="vitest/importMeta" />
 import { canonicalizeEcashAddress, toXecAlias } from '../../utils/alias'
 import {
   Tm1AliasPublicationAuthorizationError,
   type Tm1AliasPublicationAuthorizationErrorCode
 } from './tm1AliasPublicationAuthorizationError'
-import {
-  lookupTm1VerifiedAliasOwnershipToken,
-  mintTm1VerifiedAliasOwnershipToken
-} from './tm1AliasVerifiedOwnershipMint'
+import { lookupTm1VerifiedAliasOwnershipToken } from './tm1AliasOwnershipVerificationPort'
 
 export { Tm1AliasPublicationAuthorizationError }
 export type { Tm1AliasPublicationAuthorizationErrorCode }
@@ -418,112 +414,4 @@ function invalidInput(): never {
 
 function fail(code: Tm1AliasPublicationAuthorizationErrorCode): never {
   throw new Tm1AliasPublicationAuthorizationError(code)
-}
-
-if (import.meta.vitest) {
-  const { describe, expect, test } = import.meta.vitest
-  const owner = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
-  const uniqueTxid = (tag: string): string => {
-    const bytes = Array.from(tag, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('')
-    return (bytes + 'cd'.repeat(32)).slice(0, 64)
-  }
-  const mintAndIssue = (
-    tag: string,
-    evidenceOverrides: Record<string, unknown>,
-    requestOverrides: Record<string, unknown> = {}
-  ) => {
-    const alias = `${tag}.xec`
-    const evidence = mintTm1VerifiedAliasOwnershipToken({
-      alias,
-      address: owner,
-      txid: uniqueTxid(tag),
-      blockHeight: 100,
-      status: 'confirmed',
-      ...evidenceOverrides
-    })
-    return createTm1AliasPublicationAuthorizer().issue({
-      alias,
-      ownerAddress: owner,
-      evidence,
-      ...requestOverrides
-    })
-  }
-
-  describe('TM1 verified evidence expiry (unexported mint)', () => {
-    test('P2: verified evidence with expiresAt in the past is expired', () => {
-      expect(() => mintAndIssue('vexp', {
-        expiresAt: Date.now() - 60_000
-      })).toThrowError(
-        expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
-      )
-    })
-
-    test('P2 clock: expired verified evidence with now:0 is rejected', () => {
-      expect(() => mintAndIssue('clk0', {
-        expiresAt: Date.now() - 60_000
-      }, { now: 0 })).toThrowError(
-        expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
-      )
-    })
-
-    test('verified evidence with expiresAt in the future can reach commit', () => {
-      const authorization = mintAndIssue('vfut', {
-        expiresAt: Date.now() + 60_000
-      })
-      expect(authorization).toMatchObject({
-        alias: 'vfut.xec',
-        ownerAddress: owner,
-        evidenceBlockHeight: 100
-      })
-      expect(Object.isFrozen(authorization)).toBe(true)
-    })
-
-    test('verified evidence without expiresAt does not take the expiry branch', () => {
-      const authorization = mintAndIssue('vnexp', {})
-      expect(authorization).toMatchObject({ alias: 'vnexp.xec' })
-    })
-
-    test('expired verified evidence does not write replay or height', () => {
-      expect(() => mintAndIssue('vled', {
-        expiresAt: Date.now() - 60_000,
-        blockHeight: 500
-      })).toThrowError(
-        expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
-      )
-      const later = mintAndIssue('vled', {
-        txid: uniqueTxid('vledz'),
-        blockHeight: 50
-      })
-      expect(later).toMatchObject({
-        alias: 'vled.xec',
-        evidenceBlockHeight: 50
-      })
-    })
-
-    test('Date.now replaced after import does not move expiry', () => {
-      const originalNow = Date.now
-      Date.now = () => 0
-      try {
-        expect(() => mintAndIssue('clkcap', {
-          expiresAt: originalNow() - 60_000
-        })).toThrowError(
-          expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
-        )
-      } finally {
-        Date.now = originalNow
-      }
-    })
-
-    test('captured clock still commits future expiresAt after Date.now is replaced', () => {
-      const originalNow = Date.now
-      const expiresAt = originalNow() + 60_000
-      Date.now = () => Number.MAX_SAFE_INTEGER
-      try {
-        const authorization = mintAndIssue('clkfut', { expiresAt })
-        expect(authorization).toMatchObject({ alias: 'clkfut.xec' })
-      } finally {
-        Date.now = originalNow
-      }
-    })
-  })
 }

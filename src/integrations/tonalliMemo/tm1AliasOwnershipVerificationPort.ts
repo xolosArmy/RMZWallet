@@ -3,11 +3,11 @@ import {
   Tm1AliasPublicationAuthorizationError,
   type Tm1AliasPublicationAuthorizationErrorCode
 } from './tm1AliasPublicationAuthorizationError'
-import { mintTm1VerifiedAliasOwnershipToken } from './tm1AliasVerifiedOwnershipMint'
 
 /**
  * Fail-closed verification port: an injected observer plus a trusted clock
  * may mint a Tm1VerifiedAliasOwnershipToken. Caller JSON cannot.
+ * mintVerifiedAliasOwnershipToken is file-private. It is not exported.
  *
  * NOT SUFFICIENT TO ENABLE PUBLICATION
  * This module is not a signer, transport, wallet root, or UI wire.
@@ -39,6 +39,46 @@ type FrozenDeps = Readonly<{
 }>
 
 const objectFreeze = Object.freeze as <T extends object>(value: T) => T
+const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as <V>(
+  map: WeakMap<object, V>,
+  key: object
+) => V | undefined
+const weakMapSet = Function.prototype.call.bind(WeakMap.prototype.set) as <V>(
+  map: WeakMap<object, V>,
+  key: object,
+  value: V
+) => WeakMap<object, V>
+
+export type Tm1VerifiedAliasOwnershipSnapshot = Readonly<{
+  alias: string
+  address: string
+  txid: string
+  blockHeight: number
+  expiresAt?: number
+}>
+
+const verifiedEvidenceSnapshots = new WeakMap<object, Tm1VerifiedAliasOwnershipSnapshot>()
+
+function mintVerifiedAliasOwnershipToken(
+  parsed: Tm1VerifiedAliasOwnershipSnapshot
+): object {
+  const token = objectFreeze(Object.create(null))
+  weakMapSet(verifiedEvidenceSnapshots, token, objectFreeze({
+    alias: parsed.alias,
+    address: parsed.address,
+    txid: parsed.txid,
+    blockHeight: parsed.blockHeight,
+    ...(parsed.expiresAt === undefined ? {} : { expiresAt: parsed.expiresAt })
+  }))
+  return token
+}
+
+export function lookupTm1VerifiedAliasOwnershipToken(
+  value: unknown
+): Tm1VerifiedAliasOwnershipSnapshot | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  return weakMapGet(verifiedEvidenceSnapshots, value)
+}
 
 export class Tm1AliasOwnershipVerificationPort {
   private readonly observe: Tm1AliasOwnershipObserver
@@ -80,12 +120,11 @@ export class Tm1AliasOwnershipVerificationPort {
         throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_EXPIRED')
       }
     }
-    return mintTm1VerifiedAliasOwnershipToken({
+    return mintVerifiedAliasOwnershipToken({
       alias: parsed.alias,
       address: parsed.address,
       txid: parsed.txid,
       blockHeight: parsed.blockHeight,
-      status: 'confirmed',
       ...(parsed.expiresAt === undefined ? {} : { expiresAt: parsed.expiresAt })
     })
   }

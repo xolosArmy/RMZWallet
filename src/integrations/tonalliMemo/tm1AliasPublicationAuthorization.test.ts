@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'vitest'
+import { createTm1AliasOwnershipVerificationPort } from './tm1AliasOwnershipVerificationPort'
 import * as aliasAuth from './tm1AliasPublicationAuthorization'
 import {
   Tm1AliasPublicationAuthorizationError,
@@ -516,5 +517,141 @@ describe('TM1 alias publication authorization', () => {
     expect(() => authorizer().issue(fixture('parse1b').request())).toThrowError(
       expect.objectContaining(UNTRUSTED)
     )
+  })
+})
+
+describe('TM1 verified evidence expiry via verification port', () => {
+  const uniqueTxid = (tag: string): string => {
+    const bytes = Array.from(tag, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('')
+    return (bytes + 'cd'.repeat(32)).slice(0, 64)
+  }
+  const mintViaPort = async (
+    tag: string,
+    evidenceOverrides: Record<string, unknown> = {}
+  ) => {
+    const alias = `${tag}.xec`
+    const expiresAt = evidenceOverrides.expiresAt
+    const port = createTm1AliasOwnershipVerificationPort({
+      observe: async () => ({
+        alias,
+        address: OWNER,
+        txid: uniqueTxid(tag),
+        blockHeight: 100,
+        status: 'confirmed',
+        ...evidenceOverrides
+      }),
+      clock: () => typeof expiresAt === 'number' ? expiresAt - 1 : Date.now()
+    })
+    const evidence = await port.verify({ alias, ownerAddress: OWNER })
+    return { alias, evidence }
+  }
+
+  test('P2: verified evidence with expiresAt in the past is expired at issue()', async () => {
+    const { alias, evidence } = await mintViaPort('vexp', {
+      expiresAt: Date.now() - 60_000
+    })
+    expect(() => createTm1AliasPublicationAuthorizer().issue({
+      alias,
+      ownerAddress: OWNER,
+      evidence
+    })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
+  })
+
+  test('P2 clock: expired verified evidence with now:0 is rejected', async () => {
+    const { alias, evidence } = await mintViaPort('clk0', {
+      expiresAt: Date.now() - 60_000
+    })
+    expect(() => createTm1AliasPublicationAuthorizer().issue({
+      alias,
+      ownerAddress: OWNER,
+      evidence,
+      now: 0
+    })).toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
+  })
+
+  test('verified evidence with expiresAt in the future can reach commit', async () => {
+    const { alias, evidence } = await mintViaPort('vfut', {
+      expiresAt: Date.now() + 60_000
+    })
+    const authorization = createTm1AliasPublicationAuthorizer().issue({
+      alias,
+      ownerAddress: OWNER,
+      evidence
+    })
+    expect(authorization).toMatchObject({
+      alias: 'vfut.xec',
+      ownerAddress: OWNER,
+      evidenceBlockHeight: 100
+    })
+    expect(Object.isFrozen(authorization)).toBe(true)
+  })
+
+  test('verified evidence without expiresAt does not take the expiry branch', async () => {
+    const { alias, evidence } = await mintViaPort('vnexp')
+    const authorization = createTm1AliasPublicationAuthorizer().issue({
+      alias,
+      ownerAddress: OWNER,
+      evidence
+    })
+    expect(authorization).toMatchObject({ alias: 'vnexp.xec' })
+  })
+
+  test('expired verified evidence does not write replay or height', async () => {
+    const expired = await mintViaPort('vled', {
+      expiresAt: Date.now() - 60_000,
+      blockHeight: 500
+    })
+    expect(() => createTm1AliasPublicationAuthorizer().issue({
+      alias: expired.alias,
+      ownerAddress: OWNER,
+      evidence: expired.evidence
+    })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
+    const later = await mintViaPort('vled', {
+      txid: uniqueTxid('vledz'),
+      blockHeight: 50
+    })
+    const authorization = createTm1AliasPublicationAuthorizer().issue({
+      alias: later.alias,
+      ownerAddress: OWNER,
+      evidence: later.evidence
+    })
+    expect(authorization).toMatchObject({
+      alias: 'vled.xec',
+      evidenceBlockHeight: 50
+    })
+  })
+
+  test('Date.now replaced after import does not move expiry', async () => {
+    const originalNow = Date.now
+    const { alias, evidence } = await mintViaPort('clkcap', {
+      expiresAt: originalNow() - 60_000
+    })
+    Date.now = () => 0
+    try {
+      expect(() => createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence
+      })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
+    } finally {
+      Date.now = originalNow
+    }
+  })
+
+  test('captured clock still commits future expiresAt after Date.now is replaced', async () => {
+    const originalNow = Date.now
+    const expiresAt = originalNow() + 60_000
+    const { alias, evidence } = await mintViaPort('clkfut', { expiresAt })
+    Date.now = () => Number.MAX_SAFE_INTEGER
+    try {
+      const authorization = createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence
+      })
+      expect(authorization).toMatchObject({ alias: 'clkfut.xec' })
+    } finally {
+      Date.now = originalNow
+    }
   })
 })

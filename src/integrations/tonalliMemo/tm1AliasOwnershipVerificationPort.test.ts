@@ -180,6 +180,29 @@ describe('TM1 alias ownership verification port', () => {
     expect(authorization).toMatchObject({ alias: 'vpgf.xec' })
   })
 
+  test('P1: mint is not importable and cannot bypass the observer', async () => {
+    const tag = 'p1mint'
+    const json = observation(tag)
+    let mintFn: ((value: unknown) => object) | undefined
+    try {
+      const mintSpec: string = './tm1AliasVerifiedOwnershipMint'
+      const mintMod: { mintTm1VerifiedAliasOwnershipToken?: (value: unknown) => object } = await import(
+        mintSpec
+      )
+      mintFn = mintMod.mintTm1VerifiedAliasOwnershipToken
+    } catch {
+      mintFn = undefined
+    }
+    expect(typeof mintFn).not.toBe('function')
+    if (typeof mintFn !== 'function') return
+    const token = mintFn(json)
+    expect(() => createTm1AliasPublicationAuthorizer().issue({
+      alias: `${tag}.xec`,
+      ownerAddress: OWNER,
+      evidence: token
+    })).toThrowError(expect.objectContaining(UNTRUSTED))
+  })
+
   test('factory requires observe and clock and has no silent network default', () => {
     expect(() => createTm1AliasOwnershipVerificationPort({}))
       .toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))

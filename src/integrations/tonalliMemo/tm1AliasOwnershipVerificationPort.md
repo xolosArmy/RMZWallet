@@ -26,9 +26,10 @@ and no in-memory fake in this module. Tests inject both.
 2. Call `observe`. Network/abort/thrown transport → `ALIAS_OWNERSHIP_UNAVAILABLE`.
    Null / extra keys / malformed JSON-shaped results → `ALIAS_PROOF_UNVERIFIABLE`.
 3. Unconfirmed, owner mismatch, or `clock() >= expiresAt` → throw, no token.
-4. Confirmed matching observation → module-internal mint. The token is
-   an empty frozen object whose snapshot lives in a WeakMap. `issue()`
-   accepts only that token.
+4. Confirmed matching observation → file-private mint (not exported).
+   The token is an empty frozen object whose snapshot lives in a WeakMap.
+   `issue()` accepts only that token. `mintTm1VerifiedAliasOwnershipToken`
+   is not a public import.
 5. `expiresAt`, when present, is copied into the snapshot (not dropped).
 6. Observer `blockHeight` is stored only on that snapshot. The port does
    not write the issuer's process-local stale-height map.

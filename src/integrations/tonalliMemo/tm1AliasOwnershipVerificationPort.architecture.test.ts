@@ -1,19 +1,30 @@
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, test } from 'vitest'
 import * as portApi from './tm1AliasOwnershipVerificationPort'
 import * as aliasAuth from './tm1AliasPublicationAuthorization'
 
+const here = fileURLToPath(new URL('.', import.meta.url))
 const source = (relativePath: string): string => readFileSync(
-  fileURLToPath(new URL(relativePath, import.meta.url)),
+  new URL(relativePath, import.meta.url),
   'utf8'
 )
 
 const portRuntime = source('./tm1AliasOwnershipVerificationPort.ts')
-const mintRuntime = source('./tm1AliasVerifiedOwnershipMint.ts')
 const app = source('../../App.tsx')
 const registerAlias = source('../../routes/RegisterAlias.tsx')
 const orchestrator = source('./tm1RegtestPublicationOrchestrator.ts')
+
+function walkTs(dir: string): string[] {
+  const out: string[] = []
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name)
+    if (statSync(full).isDirectory()) out.push(...walkTs(full))
+    else if (name.endsWith('.ts') && !name.endsWith('.test.ts')) out.push(full)
+  }
+  return out
+}
 
 describe('TM1 alias ownership verification port isolation', () => {
   test('H: App, RegisterAlias, and orchestrator do not import the port or mint', () => {
@@ -30,13 +41,30 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(Object.keys(portApi).sort()).toEqual([
       'Tm1AliasOwnershipVerificationError',
       'Tm1AliasOwnershipVerificationPort',
-      'createTm1AliasOwnershipVerificationPort'
+      'createTm1AliasOwnershipVerificationPort',
+      'lookupTm1VerifiedAliasOwnershipToken'
     ])
-    expect(portRuntime).not.toMatch(/export function mintVerified/)
-    expect(mintRuntime).not.toMatch(/export function mintVerifiedAliasOwnershipEvidence/)
+    expect(portApi).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')
+    expect(portApi).not.toHaveProperty('mintVerifiedAliasOwnershipEvidence')
+    expect(portApi).not.toHaveProperty('mintVerifiedAliasOwnershipToken')
+    expect(portApi).not.toHaveProperty('mintTm1VerifiedAliasOwnershipToken')
     expect(aliasAuth).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')
     expect(aliasAuth).not.toHaveProperty('mintVerifiedAliasOwnershipEvidence')
+    expect(aliasAuth).not.toHaveProperty('mintTm1VerifiedAliasOwnershipToken')
     expect(aliasAuth).not.toHaveProperty('createTm1InMemoryAliasPublicationAuthorizationLedger')
+    expect(portRuntime).not.toMatch(/export\s+(async\s+)?function\s+mint/)
+    expect(portRuntime).not.toMatch(/export\s+\{[^}]*\bmint\w*/)
+  })
+
+  test('no mint* export exists under src/integrations/tonalliMemo', () => {
+    const files = walkTs(here)
+    expect(files.some(path => path.endsWith('tm1AliasVerifiedOwnershipMint.ts'))).toBe(false)
+    for (const file of files) {
+      const text = readFileSync(file, 'utf8')
+      expect(text, file).not.toMatch(/export\s+(async\s+)?function\s+mint/)
+      expect(text, file).not.toMatch(/export\s+(const|let|var)\s+mint/)
+      expect(text, file).not.toMatch(/export\s+\{[^}]*\bmint\w*/)
+    }
   })
 
   test('does not sign, broadcast, auto-wire UI, or default to a network observer', () => {
@@ -48,9 +76,6 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(portRuntime).not.toContain('https://alias.ecash.mx')
     expect(portRuntime).not.toMatch(/fetch\s*\(/)
     expect(portRuntime).toContain('NOT SUFFICIENT TO ENABLE PUBLICATION')
-    expect(mintRuntime).not.toMatch(/from ['"]react/)
-    expect(mintRuntime).not.toMatch(/ChronikClient/)
-    expect(mintRuntime).not.toMatch(/from ['"].*RegisterAlias/)
   })
 
   test('observe and clock are required injected deps with no in-memory production fallback', () => {
