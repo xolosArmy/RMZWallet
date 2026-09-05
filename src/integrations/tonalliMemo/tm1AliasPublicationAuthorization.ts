@@ -24,6 +24,7 @@ export type Tm1AliasPublicationAuthorizationErrorCode =
   | 'ALIAS_PROOF_EXPIRED'
   | 'ALIAS_PROOF_REPLAYED'
   | 'ALIAS_PROOF_STALE'
+  | 'ALIAS_EVIDENCE_UNTRUSTED'
 
 export class Tm1AliasPublicationAuthorizationError extends Error {
   readonly code: Tm1AliasPublicationAuthorizationErrorCode
@@ -52,18 +53,18 @@ type LedgerState = {
 }
 
 const weakMapHas = Function.prototype.call.bind(WeakMap.prototype.has) as (
-  map: WeakMap<object, LedgerState>,
+  map: WeakMap<object, unknown>,
   key: object
 ) => boolean
-const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as (
-  map: WeakMap<object, LedgerState>,
+const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as <V>(
+  map: WeakMap<object, V>,
   key: object
-) => LedgerState | undefined
-const weakMapSet = Function.prototype.call.bind(WeakMap.prototype.set) as (
-  map: WeakMap<object, LedgerState>,
+) => V | undefined
+const weakMapSet = Function.prototype.call.bind(WeakMap.prototype.set) as <V>(
+  map: WeakMap<object, V>,
   key: object,
-  value: LedgerState
-) => WeakMap<object, LedgerState>
+  value: V
+) => WeakMap<object, V>
 const setHas = Function.prototype.call.bind(Set.prototype.has) as (
   set: Set<string>,
   value: string
@@ -81,6 +82,15 @@ const mapSet = Function.prototype.call.bind(Map.prototype.set) as (
   key: string,
   value: number
 ) => Map<string, number>
+const objectFreeze = Object.freeze as <T extends object>(value: T) => T
+const arrayJoin = Function.prototype.call.bind(Array.prototype.join) as (
+  items: readonly unknown[],
+  separator: string
+) => string
+const applyString = Function.prototype.call.bind(String) as (
+  thisArg: unknown,
+  value: unknown
+) => string
 
 const ledgerStates = new WeakMap<object, LedgerState>()
 
@@ -90,7 +100,7 @@ const ledgerStates = new WeakMap<object, LedgerState>()
  * Ordinary callers cannot mint a replacement identity.
  */
 function createProcessLocalLedger(): Tm1AliasPublicationAuthorizationLedger {
-  const ledger = Object.freeze(Object.create(null)) as Tm1AliasPublicationAuthorizationLedger
+  const ledger = objectFreeze(Object.create(null)) as Tm1AliasPublicationAuthorizationLedger
   weakMapSet(ledgerStates, ledger, {
     consumedProofs: new Set<string>(),
     latestBlockHeightByAlias: new Map<string, number>()
@@ -99,6 +109,44 @@ function createProcessLocalLedger(): Tm1AliasPublicationAuthorizationLedger {
 }
 
 const processLocalLedger = createProcessLocalLedger()
+
+type VerifiedEvidenceSnapshot = Readonly<{
+  alias: string
+  address: string
+  txid: string
+  blockHeight: number
+}>
+
+const verifiedEvidenceSnapshots = new WeakMap<object, VerifiedEvidenceSnapshot>()
+
+/**
+ * Unexported mint for the future verification port (slice 4).
+ * Not on the public export surface. Ordinary callers cannot obtain it.
+ */
+function mintVerifiedAliasPublicationEvidence(
+  value: unknown
+): object {
+  const parsed = parseEvidence(value)
+  if (parsed.status !== 'confirmed' || parsed.blockHeight < 1) fail('ALIAS_UNCONFIRMED')
+  const token = objectFreeze(Object.create(null))
+  weakMapSet(verifiedEvidenceSnapshots, token, objectFreeze({
+    alias: parsed.alias,
+    address: parsed.address,
+    txid: parsed.txid,
+    blockHeight: parsed.blockHeight
+  }))
+  return token
+}
+
+const internalVerifiedEvidencePort = objectFreeze({
+  mint: mintVerifiedAliasPublicationEvidence
+})
+
+function lookupVerifiedEvidence(value: unknown): VerifiedEvidenceSnapshot | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  if (value === internalVerifiedEvidencePort) invalidInput()
+  return weakMapGet(verifiedEvidenceSnapshots, value)
+}
 
 function parseLedger(value: unknown): Tm1AliasPublicationAuthorizationLedger {
   if (value === null || typeof value !== 'object') invalidInput()
@@ -135,6 +183,37 @@ function recordHeight(
   mapSet(requireLedgerState(ledger).latestBlockHeightByAlias, alias, height)
 }
 
+function commitVerifiedAuthorization(
+  ledger: Tm1AliasPublicationAuthorizationLedger,
+  request: ParsedRequest
+): Tm1AliasPublicationAuthorization {
+  const evidence = request.evidence
+  const previousHeight = lastHeight(ledger, request.alias)
+  if (previousHeight !== undefined && evidence.blockHeight < previousHeight) {
+    fail('ALIAS_PROOF_STALE')
+  }
+  const proofKey = `${request.alias}\0${evidence.txid}`
+  if (hasProof(ledger, proofKey)) fail('ALIAS_PROOF_REPLAYED')
+  recordProof(ledger, proofKey)
+  recordHeight(ledger, request.alias, evidence.blockHeight)
+  const authorizationId = arrayJoin([
+    'tm1-alias-auth:v1',
+    request.alias,
+    request.ownerAddress,
+    evidence.txid,
+    applyString(undefined, evidence.blockHeight)
+  ], ':')
+  return objectFreeze({
+    protocol: TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL,
+    protocolVersion: TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL_VERSION,
+    alias: request.alias,
+    ownerAddress: request.ownerAddress,
+    evidenceTxid: evidence.txid,
+    evidenceBlockHeight: evidence.blockHeight,
+    authorizationId
+  })
+}
+
 /**
  * Fail-closed publication authorization from confirmed .xec ownership evidence.
  * It is not a signer, transport, or broadcast capability.
@@ -169,32 +248,8 @@ export class Tm1AliasPublicationAuthorizer {
       if (request.now === undefined) fail('ALIAS_PROOF_UNVERIFIABLE')
       if (request.now >= evidence.expiresAt) fail('ALIAS_PROOF_EXPIRED')
     }
-    const previousHeight = lastHeight(this.ledger, request.alias)
-    if (previousHeight !== undefined && evidence.blockHeight < previousHeight) {
-      fail('ALIAS_PROOF_STALE')
-    }
-    const proofKey = `${request.alias}\0${evidence.txid}`
-    if (hasProof(this.ledger, proofKey)) fail('ALIAS_PROOF_REPLAYED')
-
-    const authorization = Object.freeze({
-      protocol: TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL,
-      protocolVersion: TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL_VERSION,
-      alias: request.alias,
-      ownerAddress: request.ownerAddress,
-      evidenceTxid: evidence.txid,
-      evidenceBlockHeight: evidence.blockHeight,
-      authorizationId: [
-        'tm1-alias-auth:v1',
-        request.alias,
-        request.ownerAddress,
-        evidence.txid,
-        String(evidence.blockHeight)
-      ].join(':')
-    }) satisfies Tm1AliasPublicationAuthorization
-
-    recordProof(this.ledger, proofKey)
-    recordHeight(this.ledger, request.alias, evidence.blockHeight)
-    return authorization
+    if (!request.verified) fail('ALIAS_EVIDENCE_UNTRUSTED')
+    return commitVerifiedAuthorization(this.ledger, request)
   }
 }
 
@@ -222,20 +277,20 @@ export function parseTm1AliasPublicationAuthorization(
     dataValue(source, 'evidenceBlockHeight')
   )
   const authorizationId = dataValue(source, 'authorizationId')
-  const expectedId = [
+  const expectedId = arrayJoin([
     'tm1-alias-auth:v1',
     alias,
     ownerAddress,
     evidenceTxid,
-    String(evidenceBlockHeight)
-  ].join(':')
+    applyString(undefined, evidenceBlockHeight)
+  ], ':')
   if (
     dataValue(source, 'protocol') !== TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL ||
     dataValue(source, 'protocolVersion') !==
       TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL_VERSION ||
     authorizationId !== expectedId
   ) fail('INVALID_ALIAS_AUTHORIZATION_INPUT')
-  return Object.freeze({
+  return objectFreeze({
     protocol: TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL,
     protocolVersion: TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL_VERSION,
     alias,
@@ -259,6 +314,7 @@ type ParsedRequest = Readonly<{
   alias: string
   ownerAddress: string
   evidence: ParsedEvidence
+  verified: boolean
   now?: number
   tipHeight?: number
 }>
@@ -279,10 +335,24 @@ function parseRequest(value: unknown): ParsedRequest {
   const now = optionalSafeInteger(source, 'now')
   const tipHeight = optionalSafeInteger(source, 'tipHeight')
   if (tipHeight !== undefined && tipHeight < 0) fail('ALIAS_PROOF_UNVERIFIABLE')
-  return Object.freeze({
-    alias: requireAlias(dataValue(source, 'alias')),
-    ownerAddress: requireOwnerAddress(dataValue(source, 'ownerAddress')),
-    evidence: parseEvidence(dataValue(source, 'evidence')),
+  const alias = requireAlias(dataValue(source, 'alias'))
+  const ownerAddress = requireOwnerAddress(dataValue(source, 'ownerAddress'))
+  const evidenceValue = dataValue(source, 'evidence')
+  const verifiedSnapshot = lookupVerifiedEvidence(evidenceValue)
+  const evidence = verifiedSnapshot === undefined
+    ? parseEvidence(evidenceValue)
+    : objectFreeze({
+      alias: verifiedSnapshot.alias,
+      address: verifiedSnapshot.address,
+      txid: verifiedSnapshot.txid,
+      blockHeight: verifiedSnapshot.blockHeight,
+      status: 'confirmed'
+    })
+  return objectFreeze({
+    alias,
+    ownerAddress,
+    evidence,
+    verified: verifiedSnapshot !== undefined,
     ...(now === undefined ? {} : { now }),
     ...(tipHeight === undefined ? {} : { tipHeight })
   })
@@ -310,7 +380,7 @@ function parseEvidence(value: unknown): ParsedEvidence {
     fail('ALIAS_PROOF_UNVERIFIABLE')
   }
   const expiresAt = optionalSafeInteger(source, 'expiresAt')
-  return Object.freeze({
+  return objectFreeze({
     alias: requireAlias(dataValue(source, 'alias')),
     address: requireOwnerAddress(dataValue(source, 'address')),
     txid: txidValue,

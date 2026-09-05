@@ -9,6 +9,7 @@ import {
 
 const OWNER = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
 const OTHER_OWNER = 'ecash:qrrd3y2cmg6m2vxlng9h3djh889pmwffhqv9yym2p4'
+const UNTRUSTED = { code: 'ALIAS_EVIDENCE_UNTRUSTED' }
 
 function txidFrom(tag: string): string {
   const bytes = Array.from(tag, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('')
@@ -167,20 +168,11 @@ function clearRecordedCollections(receivers: readonly object[]): void {
 }
 
 describe('TM1 alias publication authorization', () => {
-  test('confirmed alias with matching owner issues a bound authorization', () => {
-    const { alias, txid, request } = fixture('ok1')
-    const authorization = authorizer().issue(request())
-    const parsed = parseTm1AliasPublicationAuthorization(authorization)
-
-    expect(parsed).toMatchObject({
-      alias,
-      ownerAddress: OWNER,
-      evidenceTxid: txid,
-      evidenceBlockHeight: 100
-    })
-    expect(parsed.authorizationId).toContain(alias)
-    expect(parsed.authorizationId).toContain(txid)
-    expect(Object.isFrozen(parsed)).toBe(true)
+  test('confirmed caller-supplied evidence is untrusted and does not issue', () => {
+    const { request } = fixture('ok1')
+    expect(() => authorizer().issue(request())).toThrowError(
+      expect.objectContaining(UNTRUSTED)
+    )
   })
 
   test('unconfirmed alias does not issue authorization', () => {
@@ -205,17 +197,14 @@ describe('TM1 alias publication authorization', () => {
     }))).toThrowError(expect.objectContaining({ code: 'ALIAS_OWNER_MISMATCH' }))
   })
 
-  test('stale or replayed proof does not issue authorization', () => {
+  test('caller-supplied confirmed evidence does not consume or stale the singleton', () => {
     const { request, evidence, laterTxid } = fixture('stale1')
     const issuer = authorizer()
-    issuer.issue(request())
-
-    expect(() => issuer.issue(request())).toThrowError(
-      expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
-    )
+    expect(() => issuer.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
+    expect(() => issuer.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
     expect(() => issuer.issue(request({
       evidence: evidence({ txid: laterTxid, blockHeight: 50 })
-    }))).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_STALE' }))
+    }))).toThrowError(expect.objectContaining(UNTRUSTED))
     expect(() => issuer.issue(request({
       evidence: evidence({
         txid: laterTxid,
@@ -226,37 +215,35 @@ describe('TM1 alias publication authorization', () => {
     }))).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
   })
 
-  test('authorization object cannot call broadcast or sign', () => {
+  test('failed issue does not return a sign or broadcast capability', () => {
     const { request } = fixture('nosign')
-    const authorization = authorizer().issue(request())
-    const keys = Reflect.ownKeys(authorization)
-
+    let thrown: unknown
+    try {
+      authorizer().issue(request())
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeInstanceOf(Tm1AliasPublicationAuthorizationError)
+    const keys = Reflect.ownKeys(thrown as object)
     expect(keys).not.toContain('broadcast')
     expect(keys).not.toContain('sign')
     expect(keys).not.toContain('broadcastTx')
-    expect(typeof (authorization as { broadcast?: unknown }).broadcast).toBe('undefined')
-    expect(typeof (authorization as { sign?: unknown }).sign).toBe('undefined')
-    expect(Object.values(authorization).every(value => typeof value !== 'function')).toBe(true)
   })
 
-  test('two factory() calls share replay of the same proof', () => {
+  test('two factory() calls share the still-empty singleton', () => {
     const { request } = fixture('share1')
     const first = createTm1AliasPublicationAuthorizer()
     const second = createTm1AliasPublicationAuthorizer()
-    first.issue(request())
-    expect(() => second.issue(request())).toThrowError(
-      expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
-    )
+    expect(() => first.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
+    expect(() => second.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
   })
 
-  test('canonical CashAddr casing of the same owner issues authorization', () => {
+  test('canonical CashAddr casing is parsed then rejected as untrusted', () => {
     const { request, evidence } = fixture('canon1')
-    const authorization = authorizer().issue(request({
+    expect(() => authorizer().issue(request({
       ownerAddress: OWNER.toUpperCase(),
       evidence: evidence()
-    }))
-    expect(authorization.ownerAddress).toBe(OWNER)
-    expect(parseTm1AliasPublicationAuthorization(authorization).ownerAddress).toBe(OWNER)
+    }))).toThrowError(expect.objectContaining(UNTRUSTED))
   })
 
   test('missing, extra, or unverifiable evidence fails closed', () => {
@@ -294,10 +281,10 @@ describe('TM1 alias publication authorization', () => {
     )
   })
 
-  test('after issue(), authorizer has no clearable collections that re-issue the same proof', () => {
+  test('after untrusted issue(), authorizer has no clearable collections', () => {
     const { request, evidence, laterTxid } = fixture('opaque1')
     const issuer = authorizer()
-    issuer.issue(request())
+    expect(() => issuer.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
 
     expect('consumedProofs' in issuer).toBe(false)
     expect('latestBlockHeightByAlias' in issuer).toBe(false)
@@ -327,17 +314,17 @@ describe('TM1 alias publication authorization', () => {
     }
 
     expect(() => createTm1AliasPublicationAuthorizer().issue(request())).toThrowError(
-      expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
+      expect.objectContaining(UNTRUSTED)
     )
     expect(() => issuer.issue(request({
       evidence: evidence({ txid: laterTxid, blockHeight: 50 })
-    }))).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_STALE' }))
+    }))).toThrowError(expect.objectContaining(UNTRUSTED))
   })
 
   test('Object.create, Proxy, and prototype walk cannot yield a clearable shared ledger', () => {
     const { request } = fixture('proxy1')
     const issuer = createTm1AliasPublicationAuthorizer()
-    issuer.issue(request())
+    expect(() => issuer.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
 
     const Stolen = Tm1AliasPublicationAuthorizer as unknown as {
       new (ledger: unknown): unknown
@@ -363,47 +350,150 @@ describe('TM1 alias publication authorization', () => {
     }
 
     expect(() => createTm1AliasPublicationAuthorizer().issue(request())).toThrowError(
-      expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
+      expect.objectContaining(UNTRUSTED)
     )
   })
 
-  test('P1-A: patched WeakMap/Set/Map prototypes cannot re-issue after clear', () => {
+  test('P1-A: patched WeakMap/Set/Map prototypes cannot mint from untrusted evidence', () => {
     const { request } = fixture('p1a')
     const issuer = authorizer()
-    issuer.issue(request())
+    expect(() => issuer.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
     const receivers: object[] = []
     const restore = patchIntrinsicsRecordingReceivers(receivers)
     try {
       try {
         issuer.issue(request())
       } catch {
-        /* first replay attempt records receivers if prototype-dispatched */
+        /* records receivers if prototype-dispatched */
       }
       clearRecordedCollections(receivers)
-      expect(() => issuer.issue(request())).toThrowError(
-        expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
-      )
+      expect(() => issuer.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
     } finally {
       restore()
     }
   })
 
-  test('P1-B: a normal consumer cannot obtain a second ledger identity', () => {
+  test('P1-B: a normal consumer cannot obtain a second ledger identity or verified mint', () => {
     const { request } = fixture('p1b')
     expect(aliasAuth).not.toHaveProperty('createTm1InMemoryAliasPublicationAuthorizationLedger')
+    expect(aliasAuth).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')
     const first = createTm1AliasPublicationAuthorizer()
     const second = createTm1AliasPublicationAuthorizer()
-    first.issue(request())
-    expect(() => second.issue(request())).toThrowError(
-      expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
-    )
+    expect(() => first.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
+    expect(() => second.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
     const extra = (
       createTm1AliasPublicationAuthorizer as (ledger?: unknown) => ReturnType<
         typeof createTm1AliasPublicationAuthorizer
       >
     )(rawLedgerBag())
-    expect(() => extra.issue(request())).toThrowError(
-      expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
+    expect(() => extra.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
+  })
+
+  test('P1-C: freeze/join/String reentry cannot mint two authorizations', () => {
+    const { request } = fixture('p1c')
+    const issuer = authorizer()
+    const req = request()
+    const auths: unknown[] = []
+    const originalFreeze = Object.freeze
+    const originalJoin = Array.prototype.join
+    const OriginalString = String
+    let reentering = false
+    const looksLikeAuth = (value: unknown): boolean => (
+      value !== null
+      && typeof value === 'object'
+      && 'authorizationId' in value
+      && 'evidenceTxid' in value
+    )
+    const reenter = () => {
+      if (reentering) return
+      reentering = true
+      try {
+        auths.push(issuer.issue(req))
+      } catch {
+        /* fail-closed nested issue */
+      }
+    }
+    try {
+      Object.freeze = ((value: unknown) => {
+        if (looksLikeAuth(value)) reenter()
+        return originalFreeze(value as object)
+      }) as typeof Object.freeze
+      Array.prototype.join = function (this: unknown[], separator?: string) {
+        const result = originalJoin.call(this, separator)
+        if (typeof result === 'string' && result.startsWith('tm1-alias-auth:v1:')) reenter()
+        return result
+      }
+      const wrappedString = function String(value?: unknown) {
+        if (new.target) return new OriginalString(value as string)
+        return OriginalString(value)
+      } as unknown as StringConstructor
+      Object.defineProperty(wrappedString, 'prototype', { value: OriginalString.prototype })
+      globalThis.String = wrappedString
+      try {
+        auths.push(issuer.issue(req))
+      } catch {
+        /* fail-closed outer issue */
+      }
+    } finally {
+      Object.freeze = originalFreeze
+      Array.prototype.join = originalJoin
+      globalThis.String = OriginalString
+    }
+    expect(auths).toHaveLength(0)
+  })
+
+  test('P1-D: MAX_SAFE_INTEGER caller height cannot poison later T2', () => {
+    const { request, evidence, laterTxid } = fixture('p1d')
+    const issuer = authorizer()
+    expect(() => issuer.issue(request({
+      evidence: evidence({ blockHeight: Number.MAX_SAFE_INTEGER })
+    }))).toThrowError(expect.objectContaining(UNTRUSTED))
+    expect(() => issuer.issue(request({
+      evidence: evidence({ txid: laterTxid, blockHeight: 50 })
+    }))).toThrowError(expect.objectContaining(UNTRUSTED))
+  })
+
+  test('forged brand, Object.create, and extra fields cannot enter the success path', () => {
+    const { alias, request, evidence } = fixture('forged')
+    const issuer = authorizer()
+    const json = evidence()
+    const created = Object.create(null, {
+      alias: { value: alias, enumerable: true },
+      address: { value: OWNER, enumerable: true },
+      txid: { value: json.txid, enumerable: true },
+      blockHeight: { value: 100, enumerable: true },
+      status: { value: 'confirmed', enumerable: true }
+    })
+    expect(() => issuer.issue(request({ evidence: created }))).toThrowError(
+      expect.objectContaining(UNTRUSTED)
+    )
+    expect(() => issuer.issue(request({
+      evidence: Object.create(json)
+    }))).toThrowError(Tm1AliasPublicationAuthorizationError)
+    expect(() => issuer.issue(request({
+      evidence: { ...json, brand: 'verified' }
+    }))).toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
+  })
+
+  test('parse of a frozen authorization record is not an issue capability', () => {
+    const { alias, txid } = fixture('parse1')
+    expect(() => parseTm1AliasPublicationAuthorization({
+      protocol: aliasAuth.TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL,
+      protocolVersion: aliasAuth.TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL_VERSION,
+      alias,
+      ownerAddress: OWNER,
+      evidenceTxid: txid,
+      evidenceBlockHeight: 100,
+      authorizationId: [
+        'tm1-alias-auth:v1',
+        alias,
+        OWNER,
+        txid,
+        '100'
+      ].join(':')
+    })).not.toThrow()
+    expect(() => authorizer().issue(fixture('parse1b').request())).toThrowError(
+      expect.objectContaining(UNTRUSTED)
     )
   })
 })

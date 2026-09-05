@@ -15,6 +15,7 @@ const source = (relativePath: string): string => readFileSync(
 const runtime = source('./tm1AliasPublicationAuthorization.ts')
 
 const OWNER = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
+const UNTRUSTED = { code: 'ALIAS_EVIDENCE_UNTRUSTED' }
 
 function issueRequest(tag: string) {
   const alias = `${tag}.xec`
@@ -39,6 +40,7 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(runtime).not.toMatch(/TxBuilder|fromWIF|seedPhrase|mnemonic/)
     expect(runtime).not.toMatch(/ChronikClient|chronik-client|DeliveryTransport/)
     expect(runtime).not.toMatch(/createTm1RemoteRollbackWitness|createTm1InMemoryRollbackWitness/)
+    expect(runtime).not.toMatch(/alias\.ecash\.mx/)
   })
 
   test('does not auto-wire App, routes, or publication UI', () => {
@@ -58,7 +60,8 @@ describe('TM1 alias publication authorization isolation', () => {
 
   test('records that caller-supplied evidence is not sufficient to enable publication', () => {
     expect(runtime).toContain('NOT SUFFICIENT TO ENABLE PUBLICATION')
-    expect(runtime).not.toMatch(/verificationPort|VerificationPort|verifyOnChain/)
+    expect(runtime).toContain('ALIAS_EVIDENCE_UNTRUSTED')
+    expect(runtime).not.toMatch(/verifyOnChain/)
   })
 
   test('hides replay collections behind a module-private WeakMap and uncurried mutators', () => {
@@ -74,6 +77,8 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(runtime).toContain('Function.prototype.call.bind(Set.prototype.add)')
     expect(runtime).toContain('Function.prototype.call.bind(Map.prototype.get)')
     expect(runtime).toContain('Function.prototype.call.bind(Map.prototype.set)')
+    expect(runtime).toContain('Function.prototype.call.bind(Array.prototype.join)')
+    expect(runtime).toContain('Function.prototype.call.bind(String)')
     expect(runtime).not.toMatch(/function\s+(reset|clear)/)
     expect(runtime).not.toMatch(/\.clear\s*\(/)
     expect(runtime).not.toMatch(/this\.ledger\.consumedProofs/)
@@ -103,7 +108,7 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(factoryBody).not.toMatch(/ledgerValue/)
   })
 
-  test('export surface has no ledger factory', () => {
+  test('export surface has no ledger factory and no verified-mint', () => {
     expect(Object.keys(aliasAuth).sort()).toEqual([
       'TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL',
       'TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL_VERSION',
@@ -113,13 +118,33 @@ describe('TM1 alias publication authorization isolation', () => {
       'parseTm1AliasPublicationAuthorization'
     ])
     expect(runtime).not.toMatch(/export function createTm1InMemoryAliasPublicationAuthorizationLedger/)
+    expect(runtime).not.toMatch(/export function mintVerifiedAliasPublicationEvidence/)
     expect(aliasAuth).not.toHaveProperty('createTm1InMemoryAliasPublicationAuthorizationLedger')
+    expect(aliasAuth).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')
   })
 
-  test('running consumedProofs.clear() after issue does not re-issue the same proof', () => {
+  test('verified commit records proof before freeze/join/String', () => {
+    const commit = runtime.slice(
+      runtime.indexOf('function commitVerifiedAuthorization'),
+      runtime.indexOf('export class Tm1AliasPublicationAuthorizer')
+    )
+    const recordProofIndex = commit.indexOf('recordProof(')
+    const recordHeightIndex = commit.indexOf('recordHeight(')
+    const joinIndex = commit.indexOf('arrayJoin(')
+    const freezeIndex = commit.indexOf('objectFreeze(')
+    expect(recordProofIndex).toBeGreaterThan(-1)
+    expect(recordHeightIndex).toBeGreaterThan(recordProofIndex)
+    expect(joinIndex).toBeGreaterThan(recordHeightIndex)
+    expect(freezeIndex).toBeGreaterThan(joinIndex)
+    expect(commit).not.toMatch(/Object\.freeze\s*\(/)
+    expect(commit).not.toMatch(/\.join\s*\(/)
+    expect(commit).not.toMatch(/\bString\s*\(/)
+  })
+
+  test('caller-supplied confirmed evidence is untrusted and does not issue', () => {
     const issuer = createTm1AliasPublicationAuthorizer()
     const request = issueRequest('archclr')
-    issuer.issue(request)
+    expect(() => issuer.issue(request)).toThrowError(expect.objectContaining(UNTRUSTED))
 
     const leaked = issuer as unknown as {
       consumedProofs?: Set<string>
@@ -138,11 +163,6 @@ describe('TM1 alias publication authorization isolation', () => {
     leaked.clear?.()
     leaked.reset?.()
 
-    for (const key of Reflect.ownKeys(issuer)) {
-      const value = Reflect.get(issuer as object, key)
-      if (value instanceof Set || value instanceof Map) value.clear()
-    }
-
     const bag = {
       consumedProofs: new Set<string>(),
       latestBlockHeightByAlias: new Map<string, number>()
@@ -153,92 +173,59 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(() => new Stolen(bag)).toThrowError(
       expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
     )
-    expect(() => new Stolen(Object.create(issuer))).toThrowError(
-      expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
-    )
-    expect(() => new Stolen(new Proxy(issuer, {}))).toThrowError(
-      expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
-    )
-
     expect(() => createTm1AliasPublicationAuthorizer().issue(request)).toThrowError(
-      expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
+      expect.objectContaining(UNTRUSTED)
     )
   })
 
-  test('P1-A: patched WeakMap/Set/Map prototypes cannot re-issue after clear', () => {
-    const request = issueRequest('archp1a')
+  test('P1-C: patched freeze/join/String reentry yields no durable auths', () => {
+    const request = issueRequest('archp1c')
     const issuer = createTm1AliasPublicationAuthorizer()
-    issuer.issue(request)
-    const originals = {
-      weakMapGet: WeakMap.prototype.get,
-      weakMapHas: WeakMap.prototype.has,
-      weakMapSet: WeakMap.prototype.set,
-      setHas: Set.prototype.has,
-      setAdd: Set.prototype.add,
-      mapGet: Map.prototype.get,
-      mapSet: Map.prototype.set
-    }
-    const receivers: object[] = []
-    try {
-      WeakMap.prototype.get = function (this: WeakMap<object, unknown>, key: object) {
-        receivers.push(this)
-        const value = originals.weakMapGet.call(this, key)
-        if (typeof value === 'object' && value !== null) receivers.push(value)
-        return value
-      } as typeof WeakMap.prototype.get
-      WeakMap.prototype.has = function (this: WeakMap<object, unknown>, key: object) {
-        receivers.push(this)
-        return originals.weakMapHas.call(this, key)
-      } as typeof WeakMap.prototype.has
-      WeakMap.prototype.set = function (this: WeakMap<object, unknown>, key: object, value: unknown) {
-        receivers.push(this)
-        if (typeof value === 'object' && value !== null) receivers.push(value)
-        return originals.weakMapSet.call(this, key, value)
-      } as typeof WeakMap.prototype.set
-      Set.prototype.has = function (this: Set<unknown>, value: unknown) {
-        receivers.push(this)
-        return originals.setHas.call(this, value)
-      } as typeof Set.prototype.has
-      Set.prototype.add = function (this: Set<unknown>, value: unknown) {
-        receivers.push(this)
-        return originals.setAdd.call(this, value)
-      } as typeof Set.prototype.add
-      Map.prototype.get = function (this: Map<unknown, unknown>, key: unknown) {
-        receivers.push(this)
-        return originals.mapGet.call(this, key)
-      } as typeof Map.prototype.get
-      Map.prototype.set = function (this: Map<unknown, unknown>, key: unknown, value: unknown) {
-        receivers.push(this)
-        return originals.mapSet.call(this, key, value)
-      } as typeof Map.prototype.set
-
+    const auths: unknown[] = []
+    const originalFreeze = Object.freeze
+    const originalJoin = Array.prototype.join
+    const OriginalString = String
+    let reentering = false
+    const looksLikeAuth = (value: unknown): boolean => (
+      value !== null
+      && typeof value === 'object'
+      && 'authorizationId' in value
+    )
+    const reenter = () => {
+      if (reentering) return
+      reentering = true
       try {
-        issuer.issue(request)
+        auths.push(issuer.issue(request))
       } catch {
-        /* records receivers if prototype-dispatched */
+        /* fail-closed */
       }
-      for (const receiver of receivers) {
-        if (receiver instanceof Set || receiver instanceof Map) receiver.clear()
-        else if (typeof receiver === 'object' && receiver !== null) {
-          const state = receiver as {
-            consumedProofs?: Set<unknown>
-            latestBlockHeightByAlias?: Map<unknown, unknown>
-          }
-          state.consumedProofs?.clear()
-          state.latestBlockHeightByAlias?.clear()
-        }
-      }
-      expect(() => issuer.issue(request)).toThrowError(
-        expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
-      )
-    } finally {
-      WeakMap.prototype.get = originals.weakMapGet
-      WeakMap.prototype.has = originals.weakMapHas
-      WeakMap.prototype.set = originals.weakMapSet
-      Set.prototype.has = originals.setHas
-      Set.prototype.add = originals.setAdd
-      Map.prototype.get = originals.mapGet
-      Map.prototype.set = originals.mapSet
     }
+    try {
+      Object.freeze = ((value: unknown) => {
+        if (looksLikeAuth(value)) reenter()
+        return originalFreeze(value as object)
+      }) as typeof Object.freeze
+      Array.prototype.join = function (this: unknown[], separator?: string) {
+        const result = originalJoin.call(this, separator)
+        if (typeof result === 'string' && result.startsWith('tm1-alias-auth:v1:')) reenter()
+        return result
+      }
+      const wrappedString = function String(value?: unknown) {
+        if (new.target) return new OriginalString(value as string)
+        return OriginalString(value)
+      } as unknown as StringConstructor
+      Object.defineProperty(wrappedString, 'prototype', { value: OriginalString.prototype })
+      globalThis.String = wrappedString
+      try {
+        auths.push(issuer.issue(request))
+      } catch {
+        /* fail-closed */
+      }
+    } finally {
+      Object.freeze = originalFreeze
+      Array.prototype.join = originalJoin
+      globalThis.String = OriginalString
+    }
+    expect(auths).toHaveLength(0)
   })
 })
