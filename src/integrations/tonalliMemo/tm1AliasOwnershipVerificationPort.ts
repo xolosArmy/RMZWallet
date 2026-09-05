@@ -51,6 +51,21 @@ const TextDecoderCtor = TextDecoder
 const AbortControllerCtor = AbortController
 const scheduleTimeout = setTimeout
 const cancelTimeout = clearTimeout
+const decodeUtf8Bytes = Function.prototype.call.bind(
+  TextDecoder.prototype.decode
+) as (
+  decoder: TextDecoder,
+  input?: BufferSource,
+  options?: TextDecodeOptions
+) => string
+const joinStrings = Function.prototype.call.bind(Array.prototype.join) as (
+  array: readonly unknown[],
+  separator?: string
+) => string
+const pushValue = Function.prototype.call.bind(Array.prototype.push) as (
+  array: unknown[],
+  ...items: unknown[]
+) => number
 
 const objectFreeze = Object.freeze as <T extends object>(value: T) => T
 const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as <V>(
@@ -239,10 +254,10 @@ async function readLimitedBody(response: Response, signal: AbortSignal): Promise
       if (done) break
       received += value.byteLength
       if (received > MAX_RESPONSE_BYTES) unavailable()
-      parts.push(decoder.decode(value, { stream: true }))
+      pushValue(parts, decodeUtf8Bytes(decoder, value, { stream: true }))
     }
-    parts.push(decoder.decode())
-    return parts.join('')
+    pushValue(parts, decodeUtf8Bytes(decoder))
+    return joinStrings(parts, '')
   } finally {
     signal.removeEventListener('abort', abortRead)
   }

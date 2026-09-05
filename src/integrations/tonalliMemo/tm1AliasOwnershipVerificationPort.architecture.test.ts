@@ -93,6 +93,16 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(portRuntime).toContain('globalThis.fetch.bind(globalThis)')
     expect(portRuntime).toContain('JSON.parse.bind(JSON)')
     expect(portRuntime).not.toMatch(/JSON\.parse\s*\(/)
+    expect(portRuntime).toContain('TextDecoder.prototype.decode')
+    expect(portRuntime).toContain('Array.prototype.join')
+    expect(portRuntime).toContain('Array.prototype.push')
+    const bodyRead = portRuntime.slice(
+      portRuntime.indexOf('async function readLimitedBody('),
+      portRuntime.indexOf('function unavailable(')
+    )
+    expect(bodyRead).not.toMatch(/\.decode\s*\(/)
+    expect(bodyRead).not.toMatch(/\.join\s*\(/)
+    expect(bodyRead).not.toMatch(/\.push\s*\(/)
     expect(portRuntime).not.toMatch(/this\.observeAliasOwnership/)
     expect(portRuntime).not.toMatch(/this\[['"]observeAliasOwnership['"]\]/)
     expect(portRuntime).toContain('function observeAliasOwnership')

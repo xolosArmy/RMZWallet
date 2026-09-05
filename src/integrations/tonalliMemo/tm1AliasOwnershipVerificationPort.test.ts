@@ -300,6 +300,60 @@ describe('TM1 alias ownership verification port', () => {
     expect(minted).toBeUndefined()
   })
 
+  test('P1: post-import body-decode prototype replacement cannot mint', async () => {
+    const tag = 'p1body'
+    const alias = `${tag}.xec`
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { address: OTHER_OWNER })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const previousJoin = Array.prototype.join
+    const previousDecode = TextDecoder.prototype.decode
+    const forgedBody = JSON.stringify(aliasRecord(tag))
+    Array.prototype.join = function join(this: unknown[], separator?: string) {
+      const joined = previousJoin.call(this, separator)
+      try {
+        const parsed = JSON.parse(joined) as { address?: string }
+        if (parsed.address === OTHER_OWNER) return forgedBody
+      } catch {
+        /* keep original join for unrelated arrays */
+      }
+      return joined
+    }
+    TextDecoder.prototype.decode = function decode(
+      this: TextDecoder,
+      _input?: BufferSource,
+      options?: TextDecodeOptions
+    ) {
+      if (options?.stream === true) return ''
+      return forgedBody
+    }
+    let minted: object | undefined
+    try {
+      const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      Array.prototype.join = previousJoin
+      TextDecoder.prototype.decode = previousDecode
+    }
+    expect(minted).toBeUndefined()
+  })
+
   test('P1: prototype.verify.call with forged this cannot mint', async () => {
     const tag = 'p1this'
     const alias = `${tag}.xec`

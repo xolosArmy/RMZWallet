@@ -10,12 +10,15 @@ enablement. App / routes / RegisterAlias / orchestrator stay unwired.
 
 `createTm1AliasOwnershipVerificationPort()` / `create({})`
 
-Public create captures `globalThis.fetch.bind(globalThis)` and
-`JSON.parse.bind(JSON)` (plus other decode primitives) once at
-module evaluation and GETs frozen `https://alias.ecash.mx/alias`.
-Passing `fetch`, `endpointUrl`, `observe`, or `clock` is extra input
+Public create captures `globalThis.fetch.bind(globalThis)`,
+`JSON.parse.bind(JSON)`, and body-decode prototype methods
+(`TextDecoder.prototype.decode`, `Array.prototype.join`,
+`Array.prototype.push`) once at module evaluation and GETs frozen
+`https://alias.ecash.mx/alias`. Passing `fetch`, `endpointUrl`,
+`observe`, or `clock` is extra input
 (`INVALID_ALIAS_AUTHORIZATION_INPUT`). Later mutation of
-`globalThis.fetch` or `JSON.parse` does not change transport or decode.
+`globalThis.fetch`, `JSON.parse`, or those prototypes does not
+change transport or decode.
 
 The production class and factory carry no test constructor. Tests that
 need fake HTTP stub `globalThis.fetch`, then `vi.resetModules()`, then
@@ -49,8 +52,9 @@ dispatched through `this`.
 Caller-supplied `{ status: 'confirmed', ... }` is still
 `ALIAS_EVIDENCE_UNTRUSTED` at `issue()`.
 
-Same-realm patch of `globalThis.fetch` or `JSON.parse` *before* this
-module is first evaluated is process load-order, not a module API.
-This slice does not pin undici/native fetch.
+Same-realm patch of `globalThis.fetch`, `JSON.parse`, or body-decode
+prototypes *before* this module is first evaluated is process
+load-order, not a module API. This slice does not pin undici/native
+fetch. `Date.now` remains request-time for expiry.
 
 **NOT SUFFICIENT TO ENABLE PUBLICATION.**
