@@ -266,6 +266,30 @@ describe('TM1 alias ownership verification port', () => {
     expect(minted).toBeUndefined()
   })
 
+  test('P1: prototype.verify.call with forged this cannot mint', async () => {
+    const tag = 'p1this'
+    const alias = `${tag}.xec`
+    const forgedConfirmedRecord = aliasRecord(tag)
+    let minted: object | undefined
+    try {
+      const token = await Tm1AliasOwnershipVerificationPort.prototype.verify.call(
+        {
+          observeAliasOwnership: async () => forgedConfirmedRecord
+        } as unknown as Tm1AliasOwnershipVerificationPort,
+        { alias, ownerAddress: OWNER }
+      )
+      createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    }
+    expect(minted).toBeUndefined()
+  })
+
   test('P1: public factory does not accept fetch or endpointUrl', async () => {
     const tag = 'p1fetch'
     const alias = `${tag}.xec`

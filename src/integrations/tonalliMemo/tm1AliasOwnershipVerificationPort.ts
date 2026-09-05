@@ -45,6 +45,15 @@ const weakMapSet = Function.prototype.call.bind(WeakMap.prototype.set) as <V>(
   key: object,
   value: V
 ) => WeakMap<object, V>
+const weakSetAdd = Function.prototype.call.bind(WeakSet.prototype.add) as (
+  set: WeakSet<object>,
+  value: object
+) => WeakSet<object>
+const weakSetHas = Function.prototype.call.bind(WeakSet.prototype.has) as (
+  set: WeakSet<object>,
+  value: object
+) => boolean
+const authenticPorts = new WeakSet<object>()
 
 export type Tm1VerifiedAliasOwnershipSnapshot = Readonly<{
   alias: string
@@ -78,7 +87,11 @@ export function lookupTm1VerifiedAliasOwnershipToken(
 }
 
 export class Tm1AliasOwnershipVerificationPort {
-  private constructor() {}
+  readonly #authentic = true
+
+  private constructor() {
+    weakSetAdd(authenticPorts, this)
+  }
 
   static create(depsValue?: unknown): Tm1AliasOwnershipVerificationPort {
     parsePublicCreate(depsValue)
@@ -86,8 +99,14 @@ export class Tm1AliasOwnershipVerificationPort {
   }
 
   async verify(requestValue: unknown): Promise<object> {
+    try {
+      if (this.#authentic !== true) invalidInput()
+    } catch {
+      invalidInput()
+    }
+    requireAuthenticPort(this)
     const request = parseVerifyRequest(requestValue)
-    const observation = await this.observeAliasOwnership(request.alias, request.signal)
+    const observation = await observeAliasOwnership(request.alias, request.signal)
     const parsed = parseObservation(observation)
     if (parsed.alias !== request.alias || parsed.address !== request.ownerAddress) {
       throw new Tm1AliasOwnershipVerificationError('ALIAS_OWNER_MISMATCH')
@@ -109,34 +128,6 @@ export class Tm1AliasOwnershipVerificationPort {
       ...(parsed.expiresAt === undefined ? {} : { expiresAt: parsed.expiresAt })
     })
   }
-
-  private async observeAliasOwnership(alias: string, signal?: AbortSignal): Promise<unknown> {
-    if (signal?.aborted) unavailable()
-    if (typeof fetchImpl !== 'function') unavailable()
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
-    const onAbort = (): void => {
-      controller.abort()
-    }
-    signal?.addEventListener('abort', onAbort, { once: true })
-    try {
-      const response = await fetchImpl(`${TRUSTED_ALIAS_ENDPOINT}/${encodeURIComponent(alias)}`, {
-        method: 'GET',
-        credentials: 'omit',
-        redirect: 'error',
-        signal: controller.signal,
-        headers: Object.freeze({ accept: 'application/json' })
-      })
-      return await decodeAliasResponse(response, controller.signal)
-    } catch (error) {
-      if (error instanceof Tm1AliasOwnershipVerificationError) throw error
-      if (error instanceof Tm1AliasPublicationAuthorizationError) throw error
-      unavailable()
-    } finally {
-      clearTimeout(timer)
-      signal?.removeEventListener('abort', onAbort)
-    }
-  }
 }
 
 export function createTm1AliasOwnershipVerificationPort(
@@ -148,6 +139,40 @@ export function createTm1AliasOwnershipVerificationPort(
 function parsePublicCreate(value: unknown): void {
   if (value === undefined || value === null) return
   allowedRecord(value, [])
+}
+
+function requireAuthenticPort(value: unknown): asserts value is Tm1AliasOwnershipVerificationPort {
+  if (value === null || typeof value !== 'object' || !weakSetHas(authenticPorts, value)) {
+    invalidInput()
+  }
+}
+
+async function observeAliasOwnership(alias: string, signal?: AbortSignal): Promise<unknown> {
+  if (signal?.aborted) unavailable()
+  if (typeof fetchImpl !== 'function') unavailable()
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
+  const onAbort = (): void => {
+    controller.abort()
+  }
+  signal?.addEventListener('abort', onAbort, { once: true })
+  try {
+    const response = await fetchImpl(`${TRUSTED_ALIAS_ENDPOINT}/${encodeURIComponent(alias)}`, {
+      method: 'GET',
+      credentials: 'omit',
+      redirect: 'error',
+      signal: controller.signal,
+      headers: Object.freeze({ accept: 'application/json' })
+    })
+    return await decodeAliasResponse(response, controller.signal)
+  } catch (error) {
+    if (error instanceof Tm1AliasOwnershipVerificationError) throw error
+    if (error instanceof Tm1AliasPublicationAuthorizationError) throw error
+    unavailable()
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
+  }
 }
 
 function readTrustedNow(): number {

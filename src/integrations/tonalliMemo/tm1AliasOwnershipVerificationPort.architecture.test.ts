@@ -83,7 +83,7 @@ describe('TM1 alias ownership verification port isolation', () => {
   test('public factory binds trusted transport and rejects fetch/endpointUrl', () => {
     const parsePublic = portRuntime.slice(
       portRuntime.indexOf('function parsePublicCreate('),
-      portRuntime.indexOf('function readTrustedNow(')
+      portRuntime.indexOf('function requireAuthenticPort(')
     )
     expect(parsePublic).toContain('allowedRecord(value, [])')
     expect(parsePublic).not.toContain("'fetch'")
@@ -91,9 +91,12 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(parsePublic).not.toContain("'observe'")
     expect(portRuntime).toContain("TRUSTED_ALIAS_ENDPOINT = 'https://alias.ecash.mx/alias'")
     expect(portRuntime).toContain('globalThis.fetch.bind(globalThis)')
+    expect(portRuntime).not.toMatch(/this\.observeAliasOwnership/)
+    expect(portRuntime).not.toMatch(/this\[['"]observeAliasOwnership['"]\]/)
+    expect(portRuntime).toContain('function observeAliasOwnership')
     const observe = portRuntime.slice(
-      portRuntime.indexOf('observeAliasOwnership'),
-      portRuntime.indexOf('export function createTm1AliasOwnershipVerificationPort')
+      portRuntime.indexOf('function observeAliasOwnership('),
+      portRuntime.indexOf('function readTrustedNow(')
     )
     expect(observe).not.toContain('globalThis.fetch')
     expect(portRuntime).not.toContain('trustedFetch')

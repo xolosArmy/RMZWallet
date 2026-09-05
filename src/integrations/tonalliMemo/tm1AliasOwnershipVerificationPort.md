@@ -24,7 +24,12 @@ production exports; App / routes must not import it.
 
 ## Verify
 
-`port.verify({ alias, ownerAddress, signal? })`
+`port.verify({ alias, ownerAddress, signal? })` is branded: `this`
+must be an instance created by `create()`. Forged
+`prototype.verify.call({ observeAliasOwnership }, request)` fails
+closed and does not mint. Observation is a file-private lexical
+function that closes over the captured `fetchImpl`; it is not
+dispatched through `this`.
 
 1. Canonicalize alias and CashAddr the same way as the authorizer.
 2. GET alias.ecash.mx. Network/abort/5xx → `ALIAS_OWNERSHIP_UNAVAILABLE`.
