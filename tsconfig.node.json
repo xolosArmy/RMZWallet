@@ -20,6 +20,7 @@
   },
   "include": [
     "vite.config.ts",
+    "vitest.config.ts",
     "server/**/*.ts",
     "api/**/*.ts",
     "netlify/functions/**/*.ts",

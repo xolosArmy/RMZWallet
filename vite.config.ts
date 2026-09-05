@@ -8,7 +8,8 @@ import topLevelAwait from 'vite-plugin-top-level-await'
 // Configuración Vite + PWA + WASM + COOP/COEP para habilitar SharedArrayBuffer de forma segura.
 export default defineConfig({
   define: {
-    global: 'globalThis'
+    global: 'globalThis',
+    'import.meta.vitest': 'undefined'
   },
   resolve: {
     alias: {
@@ -97,5 +98,8 @@ export default defineConfig({
   },
   build: {
     target: 'esnext'
+  },
+  test: {
+    includeSource: ['src/integrations/tonalliMemo/tm1AliasPublicationAuthorization.ts']
   }
 })

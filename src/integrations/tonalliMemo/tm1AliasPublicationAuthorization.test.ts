@@ -238,6 +238,14 @@ describe('TM1 alias publication authorization', () => {
     expect(() => second.issue(request())).toThrowError(expect.objectContaining(UNTRUSTED))
   })
 
+  test('caller-supplied expiresAt does not skip UNTRUSTED', () => {
+    const { request, evidence } = fixture('expun')
+    expect(() => authorizer().issue(request({
+      evidence: evidence({ expiresAt: 1_800_000_000_000 }),
+      now: 1_700_000_000_000
+    }))).toThrowError(expect.objectContaining(UNTRUSTED))
+  })
+
   test('canonical CashAddr casing is parsed then rejected as untrusted', () => {
     const { request, evidence } = fixture('canon1')
     expect(() => authorizer().issue(request({

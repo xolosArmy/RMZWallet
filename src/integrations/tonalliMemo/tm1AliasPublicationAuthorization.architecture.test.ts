@@ -123,6 +123,21 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(aliasAuth).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')
   })
 
+  test('verified snapshot preserves expiresAt when present and omits it when absent', () => {
+    const mint = runtime.slice(
+      runtime.indexOf('function mintVerifiedAliasPublicationEvidence'),
+      runtime.indexOf('const internalVerifiedEvidencePort')
+    )
+    const reconstruct = runtime.slice(
+      runtime.indexOf('const evidence = verifiedSnapshot === undefined'),
+      runtime.indexOf('verified: verifiedSnapshot !== undefined')
+    )
+    expect(mint).toContain('expiresAt: parsed.expiresAt')
+    expect(mint).toContain('parsed.expiresAt === undefined ? {}')
+    expect(reconstruct).toContain('expiresAt: verifiedSnapshot.expiresAt')
+    expect(reconstruct).toContain('verifiedSnapshot.expiresAt === undefined ? {}')
+  })
+
   test('verified commit records proof before freeze/join/String', () => {
     const commit = runtime.slice(
       runtime.indexOf('function commitVerifiedAuthorization'),

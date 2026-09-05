@@ -1,3 +1,4 @@
+/// <reference types="vitest/importMeta" />
 import { canonicalizeEcashAddress, toXecAlias } from '../../utils/alias'
 
 export const TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL =
@@ -115,6 +116,7 @@ type VerifiedEvidenceSnapshot = Readonly<{
   address: string
   txid: string
   blockHeight: number
+  expiresAt?: number
 }>
 
 const verifiedEvidenceSnapshots = new WeakMap<object, VerifiedEvidenceSnapshot>()
@@ -133,7 +135,8 @@ function mintVerifiedAliasPublicationEvidence(
     alias: parsed.alias,
     address: parsed.address,
     txid: parsed.txid,
-    blockHeight: parsed.blockHeight
+    blockHeight: parsed.blockHeight,
+    ...(parsed.expiresAt === undefined ? {} : { expiresAt: parsed.expiresAt })
   }))
   return token
 }
@@ -346,7 +349,8 @@ function parseRequest(value: unknown): ParsedRequest {
       address: verifiedSnapshot.address,
       txid: verifiedSnapshot.txid,
       blockHeight: verifiedSnapshot.blockHeight,
-      status: 'confirmed'
+      status: 'confirmed',
+      ...(verifiedSnapshot.expiresAt === undefined ? {} : { expiresAt: verifiedSnapshot.expiresAt })
     })
   return objectFreeze({
     alias,
@@ -465,4 +469,79 @@ function invalidInput(): never {
 
 function fail(code: Tm1AliasPublicationAuthorizationErrorCode): never {
   throw new Tm1AliasPublicationAuthorizationError(code)
+}
+
+if (import.meta.vitest) {
+  const { describe, expect, test } = import.meta.vitest
+  const owner = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
+  const now = 1_700_000_000_000
+  const uniqueTxid = (tag: string): string => {
+    const bytes = Array.from(tag, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('')
+    return (bytes + 'cd'.repeat(32)).slice(0, 64)
+  }
+  const mintAndIssue = (
+    tag: string,
+    evidenceOverrides: Record<string, unknown>,
+    requestOverrides: Record<string, unknown> = {}
+  ) => {
+    const alias = `${tag}.xec`
+    const evidence = mintVerifiedAliasPublicationEvidence({
+      alias,
+      address: owner,
+      txid: uniqueTxid(tag),
+      blockHeight: 100,
+      status: 'confirmed',
+      ...evidenceOverrides
+    })
+    return createTm1AliasPublicationAuthorizer().issue({
+      alias,
+      ownerAddress: owner,
+      evidence,
+      ...requestOverrides
+    })
+  }
+
+  describe('TM1 verified evidence expiry (unexported mint)', () => {
+    test('P2: verified evidence with expiresAt in the past is expired', () => {
+      expect(() => mintAndIssue('vexp', {
+        expiresAt: now - 60_000
+      }, { now })).toThrowError(
+        expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
+      )
+    })
+
+    test('verified evidence with expiresAt in the future can reach commit', () => {
+      const authorization = mintAndIssue('vfut', {
+        expiresAt: now + 60_000
+      }, { now })
+      expect(authorization).toMatchObject({
+        alias: 'vfut.xec',
+        ownerAddress: owner,
+        evidenceBlockHeight: 100
+      })
+      expect(Object.isFrozen(authorization)).toBe(true)
+    })
+
+    test('verified evidence without expiresAt does not take the expiry branch', () => {
+      const authorization = mintAndIssue('vnexp', {}, { now })
+      expect(authorization).toMatchObject({ alias: 'vnexp.xec' })
+    })
+
+    test('expired verified evidence does not write replay or height', () => {
+      expect(() => mintAndIssue('vled', {
+        expiresAt: now - 60_000,
+        blockHeight: 500
+      }, { now })).toThrowError(
+        expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
+      )
+      const later = mintAndIssue('vled', {
+        txid: uniqueTxid('vledz'),
+        blockHeight: 50
+      }, { now })
+      expect(later).toMatchObject({
+        alias: 'vled.xec',
+        evidenceBlockHeight: 50
+      })
+    })
+  })
 }
