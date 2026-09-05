@@ -66,6 +66,22 @@ const pushValue = Function.prototype.call.bind(Array.prototype.push) as (
   array: unknown[],
   ...items: unknown[]
 ) => number
+const getStreamReader = Function.prototype.call.bind(
+  ReadableStream.prototype.getReader
+) as (
+  stream: ReadableStream<Uint8Array>
+) => ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>
+const readStreamChunk = Function.prototype.call.bind(
+  ReadableStreamDefaultReader.prototype.read
+) as (
+  reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>
+) => Promise<ReadableStreamReadResult<Uint8Array<ArrayBuffer>>>
+const cancelStreamReader = Function.prototype.call.bind(
+  ReadableStreamDefaultReader.prototype.cancel
+) as (
+  reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>,
+  reason?: unknown
+) => Promise<void>
 
 const objectFreeze = Object.freeze as <T extends object>(value: T) => T
 const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as <V>(
@@ -235,12 +251,12 @@ async function decodeAliasResponse(response: Response, signal: AbortSignal): Pro
 async function readLimitedBody(response: Response, signal: AbortSignal): Promise<string> {
   const stream = response.body
   if (stream === null) return ''
-  const reader = stream.getReader()
+  const reader = getStreamReader(stream)
   const decoder = new TextDecoderCtor()
   let received = 0
   const parts: string[] = []
   const abortRead = (): void => {
-    void reader.cancel()
+    void cancelStreamReader(reader)
   }
   if (signal.aborted) {
     abortRead()
@@ -250,7 +266,7 @@ async function readLimitedBody(response: Response, signal: AbortSignal): Promise
   try {
     while (true) {
       if (signal.aborted) unavailable()
-      const { done, value } = await reader.read()
+      const { done, value } = await readStreamChunk(reader)
       if (done) break
       received += value.byteLength
       if (received > MAX_RESPONSE_BYTES) unavailable()

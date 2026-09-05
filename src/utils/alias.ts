@@ -1,5 +1,7 @@
 import { Address } from 'ecash-lib'
 
+const parseCashAddr = Address.parse.bind(Address)
+
 const BARE_ALIAS_RE = /^[a-z0-9]{1,21}$/
 const FULL_ALIAS_RE = /^([a-z0-9]{1,21})\.xec$/
 
@@ -24,7 +26,7 @@ export const isValidEcashAddress = (input: string): boolean => {
   if (!trimmed.toLowerCase().startsWith('ecash:')) return false
 
   try {
-    Address.parse(trimmed)
+    parseCashAddr(trimmed)
     return true
   } catch {
     return false
@@ -35,7 +37,7 @@ export const canonicalizeEcashAddress = (input: string): string | null => {
   if (typeof input !== 'string' || input.trim() !== input) return null
   if (!input.toLowerCase().startsWith('ecash:')) return null
   try {
-    return Address.parse(input).cash().toString()
+    return parseCashAddr(input).cash().toString()
   } catch {
     return null
   }

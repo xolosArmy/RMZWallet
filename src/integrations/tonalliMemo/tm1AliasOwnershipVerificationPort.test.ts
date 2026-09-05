@@ -354,6 +354,86 @@ describe('TM1 alias ownership verification port', () => {
     expect(minted).toBeUndefined()
   })
 
+  test('P1: post-import stream reader replacement cannot mint', async () => {
+    const tag = 'p1read'
+    const alias = `${tag}.xec`
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { address: OTHER_OWNER })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const previousRead = ReadableStreamDefaultReader.prototype.read
+    const forgedBytes = new TextEncoder().encode(JSON.stringify(aliasRecord(tag)))
+    let delivered = false
+    ReadableStreamDefaultReader.prototype.read = async function read() {
+      if (!delivered) {
+        delivered = true
+        return { done: false, value: forgedBytes }
+      }
+      return { done: true, value: undefined }
+    } as typeof previousRead
+    let minted: object | undefined
+    try {
+      const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      ReadableStreamDefaultReader.prototype.read = previousRead
+    }
+    expect(minted).toBeUndefined()
+  })
+
+  test('P1: post-import Address.parse replacement cannot mint', async () => {
+    const tag = 'p1addr'
+    const alias = `${tag}.xec`
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { address: OTHER_OWNER })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const { Address } = await import('ecash-lib')
+    const previousParse = Address.parse
+    Address.parse = ((input: string) => {
+      if (input === OTHER_OWNER) return previousParse.call(Address, OWNER)
+      return previousParse.call(Address, input)
+    }) as typeof Address.parse
+    let minted: object | undefined
+    try {
+      const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      Address.parse = previousParse
+    }
+    expect(minted).toBeUndefined()
+  })
+
   test('P1: prototype.verify.call with forged this cannot mint', async () => {
     const tag = 'p1this'
     const alias = `${tag}.xec`
