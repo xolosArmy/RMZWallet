@@ -1,5 +1,12 @@
-/// <reference types="vitest/importMeta" />
 import { canonicalizeEcashAddress, toXecAlias } from '../../utils/alias'
+import {
+  Tm1AliasPublicationAuthorizationError,
+  type Tm1AliasPublicationAuthorizationErrorCode
+} from './tm1AliasPublicationAuthorizationError'
+import { lookupTm1VerifiedAliasOwnershipToken } from './tm1AliasOwnershipVerificationPort'
+
+export { Tm1AliasPublicationAuthorizationError }
+export type { Tm1AliasPublicationAuthorizationErrorCode }
 
 export const TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL =
   'tonalli.tm1-alias-publication-authorization'
@@ -16,26 +23,6 @@ export type Tm1AliasPublicationAuthorization = Readonly<{
   evidenceBlockHeight: number
   authorizationId: string
 }>
-
-export type Tm1AliasPublicationAuthorizationErrorCode =
-  | 'INVALID_ALIAS_AUTHORIZATION_INPUT'
-  | 'ALIAS_UNCONFIRMED'
-  | 'ALIAS_OWNER_MISMATCH'
-  | 'ALIAS_PROOF_UNVERIFIABLE'
-  | 'ALIAS_PROOF_EXPIRED'
-  | 'ALIAS_PROOF_REPLAYED'
-  | 'ALIAS_PROOF_STALE'
-  | 'ALIAS_EVIDENCE_UNTRUSTED'
-
-export class Tm1AliasPublicationAuthorizationError extends Error {
-  readonly code: Tm1AliasPublicationAuthorizationErrorCode
-
-  constructor(code: Tm1AliasPublicationAuthorizationErrorCode) {
-    super(code)
-    this.name = 'Tm1AliasPublicationAuthorizationError'
-    this.code = code
-  }
-}
 
 declare const tm1AliasPublicationAuthorizationLedgerBrand: unique symbol
 
@@ -111,46 +98,6 @@ function createProcessLocalLedger(): Tm1AliasPublicationAuthorizationLedger {
 }
 
 const processLocalLedger = createProcessLocalLedger()
-
-type VerifiedEvidenceSnapshot = Readonly<{
-  alias: string
-  address: string
-  txid: string
-  blockHeight: number
-  expiresAt?: number
-}>
-
-const verifiedEvidenceSnapshots = new WeakMap<object, VerifiedEvidenceSnapshot>()
-
-/**
- * Unexported mint for the future verification port (slice 4).
- * Not on the public export surface. Ordinary callers cannot obtain it.
- */
-function mintVerifiedAliasPublicationEvidence(
-  value: unknown
-): object {
-  const parsed = parseEvidence(value)
-  if (parsed.status !== 'confirmed' || parsed.blockHeight < 1) fail('ALIAS_UNCONFIRMED')
-  const token = objectFreeze(Object.create(null))
-  weakMapSet(verifiedEvidenceSnapshots, token, objectFreeze({
-    alias: parsed.alias,
-    address: parsed.address,
-    txid: parsed.txid,
-    blockHeight: parsed.blockHeight,
-    ...(parsed.expiresAt === undefined ? {} : { expiresAt: parsed.expiresAt })
-  }))
-  return token
-}
-
-const internalVerifiedEvidencePort = objectFreeze({
-  mint: mintVerifiedAliasPublicationEvidence
-})
-
-function lookupVerifiedEvidence(value: unknown): VerifiedEvidenceSnapshot | undefined {
-  if (value === null || typeof value !== 'object') return undefined
-  if (value === internalVerifiedEvidencePort) invalidInput()
-  return weakMapGet(verifiedEvidenceSnapshots, value)
-}
 
 function parseLedger(value: unknown): Tm1AliasPublicationAuthorizationLedger {
   if (value === null || typeof value !== 'object') invalidInput()
@@ -340,7 +287,7 @@ function parseRequest(value: unknown): ParsedRequest {
   const alias = requireAlias(dataValue(source, 'alias'))
   const ownerAddress = requireOwnerAddress(dataValue(source, 'ownerAddress'))
   const evidenceValue = dataValue(source, 'evidence')
-  const verifiedSnapshot = lookupVerifiedEvidence(evidenceValue)
+  const verifiedSnapshot = lookupTm1VerifiedAliasOwnershipToken(evidenceValue)
   const evidence = verifiedSnapshot === undefined
     ? parseEvidence(evidenceValue)
     : objectFreeze({
@@ -467,112 +414,4 @@ function invalidInput(): never {
 
 function fail(code: Tm1AliasPublicationAuthorizationErrorCode): never {
   throw new Tm1AliasPublicationAuthorizationError(code)
-}
-
-if (import.meta.vitest) {
-  const { describe, expect, test } = import.meta.vitest
-  const owner = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
-  const uniqueTxid = (tag: string): string => {
-    const bytes = Array.from(tag, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('')
-    return (bytes + 'cd'.repeat(32)).slice(0, 64)
-  }
-  const mintAndIssue = (
-    tag: string,
-    evidenceOverrides: Record<string, unknown>,
-    requestOverrides: Record<string, unknown> = {}
-  ) => {
-    const alias = `${tag}.xec`
-    const evidence = mintVerifiedAliasPublicationEvidence({
-      alias,
-      address: owner,
-      txid: uniqueTxid(tag),
-      blockHeight: 100,
-      status: 'confirmed',
-      ...evidenceOverrides
-    })
-    return createTm1AliasPublicationAuthorizer().issue({
-      alias,
-      ownerAddress: owner,
-      evidence,
-      ...requestOverrides
-    })
-  }
-
-  describe('TM1 verified evidence expiry (unexported mint)', () => {
-    test('P2: verified evidence with expiresAt in the past is expired', () => {
-      expect(() => mintAndIssue('vexp', {
-        expiresAt: Date.now() - 60_000
-      })).toThrowError(
-        expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
-      )
-    })
-
-    test('P2 clock: expired verified evidence with now:0 is rejected', () => {
-      expect(() => mintAndIssue('clk0', {
-        expiresAt: Date.now() - 60_000
-      }, { now: 0 })).toThrowError(
-        expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
-      )
-    })
-
-    test('verified evidence with expiresAt in the future can reach commit', () => {
-      const authorization = mintAndIssue('vfut', {
-        expiresAt: Date.now() + 60_000
-      })
-      expect(authorization).toMatchObject({
-        alias: 'vfut.xec',
-        ownerAddress: owner,
-        evidenceBlockHeight: 100
-      })
-      expect(Object.isFrozen(authorization)).toBe(true)
-    })
-
-    test('verified evidence without expiresAt does not take the expiry branch', () => {
-      const authorization = mintAndIssue('vnexp', {})
-      expect(authorization).toMatchObject({ alias: 'vnexp.xec' })
-    })
-
-    test('expired verified evidence does not write replay or height', () => {
-      expect(() => mintAndIssue('vled', {
-        expiresAt: Date.now() - 60_000,
-        blockHeight: 500
-      })).toThrowError(
-        expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
-      )
-      const later = mintAndIssue('vled', {
-        txid: uniqueTxid('vledz'),
-        blockHeight: 50
-      })
-      expect(later).toMatchObject({
-        alias: 'vled.xec',
-        evidenceBlockHeight: 50
-      })
-    })
-
-    test('Date.now replaced after import does not move expiry', () => {
-      const originalNow = Date.now
-      Date.now = () => 0
-      try {
-        expect(() => mintAndIssue('clkcap', {
-          expiresAt: originalNow() - 60_000
-        })).toThrowError(
-          expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
-        )
-      } finally {
-        Date.now = originalNow
-      }
-    })
-
-    test('captured clock still commits future expiresAt after Date.now is replaced', () => {
-      const originalNow = Date.now
-      const expiresAt = originalNow() + 60_000
-      Date.now = () => Number.MAX_SAFE_INTEGER
-      try {
-        const authorization = mintAndIssue('clkfut', { expiresAt })
-        expect(authorization).toMatchObject({ alias: 'clkfut.xec' })
-      } finally {
-        Date.now = originalNow
-      }
-    })
-  })
 }
