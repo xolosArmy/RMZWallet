@@ -5,8 +5,8 @@ import {
 } from './tm1AliasPublicationAuthorizationError'
 
 /**
- * Fail-closed verification port: an injected observer plus a trusted clock
- * may mint a Tm1VerifiedAliasOwnershipToken. Caller JSON cannot.
+ * Fail-closed verification port bound to alias.ecash.mx (same protocol as
+ * useAliasResolution). Caller JSON and caller observe() lambdas cannot mint.
  * mintVerifiedAliasOwnershipToken is file-private. It is not exported.
  *
  * NOT SUFFICIENT TO ENABLE PUBLICATION
@@ -27,15 +27,18 @@ export class Tm1AliasOwnershipVerificationError extends Error {
   }
 }
 
-export type Tm1AliasOwnershipObserver = (input: Readonly<{
-  alias: string
-  ownerAddress: string
-  signal?: AbortSignal
-}>) => Promise<unknown>
+const DEFAULT_ALIAS_ENDPOINT = 'https://alias.ecash.mx/alias'
+const DEFAULT_TIMEOUT_MS = 8_000
+const MAX_TIMEOUT_MS = 60_000
+const MAX_RESPONSE_BYTES = 65_536
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+const TXID_PATTERN = /^[0-9a-f]{64}$/
 
 type FrozenDeps = Readonly<{
-  observe: Tm1AliasOwnershipObserver
+  fetch: typeof fetch
   clock: () => number
+  endpointUrl: string
+  timeoutMs: number
 }>
 
 const objectFreeze = Object.freeze as <T extends object>(value: T) => T
@@ -81,13 +84,17 @@ export function lookupTm1VerifiedAliasOwnershipToken(
 }
 
 export class Tm1AliasOwnershipVerificationPort {
-  private readonly observe: Tm1AliasOwnershipObserver
+  private readonly fetchImpl: typeof fetch
   private readonly clock: () => number
+  private readonly endpointUrl: string
+  private readonly timeoutMs: number
 
   private constructor(depsValue: unknown) {
     const deps = parseDeps(depsValue)
-    this.observe = deps.observe
+    this.fetchImpl = deps.fetch
     this.clock = deps.clock
+    this.endpointUrl = deps.endpointUrl
+    this.timeoutMs = deps.timeoutMs
   }
 
   static create(depsValue: unknown): Tm1AliasOwnershipVerificationPort {
@@ -96,14 +103,7 @@ export class Tm1AliasOwnershipVerificationPort {
 
   async verify(requestValue: unknown): Promise<object> {
     const request = parseVerifyRequest(requestValue)
-    let observation: unknown
-    try {
-      observation = await this.observe(request)
-    } catch (error) {
-      if (error instanceof Tm1AliasOwnershipVerificationError) throw error
-      if (error instanceof Tm1AliasPublicationAuthorizationError) throw error
-      throw new Tm1AliasOwnershipVerificationError('ALIAS_OWNERSHIP_UNAVAILABLE')
-    }
+    const observation = await this.observeAliasOwnership(request.alias, request.signal)
     const parsed = parseObservation(observation)
     if (parsed.alias !== request.alias || parsed.address !== request.ownerAddress) {
       throw new Tm1AliasOwnershipVerificationError('ALIAS_OWNER_MISMATCH')
@@ -128,6 +128,33 @@ export class Tm1AliasOwnershipVerificationPort {
       ...(parsed.expiresAt === undefined ? {} : { expiresAt: parsed.expiresAt })
     })
   }
+
+  private async observeAliasOwnership(alias: string, signal?: AbortSignal): Promise<unknown> {
+    if (signal?.aborted) unavailable()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs)
+    const onAbort = (): void => {
+      controller.abort()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    try {
+      const response = await this.fetchImpl(`${this.endpointUrl}/${encodeURIComponent(alias)}`, {
+        method: 'GET',
+        credentials: 'omit',
+        redirect: 'error',
+        signal: controller.signal,
+        headers: Object.freeze({ accept: 'application/json' })
+      })
+      return await decodeAliasResponse(response, controller.signal)
+    } catch (error) {
+      if (error instanceof Tm1AliasOwnershipVerificationError) throw error
+      if (error instanceof Tm1AliasPublicationAuthorizationError) throw error
+      unavailable()
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+    }
+  }
 }
 
 export function createTm1AliasOwnershipVerificationPort(
@@ -137,18 +164,112 @@ export function createTm1AliasOwnershipVerificationPort(
 }
 
 function parseDeps(value: unknown): FrozenDeps {
-  const source = allowedRecord(value, ['observe', 'clock'])
+  const source = allowedRecord(value, ['fetch', 'clock', 'endpointUrl', 'timeoutMs'])
   if (
-    !Reflect.ownKeys(source).includes('observe') ||
+    !Reflect.ownKeys(source).includes('fetch') ||
     !Reflect.ownKeys(source).includes('clock')
   ) invalidInput()
-  const observe = dataValue(source, 'observe')
+  const fetchImpl = dataValue(source, 'fetch')
   const clock = dataValue(source, 'clock')
-  if (typeof observe !== 'function' || typeof clock !== 'function') invalidInput()
+  if (typeof fetchImpl !== 'function' || typeof clock !== 'function') invalidInput()
+  const endpointUrl = Reflect.ownKeys(source).includes('endpointUrl')
+    ? normalizeEndpointUrl(dataValue(source, 'endpointUrl'))
+    : DEFAULT_ALIAS_ENDPOINT
+  const timeoutMs = Reflect.ownKeys(source).includes('timeoutMs')
+    ? requireTimeout(dataValue(source, 'timeoutMs'))
+    : DEFAULT_TIMEOUT_MS
   return objectFreeze({
-    observe: observe as Tm1AliasOwnershipObserver,
-    clock: clock as () => number
+    fetch: fetchImpl as typeof fetch,
+    clock: clock as () => number,
+    endpointUrl,
+    timeoutMs
   })
+}
+
+function normalizeEndpointUrl(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) invalidInput()
+  let endpoint: URL
+  try {
+    endpoint = new URL(value)
+  } catch {
+    return invalidInput()
+  }
+  if (endpoint.username.length > 0 || endpoint.password.length > 0) invalidInput()
+  if (endpoint.hash.length > 0 || endpoint.search.length > 0) invalidInput()
+  if (endpoint.protocol === 'https:') {
+    if (endpoint.hostname.length === 0) invalidInput()
+  } else if (endpoint.protocol === 'http:') {
+    if (!LOOPBACK_HOSTS.has(endpoint.hostname.toLowerCase())) invalidInput()
+  } else {
+    invalidInput()
+  }
+  const path = endpoint.pathname === '/' ? '' : endpoint.pathname.replace(/\/+$/, '')
+  return `${endpoint.origin}${path}`
+}
+
+function requireTimeout(value: unknown): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    (value as number) <= 0 ||
+    (value as number) > MAX_TIMEOUT_MS
+  ) invalidInput()
+  return value as number
+}
+
+async function decodeAliasResponse(response: Response, signal: AbortSignal): Promise<unknown> {
+  if (response.status === 404) {
+    throw new Tm1AliasOwnershipVerificationError('ALIAS_UNCONFIRMED')
+  }
+  const body = await readLimitedBody(response, signal)
+  if (!response.ok) unavailable()
+  if (body.length === 0) unverifiable()
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body) as unknown
+  } catch {
+    unverifiable()
+  }
+  if (parsed === null) unverifiable()
+  return parsed
+}
+
+async function readLimitedBody(response: Response, signal: AbortSignal): Promise<string> {
+  const stream = response.body
+  if (stream === null) return ''
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let received = 0
+  const parts: string[] = []
+  const abortRead = (): void => {
+    void reader.cancel()
+  }
+  if (signal.aborted) {
+    abortRead()
+    unavailable()
+  }
+  signal.addEventListener('abort', abortRead, { once: true })
+  try {
+    while (true) {
+      if (signal.aborted) unavailable()
+      const { done, value } = await reader.read()
+      if (done) break
+      received += value.byteLength
+      if (received > MAX_RESPONSE_BYTES) unavailable()
+      parts.push(decoder.decode(value, { stream: true }))
+    }
+    parts.push(decoder.decode())
+    return parts.join('')
+  } finally {
+    signal.removeEventListener('abort', abortRead)
+  }
+}
+
+function unavailable(): never {
+  throw new Tm1AliasOwnershipVerificationError('ALIAS_OWNERSHIP_UNAVAILABLE')
+}
+
+function unverifiable(): never {
+  throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
 }
 
 function parseVerifyRequest(value: unknown): Readonly<{
@@ -194,8 +315,9 @@ function parseObservation(value: unknown): Readonly<{
       'alias',
       'address',
       'txid',
-      'blockHeight',
+      'blockheight',
       'status',
+      'source',
       'expiresAt'
     ])
   } catch (error) {
@@ -204,7 +326,7 @@ function parseObservation(value: unknown): Readonly<{
     }
     throw error
   }
-  const required = ['alias', 'address', 'txid', 'blockHeight', 'status']
+  const required = ['alias', 'address', 'txid', 'status']
   if (required.some(key => !Reflect.ownKeys(source).includes(key))) {
     throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
   }
@@ -212,12 +334,15 @@ function parseObservation(value: unknown): Readonly<{
   if (typeof status !== 'string' || status.trim() !== status || status.length === 0) {
     throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
   }
-  const blockHeight = dataValue(source, 'blockHeight')
+  if (!Reflect.ownKeys(source).includes('blockheight')) {
+    throw new Tm1AliasOwnershipVerificationError('ALIAS_UNCONFIRMED')
+  }
+  const blockHeight = dataValue(source, 'blockheight')
   if (!Number.isSafeInteger(blockHeight) || (blockHeight as number) < 0) {
     throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
   }
   const txidValue = dataValue(source, 'txid')
-  if (typeof txidValue !== 'string' || !/^[0-9a-f]{64}$/.test(txidValue)) {
+  if (typeof txidValue !== 'string' || !TXID_PATTERN.test(txidValue)) {
     throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
   }
   let expiresAt: number | undefined

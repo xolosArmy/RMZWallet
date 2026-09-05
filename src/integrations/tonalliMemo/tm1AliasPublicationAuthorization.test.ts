@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import { createTm1AliasOwnershipVerificationPort } from './tm1AliasOwnershipVerificationPort'
+import { createTm1AliasOwnershipVerificationTestFetch } from './tm1AliasOwnershipVerificationPort.testFetch'
 import * as aliasAuth from './tm1AliasPublicationAuthorization'
 import {
   Tm1AliasPublicationAuthorizationError,
@@ -532,13 +533,18 @@ describe('TM1 verified evidence expiry via verification port', () => {
     const alias = `${tag}.xec`
     const expiresAt = evidenceOverrides.expiresAt
     const port = createTm1AliasOwnershipVerificationPort({
-      observe: async () => ({
-        alias,
-        address: OWNER,
-        txid: uniqueTxid(tag),
-        blockHeight: 100,
-        status: 'confirmed',
-        ...evidenceOverrides
+      fetch: createTm1AliasOwnershipVerificationTestFetch({
+        [alias]: {
+          status: 200,
+          json: {
+            alias,
+            address: OWNER,
+            txid: uniqueTxid(tag),
+            blockheight: 100,
+            status: 'confirmed',
+            ...evidenceOverrides
+          }
+        }
       }),
       clock: () => typeof expiresAt === 'number' ? expiresAt - 1 : Date.now()
     })
@@ -599,7 +605,7 @@ describe('TM1 verified evidence expiry via verification port', () => {
   test('expired verified evidence does not write replay or height', async () => {
     const expired = await mintViaPort('vled', {
       expiresAt: Date.now() - 60_000,
-      blockHeight: 500
+      blockheight: 500
     })
     expect(() => createTm1AliasPublicationAuthorizer().issue({
       alias: expired.alias,
@@ -608,7 +614,7 @@ describe('TM1 verified evidence expiry via verification port', () => {
     })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
     const later = await mintViaPort('vled', {
       txid: uniqueTxid('vledz'),
-      blockHeight: 50
+      blockheight: 50
     })
     const authorization = createTm1AliasPublicationAuthorizer().issue({
       alias: later.alias,

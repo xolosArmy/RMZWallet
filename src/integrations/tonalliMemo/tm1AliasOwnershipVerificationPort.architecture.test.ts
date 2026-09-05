@@ -29,11 +29,14 @@ function walkTs(dir: string): string[] {
 describe('TM1 alias ownership verification port isolation', () => {
   test('H: App, RegisterAlias, and orchestrator do not import the port or mint', () => {
     expect(app).not.toContain('tm1AliasOwnershipVerificationPort')
+    expect(app).not.toContain('tm1AliasOwnershipVerificationPort.testFetch')
     expect(app).not.toContain('tm1AliasVerifiedOwnershipMint')
     expect(app).not.toContain('tm1AliasPublicationAuthorization')
     expect(registerAlias).not.toContain('tm1AliasOwnershipVerificationPort')
+    expect(registerAlias).not.toContain('tm1AliasOwnershipVerificationPort.testFetch')
     expect(registerAlias).not.toContain('tm1AliasVerifiedOwnershipMint')
     expect(orchestrator).not.toContain('tm1AliasOwnershipVerificationPort')
+    expect(orchestrator).not.toContain('tm1AliasOwnershipVerificationPort.testFetch')
     expect(orchestrator).not.toContain('tm1AliasVerifiedOwnershipMint')
   })
 
@@ -73,14 +76,19 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(portRuntime).not.toMatch(/ChronikClient|chronik-client/)
     expect(portRuntime).not.toMatch(/from ['"]react|WalletContext|localStorage/)
     expect(portRuntime).not.toMatch(/RegisterAlias|MemoDraft|approveAndBroadcast/)
-    expect(portRuntime).not.toContain('https://alias.ecash.mx')
-    expect(portRuntime).not.toMatch(/fetch\s*\(/)
+    expect(portRuntime).toContain('https://alias.ecash.mx/alias')
     expect(portRuntime).toContain('NOT SUFFICIENT TO ENABLE PUBLICATION')
   })
 
-  test('observe and clock are required injected deps with no in-memory production fallback', () => {
-    expect(portRuntime).toContain('observe')
-    expect(portRuntime).toContain('clock')
+  test('production factory binds alias.ecash.mx and rejects caller observe()', () => {
+    const parse = portRuntime.slice(
+      portRuntime.indexOf('function parseDeps('),
+      portRuntime.indexOf('function normalizeEndpointUrl(')
+    )
+    expect(parse).toContain("'fetch'")
+    expect(parse).toContain("'clock'")
+    expect(parse).not.toContain("'observe'")
+    expect(portRuntime).toContain('observeAliasOwnership')
     expect(portRuntime).not.toContain('createTm1InMemory')
     expect(portRuntime).not.toMatch(/Date\.now\s*\(/)
     expect(portRuntime).not.toMatch(/request\.now/)

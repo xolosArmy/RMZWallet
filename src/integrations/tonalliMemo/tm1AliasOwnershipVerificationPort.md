@@ -8,14 +8,17 @@ enablement. App / routes / RegisterAlias / orchestrator stay unwired.
 
 ## Factory
 
-`createTm1AliasOwnershipVerificationPort({ observe, clock })`
+`createTm1AliasOwnershipVerificationPort({ fetch, clock, endpointUrl?, timeoutMs? })`
 
-Both deps are required. There is no default observer, no default clock,
-and no in-memory fake in this module. Tests inject both.
+`fetch` and `clock` are required. There is no caller `observe()` parameter
+and no in-memory fake in this module. Observation is bound to
+`https://alias.ecash.mx/alias` (same protocol as `useAliasResolution`).
+Tests inject a fetch double from
+`tm1AliasOwnershipVerificationPort.testFetch.ts`, which App / routes
+must not import.
 
-- `observe({ alias, ownerAddress, signal? })` → ownership observation
-  (confirmed txid, owner address, blockHeight, optional expiresAt)
-  or a thrown transport/parse failure.
+- `fetch` → HTTP GET of `{endpointUrl}/{alias}`. Never a lambda that
+  returns confirmed evidence.
 - `clock()` → trusted millisecond timestamp. Never `request.now`.
 
 ## Verify
@@ -23,16 +26,14 @@ and no in-memory fake in this module. Tests inject both.
 `port.verify({ alias, ownerAddress, signal? })`
 
 1. Canonicalize alias and CashAddr the same way as the authorizer.
-2. Call `observe`. Network/abort/thrown transport → `ALIAS_OWNERSHIP_UNAVAILABLE`.
-   Null / extra keys / malformed JSON-shaped results → `ALIAS_PROOF_UNVERIFIABLE`.
+2. GET alias.ecash.mx. Network/abort/5xx → `ALIAS_OWNERSHIP_UNAVAILABLE`.
+   Empty / invalid JSON / null → `ALIAS_PROOF_UNVERIFIABLE`.
+   HTTP 404 → `ALIAS_UNCONFIRMED`.
 3. Unconfirmed, owner mismatch, or `clock() >= expiresAt` → throw, no token.
 4. Confirmed matching observation → file-private mint (not exported).
-   The token is an empty frozen object whose snapshot lives in a WeakMap.
-   `issue()` accepts only that token. `mintTm1VerifiedAliasOwnershipToken`
-   is not a public import.
 5. `expiresAt`, when present, is copied into the snapshot (not dropped).
-6. Observer `blockHeight` is stored only on that snapshot. The port does
-   not write the issuer's process-local stale-height map.
+6. `blockheight` from the API is stored only on that snapshot. The port
+   does not write the issuer's process-local stale-height map.
 
 `request.now` is an extra field and is rejected.
 

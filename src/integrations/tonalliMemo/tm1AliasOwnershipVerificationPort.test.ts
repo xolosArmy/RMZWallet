@@ -1,9 +1,13 @@
-import { describe, expect, test, vi } from 'vitest'
+import { describe, expect, test } from 'vitest'
 import * as portApi from './tm1AliasOwnershipVerificationPort'
 import {
   createTm1AliasOwnershipVerificationPort,
   Tm1AliasOwnershipVerificationError
 } from './tm1AliasOwnershipVerificationPort'
+import {
+  createTm1AliasOwnershipVerificationTestFetch,
+  type Tm1AliasOwnershipTestFetchResponse
+} from './tm1AliasOwnershipVerificationPort.testFetch'
 import * as aliasAuth from './tm1AliasPublicationAuthorization'
 import {
   createTm1AliasPublicationAuthorizer,
@@ -19,10 +23,20 @@ function txidFrom(tag: string): string {
   return (bytes + 'ab'.repeat(32)).slice(0, 64)
 }
 
-function observation(tag: string, overrides: Record<string, unknown> = {}) {
-  const alias = `${tag}.xec`
+function aliasRecord(tag: string, overrides: Record<string, unknown> = {}) {
   return {
-    alias,
+    alias: `${tag}.xec`,
+    address: OWNER,
+    txid: txidFrom(tag),
+    blockheight: 100,
+    status: 'confirmed',
+    ...overrides
+  }
+}
+
+function callerJson(tag: string, overrides: Record<string, unknown> = {}) {
+  return {
+    alias: `${tag}.xec`,
     address: OWNER,
     txid: txidFrom(tag),
     blockHeight: 100,
@@ -33,14 +47,17 @@ function observation(tag: string, overrides: Record<string, unknown> = {}) {
 
 function portWith(
   tag: string,
-  observeImpl: (input: { alias: string; ownerAddress: string }) => unknown | Promise<unknown>,
+  response: Tm1AliasOwnershipTestFetchResponse,
   clock: () => number = () => 1_700_000_000_000
 ) {
-  const observe = vi.fn(async (input: { alias: string; ownerAddress: string }) => observeImpl(input))
-  const verifier = createTm1AliasOwnershipVerificationPort({ observe, clock })
+  const verifier = createTm1AliasOwnershipVerificationPort({
+    fetch: createTm1AliasOwnershipVerificationTestFetch({
+      [`${tag}.xec`]: response
+    }),
+    clock
+  })
   return {
     alias: `${tag}.xec`,
-    observe,
     verifier,
     request: (overrides: Record<string, unknown> = {}) => ({
       alias: `${tag}.xec`,
@@ -50,9 +67,13 @@ function portWith(
   }
 }
 
+function ok(tag: string, overrides: Record<string, unknown> = {}): Tm1AliasOwnershipTestFetchResponse {
+  return { status: 200, json: aliasRecord(tag, overrides) }
+}
+
 describe('TM1 alias ownership verification port', () => {
   test('A: confirmed matching observation mints a token that issue() accepts', async () => {
-    const { alias, verifier, request } = portWith('vpa', () => observation('vpa'))
+    const { alias, verifier, request } = portWith('vpa', ok('vpa'))
     const token = await verifier.verify(request())
     expect(Object.isFrozen(token)).toBe(true)
     expect(Reflect.ownKeys(token)).toHaveLength(0)
@@ -71,20 +92,20 @@ describe('TM1 alias ownership verification port', () => {
   })
 
   test('B: unconfirmed observation throws, mints no token, and issue is never reached', async () => {
-    const { verifier, request } = portWith('vpb', () => observation('vpb', {
+    const { verifier, request } = portWith('vpb', ok('vpb', {
       status: 'pending',
-      blockHeight: 0
+      blockheight: 0
     }))
     await expect(verifier.verify(request())).rejects.toMatchObject({ code: 'ALIAS_UNCONFIRMED' })
     expect(() => createTm1AliasPublicationAuthorizer().issue({
       alias: 'vpb.xec',
       ownerAddress: OWNER,
-      evidence: observation('vpb')
+      evidence: callerJson('vpb')
     })).toThrowError(expect.objectContaining(UNTRUSTED))
   })
 
   test('C: owner mismatch throws and does not mint', async () => {
-    const { verifier, request } = portWith('vpc', () => observation('vpc', {
+    const { verifier, request } = portWith('vpc', ok('vpc', {
       address: OTHER_OWNER
     }))
     await expect(verifier.verify(request())).rejects.toMatchObject({
@@ -93,34 +114,33 @@ describe('TM1 alias ownership verification port', () => {
   })
 
   test('D: transport, invalid JSON, empty body, and timeout throw and do not mint', async () => {
-    const cases: Array<{ tag: string; observe: () => Promise<unknown> }> = [
-      { tag: 'vpdn', observe: async () => { throw new Error('ECONNRESET') } },
-      { tag: 'vpdx', observe: async () => { throw new SyntaxError('Unexpected end of JSON') } },
-      { tag: 'vpde', observe: async () => null },
-      { tag: 'vpdt', observe: async () => {
-        const error = new Error('AbortError')
-        error.name = 'AbortError'
-        throw error
-      } }
+    const abort = new Error('AbortError')
+    abort.name = 'AbortError'
+    const cases: Array<{ tag: string; response: Tm1AliasOwnershipTestFetchResponse }> = [
+      { tag: 'vpdn', response: { status: 200, throw: new Error('ECONNRESET') } },
+      { tag: 'vpdx', response: { status: 200, text: '{' } },
+      { tag: 'vpde', response: { status: 200 } },
+      { tag: 'vpdt', response: { status: 200, throw: abort } },
+      { tag: 'vpd5', response: { status: 500, json: { ok: false } } }
     ]
-    for (const { tag, observe } of cases) {
-      const { verifier, request, alias } = portWith(tag, observe)
+    for (const { tag, response } of cases) {
+      const { verifier, request, alias } = portWith(tag, response)
       await expect(verifier.verify(request())).rejects.toBeInstanceOf(Error)
       expect(() => createTm1AliasPublicationAuthorizer().issue({
         alias,
         ownerAddress: OWNER,
-        evidence: observation(tag)
+        evidence: callerJson(tag)
       })).toThrowError(expect.objectContaining(UNTRUSTED))
     }
   })
 
   test('E: caller-supplied fake confirmed evidence is not a token and stays UNTRUSTED', async () => {
-    const { alias, verifier, request } = portWith('vpe', () => observation('vpe'))
+    const { alias, verifier, request } = portWith('vpe', ok('vpe'))
     await verifier.verify(request())
     expect(() => createTm1AliasPublicationAuthorizer().issue({
       alias,
       ownerAddress: OWNER,
-      evidence: observation('vpe')
+      evidence: callerJson('vpe')
     })).toThrowError(expect.objectContaining(UNTRUSTED))
   })
 
@@ -128,7 +148,7 @@ describe('TM1 alias ownership verification port', () => {
     const expiresAt = Date.now() - 1_000
     const { alias, verifier, request } = portWith(
       'vpf',
-      () => observation('vpf', { expiresAt }),
+      ok('vpf', { expiresAt }),
       () => expiresAt - 1
     )
     const token = await verifier.verify(request())
@@ -138,7 +158,9 @@ describe('TM1 alias ownership verification port', () => {
       evidence: token
     })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
     const later = createTm1AliasOwnershipVerificationPort({
-      observe: async () => observation('vpf', { txid: txidFrom('vpfz'), blockHeight: 50 }),
+      fetch: createTm1AliasOwnershipVerificationTestFetch({
+        'vpf.xec': ok('vpf', { txid: txidFrom('vpfz'), blockheight: 50 })
+      }),
       clock: () => Date.now()
     })
     const laterToken = await later.verify(request())
@@ -157,7 +179,7 @@ describe('TM1 alias ownership verification port', () => {
     const expiresAt = 1_800_000_000_000
     const { verifier, request } = portWith(
       'vpg',
-      () => observation('vpg', { expiresAt }),
+      ok('vpg', { expiresAt }),
       () => expiresAt
     )
     await expect(verifier.verify(request({ now: 0 }))).rejects.toMatchObject({
@@ -168,7 +190,7 @@ describe('TM1 alias ownership verification port', () => {
     })
     const future = portWith(
       'vpgf',
-      () => observation('vpgf', { expiresAt }),
+      ok('vpgf', { expiresAt }),
       () => expiresAt - 1
     )
     const token = await future.verifier.verify(future.request())
@@ -182,7 +204,7 @@ describe('TM1 alias ownership verification port', () => {
 
   test('P1: mint is not importable and cannot bypass the observer', async () => {
     const tag = 'p1mint'
-    const json = observation(tag)
+    const json = callerJson(tag)
     let mintFn: ((value: unknown) => object) | undefined
     try {
       const mintSpec: string = './tm1AliasVerifiedOwnershipMint'
@@ -203,14 +225,40 @@ describe('TM1 alias ownership verification port', () => {
     })).toThrowError(expect.objectContaining(UNTRUSTED))
   })
 
-  test('factory requires observe and clock and has no silent network default', () => {
+  test('P1: production factory does not accept arbitrary observe()', async () => {
+    const tag = 'p1obs'
+    const alias = `${tag}.xec`
+    let port: ReturnType<typeof createTm1AliasOwnershipVerificationPort> | undefined
+    try {
+      port = createTm1AliasOwnershipVerificationPort({
+        observe: async () => aliasRecord(tag),
+        clock: () => 1
+      })
+    } catch {
+      port = undefined
+    }
+    expect(port).toBeUndefined()
+    if (port === undefined) return
+    const token = await port.verify({ alias, ownerAddress: OWNER })
+    expect(() => createTm1AliasPublicationAuthorizer().issue({
+      alias,
+      ownerAddress: OWNER,
+      evidence: token
+    })).toThrowError(expect.objectContaining(UNTRUSTED))
+  })
+
+  test('factory requires fetch and clock and rejects observe()', () => {
     expect(() => createTm1AliasOwnershipVerificationPort({}))
       .toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
     expect(() => createTm1AliasOwnershipVerificationPort({
-      observe: async () => observation('needc')
+      observe: async () => aliasRecord('needc'),
+      clock: () => 1
     })).toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
     expect(() => createTm1AliasOwnershipVerificationPort({
       clock: () => 1
+    })).toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
+    expect(() => createTm1AliasOwnershipVerificationPort({
+      fetch: createTm1AliasOwnershipVerificationTestFetch({})
     })).toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
     expect(portApi).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')
     expect(portApi).not.toHaveProperty('mintVerifiedAliasOwnershipEvidence')
@@ -218,7 +266,7 @@ describe('TM1 alias ownership verification port', () => {
   })
 
   test('port errors are not a sign or broadcast capability', async () => {
-    const { verifier, request } = portWith('vperr', () => observation('vperr', {
+    const { verifier, request } = portWith('vperr', ok('vperr', {
       status: 'pending'
     }))
     let thrown: unknown
