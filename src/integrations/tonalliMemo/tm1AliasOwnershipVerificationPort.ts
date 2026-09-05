@@ -83,6 +83,15 @@ const cancelStreamReader = Function.prototype.call.bind(
   reason?: unknown
 ) => Promise<void>
 
+function settleCancel(
+  reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>
+): void {
+  Promise.resolve(cancelStreamReader(reader)).then(
+    () => undefined,
+    () => undefined
+  )
+}
+
 const objectFreeze = Object.freeze as <T extends object>(value: T) => T
 const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as <V>(
   map: WeakMap<object, V>,
@@ -256,7 +265,7 @@ async function readLimitedBody(response: Response, signal: AbortSignal): Promise
   let received = 0
   const parts: string[] = []
   const abortRead = (): void => {
-    void cancelStreamReader(reader)
+    settleCancel(reader)
   }
   if (signal.aborted) {
     abortRead()
@@ -267,9 +276,13 @@ async function readLimitedBody(response: Response, signal: AbortSignal): Promise
     while (true) {
       if (signal.aborted) unavailable()
       const { done, value } = await readStreamChunk(reader)
+      if (signal.aborted) unavailable()
       if (done) break
       received += value.byteLength
-      if (received > MAX_RESPONSE_BYTES) unavailable()
+      if (received > MAX_RESPONSE_BYTES) {
+        settleCancel(reader)
+        unavailable()
+      }
       pushValue(parts, decodeUtf8Bytes(decoder, value, { stream: true }))
     }
     pushValue(parts, decodeUtf8Bytes(decoder))

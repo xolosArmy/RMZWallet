@@ -77,6 +77,20 @@ function ok(tag: string, overrides: Record<string, unknown> = {}): Tm1AliasOwner
   return { status: 200, json: aliasRecord(tag, overrides) }
 }
 
+function hangingAliasResponse(): Response {
+  return new Response(new ReadableStream<Uint8Array>({
+    start () {
+      // Never enqueue or close: body decode must be aborted by timeout or caller.
+    },
+    cancel () {
+      return Promise.reject(new DOMException('Aborted', 'AbortError'))
+    }
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' }
+  })
+}
+
 describe('TM1 alias ownership verification port', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -433,6 +447,40 @@ describe('TM1 alias ownership verification port', () => {
     }
     expect(minted).toBeUndefined()
   })
+
+  test('P2: hanging-body cancel AbortError is not unhandled', async () => {
+    const tag = 'p2cancel'
+    const alias = `${tag}.xec`
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      vi.stubGlobal('fetch', (async () => hangingAliasResponse()) as typeof fetch)
+      vi.resetModules()
+      const portMod = await import('./tm1AliasOwnershipVerificationPort')
+      const abort = new AbortController()
+      const pending = portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER,
+        signal: abort.signal
+      })
+      await new Promise(resolve => setTimeout(resolve, 20))
+      abort.abort()
+      let verifyError: unknown
+      try {
+        await pending
+      } catch (error) {
+        verifyError = error
+      }
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(unhandled).toEqual([])
+      expect(verifyError).toMatchObject({ code: 'ALIAS_OWNERSHIP_UNAVAILABLE' })
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  }, 1_000)
 
   test('P1: prototype.verify.call with forged this cannot mint', async () => {
     const tag = 'p1this'

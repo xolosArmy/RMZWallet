@@ -17,6 +17,9 @@ Public create captures `globalThis.fetch.bind(globalThis)`,
 (`ReadableStream.prototype.getReader`,
 `ReadableStreamDefaultReader.prototype.read` / `cancel`) once at
 module evaluation and GETs frozen `https://alias.ecash.mx/alias`.
+Stream `cancel()` fulfillment and rejection are both settled
+(`settleCancel`); abort/timeout still map to
+`ALIAS_OWNERSHIP_UNAVAILABLE` and do not mint.
 CashAddr canonicalization captures `Address.parse.bind(Address)`
 in `utils/alias.ts`. Passing `fetch`, `endpointUrl`, `observe`,
 or `clock` is extra input (`INVALID_ALIAS_AUTHORIZATION_INPUT`).
