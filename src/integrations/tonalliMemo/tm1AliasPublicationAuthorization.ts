@@ -1,5 +1,16 @@
 /// <reference types="vitest/importMeta" />
 import { canonicalizeEcashAddress, toXecAlias } from '../../utils/alias'
+import {
+  Tm1AliasPublicationAuthorizationError,
+  type Tm1AliasPublicationAuthorizationErrorCode
+} from './tm1AliasPublicationAuthorizationError'
+import {
+  lookupTm1VerifiedAliasOwnershipToken,
+  mintTm1VerifiedAliasOwnershipToken
+} from './tm1AliasVerifiedOwnershipMint'
+
+export { Tm1AliasPublicationAuthorizationError }
+export type { Tm1AliasPublicationAuthorizationErrorCode }
 
 export const TM1_ALIAS_PUBLICATION_AUTHORIZATION_PROTOCOL =
   'tonalli.tm1-alias-publication-authorization'
@@ -16,26 +27,6 @@ export type Tm1AliasPublicationAuthorization = Readonly<{
   evidenceBlockHeight: number
   authorizationId: string
 }>
-
-export type Tm1AliasPublicationAuthorizationErrorCode =
-  | 'INVALID_ALIAS_AUTHORIZATION_INPUT'
-  | 'ALIAS_UNCONFIRMED'
-  | 'ALIAS_OWNER_MISMATCH'
-  | 'ALIAS_PROOF_UNVERIFIABLE'
-  | 'ALIAS_PROOF_EXPIRED'
-  | 'ALIAS_PROOF_REPLAYED'
-  | 'ALIAS_PROOF_STALE'
-  | 'ALIAS_EVIDENCE_UNTRUSTED'
-
-export class Tm1AliasPublicationAuthorizationError extends Error {
-  readonly code: Tm1AliasPublicationAuthorizationErrorCode
-
-  constructor(code: Tm1AliasPublicationAuthorizationErrorCode) {
-    super(code)
-    this.name = 'Tm1AliasPublicationAuthorizationError'
-    this.code = code
-  }
-}
 
 declare const tm1AliasPublicationAuthorizationLedgerBrand: unique symbol
 
@@ -111,46 +102,6 @@ function createProcessLocalLedger(): Tm1AliasPublicationAuthorizationLedger {
 }
 
 const processLocalLedger = createProcessLocalLedger()
-
-type VerifiedEvidenceSnapshot = Readonly<{
-  alias: string
-  address: string
-  txid: string
-  blockHeight: number
-  expiresAt?: number
-}>
-
-const verifiedEvidenceSnapshots = new WeakMap<object, VerifiedEvidenceSnapshot>()
-
-/**
- * Unexported mint for the future verification port (slice 4).
- * Not on the public export surface. Ordinary callers cannot obtain it.
- */
-function mintVerifiedAliasPublicationEvidence(
-  value: unknown
-): object {
-  const parsed = parseEvidence(value)
-  if (parsed.status !== 'confirmed' || parsed.blockHeight < 1) fail('ALIAS_UNCONFIRMED')
-  const token = objectFreeze(Object.create(null))
-  weakMapSet(verifiedEvidenceSnapshots, token, objectFreeze({
-    alias: parsed.alias,
-    address: parsed.address,
-    txid: parsed.txid,
-    blockHeight: parsed.blockHeight,
-    ...(parsed.expiresAt === undefined ? {} : { expiresAt: parsed.expiresAt })
-  }))
-  return token
-}
-
-const internalVerifiedEvidencePort = objectFreeze({
-  mint: mintVerifiedAliasPublicationEvidence
-})
-
-function lookupVerifiedEvidence(value: unknown): VerifiedEvidenceSnapshot | undefined {
-  if (value === null || typeof value !== 'object') return undefined
-  if (value === internalVerifiedEvidencePort) invalidInput()
-  return weakMapGet(verifiedEvidenceSnapshots, value)
-}
 
 function parseLedger(value: unknown): Tm1AliasPublicationAuthorizationLedger {
   if (value === null || typeof value !== 'object') invalidInput()
@@ -340,7 +291,7 @@ function parseRequest(value: unknown): ParsedRequest {
   const alias = requireAlias(dataValue(source, 'alias'))
   const ownerAddress = requireOwnerAddress(dataValue(source, 'ownerAddress'))
   const evidenceValue = dataValue(source, 'evidence')
-  const verifiedSnapshot = lookupVerifiedEvidence(evidenceValue)
+  const verifiedSnapshot = lookupTm1VerifiedAliasOwnershipToken(evidenceValue)
   const evidence = verifiedSnapshot === undefined
     ? parseEvidence(evidenceValue)
     : objectFreeze({
@@ -482,7 +433,7 @@ if (import.meta.vitest) {
     requestOverrides: Record<string, unknown> = {}
   ) => {
     const alias = `${tag}.xec`
-    const evidence = mintVerifiedAliasPublicationEvidence({
+    const evidence = mintTm1VerifiedAliasOwnershipToken({
       alias,
       address: owner,
       txid: uniqueTxid(tag),

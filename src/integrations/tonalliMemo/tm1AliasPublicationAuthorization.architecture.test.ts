@@ -55,7 +55,11 @@ describe('TM1 alias publication authorization isolation', () => {
       runtime.matchAll(/from\s+['"]([^'"]+)['"]/g),
       match => match[1]
     )
-    expect(imports).toEqual(['../../utils/alias'])
+    expect(imports.sort()).toEqual([
+      '../../utils/alias',
+      './tm1AliasPublicationAuthorizationError',
+      './tm1AliasVerifiedOwnershipMint'
+    ])
   })
 
   test('records that caller-supplied evidence is not sufficient to enable publication', () => {
@@ -120,6 +124,7 @@ describe('TM1 alias publication authorization isolation', () => {
     ])
     expect(runtime).not.toMatch(/export function createTm1InMemoryAliasPublicationAuthorizationLedger/)
     expect(runtime).not.toMatch(/export function mintVerifiedAliasPublicationEvidence/)
+    expect(runtime).not.toMatch(/export function mintTm1VerifiedAliasOwnershipToken/)
     expect(aliasAuth).not.toHaveProperty('createTm1InMemoryAliasPublicationAuthorizationLedger')
     expect(aliasAuth).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')
   })
@@ -143,9 +148,10 @@ describe('TM1 alias publication authorization isolation', () => {
   })
 
   test('verified snapshot preserves expiresAt when present and omits it when absent', () => {
-    const mint = runtime.slice(
-      runtime.indexOf('function mintVerifiedAliasPublicationEvidence'),
-      runtime.indexOf('const internalVerifiedEvidencePort')
+    const mintRuntime = source('./tm1AliasVerifiedOwnershipMint.ts')
+    const mint = mintRuntime.slice(
+      mintRuntime.indexOf('export function mintTm1VerifiedAliasOwnershipToken'),
+      mintRuntime.indexOf('export function lookupTm1VerifiedAliasOwnershipToken')
     )
     const reconstruct = runtime.slice(
       runtime.indexOf('const evidence = verifiedSnapshot === undefined'),
