@@ -62,4 +62,38 @@ describe('TM1 Draft 0.2 preview encoder', () => {
       }
     }
   })
+
+  it('rejects unpaired surrogates as INVALID_UTF8 and never reports SCRIPT_TOO_LARGE falsely', () => {
+    const surrogateCases = [
+      '\uD800',
+      '\uDFFF',
+      'leading \uD800 trailing',
+      '\uDC00\uD800'
+    ]
+
+    for (const badString of surrogateCases) {
+      expect(() => encodeTm1Draft02Post({ eventData: badString })).toThrowError(Tm1Draft02EncodingError)
+      try {
+        encodeTm1Draft02Post({ eventData: badString })
+      } catch (error) {
+        expect(error).toBeInstanceOf(Tm1Draft02EncodingError)
+        const encodingError = error as Tm1Draft02EncodingError
+        expect(encodingError.code).toBe('INVALID_UTF8')
+        expect(encodingError.code).not.toBe('SCRIPT_TOO_LARGE')
+        expect(encodingError.message).toMatch(/surrogate|UTF-8/i)
+      }
+    }
+  })
+
+  it('rejects invalid format without raw canonical errors escaping or misreporting SCRIPT_TOO_LARGE', () => {
+    expect(() => encodeTm1Draft02Post({ eventData: 123 as unknown as string })).toThrowError(Tm1Draft02EncodingError)
+    try {
+      encodeTm1Draft02Post({ eventData: 123 as unknown as string })
+    } catch (error) {
+      expect(error).toBeInstanceOf(Tm1Draft02EncodingError)
+      const encodingError = error as Tm1Draft02EncodingError
+      expect(encodingError.code).toBe('INVALID_FORMAT')
+      expect(encodingError.code).not.toBe('SCRIPT_TOO_LARGE')
+    }
+  })
 })

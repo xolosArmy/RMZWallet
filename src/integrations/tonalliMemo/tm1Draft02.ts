@@ -5,6 +5,7 @@ import {
   TM1_POST_EVENT_TYPE,
   TM1_VERSION,
   encodeTm1Post,
+  isTm1ProtocolError,
   utf8ByteLength
 } from '@xolosarmy/tonalli-memo-protocol'
 
@@ -20,6 +21,8 @@ export type Tm1Draft02EncodingErrorCode =
   | 'EMPTY_EVENT_DATA'
   | 'EVENT_DATA_TOO_LARGE'
   | 'SCRIPT_TOO_LARGE'
+  | 'INVALID_UTF8'
+  | 'INVALID_FORMAT'
 
 export class Tm1Draft02EncodingError extends Error {
   readonly code: Tm1Draft02EncodingErrorCode
@@ -51,11 +54,44 @@ export type EncodeTm1Draft02PostOptions = {
   readonly authorInputIndex?: number
 }
 
+function mapCanonicalProtocolError(error: unknown): Tm1Draft02EncodingError {
+  if (isTm1ProtocolError(error)) {
+    switch (error.code) {
+      case 'EMPTY_EVENT_DATA':
+        return new Tm1Draft02EncodingError('EMPTY_EVENT_DATA', 'El mensaje TM1 no puede estar vacío.')
+      case 'PAYLOAD_TOO_LARGE':
+        return new Tm1Draft02EncodingError('SCRIPT_TOO_LARGE', error.message)
+      case 'INVALID_UTF8':
+        return new Tm1Draft02EncodingError('INVALID_UTF8', error.message)
+      case 'INVALID_FORMAT':
+      case 'INVALID_MARKER':
+      case 'UNSUPPORTED_VERSION':
+      case 'UNSUPPORTED_EVENT_TYPE':
+        return new Tm1Draft02EncodingError('INVALID_FORMAT', error.message)
+      default:
+        return new Tm1Draft02EncodingError('INVALID_FORMAT', error.message)
+    }
+  }
+  if (error instanceof Tm1Draft02EncodingError) {
+    return error
+  }
+  return new Tm1Draft02EncodingError(
+    'INVALID_FORMAT',
+    error instanceof Error ? error.message : 'Error al codificar el mensaje TM1 canónico.'
+  )
+}
+
 export function encodeTm1Draft02Post(options: EncodeTm1Draft02PostOptions): Tm1Draft02PostPreview {
   const authorInputIndex = options.authorInputIndex ?? 0
   validateAuthorInputIndex(authorInputIndex)
 
-  const eventDataLength = utf8ByteLength(options.eventData)
+  let eventDataLength: number
+  try {
+    eventDataLength = utf8ByteLength(options.eventData)
+  } catch (error) {
+    throw mapCanonicalProtocolError(error)
+  }
+
   if (eventDataLength === 0) {
     throw new Tm1Draft02EncodingError('EMPTY_EVENT_DATA', 'El mensaje TM1 no puede estar vacío.')
   }
@@ -73,7 +109,7 @@ export function encodeTm1Draft02Post(options: EncodeTm1Draft02PostOptions): Tm1D
       authorInputIndex
     })
   } catch (error) {
-    throw new Tm1Draft02EncodingError('SCRIPT_TOO_LARGE', (error as Error).message)
+    throw mapCanonicalProtocolError(error)
   }
 
   if (encoded.script.length > TM1_DRAFT_02_MAX_SCRIPT_BYTES) {

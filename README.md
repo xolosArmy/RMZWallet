@@ -34,11 +34,11 @@ Configura estas variables en Vercel o tu entorno local:
 - `VITE_WC_PROJECT_ID` (legacy compatible; fallback si falta la principal)
 - `VITE_WC_ALLOWED_DOMAINS` (opcional, lista CSV para warning anti-phishing en UI; sugerido: `teyolia.cash,www.teyolia.cash`)
 - `VITE_CHRONIK_URL` (opcional, lista CSV) para consultas generales y broadcast de Chronik
-- `NODE_AUTH_TOKEN` (requerido para instalación): Personal Access Token (PAT) de GitHub con permiso `read:packages`, necesario para resolver paquetes del scope `@xolosarmy` desde GitHub Packages en despliegues (Vercel) e instalaciones limpias.
+- `NODE_AUTH_TOKEN` (requerido para instalación): Personal Access Token (PAT) de GitHub con permiso `read:packages`, necesario para resolver paquetes configurados para GitHub Packages (como `@xolosarmy/tonalli-memo-protocol`) en despliegues (Vercel) e instalaciones limpias.
 
 ## Dependencias y GitHub Packages
 
-Las dependencias bajo el scope `@xolosarmy` (como `@xolosarmy/tonalli-memo-protocol`) se distribuyen vía GitHub Packages (`https://npm.pkg.github.com`).
+Los paquetes configurados para GitHub Packages bajo el scope `@xolosarmy` (como `@xolosarmy/tonalli-memo-protocol`) se distribuyen vía `https://npm.pkg.github.com` (otras dependencias como `@xolosarmy/tonalli-core` continúan resolviéndose directamente desde GitHub vía git).
 Para instalaciones limpias (`npm ci` o `npm install`) en entornos locales, CI/CD o plataformas de despliegue como Vercel, es necesario proveer la variable de entorno `NODE_AUTH_TOKEN` con un Personal Access Token (PAT) de GitHub con alcance `read:packages`.
 
 El archivo `.npmrc` del repositorio mapea automáticamente el registro y autenticación:
