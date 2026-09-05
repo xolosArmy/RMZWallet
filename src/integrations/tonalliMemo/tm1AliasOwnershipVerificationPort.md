@@ -10,14 +10,15 @@ enablement. App / routes / RegisterAlias / orchestrator stay unwired.
 
 `createTm1AliasOwnershipVerificationPort()` / `create({})`
 
-Public create binds `globalThis.fetch` and frozen
+Public create binds `globalThis.fetch` at request time and frozen
 `https://alias.ecash.mx/alias` inside the module. Passing `fetch`,
 `endpointUrl`, `observe`, or `clock` is extra input
 (`INVALID_ALIAS_AUTHORIZATION_INPUT`).
 
-Tests use `createTm1AliasOwnershipVerificationPortForTests({ fetch, clock })`
-from `tm1AliasOwnershipVerificationPort.testFetch.ts`, which App / routes
-must not import.
+The production class and factory carry no test constructor. Tests stub
+`globalThis.fetch` (and fake `Date.now` when expiry must move). The
+fetch double in `tm1AliasOwnershipVerificationPort.testFetch.ts` is not
+attached to production exports; App / routes must not import it.
 
 ## Verify
 

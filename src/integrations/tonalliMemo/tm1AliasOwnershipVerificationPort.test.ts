@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import * as portApi from './tm1AliasOwnershipVerificationPort'
 import {
   Tm1AliasOwnershipVerificationPort,
@@ -6,7 +6,6 @@ import {
   Tm1AliasOwnershipVerificationError
 } from './tm1AliasOwnershipVerificationPort'
 import {
-  createTm1AliasOwnershipVerificationPortForTests,
   createTm1AliasOwnershipVerificationTestFetch,
   type Tm1AliasOwnershipTestFetchResponse
 } from './tm1AliasOwnershipVerificationPort.testFetch'
@@ -50,17 +49,18 @@ function callerJson(tag: string, overrides: Record<string, unknown> = {}) {
 function portWith(
   tag: string,
   response: Tm1AliasOwnershipTestFetchResponse,
-  clock: () => number = () => 1_700_000_000_000
+  now?: number
 ) {
-  const verifier = createTm1AliasOwnershipVerificationPortForTests({
-    fetch: createTm1AliasOwnershipVerificationTestFetch({
-      [`${tag}.xec`]: response
-    }),
-    clock
-  })
+  vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+    [`${tag}.xec`]: response
+  }))
+  if (now !== undefined) {
+    vi.useFakeTimers()
+    vi.setSystemTime(now)
+  }
   return {
     alias: `${tag}.xec`,
-    verifier,
+    verifier: createTm1AliasOwnershipVerificationPort(),
     request: (overrides: Record<string, unknown> = {}) => ({
       alias: `${tag}.xec`,
       ownerAddress: OWNER,
@@ -74,6 +74,11 @@ function ok(tag: string, overrides: Record<string, unknown> = {}): Tm1AliasOwner
 }
 
 describe('TM1 alias ownership verification port', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+  })
+
   test('A: confirmed matching observation mints a token that issue() accepts', async () => {
     const { alias, verifier, request } = portWith('vpa', ok('vpa'))
     const token = await verifier.verify(request())
@@ -151,7 +156,7 @@ describe('TM1 alias ownership verification port', () => {
     const { alias, verifier, request } = portWith(
       'vpf',
       ok('vpf', { expiresAt }),
-      () => expiresAt - 1
+      expiresAt - 1
     )
     const token = await verifier.verify(request())
     expect(() => createTm1AliasPublicationAuthorizer().issue({
@@ -159,13 +164,13 @@ describe('TM1 alias ownership verification port', () => {
       ownerAddress: OWNER,
       evidence: token
     })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
-    const later = createTm1AliasOwnershipVerificationPortForTests({
-      fetch: createTm1AliasOwnershipVerificationTestFetch({
-        'vpf.xec': ok('vpf', { txid: txidFrom('vpfz'), blockheight: 50 })
-      }),
-      clock: () => Date.now()
-    })
-    const laterToken = await later.verify(request())
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+    const later = portWith(
+      'vpf',
+      ok('vpf', { txid: txidFrom('vpfz'), blockheight: 50 })
+    )
+    const laterToken = await later.verifier.verify(request())
     const authorization = createTm1AliasPublicationAuthorizer().issue({
       alias,
       ownerAddress: OWNER,
@@ -177,12 +182,12 @@ describe('TM1 alias ownership verification port', () => {
     })
   })
 
-  test('G: expiry uses the injected clock, not request.now', async () => {
+  test('G: expiry uses Date.now at request time, not request.now', async () => {
     const expiresAt = 1_800_000_000_000
     const { verifier, request } = portWith(
       'vpg',
       ok('vpg', { expiresAt }),
-      () => expiresAt
+      expiresAt
     )
     await expect(verifier.verify(request({ now: 0 }))).rejects.toMatchObject({
       code: 'INVALID_ALIAS_AUTHORIZATION_INPUT'
@@ -193,7 +198,7 @@ describe('TM1 alias ownership verification port', () => {
     const future = portWith(
       'vpgf',
       ok('vpgf', { expiresAt }),
-      () => expiresAt - 1
+      expiresAt - 1
     )
     const token = await future.verifier.verify(future.request())
     const authorization = createTm1AliasPublicationAuthorizer().issue({
@@ -252,6 +257,48 @@ describe('TM1 alias ownership verification port', () => {
       ownerAddress: OWNER,
       evidence: token
     })).toThrowError(expect.objectContaining(UNTRUSTED))
+  })
+
+  test('P1: ownKeys on production exports do not yield a test constructor', async () => {
+    const tag = 'p1seam'
+    const alias = `${tag}.xec`
+    const fetchImpl = (async () => new Response(JSON.stringify(aliasRecord(tag)), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })) as typeof fetch
+    const forged = {
+      fetch: fetchImpl,
+      clock: () => 1,
+      endpointUrl: 'https://evil.example/alias'
+    }
+    const standard = new Set<PropertyKey>(['length', 'name', 'prototype'])
+    const seams: Array<(value: unknown) => unknown> = []
+    for (const target of [Tm1AliasOwnershipVerificationPort, createTm1AliasOwnershipVerificationPort]) {
+      for (const key of Reflect.ownKeys(target)) {
+        if (standard.has(key)) continue
+        const value = Reflect.get(target, key)
+        if (typeof value === 'function') {
+          seams.push((value as (this: unknown, deps: unknown) => unknown).bind(target))
+        }
+      }
+    }
+    let minted: object | undefined
+    for (const inject of seams) {
+      try {
+        const port = inject(forged) as { verify?: (request: unknown) => Promise<object> }
+        if (port === null || typeof port !== 'object' || typeof port.verify !== 'function') continue
+        const token = await port.verify({ alias, ownerAddress: OWNER })
+        createTm1AliasPublicationAuthorizer().issue({
+          alias,
+          ownerAddress: OWNER,
+          evidence: token
+        })
+        minted = token
+      } catch {
+        continue
+      }
+    }
+    expect(minted).toBeUndefined()
   })
 
   test('P1: production factory does not accept arbitrary observe()', async () => {

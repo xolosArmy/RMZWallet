@@ -29,21 +29,8 @@ export class Tm1AliasOwnershipVerificationError extends Error {
 
 const TRUSTED_ALIAS_ENDPOINT = 'https://alias.ecash.mx/alias'
 const DEFAULT_TIMEOUT_MS = 8_000
-const MAX_TIMEOUT_MS = 60_000
 const MAX_RESPONSE_BYTES = 65_536
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
 const TXID_PATTERN = /^[0-9a-f]{64}$/
-const TEST_SEAM = 'tonalli.tm1AliasOwnershipVerificationPort.createForTests'
-const trustedFetch = globalThis.fetch
-const dateNow = Function.prototype.call.bind(Date.now) as () => number
-const authenticDeps = new WeakSet<object>()
-
-type FrozenDeps = Readonly<{
-  fetch: typeof fetch
-  clock: () => number
-  endpointUrl: string
-  timeoutMs: number
-}>
 
 const objectFreeze = Object.freeze as <T extends object>(value: T) => T
 const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as <V>(
@@ -88,26 +75,11 @@ export function lookupTm1VerifiedAliasOwnershipToken(
 }
 
 export class Tm1AliasOwnershipVerificationPort {
-  private readonly fetchImpl: typeof fetch
-  private readonly clock: () => number
-  private readonly endpointUrl: string
-  private readonly timeoutMs: number
-
-  private constructor(deps: FrozenDeps) {
-    if (!authenticDeps.has(deps)) invalidInput()
-    this.fetchImpl = deps.fetch
-    this.clock = deps.clock
-    this.endpointUrl = deps.endpointUrl
-    this.timeoutMs = deps.timeoutMs
-  }
+  private constructor() {}
 
   static create(depsValue?: unknown): Tm1AliasOwnershipVerificationPort {
     parsePublicCreate(depsValue)
-    return new Tm1AliasOwnershipVerificationPort(bindTrustedProductionTransport())
-  }
-
-  static [TEST_SEAM](value: unknown): Tm1AliasOwnershipVerificationPort {
-    return new Tm1AliasOwnershipVerificationPort(parseTestDeps(value))
+    return new Tm1AliasOwnershipVerificationPort()
   }
 
   async verify(requestValue: unknown): Promise<object> {
@@ -121,10 +93,7 @@ export class Tm1AliasOwnershipVerificationPort {
       throw new Tm1AliasOwnershipVerificationError('ALIAS_UNCONFIRMED')
     }
     if (parsed.expiresAt !== undefined) {
-      const trustedNow = this.clock()
-      if (!Number.isFinite(trustedNow)) {
-        throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
-      }
+      const trustedNow = readTrustedNow()
       if (trustedNow >= parsed.expiresAt) {
         throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_EXPIRED')
       }
@@ -140,14 +109,16 @@ export class Tm1AliasOwnershipVerificationPort {
 
   private async observeAliasOwnership(alias: string, signal?: AbortSignal): Promise<unknown> {
     if (signal?.aborted) unavailable()
+    const fetchImpl = globalThis.fetch
+    if (typeof fetchImpl !== 'function') unavailable()
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs)
+    const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
     const onAbort = (): void => {
       controller.abort()
     }
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
-      const response = await this.fetchImpl(`${this.endpointUrl}/${encodeURIComponent(alias)}`, {
+      const response = await fetchImpl(`${TRUSTED_ALIAS_ENDPOINT}/${encodeURIComponent(alias)}`, {
         method: 'GET',
         credentials: 'omit',
         redirect: 'error',
@@ -172,95 +143,17 @@ export function createTm1AliasOwnershipVerificationPort(
   return Tm1AliasOwnershipVerificationPort.create(depsValue)
 }
 
-function bindTransport(deps: FrozenDeps): FrozenDeps {
-  const frozen = objectFreeze({
-    fetch: deps.fetch,
-    clock: deps.clock,
-    endpointUrl: deps.endpointUrl,
-    timeoutMs: deps.timeoutMs
-  })
-  authenticDeps.add(frozen)
-  return frozen
-}
-
-function bindTrustedProductionTransport(): FrozenDeps {
-  if (typeof trustedFetch !== 'function') invalidInput()
-  return bindTransport({
-    fetch: trustedFetch,
-    clock: dateNow,
-    endpointUrl: TRUSTED_ALIAS_ENDPOINT,
-    timeoutMs: DEFAULT_TIMEOUT_MS
-  })
-}
-
 function parsePublicCreate(value: unknown): void {
   if (value === undefined || value === null) return
   allowedRecord(value, [])
 }
 
-function parseTestDeps(value: unknown): FrozenDeps {
-  const source = allowedRecord(value, ['fetch', 'clock', 'endpointUrl', 'timeoutMs'])
-  if (
-    !Reflect.ownKeys(source).includes('fetch') ||
-    !Reflect.ownKeys(source).includes('clock')
-  ) invalidInput()
-  const fetchImpl = dataValue(source, 'fetch')
-  const clock = dataValue(source, 'clock')
-  if (typeof fetchImpl !== 'function' || typeof clock !== 'function') invalidInput()
-  const endpointUrl = Reflect.ownKeys(source).includes('endpointUrl')
-    ? normalizeEndpointUrl(dataValue(source, 'endpointUrl'))
-    : TRUSTED_ALIAS_ENDPOINT
-  const timeoutMs = Reflect.ownKeys(source).includes('timeoutMs')
-    ? requireTimeout(dataValue(source, 'timeoutMs'))
-    : DEFAULT_TIMEOUT_MS
-  return bindTransport({
-    fetch: fetchImpl as typeof fetch,
-    clock: clock as () => number,
-    endpointUrl,
-    timeoutMs
-  })
-}
-
-Object.defineProperty(createTm1AliasOwnershipVerificationPort, TEST_SEAM, {
-  value: (
-    Tm1AliasOwnershipVerificationPort as unknown as Record<
-      string,
-      (value: unknown) => Tm1AliasOwnershipVerificationPort
-    >
-  )[TEST_SEAM],
-  configurable: false,
-  enumerable: false,
-  writable: false
-})
-
-function normalizeEndpointUrl(value: unknown): string {
-  if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) invalidInput()
-  let endpoint: URL
-  try {
-    endpoint = new URL(value)
-  } catch {
-    return invalidInput()
+function readTrustedNow(): number {
+  const trustedNow = (Function.prototype.call.bind(Date.now) as () => number)()
+  if (!Number.isFinite(trustedNow)) {
+    throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
   }
-  if (endpoint.username.length > 0 || endpoint.password.length > 0) invalidInput()
-  if (endpoint.hash.length > 0 || endpoint.search.length > 0) invalidInput()
-  if (endpoint.protocol === 'https:') {
-    if (endpoint.hostname.length === 0) invalidInput()
-  } else if (endpoint.protocol === 'http:') {
-    if (!LOOPBACK_HOSTS.has(endpoint.hostname.toLowerCase())) invalidInput()
-  } else {
-    invalidInput()
-  }
-  const path = endpoint.pathname === '/' ? '' : endpoint.pathname.replace(/\/+$/, '')
-  return `${endpoint.origin}${path}`
-}
-
-function requireTimeout(value: unknown): number {
-  if (
-    !Number.isSafeInteger(value) ||
-    (value as number) <= 0 ||
-    (value as number) > MAX_TIMEOUT_MS
-  ) invalidInput()
-  return value as number
+  return trustedNow
 }
 
 async function decodeAliasResponse(response: Response, signal: AbortSignal): Promise<unknown> {

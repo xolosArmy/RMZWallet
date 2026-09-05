@@ -1,8 +1,6 @@
-import { describe, expect, test } from 'vitest'
-import {
-  createTm1AliasOwnershipVerificationPortForTests,
-  createTm1AliasOwnershipVerificationTestFetch
-} from './tm1AliasOwnershipVerificationPort.testFetch'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+import { createTm1AliasOwnershipVerificationPort } from './tm1AliasOwnershipVerificationPort'
+import { createTm1AliasOwnershipVerificationTestFetch } from './tm1AliasOwnershipVerificationPort.testFetch'
 import * as aliasAuth from './tm1AliasPublicationAuthorization'
 import {
   Tm1AliasPublicationAuthorizationError,
@@ -524,6 +522,11 @@ describe('TM1 alias publication authorization', () => {
 })
 
 describe('TM1 verified evidence expiry via verification port', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+  })
+
   const uniqueTxid = (tag: string): string => {
     const bytes = Array.from(tag, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('')
     return (bytes + 'cd'.repeat(32)).slice(0, 64)
@@ -534,23 +537,26 @@ describe('TM1 verified evidence expiry via verification port', () => {
   ) => {
     const alias = `${tag}.xec`
     const expiresAt = evidenceOverrides.expiresAt
-    const port = createTm1AliasOwnershipVerificationPortForTests({
-      fetch: createTm1AliasOwnershipVerificationTestFetch({
-        [alias]: {
-          status: 200,
-          json: {
-            alias,
-            address: OWNER,
-            txid: uniqueTxid(tag),
-            blockheight: 100,
-            status: 'confirmed',
-            ...evidenceOverrides
-          }
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: {
+          alias,
+          address: OWNER,
+          txid: uniqueTxid(tag),
+          blockheight: 100,
+          status: 'confirmed',
+          ...evidenceOverrides
         }
-      }),
-      clock: () => typeof expiresAt === 'number' ? expiresAt - 1 : Date.now()
-    })
+      }
+    }))
+    if (typeof expiresAt === 'number') {
+      vi.useFakeTimers()
+      vi.setSystemTime(expiresAt - 1)
+    }
+    const port = createTm1AliasOwnershipVerificationPort()
     const evidence = await port.verify({ alias, ownerAddress: OWNER })
+    vi.useRealTimers()
     return { alias, evidence }
   }
 
