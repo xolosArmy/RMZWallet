@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'vitest'
 import * as portApi from './tm1AliasOwnershipVerificationPort'
 import {
+  Tm1AliasOwnershipVerificationPort,
   createTm1AliasOwnershipVerificationPort,
   Tm1AliasOwnershipVerificationError
 } from './tm1AliasOwnershipVerificationPort'
 import {
+  createTm1AliasOwnershipVerificationPortForTests,
   createTm1AliasOwnershipVerificationTestFetch,
   type Tm1AliasOwnershipTestFetchResponse
 } from './tm1AliasOwnershipVerificationPort.testFetch'
@@ -50,7 +52,7 @@ function portWith(
   response: Tm1AliasOwnershipTestFetchResponse,
   clock: () => number = () => 1_700_000_000_000
 ) {
-  const verifier = createTm1AliasOwnershipVerificationPort({
+  const verifier = createTm1AliasOwnershipVerificationPortForTests({
     fetch: createTm1AliasOwnershipVerificationTestFetch({
       [`${tag}.xec`]: response
     }),
@@ -157,7 +159,7 @@ describe('TM1 alias ownership verification port', () => {
       ownerAddress: OWNER,
       evidence: token
     })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
-    const later = createTm1AliasOwnershipVerificationPort({
+    const later = createTm1AliasOwnershipVerificationPortForTests({
       fetch: createTm1AliasOwnershipVerificationTestFetch({
         'vpf.xec': ok('vpf', { txid: txidFrom('vpfz'), blockheight: 50 })
       }),
@@ -225,6 +227,33 @@ describe('TM1 alias ownership verification port', () => {
     })).toThrowError(expect.objectContaining(UNTRUSTED))
   })
 
+  test('P1: public factory does not accept fetch or endpointUrl', async () => {
+    const tag = 'p1fetch'
+    const alias = `${tag}.xec`
+    const fetchImpl = (async () => new Response(JSON.stringify(aliasRecord(tag)), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })) as typeof fetch
+    let port: ReturnType<typeof createTm1AliasOwnershipVerificationPort> | undefined
+    try {
+      port = createTm1AliasOwnershipVerificationPort({
+        fetch: fetchImpl,
+        clock: () => 1,
+        endpointUrl: 'https://evil.example/alias'
+      })
+    } catch {
+      port = undefined
+    }
+    expect(port).toBeUndefined()
+    if (port === undefined) return
+    const token = await port.verify({ alias, ownerAddress: OWNER })
+    expect(() => createTm1AliasPublicationAuthorizer().issue({
+      alias,
+      ownerAddress: OWNER,
+      evidence: token
+    })).toThrowError(expect.objectContaining(UNTRUSTED))
+  })
+
   test('P1: production factory does not accept arbitrary observe()', async () => {
     const tag = 'p1obs'
     const alias = `${tag}.xec`
@@ -247,9 +276,16 @@ describe('TM1 alias ownership verification port', () => {
     })).toThrowError(expect.objectContaining(UNTRUSTED))
   })
 
-  test('factory requires fetch and clock and rejects observe()', () => {
-    expect(() => createTm1AliasOwnershipVerificationPort({}))
-      .toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
+  test('public factory rejects fetch, endpointUrl, observe, and clock', () => {
+    expect(() => createTm1AliasOwnershipVerificationPort({
+      fetch: createTm1AliasOwnershipVerificationTestFetch({}),
+      clock: () => 1
+    })).toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
+    expect(() => createTm1AliasOwnershipVerificationPort({
+      fetch: createTm1AliasOwnershipVerificationTestFetch({}),
+      clock: () => 1,
+      endpointUrl: 'https://evil.example/alias'
+    })).toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
     expect(() => createTm1AliasOwnershipVerificationPort({
       observe: async () => aliasRecord('needc'),
       clock: () => 1
@@ -257,9 +293,11 @@ describe('TM1 alias ownership verification port', () => {
     expect(() => createTm1AliasOwnershipVerificationPort({
       clock: () => 1
     })).toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
-    expect(() => createTm1AliasOwnershipVerificationPort({
-      fetch: createTm1AliasOwnershipVerificationTestFetch({})
-    })).toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
+    const port = createTm1AliasOwnershipVerificationPort()
+    expect(port).toBeInstanceOf(Tm1AliasOwnershipVerificationPort)
+    expect(createTm1AliasOwnershipVerificationPort({})).toBeInstanceOf(
+      Tm1AliasOwnershipVerificationPort
+    )
     expect(portApi).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')
     expect(portApi).not.toHaveProperty('mintVerifiedAliasOwnershipEvidence')
     expect(aliasAuth).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')

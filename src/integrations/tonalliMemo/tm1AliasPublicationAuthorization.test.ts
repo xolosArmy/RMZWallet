@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'vitest'
-import { createTm1AliasOwnershipVerificationPort } from './tm1AliasOwnershipVerificationPort'
-import { createTm1AliasOwnershipVerificationTestFetch } from './tm1AliasOwnershipVerificationPort.testFetch'
+import {
+  createTm1AliasOwnershipVerificationPortForTests,
+  createTm1AliasOwnershipVerificationTestFetch
+} from './tm1AliasOwnershipVerificationPort.testFetch'
 import * as aliasAuth from './tm1AliasPublicationAuthorization'
 import {
   Tm1AliasPublicationAuthorizationError,
@@ -532,7 +534,7 @@ describe('TM1 verified evidence expiry via verification port', () => {
   ) => {
     const alias = `${tag}.xec`
     const expiresAt = evidenceOverrides.expiresAt
-    const port = createTm1AliasOwnershipVerificationPort({
+    const port = createTm1AliasOwnershipVerificationPortForTests({
       fetch: createTm1AliasOwnershipVerificationTestFetch({
         [alias]: {
           status: 200,

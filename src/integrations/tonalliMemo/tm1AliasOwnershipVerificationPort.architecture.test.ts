@@ -80,14 +80,18 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(portRuntime).toContain('NOT SUFFICIENT TO ENABLE PUBLICATION')
   })
 
-  test('production factory binds alias.ecash.mx and rejects caller observe()', () => {
-    const parse = portRuntime.slice(
-      portRuntime.indexOf('function parseDeps('),
-      portRuntime.indexOf('function normalizeEndpointUrl(')
+  test('public factory binds trusted transport and rejects fetch/endpointUrl', () => {
+    const parsePublic = portRuntime.slice(
+      portRuntime.indexOf('function parsePublicCreate('),
+      portRuntime.indexOf('function parseTestDeps(')
     )
-    expect(parse).toContain("'fetch'")
-    expect(parse).toContain("'clock'")
-    expect(parse).not.toContain("'observe'")
+    expect(parsePublic).toContain('allowedRecord(value, [])')
+    expect(parsePublic).not.toContain("'fetch'")
+    expect(parsePublic).not.toContain("'endpointUrl'")
+    expect(parsePublic).not.toContain("'observe'")
+    expect(portRuntime).toContain("TRUSTED_ALIAS_ENDPOINT = 'https://alias.ecash.mx/alias'")
+    expect(portRuntime).toContain('trustedFetch = globalThis.fetch')
+    expect(portApi).not.toHaveProperty('createTm1AliasOwnershipVerificationPortForTests')
     expect(portRuntime).toContain('observeAliasOwnership')
     expect(portRuntime).not.toContain('createTm1InMemory')
     expect(portRuntime).not.toMatch(/Date\.now\s*\(/)

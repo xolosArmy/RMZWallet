@@ -27,12 +27,16 @@ export class Tm1AliasOwnershipVerificationError extends Error {
   }
 }
 
-const DEFAULT_ALIAS_ENDPOINT = 'https://alias.ecash.mx/alias'
+const TRUSTED_ALIAS_ENDPOINT = 'https://alias.ecash.mx/alias'
 const DEFAULT_TIMEOUT_MS = 8_000
 const MAX_TIMEOUT_MS = 60_000
 const MAX_RESPONSE_BYTES = 65_536
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
 const TXID_PATTERN = /^[0-9a-f]{64}$/
+const TEST_SEAM = 'tonalli.tm1AliasOwnershipVerificationPort.createForTests'
+const trustedFetch = globalThis.fetch
+const dateNow = Function.prototype.call.bind(Date.now) as () => number
+const authenticDeps = new WeakSet<object>()
 
 type FrozenDeps = Readonly<{
   fetch: typeof fetch
@@ -89,16 +93,21 @@ export class Tm1AliasOwnershipVerificationPort {
   private readonly endpointUrl: string
   private readonly timeoutMs: number
 
-  private constructor(depsValue: unknown) {
-    const deps = parseDeps(depsValue)
+  private constructor(deps: FrozenDeps) {
+    if (!authenticDeps.has(deps)) invalidInput()
     this.fetchImpl = deps.fetch
     this.clock = deps.clock
     this.endpointUrl = deps.endpointUrl
     this.timeoutMs = deps.timeoutMs
   }
 
-  static create(depsValue: unknown): Tm1AliasOwnershipVerificationPort {
-    return new Tm1AliasOwnershipVerificationPort(depsValue)
+  static create(depsValue?: unknown): Tm1AliasOwnershipVerificationPort {
+    parsePublicCreate(depsValue)
+    return new Tm1AliasOwnershipVerificationPort(bindTrustedProductionTransport())
+  }
+
+  static [TEST_SEAM](value: unknown): Tm1AliasOwnershipVerificationPort {
+    return new Tm1AliasOwnershipVerificationPort(parseTestDeps(value))
   }
 
   async verify(requestValue: unknown): Promise<object> {
@@ -158,12 +167,38 @@ export class Tm1AliasOwnershipVerificationPort {
 }
 
 export function createTm1AliasOwnershipVerificationPort(
-  depsValue: unknown
+  depsValue?: unknown
 ): Tm1AliasOwnershipVerificationPort {
   return Tm1AliasOwnershipVerificationPort.create(depsValue)
 }
 
-function parseDeps(value: unknown): FrozenDeps {
+function bindTransport(deps: FrozenDeps): FrozenDeps {
+  const frozen = objectFreeze({
+    fetch: deps.fetch,
+    clock: deps.clock,
+    endpointUrl: deps.endpointUrl,
+    timeoutMs: deps.timeoutMs
+  })
+  authenticDeps.add(frozen)
+  return frozen
+}
+
+function bindTrustedProductionTransport(): FrozenDeps {
+  if (typeof trustedFetch !== 'function') invalidInput()
+  return bindTransport({
+    fetch: trustedFetch,
+    clock: dateNow,
+    endpointUrl: TRUSTED_ALIAS_ENDPOINT,
+    timeoutMs: DEFAULT_TIMEOUT_MS
+  })
+}
+
+function parsePublicCreate(value: unknown): void {
+  if (value === undefined || value === null) return
+  allowedRecord(value, [])
+}
+
+function parseTestDeps(value: unknown): FrozenDeps {
   const source = allowedRecord(value, ['fetch', 'clock', 'endpointUrl', 'timeoutMs'])
   if (
     !Reflect.ownKeys(source).includes('fetch') ||
@@ -174,17 +209,29 @@ function parseDeps(value: unknown): FrozenDeps {
   if (typeof fetchImpl !== 'function' || typeof clock !== 'function') invalidInput()
   const endpointUrl = Reflect.ownKeys(source).includes('endpointUrl')
     ? normalizeEndpointUrl(dataValue(source, 'endpointUrl'))
-    : DEFAULT_ALIAS_ENDPOINT
+    : TRUSTED_ALIAS_ENDPOINT
   const timeoutMs = Reflect.ownKeys(source).includes('timeoutMs')
     ? requireTimeout(dataValue(source, 'timeoutMs'))
     : DEFAULT_TIMEOUT_MS
-  return objectFreeze({
+  return bindTransport({
     fetch: fetchImpl as typeof fetch,
     clock: clock as () => number,
     endpointUrl,
     timeoutMs
   })
 }
+
+Object.defineProperty(createTm1AliasOwnershipVerificationPort, TEST_SEAM, {
+  value: (
+    Tm1AliasOwnershipVerificationPort as unknown as Record<
+      string,
+      (value: unknown) => Tm1AliasOwnershipVerificationPort
+    >
+  )[TEST_SEAM],
+  configurable: false,
+  enumerable: false,
+  writable: false
+})
 
 function normalizeEndpointUrl(value: unknown): string {
   if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) invalidInput()

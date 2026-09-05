@@ -8,18 +8,16 @@ enablement. App / routes / RegisterAlias / orchestrator stay unwired.
 
 ## Factory
 
-`createTm1AliasOwnershipVerificationPort({ fetch, clock, endpointUrl?, timeoutMs? })`
+`createTm1AliasOwnershipVerificationPort()` / `create({})`
 
-`fetch` and `clock` are required. There is no caller `observe()` parameter
-and no in-memory fake in this module. Observation is bound to
-`https://alias.ecash.mx/alias` (same protocol as `useAliasResolution`).
-Tests inject a fetch double from
-`tm1AliasOwnershipVerificationPort.testFetch.ts`, which App / routes
+Public create binds `globalThis.fetch` and frozen
+`https://alias.ecash.mx/alias` inside the module. Passing `fetch`,
+`endpointUrl`, `observe`, or `clock` is extra input
+(`INVALID_ALIAS_AUTHORIZATION_INPUT`).
+
+Tests use `createTm1AliasOwnershipVerificationPortForTests({ fetch, clock })`
+from `tm1AliasOwnershipVerificationPort.testFetch.ts`, which App / routes
 must not import.
-
-- `fetch` → HTTP GET of `{endpointUrl}/{alias}`. Never a lambda that
-  returns confirmed evidence.
-- `clock()` → trusted millisecond timestamp. Never `request.now`.
 
 ## Verify
 
