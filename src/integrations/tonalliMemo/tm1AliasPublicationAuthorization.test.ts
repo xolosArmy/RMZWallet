@@ -212,7 +212,7 @@ describe('TM1 alias publication authorization', () => {
         expiresAt: 10
       }),
       now: 10
-    }))).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
+    }))).toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
   })
 
   test('failed issue does not return a sign or broadcast capability', () => {
@@ -241,9 +241,22 @@ describe('TM1 alias publication authorization', () => {
   test('caller-supplied expiresAt does not skip UNTRUSTED', () => {
     const { request, evidence } = fixture('expun')
     expect(() => authorizer().issue(request({
-      evidence: evidence({ expiresAt: 1_800_000_000_000 }),
-      now: 1_700_000_000_000
+      evidence: evidence({ expiresAt: 1_800_000_000_000 })
     }))).toThrowError(expect.objectContaining(UNTRUSTED))
+  })
+
+  test('caller-supplied confirmed evidence with now:0 is rejected extra input', () => {
+    const { request } = fixture('now0')
+    expect(() => authorizer().issue(request({ now: 0 }))).toThrowError(
+      expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
+    )
+  })
+
+  test('extra field now does not mint', () => {
+    const { request } = fixture('nowx')
+    expect(() => authorizer().issue(request({ now: 1_700_000_000_000 }))).toThrowError(
+      expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
+    )
   })
 
   test('canonical CashAddr casing is parsed then rejected as untrusted', () => {

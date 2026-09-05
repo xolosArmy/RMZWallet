@@ -79,6 +79,7 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(runtime).toContain('Function.prototype.call.bind(Map.prototype.set)')
     expect(runtime).toContain('Function.prototype.call.bind(Array.prototype.join)')
     expect(runtime).toContain('Function.prototype.call.bind(String)')
+    expect(runtime).toContain('Function.prototype.call.bind(Date.now)')
     expect(runtime).not.toMatch(/function\s+(reset|clear)/)
     expect(runtime).not.toMatch(/\.clear\s*\(/)
     expect(runtime).not.toMatch(/this\.ledger\.consumedProofs/)
@@ -121,6 +122,24 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(runtime).not.toMatch(/export function mintVerifiedAliasPublicationEvidence/)
     expect(aliasAuth).not.toHaveProperty('createTm1InMemoryAliasPublicationAuthorizationLedger')
     expect(aliasAuth).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')
+  })
+
+  test('expiry uses captured Date.now and rejects caller now', () => {
+    const production = runtime.slice(0, runtime.indexOf('if (import.meta.vitest)'))
+    const issue = production.slice(
+      production.indexOf('\n  issue('),
+      production.indexOf('export function createTm1AliasPublicationAuthorizer')
+    )
+    const parse = production.slice(
+      production.indexOf('function parseRequest('),
+      production.indexOf('function parseEvidence(')
+    )
+    expect(issue).toContain('dateNow()')
+    expect(issue).not.toMatch(/Date\.now\s*\(/)
+    expect(issue).not.toMatch(/request\.now/)
+    expect(parse).not.toMatch(/'now'/)
+    expect(production).not.toMatch(/function\s+(setClock|fakeNow)/)
+    expect(production).not.toMatch(/export function setClock/)
   })
 
   test('verified snapshot preserves expiresAt when present and omits it when absent', () => {

@@ -92,6 +92,7 @@ const applyString = Function.prototype.call.bind(String) as (
   thisArg: unknown,
   value: unknown
 ) => string
+const dateNow = Function.prototype.call.bind(Date.now) as () => number
 
 const ledgerStates = new WeakMap<object, LedgerState>()
 
@@ -248,8 +249,9 @@ export class Tm1AliasPublicationAuthorizer {
       fail('ALIAS_PROOF_UNVERIFIABLE')
     }
     if (evidence.expiresAt !== undefined) {
-      if (request.now === undefined) fail('ALIAS_PROOF_UNVERIFIABLE')
-      if (request.now >= evidence.expiresAt) fail('ALIAS_PROOF_EXPIRED')
+      const trustedNow = dateNow()
+      if (!Number.isFinite(trustedNow)) fail('ALIAS_PROOF_UNVERIFIABLE')
+      if (trustedNow >= evidence.expiresAt) fail('ALIAS_PROOF_EXPIRED')
     }
     if (!request.verified) fail('ALIAS_EVIDENCE_UNTRUSTED')
     return commitVerifiedAuthorization(this.ledger, request)
@@ -318,7 +320,6 @@ type ParsedRequest = Readonly<{
   ownerAddress: string
   evidence: ParsedEvidence
   verified: boolean
-  now?: number
   tipHeight?: number
 }>
 
@@ -327,7 +328,6 @@ function parseRequest(value: unknown): ParsedRequest {
     'alias',
     'ownerAddress',
     'evidence',
-    'now',
     'tipHeight'
   ])
   if (
@@ -335,7 +335,6 @@ function parseRequest(value: unknown): ParsedRequest {
     !Reflect.ownKeys(source).includes('ownerAddress') ||
     !Reflect.ownKeys(source).includes('evidence')
   ) invalidInput()
-  const now = optionalSafeInteger(source, 'now')
   const tipHeight = optionalSafeInteger(source, 'tipHeight')
   if (tipHeight !== undefined && tipHeight < 0) fail('ALIAS_PROOF_UNVERIFIABLE')
   const alias = requireAlias(dataValue(source, 'alias'))
@@ -357,7 +356,6 @@ function parseRequest(value: unknown): ParsedRequest {
     ownerAddress,
     evidence,
     verified: verifiedSnapshot !== undefined,
-    ...(now === undefined ? {} : { now }),
     ...(tipHeight === undefined ? {} : { tipHeight })
   })
 }
@@ -474,7 +472,6 @@ function fail(code: Tm1AliasPublicationAuthorizationErrorCode): never {
 if (import.meta.vitest) {
   const { describe, expect, test } = import.meta.vitest
   const owner = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
-  const now = 1_700_000_000_000
   const uniqueTxid = (tag: string): string => {
     const bytes = Array.from(tag, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('')
     return (bytes + 'cd'.repeat(32)).slice(0, 64)
@@ -504,16 +501,24 @@ if (import.meta.vitest) {
   describe('TM1 verified evidence expiry (unexported mint)', () => {
     test('P2: verified evidence with expiresAt in the past is expired', () => {
       expect(() => mintAndIssue('vexp', {
-        expiresAt: now - 60_000
-      }, { now })).toThrowError(
+        expiresAt: Date.now() - 60_000
+      })).toThrowError(
         expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
+      )
+    })
+
+    test('P2 clock: expired verified evidence with now:0 is rejected', () => {
+      expect(() => mintAndIssue('clk0', {
+        expiresAt: Date.now() - 60_000
+      }, { now: 0 })).toThrowError(
+        expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
       )
     })
 
     test('verified evidence with expiresAt in the future can reach commit', () => {
       const authorization = mintAndIssue('vfut', {
-        expiresAt: now + 60_000
-      }, { now })
+        expiresAt: Date.now() + 60_000
+      })
       expect(authorization).toMatchObject({
         alias: 'vfut.xec',
         ownerAddress: owner,
@@ -523,25 +528,51 @@ if (import.meta.vitest) {
     })
 
     test('verified evidence without expiresAt does not take the expiry branch', () => {
-      const authorization = mintAndIssue('vnexp', {}, { now })
+      const authorization = mintAndIssue('vnexp', {})
       expect(authorization).toMatchObject({ alias: 'vnexp.xec' })
     })
 
     test('expired verified evidence does not write replay or height', () => {
       expect(() => mintAndIssue('vled', {
-        expiresAt: now - 60_000,
+        expiresAt: Date.now() - 60_000,
         blockHeight: 500
-      }, { now })).toThrowError(
+      })).toThrowError(
         expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
       )
       const later = mintAndIssue('vled', {
         txid: uniqueTxid('vledz'),
         blockHeight: 50
-      }, { now })
+      })
       expect(later).toMatchObject({
         alias: 'vled.xec',
         evidenceBlockHeight: 50
       })
+    })
+
+    test('Date.now replaced after import does not move expiry', () => {
+      const originalNow = Date.now
+      Date.now = () => 0
+      try {
+        expect(() => mintAndIssue('clkcap', {
+          expiresAt: originalNow() - 60_000
+        })).toThrowError(
+          expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' })
+        )
+      } finally {
+        Date.now = originalNow
+      }
+    })
+
+    test('captured clock still commits future expiresAt after Date.now is replaced', () => {
+      const originalNow = Date.now
+      const expiresAt = originalNow() + 60_000
+      Date.now = () => Number.MAX_SAFE_INTEGER
+      try {
+        const authorization = mintAndIssue('clkfut', { expiresAt })
+        expect(authorization).toMatchObject({ alias: 'clkfut.xec' })
+      } finally {
+        Date.now = originalNow
+      }
     })
   })
 }
