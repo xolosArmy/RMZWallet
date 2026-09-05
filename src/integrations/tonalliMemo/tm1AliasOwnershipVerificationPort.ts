@@ -34,6 +34,23 @@ const TXID_PATTERN = /^[0-9a-f]{64}$/
 const fetchImpl = typeof globalThis.fetch === 'function'
   ? globalThis.fetch.bind(globalThis)
   : undefined
+const parseJson = JSON.parse.bind(JSON) as (text: string) => unknown
+const arrayIsArray = Array.isArray.bind(Array) as (value: unknown) => value is unknown[]
+const objectGetPrototypeOf = Object.getPrototypeOf.bind(Object) as (value: object) => object | null
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor.bind(Object) as (
+  value: object,
+  key: PropertyKey
+) => PropertyDescriptor | undefined
+const objectCreate = Object.create.bind(Object) as (proto: object | null) => object
+const objectPrototype = Object.prototype
+const reflectOwnKeys = Reflect.ownKeys.bind(Reflect) as (value: object) => PropertyKey[]
+const numberIsSafeInteger = Number.isSafeInteger.bind(Number) as (value: unknown) => boolean
+const numberIsFinite = Number.isFinite.bind(Number) as (value: unknown) => boolean
+const encodeUriComponent = encodeURIComponent
+const TextDecoderCtor = TextDecoder
+const AbortControllerCtor = AbortController
+const scheduleTimeout = setTimeout
+const cancelTimeout = clearTimeout
 
 const objectFreeze = Object.freeze as <T extends object>(value: T) => T
 const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as <V>(
@@ -68,7 +85,7 @@ const verifiedEvidenceSnapshots = new WeakMap<object, Tm1VerifiedAliasOwnershipS
 function mintVerifiedAliasOwnershipToken(
   parsed: Tm1VerifiedAliasOwnershipSnapshot
 ): object {
-  const token = objectFreeze(Object.create(null))
+  const token = objectFreeze(objectCreate(null))
   weakMapSet(verifiedEvidenceSnapshots, token, objectFreeze({
     alias: parsed.alias,
     address: parsed.address,
@@ -150,19 +167,19 @@ function requireAuthenticPort(value: unknown): asserts value is Tm1AliasOwnershi
 async function observeAliasOwnership(alias: string, signal?: AbortSignal): Promise<unknown> {
   if (signal?.aborted) unavailable()
   if (typeof fetchImpl !== 'function') unavailable()
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
+  const controller = new AbortControllerCtor()
+  const timer = scheduleTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
   const onAbort = (): void => {
     controller.abort()
   }
   signal?.addEventListener('abort', onAbort, { once: true })
   try {
-    const response = await fetchImpl(`${TRUSTED_ALIAS_ENDPOINT}/${encodeURIComponent(alias)}`, {
+    const response = await fetchImpl(`${TRUSTED_ALIAS_ENDPOINT}/${encodeUriComponent(alias)}`, {
       method: 'GET',
       credentials: 'omit',
       redirect: 'error',
       signal: controller.signal,
-      headers: Object.freeze({ accept: 'application/json' })
+      headers: objectFreeze({ accept: 'application/json' })
     })
     return await decodeAliasResponse(response, controller.signal)
   } catch (error) {
@@ -170,14 +187,14 @@ async function observeAliasOwnership(alias: string, signal?: AbortSignal): Promi
     if (error instanceof Tm1AliasPublicationAuthorizationError) throw error
     unavailable()
   } finally {
-    clearTimeout(timer)
+    cancelTimeout(timer)
     signal?.removeEventListener('abort', onAbort)
   }
 }
 
 function readTrustedNow(): number {
   const trustedNow = (Function.prototype.call.bind(Date.now) as () => number)()
-  if (!Number.isFinite(trustedNow)) {
+  if (!numberIsFinite(trustedNow)) {
     throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
   }
   return trustedNow
@@ -192,7 +209,7 @@ async function decodeAliasResponse(response: Response, signal: AbortSignal): Pro
   if (body.length === 0) unverifiable()
   let parsed: unknown
   try {
-    parsed = JSON.parse(body) as unknown
+    parsed = parseJson(body)
   } catch {
     unverifiable()
   }
@@ -204,7 +221,7 @@ async function readLimitedBody(response: Response, signal: AbortSignal): Promise
   const stream = response.body
   if (stream === null) return ''
   const reader = stream.getReader()
-  const decoder = new TextDecoder()
+  const decoder = new TextDecoderCtor()
   let received = 0
   const parts: string[] = []
   const abortRead = (): void => {
@@ -246,8 +263,8 @@ function parseVerifyRequest(value: unknown): Readonly<{
 }> {
   const source = allowedRecord(value, ['alias', 'ownerAddress', 'signal'])
   if (
-    !Reflect.ownKeys(source).includes('alias') ||
-    !Reflect.ownKeys(source).includes('ownerAddress')
+    !reflectOwnKeys(source).includes('alias') ||
+    !reflectOwnKeys(source).includes('ownerAddress')
   ) invalidInput()
   const aliasValue = dataValue(source, 'alias')
   if (typeof aliasValue !== 'string') invalidInput()
@@ -257,7 +274,7 @@ function parseVerifyRequest(value: unknown): Readonly<{
   if (typeof ownerValue !== 'string') invalidInput()
   const ownerAddress = canonicalizeEcashAddress(ownerValue)
   if (ownerAddress === null) invalidInput()
-  if (!Reflect.ownKeys(source).includes('signal')) {
+  if (!reflectOwnKeys(source).includes('signal')) {
     return objectFreeze({ alias, ownerAddress })
   }
   const signal = dataValue(source, 'signal')
@@ -294,18 +311,18 @@ function parseObservation(value: unknown): Readonly<{
     throw error
   }
   const required = ['alias', 'address', 'txid', 'status']
-  if (required.some(key => !Reflect.ownKeys(source).includes(key))) {
+  if (required.some(key => !reflectOwnKeys(source).includes(key))) {
     throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
   }
   const status = dataValue(source, 'status')
   if (typeof status !== 'string' || status.trim() !== status || status.length === 0) {
     throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
   }
-  if (!Reflect.ownKeys(source).includes('blockheight')) {
+  if (!reflectOwnKeys(source).includes('blockheight')) {
     throw new Tm1AliasOwnershipVerificationError('ALIAS_UNCONFIRMED')
   }
   const blockHeight = dataValue(source, 'blockheight')
-  if (!Number.isSafeInteger(blockHeight) || (blockHeight as number) < 0) {
+  if (!numberIsSafeInteger(blockHeight) || (blockHeight as number) < 0) {
     throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
   }
   const txidValue = dataValue(source, 'txid')
@@ -342,24 +359,24 @@ function optionalSafeInteger(
   source: Record<string, unknown>,
   key: string
 ): number | undefined {
-  if (!Reflect.ownKeys(source).includes(key)) return undefined
+  if (!reflectOwnKeys(source).includes(key)) return undefined
   const value = dataValue(source, key)
-  if (!Number.isSafeInteger(value)) invalidInput()
+  if (!numberIsSafeInteger(value)) invalidInput()
   return value as number
 }
 
 function allowedRecord(value: unknown, allowedKeys: readonly string[]): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) invalidInput()
+  if (value === null || typeof value !== 'object' || arrayIsArray(value)) invalidInput()
   let prototype: object | null
   let keys: readonly PropertyKey[]
   try {
-    prototype = Object.getPrototypeOf(value)
-    keys = Reflect.ownKeys(value)
+    prototype = objectGetPrototypeOf(value)
+    keys = reflectOwnKeys(value)
   } catch {
     return invalidInput()
   }
   if (
-    prototype !== Object.prototype && prototype !== null ||
+    prototype !== objectPrototype && prototype !== null ||
     keys.some(key => typeof key !== 'string' || !allowedKeys.includes(key))
   ) invalidInput()
   return value as Record<string, unknown>
@@ -368,7 +385,7 @@ function allowedRecord(value: unknown, allowedKeys: readonly string[]): Record<s
 function dataValue(source: Record<string, unknown>, key: string): unknown {
   let descriptor: PropertyDescriptor | undefined
   try {
-    descriptor = Object.getOwnPropertyDescriptor(source, key)
+    descriptor = objectGetOwnPropertyDescriptor(source, key)
   } catch {
     return invalidInput()
   }

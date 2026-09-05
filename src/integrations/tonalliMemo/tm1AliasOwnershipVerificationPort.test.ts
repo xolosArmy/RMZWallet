@@ -266,6 +266,40 @@ describe('TM1 alias ownership verification port', () => {
     expect(minted).toBeUndefined()
   })
 
+  test('P1: post-import JSON.parse replacement cannot mint', async () => {
+    const tag = 'p1json'
+    const alias = `${tag}.xec`
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { address: OTHER_OWNER })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const previous = JSON.parse
+    JSON.parse = (() => aliasRecord(tag)) as typeof JSON.parse
+    let minted: object | undefined
+    try {
+      const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      JSON.parse = previous
+    }
+    expect(minted).toBeUndefined()
+  })
+
   test('P1: prototype.verify.call with forged this cannot mint', async () => {
     const tag = 'p1this'
     const alias = `${tag}.xec`

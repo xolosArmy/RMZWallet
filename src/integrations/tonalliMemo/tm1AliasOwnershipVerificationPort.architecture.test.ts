@@ -91,6 +91,8 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(parsePublic).not.toContain("'observe'")
     expect(portRuntime).toContain("TRUSTED_ALIAS_ENDPOINT = 'https://alias.ecash.mx/alias'")
     expect(portRuntime).toContain('globalThis.fetch.bind(globalThis)')
+    expect(portRuntime).toContain('JSON.parse.bind(JSON)')
+    expect(portRuntime).not.toMatch(/JSON\.parse\s*\(/)
     expect(portRuntime).not.toMatch(/this\.observeAliasOwnership/)
     expect(portRuntime).not.toMatch(/this\[['"]observeAliasOwnership['"]\]/)
     expect(portRuntime).toContain('function observeAliasOwnership')

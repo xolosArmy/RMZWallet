@@ -10,11 +10,12 @@ enablement. App / routes / RegisterAlias / orchestrator stay unwired.
 
 `createTm1AliasOwnershipVerificationPort()` / `create({})`
 
-Public create captures `globalThis.fetch.bind(globalThis)` once at
+Public create captures `globalThis.fetch.bind(globalThis)` and
+`JSON.parse.bind(JSON)` (plus other decode primitives) once at
 module evaluation and GETs frozen `https://alias.ecash.mx/alias`.
 Passing `fetch`, `endpointUrl`, `observe`, or `clock` is extra input
 (`INVALID_ALIAS_AUTHORIZATION_INPUT`). Later mutation of
-`globalThis.fetch` does not change the bound transport.
+`globalThis.fetch` or `JSON.parse` does not change transport or decode.
 
 The production class and factory carry no test constructor. Tests that
 need fake HTTP stub `globalThis.fetch`, then `vi.resetModules()`, then
@@ -48,8 +49,8 @@ dispatched through `this`.
 Caller-supplied `{ status: 'confirmed', ... }` is still
 `ALIAS_EVIDENCE_UNTRUSTED` at `issue()`.
 
-Same-realm patch of `globalThis.fetch` *before* this module is first
-evaluated is process load-order, not a module API. This slice does
-not pin undici/native fetch.
+Same-realm patch of `globalThis.fetch` or `JSON.parse` *before* this
+module is first evaluated is process load-order, not a module API.
+This slice does not pin undici/native fetch.
 
 **NOT SUFFICIENT TO ENABLE PUBLICATION.**
