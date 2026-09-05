@@ -30,3 +30,13 @@ export const isValidEcashAddress = (input: string): boolean => {
     return false
   }
 }
+
+export const canonicalizeEcashAddress = (input: string): string | null => {
+  if (typeof input !== 'string' || input.trim() !== input) return null
+  if (!input.toLowerCase().startsWith('ecash:')) return null
+  try {
+    return Address.parse(input).cash().toString()
+  } catch {
+    return null
+  }
+}
