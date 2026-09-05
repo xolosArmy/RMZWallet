@@ -1,42 +1,48 @@
 import { describe, expect, test } from 'vitest'
+import * as aliasAuth from './tm1AliasPublicationAuthorization'
 import {
   Tm1AliasPublicationAuthorizationError,
   Tm1AliasPublicationAuthorizer,
   createTm1AliasPublicationAuthorizer,
-  createTm1InMemoryAliasPublicationAuthorizationLedger,
   parseTm1AliasPublicationAuthorization
 } from './tm1AliasPublicationAuthorization'
 
-const ALIAS = 'xolosarmy.xec'
 const OWNER = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
 const OTHER_OWNER = 'ecash:qrrd3y2cmg6m2vxlng9h3djh889pmwffhqv9yym2p4'
-const TXID = 'ab'.repeat(32)
-const LATER_TXID = 'cd'.repeat(32)
 
-function confirmedEvidence(overrides: Record<string, unknown> = {}) {
-  return {
-    alias: ALIAS,
+function txidFrom(tag: string): string {
+  const bytes = Array.from(tag, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('')
+  return (bytes + 'ab'.repeat(32)).slice(0, 64)
+}
+
+function fixture(tag: string) {
+  const alias = `${tag}.xec`
+  const txid = txidFrom(tag)
+  const laterTxid = txidFrom(`${tag}z`)
+  const evidence = (overrides: Record<string, unknown> = {}) => ({
+    alias,
     address: OWNER,
-    txid: TXID,
+    txid,
     blockHeight: 100,
     status: 'confirmed',
     ...overrides
+  })
+  const request = (overrides: Record<string, unknown> = {}) => {
+    const evidenceValue = overrides.evidence
+    const rest = { ...overrides }
+    delete rest.evidence
+    return {
+      alias,
+      ownerAddress: OWNER,
+      evidence: evidenceValue === undefined ? evidence() : evidenceValue,
+      ...rest
+    }
   }
+  return { alias, txid, laterTxid, evidence, request }
 }
 
-function request(overrides: Record<string, unknown> = {}) {
-  return {
-    alias: ALIAS,
-    ownerAddress: OWNER,
-    evidence: confirmedEvidence(),
-    ...overrides
-  }
-}
-
-function authorizer(
-  ledger = createTm1InMemoryAliasPublicationAuthorizationLedger()
-) {
-  return createTm1AliasPublicationAuthorizer(ledger)
+function authorizer() {
+  return createTm1AliasPublicationAuthorizer()
 }
 
 function rawLedgerBag() {
@@ -93,43 +99,114 @@ function collectClearableCollections(root: unknown): Array<Set<unknown> | Map<un
   return found
 }
 
+function patchIntrinsicsRecordingReceivers(receivers: object[]): () => void {
+  const originals = {
+    weakMapGet: WeakMap.prototype.get,
+    weakMapHas: WeakMap.prototype.has,
+    weakMapSet: WeakMap.prototype.set,
+    setHas: Set.prototype.has,
+    setAdd: Set.prototype.add,
+    mapGet: Map.prototype.get,
+    mapSet: Map.prototype.set
+  }
+  WeakMap.prototype.get = function (this: WeakMap<object, unknown>, key: object) {
+    receivers.push(this)
+    const value = originals.weakMapGet.call(this, key)
+    if (typeof value === 'object' && value !== null) receivers.push(value)
+    return value
+  } as typeof WeakMap.prototype.get
+  WeakMap.prototype.has = function (this: WeakMap<object, unknown>, key: object) {
+    receivers.push(this)
+    return originals.weakMapHas.call(this, key)
+  } as typeof WeakMap.prototype.has
+  WeakMap.prototype.set = function (this: WeakMap<object, unknown>, key: object, value: unknown) {
+    receivers.push(this)
+    if (typeof value === 'object' && value !== null) receivers.push(value)
+    return originals.weakMapSet.call(this, key, value)
+  } as typeof WeakMap.prototype.set
+  Set.prototype.has = function (this: Set<unknown>, value: unknown) {
+    receivers.push(this)
+    return originals.setHas.call(this, value)
+  } as typeof Set.prototype.has
+  Set.prototype.add = function (this: Set<unknown>, value: unknown) {
+    receivers.push(this)
+    return originals.setAdd.call(this, value)
+  } as typeof Set.prototype.add
+  Map.prototype.get = function (this: Map<unknown, unknown>, key: unknown) {
+    receivers.push(this)
+    return originals.mapGet.call(this, key)
+  } as typeof Map.prototype.get
+  Map.prototype.set = function (this: Map<unknown, unknown>, key: unknown, value: unknown) {
+    receivers.push(this)
+    return originals.mapSet.call(this, key, value)
+  } as typeof Map.prototype.set
+  return () => {
+    WeakMap.prototype.get = originals.weakMapGet
+    WeakMap.prototype.has = originals.weakMapHas
+    WeakMap.prototype.set = originals.weakMapSet
+    Set.prototype.has = originals.setHas
+    Set.prototype.add = originals.setAdd
+    Map.prototype.get = originals.mapGet
+    Map.prototype.set = originals.mapSet
+  }
+}
+
+function clearRecordedCollections(receivers: readonly object[]): void {
+  for (const receiver of receivers) {
+    if (receiver instanceof Set || receiver instanceof Map) {
+      receiver.clear()
+    } else if (typeof receiver === 'object' && receiver !== null) {
+      const state = receiver as {
+        consumedProofs?: Set<unknown>
+        latestBlockHeightByAlias?: Map<unknown, unknown>
+      }
+      state.consumedProofs?.clear()
+      state.latestBlockHeightByAlias?.clear()
+    }
+  }
+}
+
 describe('TM1 alias publication authorization', () => {
   test('confirmed alias with matching owner issues a bound authorization', () => {
+    const { alias, txid, request } = fixture('ok1')
     const authorization = authorizer().issue(request())
     const parsed = parseTm1AliasPublicationAuthorization(authorization)
 
     expect(parsed).toMatchObject({
-      alias: ALIAS,
+      alias,
       ownerAddress: OWNER,
-      evidenceTxid: TXID,
+      evidenceTxid: txid,
       evidenceBlockHeight: 100
     })
-    expect(parsed.authorizationId).toContain(ALIAS)
-    expect(parsed.authorizationId).toContain(TXID)
+    expect(parsed.authorizationId).toContain(alias)
+    expect(parsed.authorizationId).toContain(txid)
     expect(Object.isFrozen(parsed)).toBe(true)
   })
 
   test('unconfirmed alias does not issue authorization', () => {
+    const { request, evidence } = fixture('unconf')
     const issuer = authorizer()
     expect(() => issuer.issue(request({
-      evidence: confirmedEvidence({ status: 'pending' })
+      evidence: evidence({ status: 'pending' })
     }))).toThrowError(expect.objectContaining({ code: 'ALIAS_UNCONFIRMED' }))
     expect(() => issuer.issue(request({
-      evidence: confirmedEvidence({ blockHeight: 0, status: 'confirmed' })
+      evidence: evidence({ blockHeight: 0, status: 'confirmed' })
     }))).toThrowError(expect.objectContaining({ code: 'ALIAS_UNCONFIRMED' }))
   })
 
   test('alias or owner mismatch does not issue authorization', () => {
+    const { request, evidence } = fixture('mismatch')
     const issuer = authorizer()
     expect(() => issuer.issue(request({
       ownerAddress: OTHER_OWNER
     }))).toThrowError(expect.objectContaining({ code: 'ALIAS_OWNER_MISMATCH' }))
     expect(() => issuer.issue(request({
-      evidence: confirmedEvidence({ alias: 'other.xec' })
+      evidence: evidence({ alias: 'other.xec' })
     }))).toThrowError(expect.objectContaining({ code: 'ALIAS_OWNER_MISMATCH' }))
   })
 
   test('stale or replayed proof does not issue authorization', () => {
+    const { request, evidence, laterTxid } = fixture('stale1')
     const issuer = authorizer()
     issuer.issue(request())
 
@@ -137,11 +214,11 @@ describe('TM1 alias publication authorization', () => {
       expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
     )
     expect(() => issuer.issue(request({
-      evidence: confirmedEvidence({ txid: LATER_TXID, blockHeight: 50 })
+      evidence: evidence({ txid: laterTxid, blockHeight: 50 })
     }))).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_STALE' }))
     expect(() => issuer.issue(request({
-      evidence: confirmedEvidence({
-        txid: LATER_TXID,
+      evidence: evidence({
+        txid: laterTxid,
         blockHeight: 120,
         expiresAt: 10
       }),
@@ -150,6 +227,7 @@ describe('TM1 alias publication authorization', () => {
   })
 
   test('authorization object cannot call broadcast or sign', () => {
+    const { request } = fixture('nosign')
     const authorization = authorizer().issue(request())
     const keys = Reflect.ownKeys(authorization)
 
@@ -161,10 +239,10 @@ describe('TM1 alias publication authorization', () => {
     expect(Object.values(authorization).every(value => typeof value !== 'function')).toBe(true)
   })
 
-  test('two authorizer instances sharing a ledger reject replay of the same proof', () => {
-    const ledger = createTm1InMemoryAliasPublicationAuthorizationLedger()
-    const first = createTm1AliasPublicationAuthorizer(ledger)
-    const second = createTm1AliasPublicationAuthorizer(ledger)
+  test('two factory() calls share replay of the same proof', () => {
+    const { request } = fixture('share1')
+    const first = createTm1AliasPublicationAuthorizer()
+    const second = createTm1AliasPublicationAuthorizer()
     first.issue(request())
     expect(() => second.issue(request())).toThrowError(
       expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
@@ -172,110 +250,109 @@ describe('TM1 alias publication authorization', () => {
   })
 
   test('canonical CashAddr casing of the same owner issues authorization', () => {
-    const authorization = authorizer().issue({
-      alias: ALIAS,
+    const { request, evidence } = fixture('canon1')
+    const authorization = authorizer().issue(request({
       ownerAddress: OWNER.toUpperCase(),
-      evidence: confirmedEvidence()
-    })
+      evidence: evidence()
+    }))
     expect(authorization.ownerAddress).toBe(OWNER)
     expect(parseTm1AliasPublicationAuthorization(authorization).ownerAddress).toBe(OWNER)
   })
 
-  test('missing ledger fails closed', () => {
-    expect(() => createTm1AliasPublicationAuthorizer(undefined))
-      .toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
-    expect(() => createTm1AliasPublicationAuthorizer({}))
-      .toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
-    expect(() => Tm1AliasPublicationAuthorizer.create(undefined))
-      .toThrowError(expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' }))
-  })
-
   test('missing, extra, or unverifiable evidence fails closed', () => {
+    const { alias, request, evidence } = fixture('extra1')
     const issuer = authorizer()
     expect(() => issuer.issue({
-      alias: ALIAS,
+      alias,
       ownerAddress: OWNER
     })).toThrowError(Tm1AliasPublicationAuthorizationError)
     expect(() => issuer.issue(request({ extra: true }))).toThrowError(
       expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
     )
     expect(() => issuer.issue(request({
-      evidence: confirmedEvidence({ txid: 'zz'.repeat(32) })
+      evidence: evidence({ txid: 'zz'.repeat(32) })
     }))).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_UNVERIFIABLE' }))
     expect(() => issuer.issue(request({
-      evidence: confirmedEvidence({ blockHeight: 200 }),
+      evidence: evidence({ blockHeight: 200 }),
       tipHeight: 150
     }))).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_UNVERIFIABLE' }))
   })
 
   test('raw Set/Map bag does not construct a usable issuer', () => {
     const bag = rawLedgerBag()
-    expect(() => createTm1AliasPublicationAuthorizer(bag)).toThrowError(
-      expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
-    )
-    expect(() => Tm1AliasPublicationAuthorizer.create(bag)).toThrowError(
-      expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
-    )
     const Stolen = Tm1AliasPublicationAuthorizer as unknown as {
       new (ledger: unknown): unknown
     }
     expect(() => new Stolen(bag)).toThrowError(
       expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
     )
+    expect(() => new Stolen({})).toThrowError(
+      expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
+    )
+    expect(() => new Stolen(undefined)).toThrowError(
+      expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
+    )
   })
 
-  test('after issue(), ledger has no clearable collections that re-issue the same proof', () => {
-    const ledger = createTm1InMemoryAliasPublicationAuthorizationLedger()
-    const issuer = createTm1AliasPublicationAuthorizer(ledger)
+  test('after issue(), authorizer has no clearable collections that re-issue the same proof', () => {
+    const { request, evidence, laterTxid } = fixture('opaque1')
+    const issuer = authorizer()
     issuer.issue(request())
 
-    expect(Reflect.ownKeys(ledger)).toEqual([])
-    expect('consumedProofs' in ledger).toBe(false)
-    expect('latestBlockHeightByAlias' in ledger).toBe(false)
-    expect('clear' in ledger).toBe(false)
-    expect('reset' in ledger).toBe(false)
-    expect(JSON.stringify(ledger)).toBe('{}')
+    expect('consumedProofs' in issuer).toBe(false)
+    expect('latestBlockHeightByAlias' in issuer).toBe(false)
+    expect('clear' in issuer).toBe(false)
+    expect('reset' in issuer).toBe(false)
 
-    const leaked = (ledger as {
+    const leaked = (issuer as unknown as {
       consumedProofs?: Set<string>
       latestBlockHeightByAlias?: Map<string, number>
+      ledger?: {
+        consumedProofs?: Set<string>
+        latestBlockHeightByAlias?: Map<string, number>
+      }
     })
     leaked.consumedProofs?.clear()
     leaked.latestBlockHeightByAlias?.clear()
+    leaked.ledger?.consumedProofs?.clear()
+    leaked.ledger?.latestBlockHeightByAlias?.clear()
 
     for (const collection of [
-      ...collectClearableCollections(ledger),
       ...collectClearableCollections(issuer),
-      ...collectClearableCollections(JSON.parse(JSON.stringify(ledger))),
-      ...collectClearableCollections(Object.create(ledger as object)),
-      ...collectClearableCollections(new Proxy(ledger as object, {}))
+      ...collectClearableCollections(JSON.parse(JSON.stringify(issuer))),
+      ...collectClearableCollections(Object.create(issuer as object)),
+      ...collectClearableCollections(new Proxy(issuer as object, {}))
     ]) {
       collection.clear()
     }
 
-    expect(() => createTm1AliasPublicationAuthorizer(ledger).issue(request())).toThrowError(
+    expect(() => createTm1AliasPublicationAuthorizer().issue(request())).toThrowError(
       expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
     )
     expect(() => issuer.issue(request({
-      evidence: confirmedEvidence({ txid: LATER_TXID, blockHeight: 50 })
+      evidence: evidence({ txid: laterTxid, blockHeight: 50 })
     }))).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_STALE' }))
   })
 
   test('Object.create, Proxy, and prototype walk cannot yield a clearable shared ledger', () => {
-    const ledger = createTm1InMemoryAliasPublicationAuthorizationLedger()
-    createTm1AliasPublicationAuthorizer(ledger).issue(request())
+    const { request } = fixture('proxy1')
+    const issuer = createTm1AliasPublicationAuthorizer()
+    issuer.issue(request())
 
-    expect(() => createTm1AliasPublicationAuthorizer(Object.create(ledger))).toThrowError(
+    const Stolen = Tm1AliasPublicationAuthorizer as unknown as {
+      new (ledger: unknown): unknown
+    }
+    expect(() => new Stolen(Object.create(issuer))).toThrowError(
       expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
     )
-    expect(() => createTm1AliasPublicationAuthorizer(new Proxy(ledger, {}))).toThrowError(
+    expect(() => new Stolen(new Proxy(issuer, {}))).toThrowError(
       expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
     )
-    expect(() => Tm1AliasPublicationAuthorizer.create(Object.create(null))).toThrowError(
+    expect(() => new Stolen(Object.create(null))).toThrowError(
       expect.objectContaining({ code: 'INVALID_ALIAS_AUTHORIZATION_INPUT' })
     )
 
-    let cursor: object | null = ledger as object
+    let cursor: object | null = issuer as object
     const walked = new Set<object>()
     while (cursor !== null && !walked.has(cursor)) {
       walked.add(cursor)
@@ -285,19 +362,48 @@ describe('TM1 alias publication authorization', () => {
       cursor = Object.getPrototypeOf(cursor)
     }
 
-    expect(() => createTm1AliasPublicationAuthorizer(ledger).issue(request())).toThrowError(
+    expect(() => createTm1AliasPublicationAuthorizer().issue(request())).toThrowError(
       expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
     )
   })
 
-  test('distinct opaque ledgers do not share replay state', () => {
-    const first = createTm1AliasPublicationAuthorizer(
-      createTm1InMemoryAliasPublicationAuthorizationLedger()
-    )
-    const second = createTm1AliasPublicationAuthorizer(
-      createTm1InMemoryAliasPublicationAuthorizationLedger()
-    )
+  test('P1-A: patched WeakMap/Set/Map prototypes cannot re-issue after clear', () => {
+    const { request } = fixture('p1a')
+    const issuer = authorizer()
+    issuer.issue(request())
+    const receivers: object[] = []
+    const restore = patchIntrinsicsRecordingReceivers(receivers)
+    try {
+      try {
+        issuer.issue(request())
+      } catch {
+        /* first replay attempt records receivers if prototype-dispatched */
+      }
+      clearRecordedCollections(receivers)
+      expect(() => issuer.issue(request())).toThrowError(
+        expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
+      )
+    } finally {
+      restore()
+    }
+  })
+
+  test('P1-B: a normal consumer cannot obtain a second ledger identity', () => {
+    const { request } = fixture('p1b')
+    expect(aliasAuth).not.toHaveProperty('createTm1InMemoryAliasPublicationAuthorizationLedger')
+    const first = createTm1AliasPublicationAuthorizer()
+    const second = createTm1AliasPublicationAuthorizer()
     first.issue(request())
-    expect(second.issue(request()).evidenceTxid).toBe(TXID)
+    expect(() => second.issue(request())).toThrowError(
+      expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
+    )
+    const extra = (
+      createTm1AliasPublicationAuthorizer as (ledger?: unknown) => ReturnType<
+        typeof createTm1AliasPublicationAuthorizer
+      >
+    )(rawLedgerBag())
+    expect(() => extra.issue(request())).toThrowError(
+      expect.objectContaining({ code: 'ALIAS_PROOF_REPLAYED' })
+    )
   })
 })

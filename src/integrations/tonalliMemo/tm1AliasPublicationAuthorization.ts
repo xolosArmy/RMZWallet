@@ -42,7 +42,7 @@ declare const tm1AliasPublicationAuthorizationLedgerBrand: unique symbol
  * properties. It is not durable: a crash loses it. It is not a publication
  * store and grants no transport capability.
  */
-export type Tm1AliasPublicationAuthorizationLedger = Readonly<{
+type Tm1AliasPublicationAuthorizationLedger = Readonly<{
   readonly [tm1AliasPublicationAuthorizationLedgerBrand]: never
 }>
 
@@ -51,48 +51,80 @@ type LedgerState = {
   latestBlockHeightByAlias: Map<string, number>
 }
 
+const weakMapHas = Function.prototype.call.bind(WeakMap.prototype.has) as (
+  map: WeakMap<object, LedgerState>,
+  key: object
+) => boolean
+const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as (
+  map: WeakMap<object, LedgerState>,
+  key: object
+) => LedgerState | undefined
+const weakMapSet = Function.prototype.call.bind(WeakMap.prototype.set) as (
+  map: WeakMap<object, LedgerState>,
+  key: object,
+  value: LedgerState
+) => WeakMap<object, LedgerState>
+const setHas = Function.prototype.call.bind(Set.prototype.has) as (
+  set: Set<string>,
+  value: string
+) => boolean
+const setAdd = Function.prototype.call.bind(Set.prototype.add) as (
+  set: Set<string>,
+  value: string
+) => Set<string>
+const mapGet = Function.prototype.call.bind(Map.prototype.get) as (
+  map: Map<string, number>,
+  key: string
+) => number | undefined
+const mapSet = Function.prototype.call.bind(Map.prototype.set) as (
+  map: Map<string, number>,
+  key: string,
+  value: number
+) => Map<string, number>
+
 const ledgerStates = new WeakMap<object, LedgerState>()
 
 /**
- * Process-local replay/stale ledger. It is not durable: a crash loses it.
- * It is not a publication store and grants no transport capability.
- * Created only here; raw { Set, Map } bags are not ledgers.
+ * Single process-local replay/stale ledger. It is not durable: a crash
+ * loses it. It is not a publication store and grants no transport capability.
+ * Ordinary callers cannot mint a replacement identity.
  */
-export function createTm1InMemoryAliasPublicationAuthorizationLedger():
-  Tm1AliasPublicationAuthorizationLedger {
+function createProcessLocalLedger(): Tm1AliasPublicationAuthorizationLedger {
   const ledger = Object.freeze(Object.create(null)) as Tm1AliasPublicationAuthorizationLedger
-  ledgerStates.set(ledger, {
+  weakMapSet(ledgerStates, ledger, {
     consumedProofs: new Set<string>(),
     latestBlockHeightByAlias: new Map<string, number>()
   })
   return ledger
 }
 
+const processLocalLedger = createProcessLocalLedger()
+
 function parseLedger(value: unknown): Tm1AliasPublicationAuthorizationLedger {
   if (value === null || typeof value !== 'object') invalidInput()
-  if (!ledgerStates.has(value)) invalidInput()
+  if (!weakMapHas(ledgerStates, value)) invalidInput()
   return value as Tm1AliasPublicationAuthorizationLedger
 }
 
 function requireLedgerState(ledger: Tm1AliasPublicationAuthorizationLedger): LedgerState {
-  const state = ledgerStates.get(ledger)
+  const state = weakMapGet(ledgerStates, ledger)
   if (state === undefined) invalidInput()
   return state
 }
 
 function hasProof(ledger: Tm1AliasPublicationAuthorizationLedger, proofKey: string): boolean {
-  return requireLedgerState(ledger).consumedProofs.has(proofKey)
+  return setHas(requireLedgerState(ledger).consumedProofs, proofKey)
 }
 
 function recordProof(ledger: Tm1AliasPublicationAuthorizationLedger, proofKey: string): void {
-  requireLedgerState(ledger).consumedProofs.add(proofKey)
+  setAdd(requireLedgerState(ledger).consumedProofs, proofKey)
 }
 
 function lastHeight(
   ledger: Tm1AliasPublicationAuthorizationLedger,
   alias: string
 ): number | undefined {
-  return requireLedgerState(ledger).latestBlockHeightByAlias.get(alias)
+  return mapGet(requireLedgerState(ledger).latestBlockHeightByAlias, alias)
 }
 
 function recordHeight(
@@ -100,7 +132,7 @@ function recordHeight(
   alias: string,
   height: number
 ): void {
-  requireLedgerState(ledger).latestBlockHeightByAlias.set(alias, height)
+  mapSet(requireLedgerState(ledger).latestBlockHeightByAlias, alias, height)
 }
 
 /**
@@ -117,8 +149,8 @@ export class Tm1AliasPublicationAuthorizer {
     this.ledger = parseLedger(ledgerValue)
   }
 
-  static create(ledgerValue: unknown): Tm1AliasPublicationAuthorizer {
-    return new Tm1AliasPublicationAuthorizer(parseLedger(ledgerValue))
+  static create(): Tm1AliasPublicationAuthorizer {
+    return new Tm1AliasPublicationAuthorizer(parseLedger(processLocalLedger))
   }
 
   issue(requestValue: unknown): Tm1AliasPublicationAuthorization {
@@ -166,10 +198,9 @@ export class Tm1AliasPublicationAuthorizer {
   }
 }
 
-export function createTm1AliasPublicationAuthorizer(
-  ledgerValue: unknown
-): Tm1AliasPublicationAuthorizer {
-  return Tm1AliasPublicationAuthorizer.create(parseLedger(ledgerValue))
+export function createTm1AliasPublicationAuthorizer(): Tm1AliasPublicationAuthorizer {
+  parseLedger(processLocalLedger)
+  return Tm1AliasPublicationAuthorizer.create()
 }
 
 export function parseTm1AliasPublicationAuthorization(
