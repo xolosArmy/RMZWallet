@@ -2,8 +2,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 import * as portApi from './tm1AliasOwnershipVerificationPort'
 import {
   Tm1AliasOwnershipVerificationPort,
-  createTm1AliasOwnershipVerificationPort,
-  Tm1AliasOwnershipVerificationError
+  createTm1AliasOwnershipVerificationPort
 } from './tm1AliasOwnershipVerificationPort'
 import {
   createTm1AliasOwnershipVerificationTestFetch,
@@ -11,8 +10,7 @@ import {
 } from './tm1AliasOwnershipVerificationPort.testFetch'
 import * as aliasAuth from './tm1AliasPublicationAuthorization'
 import {
-  createTm1AliasPublicationAuthorizer,
-  Tm1AliasPublicationAuthorizationError
+  createTm1AliasPublicationAuthorizer
 } from './tm1AliasPublicationAuthorization'
 
 const OWNER = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
@@ -46,7 +44,7 @@ function callerJson(tag: string, overrides: Record<string, unknown> = {}) {
   }
 }
 
-function portWith(
+async function portWith(
   tag: string,
   response: Tm1AliasOwnershipTestFetchResponse,
   now?: number
@@ -54,13 +52,19 @@ function portWith(
   vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
     [`${tag}.xec`]: response
   }))
+  vi.resetModules()
+  const portMod = await import('./tm1AliasOwnershipVerificationPort')
+  const authMod = await import('./tm1AliasPublicationAuthorization')
   if (now !== undefined) {
     vi.useFakeTimers()
     vi.setSystemTime(now)
   }
   return {
     alias: `${tag}.xec`,
-    verifier: createTm1AliasOwnershipVerificationPort(),
+    verifier: portMod.createTm1AliasOwnershipVerificationPort(),
+    PortError: portMod.Tm1AliasOwnershipVerificationError,
+    AuthError: authMod.Tm1AliasPublicationAuthorizationError,
+    issue: (request: unknown) => authMod.createTm1AliasPublicationAuthorizer().issue(request),
     request: (overrides: Record<string, unknown> = {}) => ({
       alias: `${tag}.xec`,
       ownerAddress: OWNER,
@@ -80,11 +84,11 @@ describe('TM1 alias ownership verification port', () => {
   })
 
   test('A: confirmed matching observation mints a token that issue() accepts', async () => {
-    const { alias, verifier, request } = portWith('vpa', ok('vpa'))
+    const { alias, verifier, request, issue } = await portWith('vpa', ok('vpa'))
     const token = await verifier.verify(request())
     expect(Object.isFrozen(token)).toBe(true)
     expect(Reflect.ownKeys(token)).toHaveLength(0)
-    const authorization = createTm1AliasPublicationAuthorizer().issue({
+    const authorization = issue({
       alias,
       ownerAddress: OWNER,
       evidence: token
@@ -99,7 +103,7 @@ describe('TM1 alias ownership verification port', () => {
   })
 
   test('B: unconfirmed observation throws, mints no token, and issue is never reached', async () => {
-    const { verifier, request } = portWith('vpb', ok('vpb', {
+    const { verifier, request } = await portWith('vpb', ok('vpb', {
       status: 'pending',
       blockheight: 0
     }))
@@ -112,7 +116,7 @@ describe('TM1 alias ownership verification port', () => {
   })
 
   test('C: owner mismatch throws and does not mint', async () => {
-    const { verifier, request } = portWith('vpc', ok('vpc', {
+    const { verifier, request } = await portWith('vpc', ok('vpc', {
       address: OTHER_OWNER
     }))
     await expect(verifier.verify(request())).rejects.toMatchObject({
@@ -131,7 +135,7 @@ describe('TM1 alias ownership verification port', () => {
       { tag: 'vpd5', response: { status: 500, json: { ok: false } } }
     ]
     for (const { tag, response } of cases) {
-      const { verifier, request, alias } = portWith(tag, response)
+      const { verifier, request, alias } = await portWith(tag, response)
       await expect(verifier.verify(request())).rejects.toBeInstanceOf(Error)
       expect(() => createTm1AliasPublicationAuthorizer().issue({
         alias,
@@ -142,7 +146,7 @@ describe('TM1 alias ownership verification port', () => {
   })
 
   test('E: caller-supplied fake confirmed evidence is not a token and stays UNTRUSTED', async () => {
-    const { alias, verifier, request } = portWith('vpe', ok('vpe'))
+    const { alias, verifier, request } = await portWith('vpe', ok('vpe'))
     await verifier.verify(request())
     expect(() => createTm1AliasPublicationAuthorizer().issue({
       alias,
@@ -153,25 +157,25 @@ describe('TM1 alias ownership verification port', () => {
 
   test('F: expiresAt on the observation is preserved; issue() past expiry throws ALIAS_PROOF_EXPIRED', async () => {
     const expiresAt = Date.now() - 1_000
-    const { alias, verifier, request } = portWith(
+    const { alias, verifier, request, issue } = await portWith(
       'vpf',
       ok('vpf', { expiresAt }),
       expiresAt - 1
     )
     const token = await verifier.verify(request())
-    expect(() => createTm1AliasPublicationAuthorizer().issue({
+    expect(() => issue({
       alias,
       ownerAddress: OWNER,
       evidence: token
     })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
     vi.unstubAllGlobals()
     vi.useRealTimers()
-    const later = portWith(
+    const later = await portWith(
       'vpf',
       ok('vpf', { txid: txidFrom('vpfz'), blockheight: 50 })
     )
     const laterToken = await later.verifier.verify(request())
-    const authorization = createTm1AliasPublicationAuthorizer().issue({
+    const authorization = later.issue({
       alias,
       ownerAddress: OWNER,
       evidence: laterToken
@@ -184,7 +188,7 @@ describe('TM1 alias ownership verification port', () => {
 
   test('G: expiry uses Date.now at request time, not request.now', async () => {
     const expiresAt = 1_800_000_000_000
-    const { verifier, request } = portWith(
+    const { verifier, request } = await portWith(
       'vpg',
       ok('vpg', { expiresAt }),
       expiresAt
@@ -195,13 +199,15 @@ describe('TM1 alias ownership verification port', () => {
     await expect(verifier.verify(request())).rejects.toMatchObject({
       code: 'ALIAS_PROOF_EXPIRED'
     })
-    const future = portWith(
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+    const future = await portWith(
       'vpgf',
       ok('vpgf', { expiresAt }),
       expiresAt - 1
     )
     const token = await future.verifier.verify(future.request())
-    const authorization = createTm1AliasPublicationAuthorizer().issue({
+    const authorization = future.issue({
       alias: 'vpgf.xec',
       ownerAddress: OWNER,
       evidence: token
@@ -230,6 +236,34 @@ describe('TM1 alias ownership verification port', () => {
       ownerAddress: OWNER,
       evidence: token
     })).toThrowError(expect.objectContaining(UNTRUSTED))
+  })
+
+  test('P1: post-import globalThis.fetch replacement cannot mint', async () => {
+    const tag = 'p1swap'
+    const alias = `${tag}.xec`
+    const previous = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify(aliasRecord(tag)), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })) as typeof fetch
+    let minted: object | undefined
+    try {
+      const token = await createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      globalThis.fetch = previous
+    }
+    expect(minted).toBeUndefined()
   })
 
   test('P1: public factory does not accept fetch or endpointUrl', async () => {
@@ -351,7 +385,7 @@ describe('TM1 alias ownership verification port', () => {
   })
 
   test('port errors are not a sign or broadcast capability', async () => {
-    const { verifier, request } = portWith('vperr', ok('vperr', {
+    const { verifier, request, PortError, AuthError } = await portWith('vperr', ok('vperr', {
       status: 'pending'
     }))
     let thrown: unknown
@@ -361,8 +395,8 @@ describe('TM1 alias ownership verification port', () => {
       thrown = error
     }
     expect(
-      thrown instanceof Tm1AliasOwnershipVerificationError
-      || thrown instanceof Tm1AliasPublicationAuthorizationError
+      thrown instanceof PortError
+      || thrown instanceof AuthError
     ).toBe(true)
     expect(Reflect.ownKeys(thrown as object)).not.toContain('broadcast')
     expect(Reflect.ownKeys(thrown as object)).not.toContain('sign')

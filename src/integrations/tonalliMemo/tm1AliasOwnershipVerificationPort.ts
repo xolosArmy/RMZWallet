@@ -31,6 +31,9 @@ const TRUSTED_ALIAS_ENDPOINT = 'https://alias.ecash.mx/alias'
 const DEFAULT_TIMEOUT_MS = 8_000
 const MAX_RESPONSE_BYTES = 65_536
 const TXID_PATTERN = /^[0-9a-f]{64}$/
+const fetchImpl = typeof globalThis.fetch === 'function'
+  ? globalThis.fetch.bind(globalThis)
+  : undefined
 
 const objectFreeze = Object.freeze as <T extends object>(value: T) => T
 const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as <V>(
@@ -109,7 +112,6 @@ export class Tm1AliasOwnershipVerificationPort {
 
   private async observeAliasOwnership(alias: string, signal?: AbortSignal): Promise<unknown> {
     if (signal?.aborted) unavailable()
-    const fetchImpl = globalThis.fetch
     if (typeof fetchImpl !== 'function') unavailable()
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
