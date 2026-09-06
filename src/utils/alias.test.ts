@@ -179,4 +179,79 @@ describe('P1 isolate-string-prototype-decoder', () => {
       String.prototype.trim = originalTrim
     }
   })
+
+  test('parseCashAddr and canonicalizeEcashAddress immune to monkeypatched Uint8Array.prototype.subarray (shadowing)', () => {
+    const validHash = Address.parse(VALID_ADDR).hash
+    const u8Proto = Uint8Array.prototype as unknown as Record<string, unknown>
+    const origSubarray = Uint8Array.prototype.subarray
+
+    try {
+      // Attacker shadows subarray on Uint8Array.prototype to substitute validHash bytes
+      u8Proto['subarray'] = function (this: Uint8Array, begin?: number, end?: number): Uint8Array {
+        if (begin === 1 && end === undefined && this.length === 21) {
+          const forgedBytes = new Uint8Array(
+            (validHash.match(/.{1,2}/g) ?? []).map((b: string) => parseInt(b, 16))
+          )
+          return forgedBytes
+        }
+        return Reflect.apply(origSubarray, this, [begin, end]) as Uint8Array
+      }
+
+      // Outside isolated decoder, the attack succeeds on an unprotected raw buffer
+      const probe = new Uint8Array(21)
+      expect((probe as unknown as { subarray: (b?: number) => Uint8Array }).subarray(1).length).toBe(20)
+
+      // Inside parseCashAddr and canonicalizeEcashAddress, authentic OTHER_ADDR is decoded
+      const parsed = parseCashAddr(OTHER_ADDR)
+      expect(parsed.cash().toString()).toBe(OTHER_ADDR)
+      expect(canonicalizeEcashAddress(OTHER_ADDR)).toBe(OTHER_ADDR)
+    } finally {
+      delete u8Proto['subarray']
+    }
+  })
+
+  test('parseCashAddr and canonicalizeEcashAddress immune to monkeypatched TypedArray.prototype.subarray (inherited)', () => {
+    const validHash = Address.parse(VALID_ADDR).hash
+    const typedArrayProto = Object.getPrototypeOf(Uint8Array.prototype) as Record<string, unknown>
+    const origSubarray = typedArrayProto['subarray'] as (this: Uint8Array, begin?: number, end?: number) => Uint8Array
+
+    try {
+      // Attacker mutates inherited TypedArray.prototype.subarray
+      typedArrayProto['subarray'] = function (this: Uint8Array, begin?: number, end?: number): Uint8Array {
+        if (begin === 1 && end === undefined && this.length === 21) {
+          const forgedBytes = new Uint8Array(
+            (validHash.match(/.{1,2}/g) ?? []).map((b: string) => parseInt(b, 16))
+          )
+          return forgedBytes
+        }
+        return Reflect.apply(origSubarray, this, [begin, end]) as Uint8Array
+      }
+
+      // Inside parseCashAddr and canonicalizeEcashAddress, authentic OTHER_ADDR is decoded
+      const parsed = parseCashAddr(OTHER_ADDR)
+      expect(parsed.cash().toString()).toBe(OTHER_ADDR)
+      expect(canonicalizeEcashAddress(OTHER_ADDR)).toBe(OTHER_ADDR)
+    } finally {
+      typedArrayProto['subarray'] = origSubarray
+    }
+  })
+
+  test('parseCashAddr and canonicalizeEcashAddress immune to monkeypatched Uint8Array.prototype.set and slice', () => {
+    const u8Proto = Uint8Array.prototype as unknown as Record<string, unknown>
+    try {
+      u8Proto['set'] = () => {
+        throw new Error('tampered set')
+      }
+      u8Proto['slice'] = () => {
+        throw new Error('tampered slice')
+      }
+
+      const parsed = parseCashAddr(OTHER_ADDR)
+      expect(parsed.cash().toString()).toBe(OTHER_ADDR)
+      expect(canonicalizeEcashAddress(OTHER_ADDR)).toBe(OTHER_ADDR)
+    } finally {
+      delete u8Proto['set']
+      delete u8Proto['slice']
+    }
+  })
 })

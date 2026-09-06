@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { Address } from 'ecash-lib'
 import * as portApi from './tm1AliasOwnershipVerificationPort'
 import {
   Tm1AliasOwnershipVerificationPort,
@@ -603,6 +604,54 @@ describe('TM1 alias ownership verification port', () => {
     } finally {
       stringProto['split'] = originalSplit
       stringProto['toLowerCase'] = originalLower
+    }
+    expect(minted).toBeUndefined()
+  })
+
+  test('P1: post-import Uint8Array.prototype.subarray replacement cannot mint', async () => {
+    const tag = 'p1u8sub'
+    const alias = `${tag}.xec`
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { address: OTHER_OWNER })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+
+    const ownerHash = Address.parse(OWNER).hash
+    const u8Proto = Uint8Array.prototype as unknown as Record<string, unknown>
+    const origSubarray = Uint8Array.prototype.subarray
+
+    // Malicious attacker attempts to forge hash extraction so OTHER_OWNER decodes as OWNER
+    u8Proto['subarray'] = function (this: Uint8Array, begin?: number, end?: number): Uint8Array {
+      if (begin === 1 && end === undefined && this.length === 21) {
+        const forgedBytes = new Uint8Array(
+          (ownerHash.match(/.{1,2}/g) ?? []).map((b: string) => parseInt(b, 16))
+        )
+        return forgedBytes
+      }
+      return Reflect.apply(origSubarray, this, [begin, end]) as Uint8Array
+    }
+
+    let minted: object | undefined
+    try {
+      const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      delete u8Proto['subarray']
     }
     expect(minted).toBeUndefined()
   })

@@ -27,11 +27,40 @@ const CAPTURED_STRING_METHODS = [
   'toString'
 ] as const
 
-type StringMethodName = (typeof CAPTURED_STRING_METHODS)[number]
+const CAPTURED_TYPED_ARRAY_METHODS = [
+  'subarray',
+  'slice',
+  'set',
+  'fill',
+  'copyWithin',
+  'indexOf',
+  'lastIndexOf',
+  'includes',
+  'join',
+  'map',
+  'forEach',
+  'reduce',
+  'reduceRight',
+  'reverse',
+  'sort',
+  'every',
+  'some',
+  'find',
+  'findIndex',
+  'findLast',
+  'findLastIndex',
+  'at',
+  'toString',
+  'toLocaleString',
+  'entries',
+  'keys',
+  'values'
+] as const
 
-interface MethodSnapshot {
-  readonly name: StringMethodName
-  readonly desc: PropertyDescriptor
+interface TargetSnapshot {
+  readonly target: object
+  readonly name: string
+  readonly authenticDesc?: PropertyDescriptor
 }
 
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor.bind(Object)
@@ -44,29 +73,83 @@ const stringStartsWith = Function.prototype.call.bind(
   String.prototype.startsWith
 ) as (target: string, search: string, position?: number) => boolean
 
-const authenticSnapshots: MethodSnapshot[] = []
+const authenticSnapshots: TargetSnapshot[] = []
+
 for (let i = 0; i < CAPTURED_STRING_METHODS.length; i++) {
   const name = CAPTURED_STRING_METHODS[i]
   const desc = objectGetOwnPropertyDescriptor(String.prototype, name)
   if (desc) {
-    authenticSnapshots[authenticSnapshots.length] = { name, desc }
+    authenticSnapshots[authenticSnapshots.length] = {
+      target: String.prototype,
+      name,
+      authenticDesc: desc
+    }
   }
 }
 
-export function runWithIsolatedStringDecoder<T>(action: () => T): T {
+const typedArrayProto =
+  typeof Uint8Array !== 'undefined'
+    ? Object.getPrototypeOf(Uint8Array.prototype)
+    : undefined
+
+if (typedArrayProto) {
+  for (let i = 0; i < CAPTURED_TYPED_ARRAY_METHODS.length; i++) {
+    const name = CAPTURED_TYPED_ARRAY_METHODS[i]
+    const desc = objectGetOwnPropertyDescriptor(typedArrayProto, name)
+    if (desc) {
+      authenticSnapshots[authenticSnapshots.length] = {
+        target: typedArrayProto,
+        name,
+        authenticDesc: desc
+      }
+    }
+  }
+}
+
+if (typeof Uint8Array !== 'undefined' && Uint8Array.prototype) {
+  for (let i = 0; i < CAPTURED_TYPED_ARRAY_METHODS.length; i++) {
+    const name = CAPTURED_TYPED_ARRAY_METHODS[i]
+    const desc = objectGetOwnPropertyDescriptor(Uint8Array.prototype, name)
+    authenticSnapshots[authenticSnapshots.length] = {
+      target: Uint8Array.prototype,
+      name,
+      authenticDesc: desc
+    }
+  }
+}
+
+export function runWithIsolatedDecoder<T>(action: () => T): T {
   const previousDescriptors: Array<PropertyDescriptor | undefined> = []
   const tamperedIndices: number[] = []
 
   for (let i = 0; i < authenticSnapshots.length; i++) {
-    const { name, desc: authenticDesc } = authenticSnapshots[i]
-    const currentDesc = objectGetOwnPropertyDescriptor(String.prototype, name)
-    if (currentDesc?.value !== authenticDesc.value) {
-      previousDescriptors[i] = currentDesc
-      tamperedIndices[tamperedIndices.length] = i
-      try {
-        objectDefineProperty(String.prototype, name, authenticDesc)
-      } catch {
-        /* ignore if non-configurable */
+    const { target, name, authenticDesc } = authenticSnapshots[i]
+    const currentDesc = objectGetOwnPropertyDescriptor(target, name)
+
+    if (authenticDesc) {
+      if (
+        currentDesc?.value !== authenticDesc.value ||
+        currentDesc?.get !== authenticDesc.get ||
+        currentDesc?.set !== authenticDesc.set
+      ) {
+        previousDescriptors[i] = currentDesc
+        tamperedIndices[tamperedIndices.length] = i
+        try {
+          objectDefineProperty(target, name, authenticDesc)
+        } catch {
+          /* ignore if non-configurable */
+        }
+      }
+    } else {
+      // Authentic state had no own property on target (e.g. shadowing on Uint8Array.prototype)
+      if (currentDesc !== undefined) {
+        previousDescriptors[i] = currentDesc
+        tamperedIndices[tamperedIndices.length] = i
+        try {
+          delete (target as unknown as Record<string, unknown>)[name]
+        } catch {
+          /* ignore */
+        }
       }
     }
   }
@@ -76,13 +159,13 @@ export function runWithIsolatedStringDecoder<T>(action: () => T): T {
   } finally {
     for (let j = 0; j < tamperedIndices.length; j++) {
       const idx = tamperedIndices[j]
-      const name = authenticSnapshots[idx].name
+      const { target, name } = authenticSnapshots[idx]
       const previousDesc = previousDescriptors[idx]
       try {
         if (previousDesc) {
-          objectDefineProperty(String.prototype, name, previousDesc)
+          objectDefineProperty(target, name, previousDesc)
         } else {
-          delete (String.prototype as unknown as Record<string, unknown>)[name]
+          delete (target as unknown as Record<string, unknown>)[name]
         }
       } catch {
         /* ignore */
@@ -91,13 +174,28 @@ export function runWithIsolatedStringDecoder<T>(action: () => T): T {
   }
 }
 
+export const runWithIsolatedStringDecoder = runWithIsolatedDecoder
+
 const rawParseCashAddr = Address.parse.bind(Address)
+
+const wrapAddressInstance = (instance: ReturnType<typeof rawParseCashAddr>): ReturnType<typeof rawParseCashAddr> => {
+  if (!instance || typeof instance !== 'object') return instance
+  const origCash = instance.cash
+  if (typeof origCash === 'function') {
+    instance.cash = () => wrapAddressInstance(runWithIsolatedDecoder(() => origCash.call(instance)))
+  }
+  const origLegacy = instance.legacy
+  if (typeof origLegacy === 'function') {
+    instance.legacy = () => wrapAddressInstance(runWithIsolatedDecoder(() => origLegacy.call(instance)))
+  }
+  return instance
+}
 
 export const parseCashAddr = (address: string): ReturnType<typeof rawParseCashAddr> => {
   if (typeof address !== 'string') {
     throw new TypeError('Address must be a string')
   }
-  return runWithIsolatedStringDecoder(() => rawParseCashAddr(address))
+  return wrapAddressInstance(runWithIsolatedDecoder(() => rawParseCashAddr(address)))
 }
 
 const BARE_ALIAS_RE = /^[a-z0-9]{1,21}$/
@@ -138,7 +236,7 @@ export const canonicalizeEcashAddress = (input: string): string | null => {
   if (typeof input !== 'string' || stringTrim(input) !== input) return null
   if (!stringStartsWith(stringToLowerCase(input), 'ecash:')) return null
   try {
-    return runWithIsolatedStringDecoder(() => {
+    return runWithIsolatedDecoder(() => {
       return rawParseCashAddr(input).cash().toString()
     })
   } catch {

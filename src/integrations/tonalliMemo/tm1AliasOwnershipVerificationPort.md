@@ -38,9 +38,10 @@ in `utils/alias.ts`. `Address.prototype` is frozen and severed from
 `Object.prototype` (`null` prototype) at module evaluation to prevent
 prototype pollution / setter interception (`this.address = ...`).
 `String.prototype` methods (`split`, `toLowerCase`, `toUpperCase`, etc.)
+and `Uint8Array.prototype` / `TypedArray.prototype` methods (`subarray`, `set`, `slice`, etc.)
 are snapshot at module evaluation; CashAddr parsing runs inside
-`runWithIsolatedStringDecoder`, guaranteeing 100% deterministic decoding
-immune to post-import string prototype tampering.
+`runWithIsolatedDecoder`, guaranteeing 100% deterministic decoding
+immune to post-import string and typed array prototype tampering.
 `cash()` / `toString()` are instance own
 properties created inside `Address` construction, not live
 prototype dispatch. Passing `fetch`, `endpointUrl`, `observe`,
@@ -100,8 +101,9 @@ do not prevent verifier timeout or caller-abort from cutting hanging requests.
 methods are own properties on each parsed instance. Post-import
 `Address.prototype` setter injections are rejected by `Object.freeze` and
 cannot intercept constructor assignments. Post-import `String.prototype.split`
-or `toLowerCase` replacements cannot forge parsed address payloads because
-`runWithIsolatedStringDecoder` restores authentic method descriptors during parsing.
+or `toLowerCase` replacements, as well as `Uint8Array.prototype` / `TypedArray.prototype.subarray`, `slice`, or `set`
+replacements or shadowing, cannot forge parsed address payloads because
+`runWithIsolatedDecoder` restores authentic method descriptors during parsing.
 Post-import `Array.prototype` index setters do not mint: body text is not
 accumulated in an Array.
 
