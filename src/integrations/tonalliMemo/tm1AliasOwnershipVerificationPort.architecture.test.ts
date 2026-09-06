@@ -161,6 +161,8 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(aliasRuntime).toContain('runWithIsolatedDecoder')
     expect(aliasRuntime).toContain('CAPTURED_TYPED_ARRAY_METHODS')
     expect(aliasRuntime).toContain('Uint8Array.prototype')
+    expect(aliasRuntime).not.toContain('/* ignore if non-configurable */')
+    expect(aliasRuntime).toContain('throw restorationError')
     expect(portRuntime).not.toMatch(/Date\.now\s*\(/)
     expect(portRuntime).not.toMatch(/request\.now/)
   })

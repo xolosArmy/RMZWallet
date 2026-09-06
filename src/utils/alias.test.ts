@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { describe, expect, test } from 'vitest'
 import { Address } from 'ecash-lib'
 import {
@@ -253,5 +254,135 @@ describe('P1 isolate-string-prototype-decoder', () => {
       delete u8Proto['set']
       delete u8Proto['slice']
     }
+  })
+
+  test('fail-closed: runWithIsolatedDecoder throws immediately and aborts action if prototype property is non-configurable', () => {
+    const script = `
+      import { runWithIsolatedDecoder, parseCashAddr, canonicalizeEcashAddress } from './src/utils/alias.ts'
+      Object.defineProperty(String.prototype, 'split', {
+        value: () => ['ecash', 'fake'],
+        configurable: false,
+        writable: false
+      })
+
+      let executed = false
+      let threw = false
+      try {
+        runWithIsolatedDecoder(() => {
+          executed = true
+        })
+      } catch (err) {
+        threw = true
+      }
+      if (executed) throw new Error('Action must not execute when prototype is non-configurable')
+      if (!threw) throw new Error('runWithIsolatedDecoder must throw on non-configurable property')
+
+      let parseThrew = false
+      try {
+        parseCashAddr('ecash:dummy')
+      } catch {
+        parseThrew = true
+      }
+      if (!parseThrew) throw new Error('parseCashAddr must throw on non-configurable prototype')
+
+      const canon = canonicalizeEcashAddress('ecash:dummy')
+      if (canon !== null) throw new Error('canonicalizeEcashAddress must return null on non-configurable prototype')
+      process.stdout.write('OK')
+    `
+    const result = execFileSync(
+      process.execPath,
+      ['--import', 'tsx', '--input-type=module', '-e', script],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: { ...process.env, PATH: process.env.PATH }
+      }
+    )
+    expect(result.trim()).toBe('OK')
+  })
+
+  test('fail-closed: runWithIsolatedDecoder throws immediately and aborts action if Uint8Array shadowing is non-configurable', () => {
+    const script = `
+      import { runWithIsolatedDecoder, parseCashAddr, canonicalizeEcashAddress } from './src/utils/alias.ts'
+      Object.defineProperty(Uint8Array.prototype, 'subarray', {
+        value: function () { return new Uint8Array([99]) },
+        configurable: false,
+        writable: false
+      })
+
+      let executed = false
+      let threw = false
+      try {
+        runWithIsolatedDecoder(() => {
+          executed = true
+        })
+      } catch (err) {
+        threw = true
+      }
+      if (executed) throw new Error('Action must not execute when Uint8Array shadowing is non-configurable')
+      if (!threw) throw new Error('runWithIsolatedDecoder must throw on non-configurable Uint8Array shadowing')
+
+      let parseThrew = false
+      try {
+        parseCashAddr('ecash:dummy')
+      } catch {
+        parseThrew = true
+      }
+      if (!parseThrew) throw new Error('parseCashAddr must throw on non-configurable Uint8Array shadowing')
+
+      const canon = canonicalizeEcashAddress('ecash:dummy')
+      if (canon !== null) throw new Error('canonicalizeEcashAddress must return null on non-configurable Uint8Array shadowing')
+      process.stdout.write('OK')
+    `
+    const result = execFileSync(
+      process.execPath,
+      ['--import', 'tsx', '--input-type=module', '-e', script],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: { ...process.env, PATH: process.env.PATH }
+      }
+    )
+    expect(result.trim()).toBe('OK')
+  })
+
+  test('fail-closed: runWithIsolatedDecoder throws if finally cleanup fails to restore previous descriptor', () => {
+    const script = `
+      import { runWithIsolatedDecoder } from './src/utils/alias.ts'
+
+      const orig = String.prototype.split
+      String.prototype.split = () => ['tampered']
+
+      let executed = false
+      let threw = false
+      try {
+        runWithIsolatedDecoder(() => {
+          executed = true
+          // Inside action, freeze/lock split so restoring it in finally fails
+          Object.defineProperty(String.prototype, 'split', {
+            value: orig,
+            configurable: false,
+            writable: false
+          })
+          return 'done'
+        })
+      } catch (err) {
+        threw = true
+      }
+
+      if (!executed) throw new Error('Action was expected to run before cleanup')
+      if (!threw) throw new Error('runWithIsolatedDecoder must throw when finally cleanup fails')
+      process.stdout.write('OK')
+    `
+    const result = execFileSync(
+      process.execPath,
+      ['--import', 'tsx', '--input-type=module', '-e', script],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: { ...process.env, PATH: process.env.PATH }
+      }
+    )
+    expect(result.trim()).toBe('OK')
   })
 })

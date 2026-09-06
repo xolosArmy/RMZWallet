@@ -122,41 +122,37 @@ export function runWithIsolatedDecoder<T>(action: () => T): T {
   const previousDescriptors: Array<PropertyDescriptor | undefined> = []
   const tamperedIndices: number[] = []
 
-  for (let i = 0; i < authenticSnapshots.length; i++) {
-    const { target, name, authenticDesc } = authenticSnapshots[i]
-    const currentDesc = objectGetOwnPropertyDescriptor(target, name)
+  try {
+    for (let i = 0; i < authenticSnapshots.length; i++) {
+      const { target, name, authenticDesc } = authenticSnapshots[i]
+      const currentDesc = objectGetOwnPropertyDescriptor(target, name)
 
-    if (authenticDesc) {
-      if (
-        currentDesc?.value !== authenticDesc.value ||
-        currentDesc?.get !== authenticDesc.get ||
-        currentDesc?.set !== authenticDesc.set
-      ) {
-        previousDescriptors[i] = currentDesc
-        tamperedIndices[tamperedIndices.length] = i
-        try {
+      if (authenticDesc) {
+        if (
+          currentDesc?.value !== authenticDesc.value ||
+          currentDesc?.get !== authenticDesc.get ||
+          currentDesc?.set !== authenticDesc.set
+        ) {
           objectDefineProperty(target, name, authenticDesc)
-        } catch {
-          /* ignore if non-configurable */
+          previousDescriptors[i] = currentDesc
+          tamperedIndices[tamperedIndices.length] = i
         }
-      }
-    } else {
-      // Authentic state had no own property on target (e.g. shadowing on Uint8Array.prototype)
-      if (currentDesc !== undefined) {
-        previousDescriptors[i] = currentDesc
-        tamperedIndices[tamperedIndices.length] = i
-        try {
-          delete (target as unknown as Record<string, unknown>)[name]
-        } catch {
-          /* ignore */
+      } else {
+        // Authentic state had no own property on target (e.g. shadowing on Uint8Array.prototype)
+        if (currentDesc !== undefined) {
+          const deleted = delete (target as unknown as Record<string, unknown>)[name]
+          if (!deleted || objectGetOwnPropertyDescriptor(target, name) !== undefined) {
+            throw new TypeError(`Cannot delete non-configurable prototype property '${name}'`)
+          }
+          previousDescriptors[i] = currentDesc
+          tamperedIndices[tamperedIndices.length] = i
         }
       }
     }
-  }
 
-  try {
     return action()
   } finally {
+    let restorationError: unknown = null
     for (let j = 0; j < tamperedIndices.length; j++) {
       const idx = tamperedIndices[j]
       const { target, name } = authenticSnapshots[idx]
@@ -165,11 +161,22 @@ export function runWithIsolatedDecoder<T>(action: () => T): T {
         if (previousDesc) {
           objectDefineProperty(target, name, previousDesc)
         } else {
-          delete (target as unknown as Record<string, unknown>)[name]
+          const deleted = delete (target as unknown as Record<string, unknown>)[name]
+          if (!deleted || objectGetOwnPropertyDescriptor(target, name) !== undefined) {
+            if (!restorationError) {
+              restorationError = new TypeError(`Cannot restore deleted prototype property '${name}'`)
+            }
+          }
         }
-      } catch {
-        /* ignore */
+      } catch (err) {
+        if (!restorationError) {
+          restorationError = err
+        }
       }
+    }
+    if (restorationError) {
+      // eslint-disable-next-line no-unsafe-finally
+      throw restorationError
     }
   }
 }

@@ -41,7 +41,8 @@ prototype pollution / setter interception (`this.address = ...`).
 and `Uint8Array.prototype` / `TypedArray.prototype` methods (`subarray`, `set`, `slice`, etc.)
 are snapshot at module evaluation; CashAddr parsing runs inside
 `runWithIsolatedDecoder`, guaranteeing 100% deterministic decoding
-immune to post-import string and typed array prototype tampering.
+immune to post-import string and typed array prototype tampering,
+and failing closed immediately if any prototype method cannot be restored.
 `cash()` / `toString()` are instance own
 properties created inside `Address` construction, not live
 prototype dispatch. Passing `fetch`, `endpointUrl`, `observe`,
@@ -103,7 +104,9 @@ methods are own properties on each parsed instance. Post-import
 cannot intercept constructor assignments. Post-import `String.prototype.split`
 or `toLowerCase` replacements, as well as `Uint8Array.prototype` / `TypedArray.prototype.subarray`, `slice`, or `set`
 replacements or shadowing, cannot forge parsed address payloads because
-`runWithIsolatedDecoder` restores authentic method descriptors during parsing.
+`runWithIsolatedDecoder` restores authentic method descriptors during parsing,
+failing closed (throwing immediately and aborting verification) if any prototype
+property was made non-configurable.
 Post-import `Array.prototype` index setters do not mint: body text is not
 accumulated in an Array.
 

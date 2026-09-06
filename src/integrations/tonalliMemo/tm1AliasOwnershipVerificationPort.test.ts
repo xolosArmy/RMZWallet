@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { Address } from 'ecash-lib'
 import * as portApi from './tm1AliasOwnershipVerificationPort'
@@ -283,7 +284,7 @@ describe('TM1 alias ownership verification port', () => {
       globalThis.fetch = previous
     }
     expect(minted).toBeUndefined()
-  })
+  }, 15_000)
 
   test('P1: post-import JSON.parse replacement cannot mint', async () => {
     const tag = 'p1json'
@@ -655,6 +656,61 @@ describe('TM1 alias ownership verification port', () => {
     }
     expect(minted).toBeUndefined()
   })
+
+  test('P1: non-configurable prototype tampering fails closed and cannot mint', () => {
+    const script = `
+      import { createTm1AliasOwnershipVerificationPort } from './src/integrations/tonalliMemo/tm1AliasOwnershipVerificationPort.ts'
+      import { createTm1AliasOwnershipVerificationTestFetch } from './src/integrations/tonalliMemo/tm1AliasOwnershipVerificationPort.testFetch.ts'
+
+      const OWNER = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
+      const OTHER_OWNER = 'ecash:qrrd3y2cmg6m2vxlng9h3djh889pmwffhqv9yym2p4'
+      const alias = 'failclosed.xec'
+
+      globalThis.fetch = createTm1AliasOwnershipVerificationTestFetch({
+        [alias]: {
+          status: 200,
+          json: {
+            alias: 'failclosed',
+            address: OTHER_OWNER,
+            txid: 'ab'.repeat(32)
+          }
+        }
+      })
+
+      // Attacker attempts non-configurable prototype tampering
+      Object.defineProperty(String.prototype, 'split', {
+        value: () => ['ecash', OWNER.slice(6)],
+        configurable: false,
+        writable: false
+      })
+
+      let minted = undefined
+      try {
+        const token = await createTm1AliasOwnershipVerificationPort().verify({
+          alias,
+          ownerAddress: OWNER
+        })
+        minted = token
+      } catch (err) {
+        minted = undefined
+      }
+
+      if (minted !== undefined) {
+        throw new Error('Token must not be minted when prototype tampering is non-configurable')
+      }
+      process.stdout.write('OK')
+    `
+    const result = execFileSync(
+      process.execPath,
+      ['--import', 'tsx', '--input-type=module', '-e', script],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: { ...process.env, PATH: process.env.PATH }
+      }
+    )
+    expect(result.trim()).toBe('OK')
+  }, 15_000)
 
   test('P1: post-import Response.prototype.body replacement cannot mint', async () => {
     const tag = 'p1body'

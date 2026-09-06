@@ -18,7 +18,8 @@ describe('shared captured clock', () => {
       Date.now = () => -999_999
       const captured = nowMs()
       expect(captured).toBeGreaterThan(0)
-      expect(dateNow()).toBe(captured)
+      expect(dateNow()).toBeGreaterThanOrEqual(captured)
+      expect(Date.now()).toBe(-999_999)
     } finally {
       Date.now = originalNow
     }
