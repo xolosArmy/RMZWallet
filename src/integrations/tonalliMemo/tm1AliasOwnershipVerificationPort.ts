@@ -54,6 +54,12 @@ const AbortControllerCtor = AbortController
 const abortController = Function.prototype.call.bind(
   AbortController.prototype.abort
 ) as (controller: AbortController, reason?: unknown) => void
+const getAbortSignal = Function.prototype.call.bind(
+  Object.getOwnPropertyDescriptor(
+    AbortController.prototype,
+    'signal'
+  )!.get!
+) as (controller: AbortController) => AbortSignal
 const scheduleTimeout = setTimeout
 const cancelTimeout = clearTimeout
 const decodeUtf8Bytes = Function.prototype.call.bind(
@@ -210,31 +216,32 @@ function requireAuthenticPort(value: unknown): asserts value is Tm1AliasOwnershi
   }
 }
 
-async function observeAliasOwnership(alias: string, signal?: AbortSignal): Promise<unknown> {
-  if (signal?.aborted) unavailable()
+async function observeAliasOwnership(alias: string, callerSignal?: AbortSignal): Promise<unknown> {
+  if (callerSignal?.aborted) unavailable()
   if (typeof fetchImpl !== 'function') unavailable()
   const controller = new AbortControllerCtor()
+  const signal = getAbortSignal(controller)
   const timer = scheduleTimeout(() => abortController(controller), DEFAULT_TIMEOUT_MS)
   const onAbort = (): void => {
     abortController(controller)
   }
-  signal?.addEventListener('abort', onAbort, { once: true })
+  callerSignal?.addEventListener('abort', onAbort, { once: true })
   try {
     const response = await fetchImpl(`${TRUSTED_ALIAS_ENDPOINT}/${encodeUriComponent(alias)}`, {
       method: 'GET',
       credentials: 'omit',
       redirect: 'error',
-      signal: controller.signal,
+      signal,
       headers: objectFreeze({ accept: 'application/json' })
     })
-    return await decodeAliasResponse(response, controller.signal)
+    return await decodeAliasResponse(response, signal)
   } catch (error) {
     if (error instanceof Tm1AliasOwnershipVerificationError) throw error
     if (error instanceof Tm1AliasPublicationAuthorizationError) throw error
     unavailable()
   } finally {
     cancelTimeout(timer)
-    signal?.removeEventListener('abort', onAbort)
+    callerSignal?.removeEventListener('abort', onAbort)
   }
 }
 

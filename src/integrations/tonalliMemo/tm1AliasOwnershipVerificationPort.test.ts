@@ -830,6 +830,108 @@ describe('TM1 alias ownership verification port', () => {
     }
   }, 2_000)
 
+  test('P2: post-import AbortController.prototype.signal getter swap: hanging fetch/body maps to UNAVAILABLE within timeout', async () => {
+    const originalSignalDesc = Object.getOwnPropertyDescriptor(
+      AbortController.prototype,
+      'signal'
+    )
+    const timeoutMs = 8_000
+    try {
+      vi.stubGlobal('fetch', (async () => hangingAliasResponse()) as typeof fetch)
+      vi.resetModules()
+      const portMod = await import('./tm1AliasOwnershipVerificationPort')
+      const dummySignal = new AbortController().signal
+      Object.defineProperty(AbortController.prototype, 'signal', {
+        configurable: true,
+        get () {
+          return dummySignal
+        }
+      })
+
+      const tag = 'p2signal'
+      const alias = `${tag}.xec`
+      const verifier = portMod.createTm1AliasOwnershipVerificationPort()
+
+      const failAfter = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('TIMEOUT_EXCEEDED')), timeoutMs + 250)
+      })
+
+      await expect(Promise.race([
+        verifier.verify({ alias, ownerAddress: OWNER }),
+        failAfter
+      ])).rejects.toMatchObject({ code: 'ALIAS_OWNERSHIP_UNAVAILABLE' })
+    } finally {
+      if (originalSignalDesc) {
+        Object.defineProperty(AbortController.prototype, 'signal', originalSignalDesc)
+      }
+    }
+  }, 12_000)
+
+  test('P2: post-import AbortController.prototype.signal getter swap: caller abort still maps to UNAVAILABLE', async () => {
+    const originalSignalDesc = Object.getOwnPropertyDescriptor(
+      AbortController.prototype,
+      'signal'
+    )
+    try {
+      const cases: Array<{ name: string; fetch: typeof fetch }> = [
+        {
+          name: 'body',
+          fetch: (async () => hangingAliasResponse()) as typeof fetch
+        },
+        {
+          name: 'headers',
+          fetch: ((_url: string, init?: RequestInit) => new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(new DOMException('Aborted', 'AbortError'))
+            })
+          })) as typeof fetch
+        }
+      ]
+      for (const tc of cases) {
+        if (originalSignalDesc) {
+          Object.defineProperty(AbortController.prototype, 'signal', originalSignalDesc)
+        }
+        vi.stubGlobal('fetch', tc.fetch)
+        vi.resetModules()
+        const callerAbort = new AbortController()
+        const callerSignal = callerAbort.signal
+        const portMod = await import('./tm1AliasOwnershipVerificationPort')
+        const dummySignal = new AbortController().signal
+        Object.defineProperty(AbortController.prototype, 'signal', {
+          configurable: true,
+          get () {
+            return dummySignal
+          }
+        })
+
+        const tag = `p2s${tc.name}`
+        const alias = `${tag}.xec`
+        const verifier = portMod.createTm1AliasOwnershipVerificationPort()
+
+        const pending = verifier.verify({
+          alias,
+          ownerAddress: OWNER,
+          signal: callerSignal
+        })
+        await new Promise(resolve => setTimeout(resolve, 20))
+        callerAbort.abort()
+
+        const failAfter = new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error('TIMEOUT_EXCEEDED')), 500)
+        })
+
+        await expect(Promise.race([
+          pending,
+          failAfter
+        ])).rejects.toMatchObject({ code: 'ALIAS_OWNERSHIP_UNAVAILABLE' })
+      }
+    } finally {
+      if (originalSignalDesc) {
+        Object.defineProperty(AbortController.prototype, 'signal', originalSignalDesc)
+      }
+    }
+  }, 2_000)
+
   test('P1: prototype.verify.call with forged this cannot mint', async () => {
     const tag = 'p1this'
     const alias = `${tag}.xec`
