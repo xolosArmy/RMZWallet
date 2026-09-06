@@ -32,7 +32,10 @@ post-import replacement of `AbortController.prototype.abort` or
 `AbortController.prototype.signal` getter does not hang pending verify() calls;
 abort/timeout still map to `ALIAS_OWNERSHIP_UNAVAILABLE` and do not mint.
 CashAddr canonicalization captures `Address.parse.bind(Address)`
-in `utils/alias.ts`. `cash()` / `toString()` are instance own
+in `utils/alias.ts`. `Address.prototype` is frozen and severed from
+`Object.prototype` (`null` prototype) at module evaluation to prevent
+prototype pollution / setter interception (`this.address = ...`).
+`cash()` / `toString()` are instance own
 properties created inside `Address` construction, not live
 prototype dispatch. Passing `fetch`, `endpointUrl`, `observe`,
 or `clock` is extra input (`INVALID_ALIAS_AUTHORIZATION_INPUT`).
@@ -87,6 +90,8 @@ clock skew attacks. Post-import `AbortController.prototype.abort` and `signal` r
 do not prevent verifier timeout or caller-abort from cutting hanging requests.
 `Address.prototype.cash` / `toString` post-import swaps do not mint: those
 methods are own properties on each parsed instance. Post-import
+`Address.prototype` setter injections are rejected by `Object.freeze` and
+cannot intercept constructor assignments. Post-import
 `Array.prototype` index setters do not mint: body text is not
 accumulated in an Array.
 

@@ -470,11 +470,15 @@ describe('TM1 alias ownership verification port', () => {
     }
     const previousCash = Object.getOwnPropertyDescriptor(proto, 'cash')
     const previousToString = Object.getOwnPropertyDescriptor(proto, 'toString')
-    proto.cash = function cash() {
-      return this
-    }
-    proto.toString = function toString() {
-      return OWNER
+    try {
+      proto.cash = function cash() {
+        return this
+      }
+      proto.toString = function toString() {
+        return OWNER
+      }
+    } catch {
+      // Address.prototype is frozen / non-extensible
     }
     let minted: object | undefined
     try {
@@ -501,6 +505,50 @@ describe('TM1 alias ownership verification port', () => {
       } else {
         Object.defineProperty(proto, 'toString', previousToString)
       }
+    }
+    expect(minted).toBeUndefined()
+  })
+
+  test('P1: post-import Address.prototype setter injection cannot mint', async () => {
+    const tag = 'p1addrproto'
+    const alias = `${tag}.xec`
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { address: OTHER_OWNER })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const { Address } = await import('ecash-lib')
+    const proto = Address.prototype as typeof Address.prototype & {
+      address?: string
+    }
+    expect(() => {
+      Object.defineProperty(proto, 'address', {
+        get() {
+          return OWNER
+        },
+        set() {},
+        configurable: true
+      })
+    }).toThrow()
+
+    let minted: object | undefined
+    try {
+      const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
     }
     expect(minted).toBeUndefined()
   })

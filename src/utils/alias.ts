@@ -1,6 +1,20 @@
 import { Address } from 'ecash-lib'
 
-const parseCashAddr = Address.parse.bind(Address)
+// Isolate and freeze Address.prototype to prevent prototype pollution and setter interception
+const addressProto = Address.prototype as unknown as Record<string, unknown>
+for (const key of Object.getOwnPropertyNames(addressProto)) {
+  if (key !== 'constructor') {
+    try {
+      delete addressProto[key]
+    } catch {
+      /* ignore non-configurable */
+    }
+  }
+}
+Object.setPrototypeOf(Address.prototype, null)
+Object.freeze(Address.prototype)
+
+export const parseCashAddr = Address.parse.bind(Address)
 
 const BARE_ALIAS_RE = /^[a-z0-9]{1,21}$/
 const FULL_ALIAS_RE = /^([a-z0-9]{1,21})\.xec$/

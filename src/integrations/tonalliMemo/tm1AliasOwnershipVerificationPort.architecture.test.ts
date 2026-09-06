@@ -127,6 +127,8 @@ describe('TM1 alias ownership verification port isolation', () => {
     const aliasRuntime = source('../../utils/alias.ts')
     expect(aliasRuntime).toContain('Address.parse.bind(Address)')
     expect(aliasRuntime).not.toMatch(/Address\.parse\s*\(/)
+    expect(aliasRuntime).toContain('Object.freeze(Address.prototype)')
+    expect(aliasRuntime).toContain('Object.setPrototypeOf(Address.prototype, null)')
     expect(portRuntime).not.toMatch(/this\.observeAliasOwnership/)
     expect(portRuntime).not.toMatch(/this\[['"]observeAliasOwnership['"]\]/)
     expect(portRuntime).toContain('function observeAliasOwnership')
@@ -167,5 +169,21 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(portRuntime).not.toContain('createForTests')
     expect(portRuntime).not.toContain('parseTestDeps')
     expect(portRuntime).not.toContain('ForTests')
+  })
+
+  test('Address.prototype is frozen and isolated to prevent setter interception', async () => {
+    await import('../../utils/alias')
+    const { Address } = await import('ecash-lib')
+    expect(Object.isFrozen(Address.prototype)).toBe(true)
+    expect(Object.getPrototypeOf(Address.prototype)).toBeNull()
+    expect(() => {
+      Object.defineProperty(Address.prototype, 'address', {
+        get() {
+          return 'evil'
+        },
+        set() {},
+        configurable: true
+      })
+    }).toThrow()
   })
 })
