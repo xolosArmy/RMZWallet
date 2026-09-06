@@ -60,14 +60,10 @@ const decodeUtf8Bytes = Function.prototype.call.bind(
   input?: BufferSource,
   options?: TextDecodeOptions
 ) => string
-const joinStrings = Function.prototype.call.bind(Array.prototype.join) as (
-  array: readonly unknown[],
-  separator?: string
+const concatStrings = Function.prototype.call.bind(String.prototype.concat) as (
+  text: string,
+  ...pieces: string[]
 ) => string
-const pushValue = Function.prototype.call.bind(Array.prototype.push) as (
-  array: unknown[],
-  ...items: unknown[]
-) => number
 const getStreamReader = Function.prototype.call.bind(
   ReadableStream.prototype.getReader
 ) as (
@@ -284,7 +280,7 @@ async function readLimitedBody(response: Response, signal: AbortSignal): Promise
   const reader = getStreamReader(stream)
   const decoder = new TextDecoderCtor()
   let received = 0
-  const parts: string[] = []
+  let text = ''
   const abortRead = (): void => {
     settleCancel(reader)
   }
@@ -304,10 +300,9 @@ async function readLimitedBody(response: Response, signal: AbortSignal): Promise
         settleCancel(reader)
         unavailable()
       }
-      pushValue(parts, decodeUtf8Bytes(decoder, value, { stream: true }))
+      text = concatStrings(text, decodeUtf8Bytes(decoder, value, { stream: true }))
     }
-    pushValue(parts, decodeUtf8Bytes(decoder))
-    return joinStrings(parts, '')
+    return concatStrings(text, decodeUtf8Bytes(decoder))
   } finally {
     signal.removeEventListener('abort', abortRead)
   }

@@ -555,6 +555,59 @@ describe('TM1 alias ownership verification port', () => {
     expect(minted).toBeUndefined()
   })
 
+  test('P1: post-import Array.prototype[0] setter cannot mint', async () => {
+    const tag = 'p1idx'
+    const alias = `${tag}.xec`
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { address: OTHER_OWNER })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const previousZero = Object.getOwnPropertyDescriptor(Array.prototype, '0')
+    const forged = JSON.stringify(aliasRecord(tag))
+    Object.defineProperty(Array.prototype, '0', {
+      configurable: true,
+      enumerable: false,
+      set (value: unknown) {
+        const replaced = typeof value === 'string' && value.includes(OTHER_OWNER)
+          ? forged
+          : value
+        Object.defineProperty(this as object, '0', {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value: replaced
+        })
+      }
+    })
+    let minted: object | undefined
+    try {
+      const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      if (previousZero === undefined) {
+        Reflect.deleteProperty(Array.prototype, '0')
+      } else {
+        Object.defineProperty(Array.prototype, '0', previousZero)
+      }
+    }
+    expect(minted).toBeUndefined()
+  })
+
   test('P1: omitted expiresAt cannot remain valid forever', async () => {
     const tag = 'p1ttl'
     const alias = `${tag}.xec`

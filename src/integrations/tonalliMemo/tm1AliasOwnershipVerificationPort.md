@@ -12,11 +12,14 @@ enablement. App / routes / RegisterAlias / orchestrator stay unwired.
 
 Public create captures `globalThis.fetch.bind(globalThis)`,
 `JSON.parse.bind(JSON)`, body-decode prototype methods
-(`TextDecoder.prototype.decode`, `Array.prototype.join`,
-`Array.prototype.push`), and stream reader methods
+(`TextDecoder.prototype.decode`, `String.prototype.concat`),
+and stream reader methods
 (`ReadableStream.prototype.getReader`,
 `ReadableStreamDefaultReader.prototype.read` / `cancel`) once at
 module evaluation and GETs frozen `https://alias.ecash.mx/alias`.
+Decoded body text is assembled with captured `concatStrings` on
+string primitives; it is not accumulated in an Array and does not
+indexed-write chunks that can inherit prototype setters.
 `Response.prototype.body` is read through a getter captured at
 module evaluation (`getResponseBody`); later replacement of that
 getter does not change decode. Stream `cancel()` fulfillment and
@@ -66,13 +69,15 @@ dispatched through `this`.
 Caller-supplied `{ status: 'confirmed', ... }` is still
 `ALIAS_EVIDENCE_UNTRUSTED` at `issue()`.
 
-Same-realm patch of fetch / JSON.parse / decode / stream reader /
-`Response.prototype.body` / `Address.parse` / `Date.now` *before*
-this module (or `utils/alias.ts`) is first evaluated is process
-load-order, not a module API. This slice does not pin undici/native
-fetch. Request-time expiry uses captured `nowMs`, not live
-`Date.now()`. `Address.prototype.cash` / `toString` post-import
-swaps do not mint: those methods are own properties on each parsed
-instance.
+Same-realm patch of fetch / JSON.parse / decode / concat /
+stream reader / `Response.prototype.body` / `Address.parse` /
+`Date.now` *before* this module (or `utils/alias.ts`) is first
+evaluated is process load-order, not a module API. This slice does
+not pin undici/native fetch. Request-time expiry uses captured
+`nowMs`, not live `Date.now()`. `Address.prototype.cash` /
+`toString` post-import swaps do not mint: those methods are own
+properties on each parsed instance. Post-import
+`Array.prototype` index setters do not mint: body text is not
+accumulated in an Array.
 
 **NOT SUFFICIENT TO ENABLE PUBLICATION.**
