@@ -102,6 +102,8 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(portRuntime).toContain('function settleCancel')
     expect(portRuntime).toContain('Promise.resolve(cancelStreamReader')
     expect(portRuntime).not.toMatch(/void\s+cancelStreamReader/)
+    expect(portRuntime).toContain("Object.getOwnPropertyDescriptor(Response.prototype, 'body')")
+    expect(portRuntime).toContain('getResponseBody')
     const bodyRead = portRuntime.slice(
       portRuntime.indexOf('async function readLimitedBody('),
       portRuntime.indexOf('function unavailable(')
@@ -114,6 +116,8 @@ describe('TM1 alias ownership verification port isolation', () => {
     expect(bodyRead).not.toMatch(/\.cancel\s*\(/)
     expect(bodyRead).toContain('settleCancel(reader)')
     expect(bodyRead).not.toContain('void cancelStreamReader')
+    expect(bodyRead).toContain('getResponseBody(response)')
+    expect(bodyRead).not.toMatch(/response\.body/)
     const aliasRuntime = source('../../utils/alias.ts')
     expect(aliasRuntime).toContain('Address.parse.bind(Address)')
     expect(aliasRuntime).not.toMatch(/Address\.parse\s*\(/)

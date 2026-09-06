@@ -92,6 +92,13 @@ function settleCancel(
   )
 }
 
+const bodyDesc = Object.getOwnPropertyDescriptor(Response.prototype, 'body')
+const getResponseBody = typeof bodyDesc?.get === 'function'
+  ? (Function.prototype.call.bind(bodyDesc.get) as (
+      response: Response
+    ) => ReadableStream<Uint8Array> | null)
+  : undefined
+
 const objectFreeze = Object.freeze as <T extends object>(value: T) => T
 const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get) as <V>(
   map: WeakMap<object, V>,
@@ -258,7 +265,8 @@ async function decodeAliasResponse(response: Response, signal: AbortSignal): Pro
 }
 
 async function readLimitedBody(response: Response, signal: AbortSignal): Promise<string> {
-  const stream = response.body
+  if (typeof getResponseBody !== 'function') unavailable()
+  const stream = getResponseBody(response)
   if (stream === null) return ''
   const reader = getStreamReader(stream)
   const decoder = new TextDecoderCtor()

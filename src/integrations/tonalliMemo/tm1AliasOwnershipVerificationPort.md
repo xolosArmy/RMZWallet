@@ -17,11 +17,15 @@ Public create captures `globalThis.fetch.bind(globalThis)`,
 (`ReadableStream.prototype.getReader`,
 `ReadableStreamDefaultReader.prototype.read` / `cancel`) once at
 module evaluation and GETs frozen `https://alias.ecash.mx/alias`.
-Stream `cancel()` fulfillment and rejection are both settled
-(`settleCancel`); abort/timeout still map to
-`ALIAS_OWNERSHIP_UNAVAILABLE` and do not mint.
+`Response.prototype.body` is read through a getter captured at
+module evaluation (`getResponseBody`); later replacement of that
+getter does not change decode. Stream `cancel()` fulfillment and
+rejection are both settled (`settleCancel`); abort/timeout still
+map to `ALIAS_OWNERSHIP_UNAVAILABLE` and do not mint.
 CashAddr canonicalization captures `Address.parse.bind(Address)`
-in `utils/alias.ts`. Passing `fetch`, `endpointUrl`, `observe`,
+in `utils/alias.ts`. `cash()` / `toString()` are instance own
+properties created inside `Address` construction, not live
+prototype dispatch. Passing `fetch`, `endpointUrl`, `observe`,
 or `clock` is extra input (`INVALID_ALIAS_AUTHORIZATION_INPUT`).
 Later mutation of those globals/prototypes does not change
 transport, decode, or canonicalize.
@@ -59,9 +63,11 @@ Caller-supplied `{ status: 'confirmed', ... }` is still
 `ALIAS_EVIDENCE_UNTRUSTED` at `issue()`.
 
 Same-realm patch of fetch / JSON.parse / decode / stream reader /
-`Address.parse` *before* this module (or `utils/alias.ts`) is first
-evaluated is process load-order, not a module API. This slice does
-not pin undici/native fetch. `Date.now` remains request-time for
-expiry.
+`Response.prototype.body` / `Address.parse` *before* this module
+(or `utils/alias.ts`) is first evaluated is process load-order,
+not a module API. This slice does not pin undici/native fetch.
+`Date.now` remains request-time for expiry. `Address.prototype.cash`
+/ `toString` post-import swaps do not mint: those methods are own
+properties on each parsed instance.
 
 **NOT SUFFICIENT TO ENABLE PUBLICATION.**

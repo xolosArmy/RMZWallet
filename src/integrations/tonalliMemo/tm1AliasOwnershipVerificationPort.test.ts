@@ -448,6 +448,109 @@ describe('TM1 alias ownership verification port', () => {
     expect(minted).toBeUndefined()
   })
 
+  test('P1: post-import Address.prototype.cash/toString replacement cannot mint', async () => {
+    const tag = 'p1cash'
+    const alias = `${tag}.xec`
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { address: OTHER_OWNER })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const { Address } = await import('ecash-lib')
+    const proto = Address.prototype as typeof Address.prototype & {
+      cash?: () => unknown
+    }
+    const previousCash = Object.getOwnPropertyDescriptor(proto, 'cash')
+    const previousToString = Object.getOwnPropertyDescriptor(proto, 'toString')
+    proto.cash = function cash() {
+      return this
+    }
+    proto.toString = function toString() {
+      return OWNER
+    }
+    let minted: object | undefined
+    try {
+      const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      if (previousCash === undefined) {
+        Reflect.deleteProperty(proto, 'cash')
+      } else {
+        Object.defineProperty(proto, 'cash', previousCash)
+      }
+      if (previousToString === undefined) {
+        Reflect.deleteProperty(proto, 'toString')
+      } else {
+        Object.defineProperty(proto, 'toString', previousToString)
+      }
+    }
+    expect(minted).toBeUndefined()
+  })
+
+  test('P1: post-import Response.prototype.body replacement cannot mint', async () => {
+    const tag = 'p1body'
+    const alias = `${tag}.xec`
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { address: OTHER_OWNER })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const previousBody = Object.getOwnPropertyDescriptor(Response.prototype, 'body')
+    const forgedBytes = new TextEncoder().encode(JSON.stringify(aliasRecord(tag)))
+    Object.defineProperty(Response.prototype, 'body', {
+      configurable: true,
+      enumerable: true,
+      get () {
+        return new ReadableStream<Uint8Array>({
+          start (controller) {
+            controller.enqueue(forgedBytes)
+            controller.close()
+          }
+        })
+      }
+    })
+    let minted: object | undefined
+    try {
+      const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      if (previousBody === undefined) {
+        delete (Response.prototype as { body?: unknown }).body
+      } else {
+        Object.defineProperty(Response.prototype, 'body', previousBody)
+      }
+    }
+    expect(minted).toBeUndefined()
+  })
+
   test('P2: hanging-body cancel AbortError is not unhandled', async () => {
     const tag = 'p2cancel'
     const alias = `${tag}.xec`
