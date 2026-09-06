@@ -1,4 +1,5 @@
 import { canonicalizeEcashAddress, toXecAlias } from '../../utils/alias'
+import { dateNow } from '../../utils/clock'
 import {
   Tm1AliasPublicationAuthorizationError,
   type Tm1AliasPublicationAuthorizationErrorCode
@@ -79,7 +80,6 @@ const applyString = Function.prototype.call.bind(String) as (
   thisArg: unknown,
   value: unknown
 ) => string
-const dateNow = Function.prototype.call.bind(Date.now) as () => number
 
 const ledgerStates = new WeakMap<object, LedgerState>()
 

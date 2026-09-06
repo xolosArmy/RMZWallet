@@ -1,4 +1,5 @@
 import { canonicalizeEcashAddress, toXecAlias } from '../../utils/alias'
+import { nowMs } from '../../utils/clock'
 import {
   Tm1AliasPublicationAuthorizationError,
   type Tm1AliasPublicationAuthorizationErrorCode
@@ -32,7 +33,6 @@ const DEFAULT_TIMEOUT_MS = 8_000
 const MAX_RESPONSE_BYTES = 65_536
 const MAX_TOKEN_TTL_MS = 60_000
 const TXID_PATTERN = /^[0-9a-f]{64}$/
-const nowMs = Function.prototype.call.bind(Date.now) as () => number
 const fetchImpl = typeof globalThis.fetch === 'function'
   ? globalThis.fetch.bind(globalThis)
   : undefined

@@ -689,4 +689,51 @@ describe('TM1 verified evidence expiry via verification port', () => {
       Date.now = originalNow
     }
   })
+
+  test('P1 load-order attack: Date.now replaced between verifier import and authorizer import does not bypass expiry', async () => {
+    const frozenNow = 1_700_000_000_000
+    const originalNow = Date.now
+    const tag = 'loadord'
+    const alias = `${tag}.xec`
+    vi.useFakeTimers()
+    vi.setSystemTime(frozenNow)
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: {
+          alias,
+          address: OWNER,
+          txid: uniqueTxid(tag),
+          blockheight: 100,
+          status: 'confirmed',
+          expiresAt: frozenNow + 1_000
+        }
+      }
+    }))
+    vi.resetModules()
+    try {
+      const { createTm1AliasOwnershipVerificationPort: createPort } = await import(
+        './tm1AliasOwnershipVerificationPort'
+      )
+      const port = createPort()
+      const evidence = await port.verify({ alias, ownerAddress: OWNER })
+
+      vi.setSystemTime(frozenNow + 1_001)
+      Date.now = () => 0
+
+      const { createTm1AliasPublicationAuthorizer: createAuthorizer } = await import(
+        './tm1AliasPublicationAuthorization'
+      )
+      const authorizerInstance = createAuthorizer()
+
+      expect(() => authorizerInstance.issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence
+      })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
+    } finally {
+      Date.now = originalNow
+      vi.useRealTimers()
+    }
+  })
 })

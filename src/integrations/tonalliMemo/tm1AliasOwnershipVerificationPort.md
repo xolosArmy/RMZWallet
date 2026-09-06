@@ -78,10 +78,12 @@ Caller-supplied `{ status: 'confirmed', ... }` is still
 Same-realm patch of fetch / JSON.parse / decode / concat /
 stream reader / `Response.prototype.body` / `AbortController.prototype.abort` /
 `AbortController.prototype.signal` / `Address.parse` / `Date.now` *before*
-this module (or `utils/alias.ts`) is first evaluated is process load-order,
+this module (or `utils/alias.ts` or `utils/clock.ts`) is first evaluated is process load-order,
 not a module API. This slice does not pin undici/native fetch.
 Request-time expiry uses captured `nowMs`, not live `Date.now()`.
-Post-import `AbortController.prototype.abort` and `signal` replacements
+The evaluation-time captured clock is shared between the verification port
+and the publication authorizer via `utils/clock.ts` to prevent load-order
+clock skew attacks. Post-import `AbortController.prototype.abort` and `signal` replacements
 do not prevent verifier timeout or caller-abort from cutting hanging requests.
 `Address.prototype.cash` / `toString` post-import swaps do not mint: those
 methods are own properties on each parsed instance. Post-import
