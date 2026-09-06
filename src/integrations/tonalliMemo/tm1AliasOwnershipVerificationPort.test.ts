@@ -712,6 +712,56 @@ describe('TM1 alias ownership verification port', () => {
     expect(result.trim()).toBe('OK')
   }, 15_000)
 
+  test('P1: post-import globalThis.parseInt monkeypatching cannot break verification or mint maliciously', async () => {
+    const tag = 'p1parseint'
+    const alias = `${tag}.xec`
+    const { verifier, request, issue } = await portWith(tag, ok(tag))
+    const origParseInt = globalThis.parseInt
+    let minted: object | undefined
+    try {
+      globalThis.parseInt = () => 0
+      const token = await verifier.verify(request())
+      issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      globalThis.parseInt = origParseInt
+    }
+    expect(minted).toBeDefined()
+  })
+
+  test('P1: post-import prototype chain alteration cannot mint for different address', async () => {
+    const tag = 'p1protochain'
+    const alias = `${tag}.xec`
+    const { verifier, request, issue } = await portWith(tag, ok(tag, { address: OTHER_OWNER }))
+    const typedArrayProto = Object.getPrototypeOf(Uint8Array.prototype)
+    const fakeProto = Object.create(typedArrayProto)
+    fakeProto.subarray = function () {
+      return new Uint8Array([77, 88])
+    }
+    let minted: object | undefined
+    try {
+      Object.setPrototypeOf(Uint8Array.prototype, fakeProto)
+      const token = await verifier.verify(request())
+      issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      Object.setPrototypeOf(Uint8Array.prototype, typedArrayProto)
+    }
+    expect(minted).toBeUndefined()
+  })
+
   test('P1: post-import Response.prototype.body replacement cannot mint', async () => {
     const tag = 'p1body'
     const alias = `${tag}.xec`

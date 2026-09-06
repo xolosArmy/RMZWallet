@@ -37,12 +37,13 @@ CashAddr canonicalization captures `Address.parse.bind(Address)`
 in `utils/alias.ts`. `Address.prototype` is frozen and severed from
 `Object.prototype` (`null` prototype) at module evaluation to prevent
 prototype pollution / setter interception (`this.address = ...`).
-`String.prototype` methods (`split`, `toLowerCase`, `toUpperCase`, etc.)
-and `Uint8Array.prototype` / `TypedArray.prototype` methods (`subarray`, `set`, `slice`, etc.)
-are snapshot at module evaluation; CashAddr parsing runs inside
+`String.prototype` methods (`split`, `toLowerCase`, `toUpperCase`, etc.),
+`Uint8Array.prototype` / `TypedArray.prototype` methods (`subarray`, `set`, `slice`, etc.),
+and prototype chains (`Uint8Array.prototype`, `String.prototype`, `Array.prototype`, `%TypedArray%.prototype`),
+as well as `globalThis.parseInt`, are captured at module evaluation. CashAddr parsing runs inside
 `runWithIsolatedDecoder`, guaranteeing 100% deterministic decoding
-immune to post-import string and typed array prototype tampering,
-and failing closed immediately if any prototype method cannot be restored.
+immune to post-import prototype chain alteration, string / typed array prototype tampering,
+and `parseInt` monkeypatching, failing closed immediately if any property or prototype cannot be restored.
 `cash()` / `toString()` are instance own
 properties created inside `Address` construction, not live
 prototype dispatch. Passing `fetch`, `endpointUrl`, `observe`,
@@ -103,10 +104,10 @@ methods are own properties on each parsed instance. Post-import
 `Address.prototype` setter injections are rejected by `Object.freeze` and
 cannot intercept constructor assignments. Post-import `String.prototype.split`
 or `toLowerCase` replacements, as well as `Uint8Array.prototype` / `TypedArray.prototype.subarray`, `slice`, or `set`
-replacements or shadowing, cannot forge parsed address payloads because
-`runWithIsolatedDecoder` restores authentic method descriptors during parsing,
-failing closed (throwing immediately and aborting verification) if any prototype
-property was made non-configurable.
+replacements or shadowing, `globalThis.parseInt` monkeypatching, or `Object.setPrototypeOf` prototype chain
+alteration, cannot forge parsed address payloads because `runWithIsolatedDecoder` restores authentic method
+descriptors and pins prototype chains during parsing, failing closed (throwing immediately and aborting verification)
+if any prototype property or chain was made non-configurable or non-extensible.
 Post-import `Array.prototype` index setters do not mint: body text is not
 accumulated in an Array.
 

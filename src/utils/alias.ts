@@ -63,8 +63,15 @@ interface TargetSnapshot {
   readonly authenticDesc?: PropertyDescriptor
 }
 
+interface ProtoChainSnapshot {
+  readonly target: object
+  readonly authenticProto: object | null
+}
+
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor.bind(Object)
 const objectDefineProperty = Object.defineProperty.bind(Object)
+const objectGetPrototypeOf = Object.getPrototypeOf.bind(Object)
+const objectSetPrototypeOf = Object.setPrototypeOf.bind(Object)
 const stringTrim = Function.prototype.call.bind(String.prototype.trim) as (target: string) => string
 const stringToLowerCase = Function.prototype.call.bind(
   String.prototype.toLowerCase
@@ -72,6 +79,9 @@ const stringToLowerCase = Function.prototype.call.bind(
 const stringStartsWith = Function.prototype.call.bind(
   String.prototype.startsWith
 ) as (target: string, search: string, position?: number) => boolean
+
+export const capturedGlobalParseInt =
+  typeof globalThis !== 'undefined' ? globalThis.parseInt : undefined
 
 const authenticSnapshots: TargetSnapshot[] = []
 
@@ -89,7 +99,7 @@ for (let i = 0; i < CAPTURED_STRING_METHODS.length; i++) {
 
 const typedArrayProto =
   typeof Uint8Array !== 'undefined'
-    ? Object.getPrototypeOf(Uint8Array.prototype)
+    ? objectGetPrototypeOf(Uint8Array.prototype)
     : undefined
 
 if (typedArrayProto) {
@@ -118,11 +128,87 @@ if (typeof Uint8Array !== 'undefined' && Uint8Array.prototype) {
   }
 }
 
+if (typeof globalThis !== 'undefined' && capturedGlobalParseInt) {
+  const desc =
+    objectGetOwnPropertyDescriptor(globalThis, 'parseInt') ?? {
+      value: capturedGlobalParseInt,
+      writable: true,
+      enumerable: false,
+      configurable: true
+    }
+  authenticSnapshots[authenticSnapshots.length] = {
+    target: globalThis as unknown as object,
+    name: 'parseInt',
+    authenticDesc: desc
+  }
+}
+
+if (typeof Number !== 'undefined' && Number.parseInt) {
+  const desc =
+    objectGetOwnPropertyDescriptor(Number, 'parseInt') ?? {
+      value: Number.parseInt,
+      writable: true,
+      enumerable: false,
+      configurable: true
+    }
+  authenticSnapshots[authenticSnapshots.length] = {
+    target: Number as unknown as object,
+    name: 'parseInt',
+    authenticDesc: desc
+  }
+}
+
+const protoChainSnapshots: ProtoChainSnapshot[] = []
+
+if (typeof String !== 'undefined' && String.prototype) {
+  protoChainSnapshots[protoChainSnapshots.length] = {
+    target: String.prototype,
+    authenticProto: objectGetPrototypeOf(String.prototype)
+  }
+}
+
+if (typeof Uint8Array !== 'undefined' && Uint8Array.prototype) {
+  protoChainSnapshots[protoChainSnapshots.length] = {
+    target: Uint8Array.prototype,
+    authenticProto: objectGetPrototypeOf(Uint8Array.prototype)
+  }
+}
+
+if (typedArrayProto) {
+  protoChainSnapshots[protoChainSnapshots.length] = {
+    target: typedArrayProto,
+    authenticProto: objectGetPrototypeOf(typedArrayProto)
+  }
+}
+
+if (typeof Array !== 'undefined' && Array.prototype) {
+  protoChainSnapshots[protoChainSnapshots.length] = {
+    target: Array.prototype,
+    authenticProto: objectGetPrototypeOf(Array.prototype)
+  }
+}
+
 export function runWithIsolatedDecoder<T>(action: () => T): T {
   const previousDescriptors: Array<PropertyDescriptor | undefined> = []
   const tamperedIndices: number[] = []
+  const previousProtos: Array<object | null | undefined> = []
+  const tamperedProtoIndices: number[] = []
 
   try {
+    for (let i = 0; i < protoChainSnapshots.length; i++) {
+      const { target, authenticProto } = protoChainSnapshots[i]
+      const currentProto = objectGetPrototypeOf(target)
+
+      if (currentProto !== authenticProto) {
+        objectSetPrototypeOf(target, authenticProto)
+        if (objectGetPrototypeOf(target) !== authenticProto) {
+          throw new TypeError('Cannot restore prototype chain')
+        }
+        previousProtos[i] = currentProto
+        tamperedProtoIndices[tamperedProtoIndices.length] = i
+      }
+    }
+
     for (let i = 0; i < authenticSnapshots.length; i++) {
       const { target, name, authenticDesc } = authenticSnapshots[i]
       const currentDesc = objectGetOwnPropertyDescriptor(target, name)
@@ -174,6 +260,27 @@ export function runWithIsolatedDecoder<T>(action: () => T): T {
         }
       }
     }
+
+    for (let p = 0; p < tamperedProtoIndices.length; p++) {
+      const idx = tamperedProtoIndices[p]
+      const { target } = protoChainSnapshots[idx]
+      const previousProto = previousProtos[idx]
+      try {
+        if (previousProto !== undefined) {
+          objectSetPrototypeOf(target, previousProto)
+          if (objectGetPrototypeOf(target) !== previousProto) {
+            if (!restorationError) {
+              restorationError = new TypeError('Cannot restore tampered prototype chain')
+            }
+          }
+        }
+      } catch (err) {
+        if (!restorationError) {
+          restorationError = err
+        }
+      }
+    }
+
     if (restorationError) {
       // eslint-disable-next-line no-unsafe-finally
       throw restorationError
@@ -194,6 +301,10 @@ const wrapAddressInstance = (instance: ReturnType<typeof rawParseCashAddr>): Ret
   const origLegacy = instance.legacy
   if (typeof origLegacy === 'function') {
     instance.legacy = () => wrapAddressInstance(runWithIsolatedDecoder(() => origLegacy.call(instance)))
+  }
+  const origToString = instance.toString
+  if (typeof origToString === 'function') {
+    instance.toString = () => runWithIsolatedDecoder(() => origToString.call(instance))
   }
   return instance
 }

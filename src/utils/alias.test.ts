@@ -385,4 +385,142 @@ describe('P1 isolate-string-prototype-decoder', () => {
     )
     expect(result.trim()).toBe('OK')
   })
+
+  test('parseCashAddr and canonicalizeEcashAddress immune to monkeypatched globalThis.parseInt', () => {
+    const origParseInt = globalThis.parseInt
+    try {
+      globalThis.parseInt = () => 0
+      const parsed = parseCashAddr(VALID_ADDR)
+      expect(parsed.cash().toString()).toBe(VALID_ADDR)
+      expect(parsed.toString()).toBe(VALID_ADDR)
+      expect(canonicalizeEcashAddress(VALID_ADDR)).toBe(VALID_ADDR)
+      // Verify monkeypatch is restored outside
+      expect(globalThis.parseInt('42', 10)).toBe(0)
+    } finally {
+      globalThis.parseInt = origParseInt
+    }
+  })
+
+  test('parseCashAddr and canonicalizeEcashAddress immune to altered Uint8Array.prototype prototype chain', () => {
+    const typedArrayProto = Object.getPrototypeOf(Uint8Array.prototype)
+    const fakeProto = Object.create(typedArrayProto)
+    fakeProto.subarray = function () {
+      return new Uint8Array([77, 88])
+    }
+    try {
+      Object.setPrototypeOf(Uint8Array.prototype, fakeProto)
+      const parsed = parseCashAddr(VALID_ADDR)
+      expect(parsed.cash().toString()).toBe(VALID_ADDR)
+      expect(canonicalizeEcashAddress(VALID_ADDR)).toBe(VALID_ADDR)
+      // Verify tampered prototype chain was restored outside
+      expect(Object.getPrototypeOf(Uint8Array.prototype)).toBe(fakeProto)
+    } finally {
+      Object.setPrototypeOf(Uint8Array.prototype, typedArrayProto)
+    }
+  })
+
+  test('parseCashAddr and canonicalizeEcashAddress immune to altered String.prototype prototype chain', () => {
+    const origStringProto = Object.getPrototypeOf(String.prototype)
+    const fakeProto = Object.create(origStringProto)
+    try {
+      Object.setPrototypeOf(String.prototype, fakeProto)
+      const parsed = parseCashAddr(VALID_ADDR)
+      expect(parsed.cash().toString()).toBe(VALID_ADDR)
+      expect(canonicalizeEcashAddress(VALID_ADDR)).toBe(VALID_ADDR)
+      expect(Object.getPrototypeOf(String.prototype)).toBe(fakeProto)
+    } finally {
+      Object.setPrototypeOf(String.prototype, origStringProto)
+    }
+  })
+
+  test('fail-closed: runWithIsolatedDecoder throws immediately and aborts action if globalThis.parseInt is non-configurable', () => {
+    const script = `
+      import { runWithIsolatedDecoder, parseCashAddr, canonicalizeEcashAddress } from './src/utils/alias.ts'
+
+      Object.defineProperty(globalThis, 'parseInt', {
+        value: () => 0,
+        configurable: false,
+        writable: false
+      })
+
+      let executed = false
+      let threw = false
+      try {
+        runWithIsolatedDecoder(() => {
+          executed = true
+        })
+      } catch {
+        threw = true
+      }
+      if (executed) throw new Error('Action must not execute when parseInt is non-configurable')
+      if (!threw) throw new Error('runWithIsolatedDecoder must throw on non-configurable parseInt')
+
+      let parseThrew = false
+      try {
+        parseCashAddr('ecash:dummy')
+      } catch {
+        parseThrew = true
+      }
+      if (!parseThrew) throw new Error('parseCashAddr must throw on non-configurable parseInt')
+
+      const canon = canonicalizeEcashAddress('ecash:dummy')
+      if (canon !== null) throw new Error('canonicalizeEcashAddress must return null on non-configurable parseInt')
+      process.stdout.write('OK')
+    `
+    const result = execFileSync(
+      process.execPath,
+      ['--import', 'tsx', '--input-type=module', '-e', script],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: { ...process.env, PATH: process.env.PATH }
+      }
+    )
+    expect(result.trim()).toBe('OK')
+  })
+
+  test('fail-closed: runWithIsolatedDecoder throws immediately if prototype chain tampering is non-extensible', () => {
+    const script = `
+      import { runWithIsolatedDecoder, parseCashAddr, canonicalizeEcashAddress } from './src/utils/alias.ts'
+
+      const origProto = Object.getPrototypeOf(Uint8Array.prototype)
+      const fakeProto = Object.create(origProto)
+      Object.setPrototypeOf(Uint8Array.prototype, fakeProto)
+      Object.preventExtensions(Uint8Array.prototype)
+
+      let executed = false
+      let threw = false
+      try {
+        runWithIsolatedDecoder(() => {
+          executed = true
+        })
+      } catch {
+        threw = true
+      }
+      if (executed) throw new Error('Action must not execute when prototype is non-extensible')
+      if (!threw) throw new Error('runWithIsolatedDecoder must throw on non-extensible prototype chain')
+
+      let parseThrew = false
+      try {
+        parseCashAddr('ecash:dummy')
+      } catch {
+        parseThrew = true
+      }
+      if (!parseThrew) throw new Error('parseCashAddr must throw on non-extensible prototype chain')
+
+      const canon = canonicalizeEcashAddress('ecash:dummy')
+      if (canon !== null) throw new Error('canonicalizeEcashAddress must return null on non-extensible prototype chain')
+      process.stdout.write('OK')
+    `
+    const result = execFileSync(
+      process.execPath,
+      ['--import', 'tsx', '--input-type=module', '-e', script],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: { ...process.env, PATH: process.env.PATH }
+      }
+    )
+    expect(result.trim()).toBe('OK')
+  })
 })
