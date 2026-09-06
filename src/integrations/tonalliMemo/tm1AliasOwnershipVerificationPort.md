@@ -13,9 +13,10 @@ enablement. App / routes / RegisterAlias / orchestrator stay unwired.
 Public create captures `globalThis.fetch.bind(globalThis)`,
 `JSON.parse.bind(JSON)`, body-decode prototype methods
 (`TextDecoder.prototype.decode`, `String.prototype.concat`),
-and stream reader methods
+stream reader methods
 (`ReadableStream.prototype.getReader`,
-`ReadableStreamDefaultReader.prototype.read` / `cancel`) once at
+`ReadableStreamDefaultReader.prototype.read` / `cancel`),
+and `AbortController.prototype.abort` once at
 module evaluation and GETs frozen `https://alias.ecash.mx/alias`.
 Decoded body text is assembled with captured `concatStrings` on
 string primitives; it is not accumulated in an Array and does not
@@ -23,7 +24,10 @@ indexed-write chunks that can inherit prototype setters.
 `Response.prototype.body` is read through a getter captured at
 module evaluation (`getResponseBody`); later replacement of that
 getter does not change decode. Stream `cancel()` fulfillment and
-rejection are both settled (`settleCancel`); abort/timeout still
+rejection are both settled (`settleCancel`); timeout and caller-abort
+invoke captured `abortController(controller)` rather than live
+prototype dispatch; post-import replacement of `AbortController.prototype.abort`
+does not hang pending verify() calls; abort/timeout still
 map to `ALIAS_OWNERSHIP_UNAVAILABLE` and do not mint.
 CashAddr canonicalization captures `Address.parse.bind(Address)`
 in `utils/alias.ts`. `cash()` / `toString()` are instance own
@@ -70,11 +74,13 @@ Caller-supplied `{ status: 'confirmed', ... }` is still
 `ALIAS_EVIDENCE_UNTRUSTED` at `issue()`.
 
 Same-realm patch of fetch / JSON.parse / decode / concat /
-stream reader / `Response.prototype.body` / `Address.parse` /
-`Date.now` *before* this module (or `utils/alias.ts`) is first
+stream reader / `Response.prototype.body` / `AbortController.prototype.abort` /
+`Address.parse` / `Date.now` *before* this module (or `utils/alias.ts`) is first
 evaluated is process load-order, not a module API. This slice does
 not pin undici/native fetch. Request-time expiry uses captured
-`nowMs`, not live `Date.now()`. `Address.prototype.cash` /
+`nowMs`, not live `Date.now()`. Post-import `AbortController.prototype.abort`
+replacements do not prevent verifier timeout or caller-abort from cutting
+hanging requests. `Address.prototype.cash` /
 `toString` post-import swaps do not mint: those methods are own
 properties on each parsed instance. Post-import
 `Array.prototype` index setters do not mint: body text is not

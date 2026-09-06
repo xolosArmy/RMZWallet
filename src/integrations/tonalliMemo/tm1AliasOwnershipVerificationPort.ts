@@ -51,6 +51,9 @@ const numberIsFinite = Number.isFinite.bind(Number) as (value: unknown) => boole
 const encodeUriComponent = encodeURIComponent
 const TextDecoderCtor = TextDecoder
 const AbortControllerCtor = AbortController
+const abortController = Function.prototype.call.bind(
+  AbortController.prototype.abort
+) as (controller: AbortController, reason?: unknown) => void
 const scheduleTimeout = setTimeout
 const cancelTimeout = clearTimeout
 const decodeUtf8Bytes = Function.prototype.call.bind(
@@ -211,9 +214,9 @@ async function observeAliasOwnership(alias: string, signal?: AbortSignal): Promi
   if (signal?.aborted) unavailable()
   if (typeof fetchImpl !== 'function') unavailable()
   const controller = new AbortControllerCtor()
-  const timer = scheduleTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
+  const timer = scheduleTimeout(() => abortController(controller), DEFAULT_TIMEOUT_MS)
   const onAbort = (): void => {
-    controller.abort()
+    abortController(controller)
   }
   signal?.addEventListener('abort', onAbort, { once: true })
   try {

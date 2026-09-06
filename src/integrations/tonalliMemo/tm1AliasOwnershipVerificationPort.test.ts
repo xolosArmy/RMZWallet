@@ -753,6 +753,83 @@ describe('TM1 alias ownership verification port', () => {
     }
   }, 1_000)
 
+  test('P2: post-import AbortController.prototype.abort no-op: hanging fetch/body maps to UNAVAILABLE within timeout', async () => {
+    const originalAbort = AbortController.prototype.abort
+    const timeoutMs = 8_000
+    try {
+      vi.stubGlobal('fetch', (async () => hangingAliasResponse()) as typeof fetch)
+      vi.resetModules()
+      const portMod = await import('./tm1AliasOwnershipVerificationPort')
+      AbortController.prototype.abort = function () {}
+
+      const tag = 'p2abort'
+      const alias = `${tag}.xec`
+      const verifier = portMod.createTm1AliasOwnershipVerificationPort()
+
+      const failAfter = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('TIMEOUT_EXCEEDED')), timeoutMs + 250)
+      })
+
+      await expect(Promise.race([
+        verifier.verify({ alias, ownerAddress: OWNER }),
+        failAfter
+      ])).rejects.toMatchObject({ code: 'ALIAS_OWNERSHIP_UNAVAILABLE' })
+    } finally {
+      AbortController.prototype.abort = originalAbort
+    }
+  }, 12_000)
+
+  test('P2: post-import AbortController.prototype.abort no-op: caller abort still maps to UNAVAILABLE', async () => {
+    const originalAbort = AbortController.prototype.abort
+    try {
+      const cases: Array<{ name: string; fetch: typeof fetch }> = [
+        {
+          name: 'body',
+          fetch: (async () => hangingAliasResponse()) as typeof fetch
+        },
+        {
+          name: 'headers',
+          fetch: ((_url: string, init?: RequestInit) => new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(new DOMException('Aborted', 'AbortError'))
+            })
+          })) as typeof fetch
+        }
+      ]
+      for (const tc of cases) {
+        AbortController.prototype.abort = originalAbort
+        vi.stubGlobal('fetch', tc.fetch)
+        vi.resetModules()
+        const portMod = await import('./tm1AliasOwnershipVerificationPort')
+        AbortController.prototype.abort = function () {}
+
+        const tag = `p2c${tc.name}`
+        const alias = `${tag}.xec`
+        const verifier = portMod.createTm1AliasOwnershipVerificationPort()
+        const callerAbort = new AbortController()
+
+        const pending = verifier.verify({
+          alias,
+          ownerAddress: OWNER,
+          signal: callerAbort.signal
+        })
+        await new Promise(resolve => setTimeout(resolve, 20))
+        originalAbort.call(callerAbort)
+
+        const failAfter = new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error('TIMEOUT_EXCEEDED')), 500)
+        })
+
+        await expect(Promise.race([
+          pending,
+          failAfter
+        ])).rejects.toMatchObject({ code: 'ALIAS_OWNERSHIP_UNAVAILABLE' })
+      }
+    } finally {
+      AbortController.prototype.abort = originalAbort
+    }
+  }, 2_000)
+
   test('P1: prototype.verify.call with forged this cannot mint', async () => {
     const tag = 'p1this'
     const alias = `${tag}.xec`
