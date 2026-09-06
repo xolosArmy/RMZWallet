@@ -50,12 +50,18 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(runtime).not.toMatch(/RegisterAlias|MemoDraft|approveAndBroadcast/)
   })
 
-  test('reuses existing alias format helpers only', () => {
+  test('reuses existing alias format helpers and shared captured clock only', () => {
     const imports = Array.from(
       runtime.matchAll(/from\s+['"]([^'"]+)['"]/g),
       match => match[1]
     )
-    expect(imports).toEqual(['../../utils/alias'])
+    expect(imports.sort()).toEqual([
+      '../../utils/alias',
+      '../../utils/clock',
+      './tm1AliasOwnershipVerificationPort',
+      './tm1AliasPublicationAuthorizationError'
+    ])
+    expect(runtime).not.toMatch(/mintTm1VerifiedAliasOwnershipToken|mintVerifiedAliasOwnershipToken/)
   })
 
   test('records that caller-supplied evidence is not sufficient to enable publication', () => {
@@ -79,7 +85,10 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(runtime).toContain('Function.prototype.call.bind(Map.prototype.set)')
     expect(runtime).toContain('Function.prototype.call.bind(Array.prototype.join)')
     expect(runtime).toContain('Function.prototype.call.bind(String)')
-    expect(runtime).toContain('Function.prototype.call.bind(Date.now)')
+    const clockRuntime = source('../../utils/clock.ts')
+    expect(clockRuntime).toContain('Function.prototype.call.bind(Date.now)')
+    expect(clockRuntime).not.toMatch(/Date\.now\s*\(/)
+    expect(runtime).toContain("from '../../utils/clock'")
     expect(runtime).not.toMatch(/function\s+(reset|clear)/)
     expect(runtime).not.toMatch(/\.clear\s*\(/)
     expect(runtime).not.toMatch(/this\.ledger\.consumedProofs/)
@@ -120,12 +129,15 @@ describe('TM1 alias publication authorization isolation', () => {
     ])
     expect(runtime).not.toMatch(/export function createTm1InMemoryAliasPublicationAuthorizationLedger/)
     expect(runtime).not.toMatch(/export function mintVerifiedAliasPublicationEvidence/)
+    expect(runtime).not.toMatch(/export function mintTm1VerifiedAliasOwnershipToken/)
     expect(aliasAuth).not.toHaveProperty('createTm1InMemoryAliasPublicationAuthorizationLedger')
     expect(aliasAuth).not.toHaveProperty('mintVerifiedAliasPublicationEvidence')
   })
 
   test('expiry uses captured Date.now and rejects caller now', () => {
-    const production = runtime.slice(0, runtime.indexOf('if (import.meta.vitest)'))
+    const production = runtime.includes('if (import.meta.vitest)')
+      ? runtime.slice(0, runtime.indexOf('if (import.meta.vitest)'))
+      : runtime
     const issue = production.slice(
       production.indexOf('\n  issue('),
       production.indexOf('export function createTm1AliasPublicationAuthorizer')
@@ -142,19 +154,32 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(production).not.toMatch(/export function setClock/)
   })
 
-  test('verified snapshot preserves expiresAt when present and omits it when absent', () => {
-    const mint = runtime.slice(
-      runtime.indexOf('function mintVerifiedAliasPublicationEvidence'),
-      runtime.indexOf('const internalVerifiedEvidencePort')
+  test('verified snapshot always writes a finite verifier-bounded expiresAt', () => {
+    const portRuntime = source('./tm1AliasOwnershipVerificationPort.ts')
+    const mint = portRuntime.slice(
+      portRuntime.indexOf('function mintVerifiedAliasOwnershipToken'),
+      portRuntime.indexOf('export function lookupTm1VerifiedAliasOwnershipToken')
     )
+    expect(mint).not.toMatch(/^export /m)
     const reconstruct = runtime.slice(
       runtime.indexOf('const evidence = verifiedSnapshot === undefined'),
       runtime.indexOf('verified: verifiedSnapshot !== undefined')
     )
     expect(mint).toContain('expiresAt: parsed.expiresAt')
-    expect(mint).toContain('parsed.expiresAt === undefined ? {}')
+    expect(mint).not.toContain('parsed.expiresAt === undefined ? {}')
+    expect(portRuntime).toContain('MAX_TOKEN_TTL_MS = 60_000')
+    const clockRuntime = source('../../utils/clock.ts')
+    expect(clockRuntime).toContain('Function.prototype.call.bind(Date.now)')
+    expect(portRuntime).toContain("from '../../utils/clock'")
+    expect(portRuntime).toContain('boundTokenExpiry')
     expect(reconstruct).toContain('expiresAt: verifiedSnapshot.expiresAt')
-    expect(reconstruct).toContain('verifiedSnapshot.expiresAt === undefined ? {}')
+    expect(reconstruct).not.toContain('verifiedSnapshot.expiresAt === undefined ? {}')
+    const issue = runtime.slice(
+      runtime.indexOf('\n  issue('),
+      runtime.indexOf('export function createTm1AliasPublicationAuthorizer')
+    )
+    expect(issue).toContain("typeof evidence.expiresAt !== 'number'")
+    expect(issue).toContain("fail('ALIAS_PROOF_EXPIRED')")
   })
 
   test('verified commit records proof before freeze/join/String', () => {
@@ -261,5 +286,16 @@ describe('TM1 alias publication authorization isolation', () => {
       globalThis.String = OriginalString
     }
     expect(auths).toHaveLength(0)
+  })
+
+  test('verification port and publication authorizer share the exact same captured clock reference', async () => {
+    const clock = await import('../../utils/clock')
+    expect(typeof clock.nowMs).toBe('function')
+    expect(clock.nowMs).toBe(clock.dateNow)
+    expect(runtime).toContain("from '../../utils/clock'")
+    const portRuntime = source('./tm1AliasOwnershipVerificationPort.ts')
+    expect(portRuntime).toContain("from '../../utils/clock'")
+    expect(runtime).not.toMatch(/Date\.now\s*\(/)
+    expect(portRuntime).not.toMatch(/Date\.now\s*\(/)
   })
 })
