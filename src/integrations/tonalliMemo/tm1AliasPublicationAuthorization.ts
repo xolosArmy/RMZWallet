@@ -201,6 +201,12 @@ export class Tm1AliasPublicationAuthorizer {
       if (trustedNow >= evidence.expiresAt) fail('ALIAS_PROOF_EXPIRED')
     }
     if (!request.verified) fail('ALIAS_EVIDENCE_UNTRUSTED')
+    if (
+      typeof evidence.expiresAt !== 'number' ||
+      !Number.isFinite(evidence.expiresAt)
+    ) {
+      fail('ALIAS_PROOF_EXPIRED')
+    }
     return commitVerifiedAuthorization(this.ledger, request)
   }
 }
@@ -296,7 +302,7 @@ function parseRequest(value: unknown): ParsedRequest {
       txid: verifiedSnapshot.txid,
       blockHeight: verifiedSnapshot.blockHeight,
       status: 'confirmed',
-      ...(verifiedSnapshot.expiresAt === undefined ? {} : { expiresAt: verifiedSnapshot.expiresAt })
+      expiresAt: verifiedSnapshot.expiresAt
     })
   return objectFreeze({
     alias,

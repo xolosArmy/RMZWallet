@@ -49,9 +49,13 @@ dispatched through `this`.
 2. GET alias.ecash.mx. Network/abort/5xx → `ALIAS_OWNERSHIP_UNAVAILABLE`.
    Empty / invalid JSON / null → `ALIAS_PROOF_UNVERIFIABLE`.
    HTTP 404 → `ALIAS_UNCONFIRMED`.
-3. Unconfirmed, owner mismatch, or `clock() >= expiresAt` → throw, no token.
+3. Unconfirmed, owner mismatch, or captured `nowMs() >= expiresAt` → throw, no token.
 4. Confirmed matching observation → file-private mint (not exported).
-5. `expiresAt`, when present, is copied into the snapshot (not dropped).
+5. Mint always writes a finite `expiresAt`: observed value if it is in
+   `(now, now+MAX_TOKEN_TTL_MS]`, otherwise `now+MAX_TOKEN_TTL_MS`
+   (60_000 ms). Past observed expiry does not mint. Omitted expiry is
+   not valid forever. `issue()` requires finite `expiresAt` and
+   `nowMs() < expiresAt`.
 6. `blockheight` from the API is stored only on that snapshot. The port
    does not write the issuer's process-local stale-height map.
 
@@ -63,11 +67,12 @@ Caller-supplied `{ status: 'confirmed', ... }` is still
 `ALIAS_EVIDENCE_UNTRUSTED` at `issue()`.
 
 Same-realm patch of fetch / JSON.parse / decode / stream reader /
-`Response.prototype.body` / `Address.parse` *before* this module
-(or `utils/alias.ts`) is first evaluated is process load-order,
-not a module API. This slice does not pin undici/native fetch.
-`Date.now` remains request-time for expiry. `Address.prototype.cash`
-/ `toString` post-import swaps do not mint: those methods are own
-properties on each parsed instance.
+`Response.prototype.body` / `Address.parse` / `Date.now` *before*
+this module (or `utils/alias.ts`) is first evaluated is process
+load-order, not a module API. This slice does not pin undici/native
+fetch. Request-time expiry uses captured `nowMs`, not live
+`Date.now()`. `Address.prototype.cash` / `toString` post-import
+swaps do not mint: those methods are own properties on each parsed
+instance.
 
 **NOT SUFFICIENT TO ENABLE PUBLICATION.**

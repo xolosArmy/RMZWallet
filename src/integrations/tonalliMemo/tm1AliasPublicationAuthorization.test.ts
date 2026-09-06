@@ -532,10 +532,14 @@ describe('TM1 verified evidence expiry via verification port', () => {
   }
   const mintViaPort = async (
     tag: string,
-    evidenceOverrides: Record<string, unknown> = {}
+    evidenceOverrides: Record<string, unknown> = {},
+    frozenNow?: number
   ) => {
     const alias = `${tag}.xec`
-    const expiresAt = evidenceOverrides.expiresAt
+    if (frozenNow !== undefined) {
+      vi.useFakeTimers()
+      vi.setSystemTime(frozenNow)
+    }
     vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
       [alias]: {
         status: 200,
@@ -556,13 +560,8 @@ describe('TM1 verified evidence expiry via verification port', () => {
     const { createTm1AliasPublicationAuthorizer: createAuthorizer } = await import(
       './tm1AliasPublicationAuthorization'
     )
-    if (typeof expiresAt === 'number') {
-      vi.useFakeTimers()
-      vi.setSystemTime(expiresAt - 1)
-    }
     const port = createPort()
     const evidence = await port.verify({ alias, ownerAddress: OWNER })
-    vi.useRealTimers()
     return {
       alias,
       evidence,
@@ -571,9 +570,11 @@ describe('TM1 verified evidence expiry via verification port', () => {
   }
 
   test('P2: verified evidence with expiresAt in the past is expired at issue()', async () => {
+    const frozenNow = 1_700_000_000_000
     const { alias, evidence, issue } = await mintViaPort('vexp', {
-      expiresAt: Date.now() - 60_000
-    })
+      expiresAt: frozenNow + 1_000
+    }, frozenNow)
+    vi.setSystemTime(frozenNow + 1_000)
     expect(() => issue({
       alias,
       ownerAddress: OWNER,
@@ -582,9 +583,11 @@ describe('TM1 verified evidence expiry via verification port', () => {
   })
 
   test('P2 clock: expired verified evidence with now:0 is rejected', async () => {
+    const frozenNow = 1_700_000_000_000
     const { alias, evidence, issue } = await mintViaPort('clk0', {
-      expiresAt: Date.now() - 60_000
-    })
+      expiresAt: frozenNow + 1_000
+    }, frozenNow)
+    vi.setSystemTime(frozenNow + 1_000)
     expect(() => issue({
       alias,
       ownerAddress: OWNER,
@@ -594,9 +597,10 @@ describe('TM1 verified evidence expiry via verification port', () => {
   })
 
   test('verified evidence with expiresAt in the future can reach commit', async () => {
+    const frozenNow = 1_700_000_000_000
     const { alias, evidence, issue } = await mintViaPort('vfut', {
-      expiresAt: Date.now() + 60_000
-    })
+      expiresAt: frozenNow + 30_000
+    }, frozenNow)
     const authorization = issue({
       alias,
       ownerAddress: OWNER,
@@ -610,7 +614,7 @@ describe('TM1 verified evidence expiry via verification port', () => {
     expect(Object.isFrozen(authorization)).toBe(true)
   })
 
-  test('verified evidence without expiresAt does not take the expiry branch', async () => {
+  test('verified evidence without expiresAt can issue before verifier TTL elapses', async () => {
     const { alias, evidence, issue } = await mintViaPort('vnexp')
     const authorization = issue({
       alias,
@@ -621,15 +625,18 @@ describe('TM1 verified evidence expiry via verification port', () => {
   })
 
   test('expired verified evidence does not write replay or height', async () => {
+    const frozenNow = 1_700_000_000_000
     const expired = await mintViaPort('vled', {
-      expiresAt: Date.now() - 60_000,
+      expiresAt: frozenNow + 1_000,
       blockheight: 500
-    })
+    }, frozenNow)
+    vi.setSystemTime(frozenNow + 1_000)
     expect(() => expired.issue({
       alias: expired.alias,
       ownerAddress: OWNER,
       evidence: expired.evidence
     })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
+    vi.useRealTimers()
     const later = await mintViaPort('vled', {
       txid: uniqueTxid('vledz'),
       blockheight: 50
@@ -646,10 +653,12 @@ describe('TM1 verified evidence expiry via verification port', () => {
   })
 
   test('Date.now replaced after import does not move expiry', async () => {
+    const frozenNow = 1_700_000_000_000
     const originalNow = Date.now
     const { alias, evidence, issue } = await mintViaPort('clkcap', {
-      expiresAt: originalNow() - 60_000
-    })
+      expiresAt: frozenNow + 1_000
+    }, frozenNow)
+    vi.setSystemTime(frozenNow + 1_000)
     Date.now = () => 0
     try {
       expect(() => issue({
@@ -663,9 +672,11 @@ describe('TM1 verified evidence expiry via verification port', () => {
   })
 
   test('captured clock still commits future expiresAt after Date.now is replaced', async () => {
+    const frozenNow = 1_700_000_000_000
     const originalNow = Date.now
-    const expiresAt = originalNow() + 60_000
-    const { alias, evidence, issue } = await mintViaPort('clkfut', { expiresAt })
+    const { alias, evidence, issue } = await mintViaPort('clkfut', {
+      expiresAt: frozenNow + 30_000
+    }, frozenNow)
     Date.now = () => Number.MAX_SAFE_INTEGER
     try {
       const authorization = issue({

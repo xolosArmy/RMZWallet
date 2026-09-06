@@ -16,6 +16,7 @@ import {
 const OWNER = 'ecash:qrwzys2q6xq98vwz0kjn6ulu5m6yljr5fyc909kalg'
 const OTHER_OWNER = 'ecash:qrrd3y2cmg6m2vxlng9h3djh889pmwffhqv9yym2p4'
 const UNTRUSTED = { code: 'ALIAS_EVIDENCE_UNTRUSTED' }
+const MAX_TOKEN_TTL_MS = 60_000
 
 function txidFrom(tag: string): string {
   const bytes = Array.from(tag, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('')
@@ -170,15 +171,23 @@ describe('TM1 alias ownership verification port', () => {
   })
 
   test('F: expiresAt on the observation is preserved; issue() past expiry throws ALIAS_PROOF_EXPIRED', async () => {
-    const expiresAt = Date.now() - 1_000
-    const { alias, verifier, request, issue } = await portWith(
-      'vpf',
-      ok('vpf', { expiresAt }),
-      expiresAt - 1
-    )
-    const token = await verifier.verify(request())
-    expect(() => issue({
-      alias,
+    const frozenNow = 1_700_000_000_000
+    const expiresAt = frozenNow + 1_000
+    vi.useFakeTimers()
+    vi.setSystemTime(frozenNow)
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      'vpf.xec': { status: 200, json: aliasRecord('vpf', { expiresAt }) }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+      alias: 'vpf.xec',
+      ownerAddress: OWNER
+    })
+    vi.setSystemTime(expiresAt)
+    expect(() => authMod.createTm1AliasPublicationAuthorizer().issue({
+      alias: 'vpf.xec',
       ownerAddress: OWNER,
       evidence: token
     })).toThrowError(expect.objectContaining({ code: 'ALIAS_PROOF_EXPIRED' }))
@@ -188,24 +197,22 @@ describe('TM1 alias ownership verification port', () => {
       'vpf',
       ok('vpf', { txid: txidFrom('vpfz'), blockheight: 50 })
     )
-    const laterToken = await later.verifier.verify(request())
+    const laterToken = await later.verifier.verify(later.request())
     const authorization = later.issue({
-      alias,
+      alias: 'vpf.xec',
       ownerAddress: OWNER,
       evidence: laterToken
     })
     expect(authorization).toMatchObject({
-      alias,
+      alias: 'vpf.xec',
       evidenceBlockHeight: 50
     })
   })
 
-  test('G: expiry uses Date.now at request time, not request.now', async () => {
-    const expiresAt = 1_800_000_000_000
+  test('G: expiry uses captured nowMs, not request.now', async () => {
     const { verifier, request } = await portWith(
       'vpg',
-      ok('vpg', { expiresAt }),
-      expiresAt
+      ok('vpg', { expiresAt: Date.now() - 1 })
     )
     await expect(verifier.verify(request({ now: 0 }))).rejects.toMatchObject({
       code: 'INVALID_ALIAS_AUTHORIZATION_INPUT'
@@ -213,12 +220,9 @@ describe('TM1 alias ownership verification port', () => {
     await expect(verifier.verify(request())).rejects.toMatchObject({
       code: 'ALIAS_PROOF_EXPIRED'
     })
-    vi.unstubAllGlobals()
-    vi.useRealTimers()
     const future = await portWith(
       'vpgf',
-      ok('vpgf', { expiresAt }),
-      expiresAt - 1
+      ok('vpgf', { expiresAt: Date.now() + 30_000 })
     )
     const token = await future.verifier.verify(future.request())
     const authorization = future.issue({
@@ -549,6 +553,117 @@ describe('TM1 alias ownership verification port', () => {
       }
     }
     expect(minted).toBeUndefined()
+  })
+
+  test('P1: omitted expiresAt cannot remain valid forever', async () => {
+    const tag = 'p1ttl'
+    const alias = `${tag}.xec`
+    const frozenNow = 1_700_000_000_000
+    vi.useFakeTimers()
+    vi.setSystemTime(frozenNow)
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [`${tag}i.xec`]: {
+        status: 200,
+        json: aliasRecord(`${tag}i`)
+      },
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag)
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const verifier = portMod.createTm1AliasOwnershipVerificationPort()
+    const authorizer = authMod.createTm1AliasPublicationAuthorizer()
+    const immediateToken = await verifier.verify({
+      alias: `${tag}i.xec`,
+      ownerAddress: OWNER
+    })
+    expect(authorizer.issue({
+      alias: `${tag}i.xec`,
+      ownerAddress: OWNER,
+      evidence: immediateToken
+    })).toMatchObject({ alias: `${tag}i.xec` })
+    const token = await verifier.verify({
+      alias,
+      ownerAddress: OWNER
+    })
+    const snapshot = portMod.lookupTm1VerifiedAliasOwnershipToken(token)
+    expect(typeof snapshot?.expiresAt).toBe('number')
+    expect(Number.isFinite(snapshot?.expiresAt)).toBe(true)
+    expect(snapshot?.expiresAt).toBeGreaterThan(frozenNow)
+    expect(snapshot?.expiresAt).toBeLessThanOrEqual(frozenNow + MAX_TOKEN_TTL_MS)
+    vi.setSystemTime((snapshot?.expiresAt ?? frozenNow) + 1)
+    let result: unknown
+    try {
+      result = authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+    } catch (error) {
+      result = error
+    }
+    expect(result).toMatchObject({ code: 'ALIAS_PROOF_EXPIRED' })
+  })
+
+  test('P1: observed expiresAt within cap is preserved', async () => {
+    const tag = 'p1win'
+    const alias = `${tag}.xec`
+    const frozenNow = 1_700_000_000_000
+    const expiresAt = frozenNow + 30_000
+    vi.useFakeTimers()
+    vi.setSystemTime(frozenNow)
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: { status: 200, json: aliasRecord(tag, { expiresAt }) }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+    const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+      alias,
+      ownerAddress: OWNER
+    })
+    const snapshot = portMod.lookupTm1VerifiedAliasOwnershipToken(token)
+    expect(snapshot?.expiresAt).toBe(expiresAt)
+    expect(authMod.createTm1AliasPublicationAuthorizer().issue({
+      alias,
+      ownerAddress: OWNER,
+      evidence: token
+    })).toMatchObject({ alias })
+  })
+
+  test('P1: observed expiresAt beyond MAX_TOKEN_TTL_MS is clamped', async () => {
+    const tag = 'p1clamp'
+    const alias = `${tag}.xec`
+    const frozenNow = 1_700_000_000_000
+    vi.useFakeTimers()
+    vi.setSystemTime(frozenNow)
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { expiresAt: frozenNow + 10_000_000 })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+      alias,
+      ownerAddress: OWNER
+    })
+    const snapshot = portMod.lookupTm1VerifiedAliasOwnershipToken(token)
+    expect(snapshot?.expiresAt).toBe(frozenNow + MAX_TOKEN_TTL_MS)
+  })
+
+  test('P1: observed expiresAt already past does not mint', async () => {
+    const { verifier, request } = await portWith(
+      'p1past',
+      ok('p1past', { expiresAt: Date.now() - 1 })
+    )
+    await expect(verifier.verify(request())).rejects.toMatchObject({
+      code: 'ALIAS_PROOF_EXPIRED'
+    })
   })
 
   test('P2: hanging-body cancel AbortError is not unhandled', async () => {

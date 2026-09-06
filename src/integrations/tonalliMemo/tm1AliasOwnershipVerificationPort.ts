@@ -30,7 +30,9 @@ export class Tm1AliasOwnershipVerificationError extends Error {
 const TRUSTED_ALIAS_ENDPOINT = 'https://alias.ecash.mx/alias'
 const DEFAULT_TIMEOUT_MS = 8_000
 const MAX_RESPONSE_BYTES = 65_536
+const MAX_TOKEN_TTL_MS = 60_000
 const TXID_PATTERN = /^[0-9a-f]{64}$/
+const nowMs = Function.prototype.call.bind(Date.now) as () => number
 const fetchImpl = typeof globalThis.fetch === 'function'
   ? globalThis.fetch.bind(globalThis)
   : undefined
@@ -124,7 +126,7 @@ export type Tm1VerifiedAliasOwnershipSnapshot = Readonly<{
   address: string
   txid: string
   blockHeight: number
-  expiresAt?: number
+  expiresAt: number
 }>
 
 const verifiedEvidenceSnapshots = new WeakMap<object, Tm1VerifiedAliasOwnershipSnapshot>()
@@ -138,7 +140,7 @@ function mintVerifiedAliasOwnershipToken(
     address: parsed.address,
     txid: parsed.txid,
     blockHeight: parsed.blockHeight,
-    ...(parsed.expiresAt === undefined ? {} : { expiresAt: parsed.expiresAt })
+    expiresAt: parsed.expiresAt
   }))
   return token
 }
@@ -178,18 +180,16 @@ export class Tm1AliasOwnershipVerificationPort {
     if (parsed.status !== 'confirmed' || parsed.blockHeight < 1) {
       throw new Tm1AliasOwnershipVerificationError('ALIAS_UNCONFIRMED')
     }
-    if (parsed.expiresAt !== undefined) {
-      const trustedNow = readTrustedNow()
-      if (trustedNow >= parsed.expiresAt) {
-        throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_EXPIRED')
-      }
+    const trustedNow = readTrustedNow()
+    if (parsed.expiresAt !== undefined && trustedNow >= parsed.expiresAt) {
+      throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_EXPIRED')
     }
     return mintVerifiedAliasOwnershipToken({
       alias: parsed.alias,
       address: parsed.address,
       txid: parsed.txid,
       blockHeight: parsed.blockHeight,
-      ...(parsed.expiresAt === undefined ? {} : { expiresAt: parsed.expiresAt })
+      expiresAt: boundTokenExpiry(parsed.expiresAt, trustedNow)
     })
   }
 }
@@ -240,11 +240,24 @@ async function observeAliasOwnership(alias: string, signal?: AbortSignal): Promi
 }
 
 function readTrustedNow(): number {
-  const trustedNow = (Function.prototype.call.bind(Date.now) as () => number)()
+  const trustedNow = nowMs()
   if (!numberIsFinite(trustedNow)) {
     throw new Tm1AliasOwnershipVerificationError('ALIAS_PROOF_UNVERIFIABLE')
   }
   return trustedNow
+}
+
+function boundTokenExpiry(observedExpiresAt: number | undefined, now: number): number {
+  const cap = now + MAX_TOKEN_TTL_MS
+  if (
+    typeof observedExpiresAt === 'number' &&
+    numberIsFinite(observedExpiresAt) &&
+    observedExpiresAt > now &&
+    observedExpiresAt <= cap
+  ) {
+    return observedExpiresAt
+  }
+  return cap
 }
 
 async function decodeAliasResponse(response: Response, signal: AbortSignal): Promise<unknown> {

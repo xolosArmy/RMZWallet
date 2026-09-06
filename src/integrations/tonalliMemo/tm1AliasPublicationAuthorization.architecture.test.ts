@@ -150,7 +150,7 @@ describe('TM1 alias publication authorization isolation', () => {
     expect(production).not.toMatch(/export function setClock/)
   })
 
-  test('verified snapshot preserves expiresAt when present and omits it when absent', () => {
+  test('verified snapshot always writes a finite verifier-bounded expiresAt', () => {
     const portRuntime = source('./tm1AliasOwnershipVerificationPort.ts')
     const mint = portRuntime.slice(
       portRuntime.indexOf('function mintVerifiedAliasOwnershipToken'),
@@ -162,9 +162,18 @@ describe('TM1 alias publication authorization isolation', () => {
       runtime.indexOf('verified: verifiedSnapshot !== undefined')
     )
     expect(mint).toContain('expiresAt: parsed.expiresAt')
-    expect(mint).toContain('parsed.expiresAt === undefined ? {}')
+    expect(mint).not.toContain('parsed.expiresAt === undefined ? {}')
+    expect(portRuntime).toContain('MAX_TOKEN_TTL_MS = 60_000')
+    expect(portRuntime).toContain('Function.prototype.call.bind(Date.now)')
+    expect(portRuntime).toContain('boundTokenExpiry')
     expect(reconstruct).toContain('expiresAt: verifiedSnapshot.expiresAt')
-    expect(reconstruct).toContain('verifiedSnapshot.expiresAt === undefined ? {}')
+    expect(reconstruct).not.toContain('verifiedSnapshot.expiresAt === undefined ? {}')
+    const issue = runtime.slice(
+      runtime.indexOf('\n  issue('),
+      runtime.indexOf('export function createTm1AliasPublicationAuthorizer')
+    )
+    expect(issue).toContain("typeof evidence.expiresAt !== 'number'")
+    expect(issue).toContain("fail('ALIAS_PROOF_EXPIRED')")
   })
 
   test('verified commit records proof before freeze/join/String', () => {
