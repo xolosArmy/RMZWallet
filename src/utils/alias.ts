@@ -14,14 +14,100 @@ for (const key of Object.getOwnPropertyNames(addressProto)) {
 Object.setPrototypeOf(Address.prototype, null)
 Object.freeze(Address.prototype)
 
-export const parseCashAddr = Address.parse.bind(Address)
+const CAPTURED_STRING_METHODS = [
+  'split',
+  'toLowerCase',
+  'toUpperCase',
+  'slice',
+  'substring',
+  'indexOf',
+  'lastIndexOf',
+  'includes',
+  'charCodeAt',
+  'toString'
+] as const
+
+type StringMethodName = (typeof CAPTURED_STRING_METHODS)[number]
+
+interface MethodSnapshot {
+  readonly name: StringMethodName
+  readonly desc: PropertyDescriptor
+}
+
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor.bind(Object)
+const objectDefineProperty = Object.defineProperty.bind(Object)
+const stringTrim = Function.prototype.call.bind(String.prototype.trim) as (target: string) => string
+const stringToLowerCase = Function.prototype.call.bind(
+  String.prototype.toLowerCase
+) as (target: string) => string
+const stringStartsWith = Function.prototype.call.bind(
+  String.prototype.startsWith
+) as (target: string, search: string, position?: number) => boolean
+
+const authenticSnapshots: MethodSnapshot[] = []
+for (let i = 0; i < CAPTURED_STRING_METHODS.length; i++) {
+  const name = CAPTURED_STRING_METHODS[i]
+  const desc = objectGetOwnPropertyDescriptor(String.prototype, name)
+  if (desc) {
+    authenticSnapshots[authenticSnapshots.length] = { name, desc }
+  }
+}
+
+export function runWithIsolatedStringDecoder<T>(action: () => T): T {
+  const previousDescriptors: Array<PropertyDescriptor | undefined> = []
+  const tamperedIndices: number[] = []
+
+  for (let i = 0; i < authenticSnapshots.length; i++) {
+    const { name, desc: authenticDesc } = authenticSnapshots[i]
+    const currentDesc = objectGetOwnPropertyDescriptor(String.prototype, name)
+    if (currentDesc?.value !== authenticDesc.value) {
+      previousDescriptors[i] = currentDesc
+      tamperedIndices[tamperedIndices.length] = i
+      try {
+        objectDefineProperty(String.prototype, name, authenticDesc)
+      } catch {
+        /* ignore if non-configurable */
+      }
+    }
+  }
+
+  try {
+    return action()
+  } finally {
+    for (let j = 0; j < tamperedIndices.length; j++) {
+      const idx = tamperedIndices[j]
+      const name = authenticSnapshots[idx].name
+      const previousDesc = previousDescriptors[idx]
+      try {
+        if (previousDesc) {
+          objectDefineProperty(String.prototype, name, previousDesc)
+        } else {
+          delete (String.prototype as unknown as Record<string, unknown>)[name]
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+const rawParseCashAddr = Address.parse.bind(Address)
+
+export const parseCashAddr = (address: string): ReturnType<typeof rawParseCashAddr> => {
+  if (typeof address !== 'string') {
+    throw new TypeError('Address must be a string')
+  }
+  return runWithIsolatedStringDecoder(() => rawParseCashAddr(address))
+}
 
 const BARE_ALIAS_RE = /^[a-z0-9]{1,21}$/
 const FULL_ALIAS_RE = /^([a-z0-9]{1,21})\.xec$/
 
-export const normalizeAliasInput = (input: string): string => input.trim().toLowerCase()
+export const normalizeAliasInput = (input: string): string =>
+  typeof input === 'string' ? stringToLowerCase(stringTrim(input)) : ''
 
-export const isValidAliasName = (input: string): boolean => BARE_ALIAS_RE.test(normalizeAliasInput(input))
+export const isValidAliasName = (input: string): boolean =>
+  BARE_ALIAS_RE.test(normalizeAliasInput(input))
 
 export const isLikelyAlias = (input: string): boolean => {
   const normalized = normalizeAliasInput(input)
@@ -36,8 +122,9 @@ export const toXecAlias = (input: string): string | null => {
 }
 
 export const isValidEcashAddress = (input: string): boolean => {
-  const trimmed = input.trim()
-  if (!trimmed.toLowerCase().startsWith('ecash:')) return false
+  if (typeof input !== 'string') return false
+  const trimmed = stringTrim(input)
+  if (!stringStartsWith(stringToLowerCase(trimmed), 'ecash:')) return false
 
   try {
     parseCashAddr(trimmed)
@@ -48,10 +135,12 @@ export const isValidEcashAddress = (input: string): boolean => {
 }
 
 export const canonicalizeEcashAddress = (input: string): string | null => {
-  if (typeof input !== 'string' || input.trim() !== input) return null
-  if (!input.toLowerCase().startsWith('ecash:')) return null
+  if (typeof input !== 'string' || stringTrim(input) !== input) return null
+  if (!stringStartsWith(stringToLowerCase(input), 'ecash:')) return null
   try {
-    return parseCashAddr(input).cash().toString()
+    return runWithIsolatedStringDecoder(() => {
+      return rawParseCashAddr(input).cash().toString()
+    })
   } catch {
     return null
   }

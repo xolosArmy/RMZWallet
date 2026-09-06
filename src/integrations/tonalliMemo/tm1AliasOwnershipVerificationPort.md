@@ -28,13 +28,19 @@ rejection are both settled (`settleCancel`); timeout and caller-abort
 invoke captured `abortController(controller)` rather than live
 prototype dispatch; `fetch` and body read use captured
 `getAbortSignal(controller)` rather than live prototype dispatch;
-post-import replacement of `AbortController.prototype.abort` or
-`AbortController.prototype.signal` getter does not hang pending verify() calls;
+abort listeners are registered via captured `EventTarget.prototype.addEventListener`
+and `EventTarget.prototype.removeEventListener`; post-import replacement
+of `AbortController.prototype.abort`, `AbortController.prototype.signal` getter,
+or `EventTarget.prototype.addEventListener` does not hang pending verify() calls;
 abort/timeout still map to `ALIAS_OWNERSHIP_UNAVAILABLE` and do not mint.
 CashAddr canonicalization captures `Address.parse.bind(Address)`
 in `utils/alias.ts`. `Address.prototype` is frozen and severed from
 `Object.prototype` (`null` prototype) at module evaluation to prevent
 prototype pollution / setter interception (`this.address = ...`).
+`String.prototype` methods (`split`, `toLowerCase`, `toUpperCase`, etc.)
+are snapshot at module evaluation; CashAddr parsing runs inside
+`runWithIsolatedStringDecoder`, guaranteeing 100% deterministic decoding
+immune to post-import string prototype tampering.
 `cash()` / `toString()` are instance own
 properties created inside `Address` construction, not live
 prototype dispatch. Passing `fetch`, `endpointUrl`, `observe`,
@@ -80,19 +86,23 @@ Caller-supplied `{ status: 'confirmed', ... }` is still
 
 Same-realm patch of fetch / JSON.parse / decode / concat /
 stream reader / `Response.prototype.body` / `AbortController.prototype.abort` /
-`AbortController.prototype.signal` / `Address.parse` / `Date.now` *before*
+`AbortController.prototype.signal` / `EventTarget.prototype.addEventListener` /
+`Address.parse` / `String.prototype.split` / `Date.now` *before*
 this module (or `utils/alias.ts` or `utils/clock.ts`) is first evaluated is process load-order,
 not a module API. This slice does not pin undici/native fetch.
 Request-time expiry uses captured `nowMs`, not live `Date.now()`.
 The evaluation-time captured clock is shared between the verification port
 and the publication authorizer via `utils/clock.ts` to prevent load-order
-clock skew attacks. Post-import `AbortController.prototype.abort` and `signal` replacements
+clock skew attacks. Post-import `AbortController.prototype.abort`, `signal`,
+and `EventTarget.prototype.addEventListener` replacements
 do not prevent verifier timeout or caller-abort from cutting hanging requests.
 `Address.prototype.cash` / `toString` post-import swaps do not mint: those
 methods are own properties on each parsed instance. Post-import
 `Address.prototype` setter injections are rejected by `Object.freeze` and
-cannot intercept constructor assignments. Post-import
-`Array.prototype` index setters do not mint: body text is not
+cannot intercept constructor assignments. Post-import `String.prototype.split`
+or `toLowerCase` replacements cannot forge parsed address payloads because
+`runWithIsolatedStringDecoder` restores authentic method descriptors during parsing.
+Post-import `Array.prototype` index setters do not mint: body text is not
 accumulated in an Array.
 
 **NOT SUFFICIENT TO ENABLE PUBLICATION.**

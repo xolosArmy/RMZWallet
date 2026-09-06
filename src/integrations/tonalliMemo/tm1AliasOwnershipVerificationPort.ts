@@ -60,6 +60,52 @@ const getAbortSignal = Function.prototype.call.bind(
     'signal'
   )!.get!
 ) as (controller: AbortController) => AbortSignal
+const addEventListenerImpl = typeof EventTarget !== 'undefined' &&
+  typeof EventTarget.prototype?.addEventListener === 'function'
+    ? (Function.prototype.call.bind(
+        EventTarget.prototype.addEventListener
+      ) as (
+        target: EventTarget,
+        type: string,
+        listener: EventListenerOrEventListenerObject | null,
+        options?: boolean | AddEventListenerOptions
+      ) => void)
+    : undefined
+const removeEventListenerImpl = typeof EventTarget !== 'undefined' &&
+  typeof EventTarget.prototype?.removeEventListener === 'function'
+    ? (Function.prototype.call.bind(
+        EventTarget.prototype.removeEventListener
+      ) as (
+        target: EventTarget,
+        type: string,
+        listener: EventListenerOrEventListenerObject | null,
+        options?: boolean | EventListenerOptions
+      ) => void)
+    : undefined
+
+function registerAbortListener(
+  target: AbortSignal | undefined,
+  listener: () => void
+): void {
+  if (!target) return
+  if (addEventListenerImpl) {
+    addEventListenerImpl(target, 'abort', listener, { once: true })
+  } else if (typeof target.addEventListener === 'function') {
+    target.addEventListener('abort', listener, { once: true })
+  }
+}
+
+function unregisterAbortListener(
+  target: AbortSignal | undefined,
+  listener: () => void
+): void {
+  if (!target) return
+  if (removeEventListenerImpl) {
+    removeEventListenerImpl(target, 'abort', listener)
+  } else if (typeof target.removeEventListener === 'function') {
+    target.removeEventListener('abort', listener)
+  }
+}
 const scheduleTimeout = setTimeout
 const cancelTimeout = clearTimeout
 const decodeUtf8Bytes = Function.prototype.call.bind(
@@ -225,7 +271,7 @@ async function observeAliasOwnership(alias: string, callerSignal?: AbortSignal):
   const onAbort = (): void => {
     abortController(controller)
   }
-  callerSignal?.addEventListener('abort', onAbort, { once: true })
+  registerAbortListener(callerSignal, onAbort)
   try {
     const response = await fetchImpl(`${TRUSTED_ALIAS_ENDPOINT}/${encodeUriComponent(alias)}`, {
       method: 'GET',
@@ -241,7 +287,7 @@ async function observeAliasOwnership(alias: string, callerSignal?: AbortSignal):
     unavailable()
   } finally {
     cancelTimeout(timer)
-    callerSignal?.removeEventListener('abort', onAbort)
+    unregisterAbortListener(callerSignal, onAbort)
   }
 }
 
@@ -298,7 +344,7 @@ async function readLimitedBody(response: Response, signal: AbortSignal): Promise
     abortRead()
     unavailable()
   }
-  signal.addEventListener('abort', abortRead, { once: true })
+  registerAbortListener(signal, abortRead)
   try {
     while (true) {
       if (signal.aborted) unavailable()
@@ -314,7 +360,7 @@ async function readLimitedBody(response: Response, signal: AbortSignal): Promise
     }
     return concatStrings(text, decodeUtf8Bytes(decoder))
   } finally {
-    signal.removeEventListener('abort', abortRead)
+    unregisterAbortListener(signal, abortRead)
   }
 }
 

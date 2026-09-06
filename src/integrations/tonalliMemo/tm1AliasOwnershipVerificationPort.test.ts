@@ -553,6 +553,60 @@ describe('TM1 alias ownership verification port', () => {
     expect(minted).toBeUndefined()
   })
 
+  test('P1: post-import String.prototype.split/toLowerCase replacement cannot mint', async () => {
+    const tag = 'p1strproto'
+    const alias = `${tag}.xec`
+    vi.stubGlobal('fetch', createTm1AliasOwnershipVerificationTestFetch({
+      [alias]: {
+        status: 200,
+        json: aliasRecord(tag, { address: OTHER_OWNER })
+      }
+    }))
+    vi.resetModules()
+    const portMod = await import('./tm1AliasOwnershipVerificationPort')
+    const authMod = await import('./tm1AliasPublicationAuthorization')
+
+    const originalSplit = String.prototype.split
+    const originalLower = String.prototype.toLowerCase
+    const stringProto = String.prototype as unknown as Record<string, unknown>
+
+    // Malicious attacker attempts to forge address decode so OTHER_OWNER decodes as OWNER
+    stringProto['split'] = function (this: unknown, separator?: unknown, limit?: number): string[] {
+      const self = String(this)
+      if (self.includes('ecash:')) {
+        return ['ecash', OWNER.slice(6)]
+      }
+      return Reflect.apply(originalSplit, this, [separator, limit]) as string[]
+    }
+    stringProto['toLowerCase'] = function (this: unknown): string {
+      const self = String(this)
+      if (self.includes('ecash:')) {
+        return OWNER
+      }
+      return Reflect.apply(originalLower, this, []) as string
+    }
+
+    let minted: object | undefined
+    try {
+      const token = await portMod.createTm1AliasOwnershipVerificationPort().verify({
+        alias,
+        ownerAddress: OWNER
+      })
+      authMod.createTm1AliasPublicationAuthorizer().issue({
+        alias,
+        ownerAddress: OWNER,
+        evidence: token
+      })
+      minted = token
+    } catch {
+      minted = undefined
+    } finally {
+      stringProto['split'] = originalSplit
+      stringProto['toLowerCase'] = originalLower
+    }
+    expect(minted).toBeUndefined()
+  })
+
   test('P1: post-import Response.prototype.body replacement cannot mint', async () => {
     const tag = 'p1body'
     const alias = `${tag}.xec`
@@ -977,6 +1031,43 @@ describe('TM1 alias ownership verification port', () => {
       if (originalSignalDesc) {
         Object.defineProperty(AbortController.prototype, 'signal', originalSignalDesc)
       }
+    }
+  }, 2_000)
+
+  test('P2: post-import EventTarget.prototype.addEventListener replacement: caller abort still maps to UNAVAILABLE', async () => {
+    const originalAddEventListener = EventTarget.prototype.addEventListener
+    try {
+      vi.stubGlobal('fetch', (async () => hangingAliasResponse()) as typeof fetch)
+      vi.resetModules()
+      const portMod = await import('./tm1AliasOwnershipVerificationPort')
+      const verifier = portMod.createTm1AliasOwnershipVerificationPort()
+      const callerAbort = new AbortController()
+
+      // Hostile monkeypatch of EventTarget.prototype.addEventListener
+      EventTarget.prototype.addEventListener = function () {}
+
+      const alias = 'p2eventtarget.xec'
+      const pending = verifier.verify({
+        alias,
+        ownerAddress: OWNER,
+        signal: callerAbort.signal
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 20))
+
+      // Caller aborts while body read is hanging and EventTarget.prototype.addEventListener is neutered
+      callerAbort.abort()
+
+      const failAfter = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('HANG: verify() did not abort within timeout')), 800)
+      })
+
+      await expect(Promise.race([
+        pending,
+        failAfter
+      ])).rejects.toMatchObject({ code: 'ALIAS_OWNERSHIP_UNAVAILABLE' })
+    } finally {
+      EventTarget.prototype.addEventListener = originalAddEventListener
     }
   }, 2_000)
 

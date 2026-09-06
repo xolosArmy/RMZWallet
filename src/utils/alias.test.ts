@@ -105,3 +105,78 @@ describe('P1 prevent-address-prototype-interception', () => {
     }
   })
 })
+
+describe('P1 isolate-string-prototype-decoder', () => {
+  const OTHER_ADDR = 'ecash:qrrd3y2cmg6m2vxlng9h3djh889pmwffhqv9yym2p4'
+
+  test('parseCashAddr throws TypeError on non-string input', () => {
+    expect(() => (parseCashAddr as unknown as (x: unknown) => void)(123)).toThrow(TypeError)
+    expect(() => (parseCashAddr as unknown as (x: unknown) => void)({})).toThrow(TypeError)
+    expect(() => (parseCashAddr as unknown as (x: unknown) => void)(null)).toThrow(TypeError)
+  })
+
+  test('parseCashAddr and canonicalizeEcashAddress immune to monkeypatched String.prototype.split', () => {
+    const originalSplit = String.prototype.split
+    const stringProto = String.prototype as unknown as Record<string, unknown>
+    try {
+      stringProto['split'] = function (this: unknown, separator?: unknown, limit?: number): string[] {
+        const self = String(this)
+        if (self.includes('ecash:')) {
+          // Attacker attempts to forge the payload to VALID_ADDR
+          return ['ecash', VALID_ADDR.slice(6)]
+        }
+        return Reflect.apply(originalSplit, this, [separator, limit]) as string[]
+      }
+
+      // Outside isolated parse, split is indeed forged
+      expect('ecash:dummy'.split(':')[1]).toBe(VALID_ADDR.slice(6))
+
+      // Inside parseCashAddr and canonicalizeEcashAddress, authentic OTHER_ADDR is decoded
+      const parsed = parseCashAddr(OTHER_ADDR)
+      expect(parsed.cash().toString()).toBe(OTHER_ADDR)
+      expect(canonicalizeEcashAddress(OTHER_ADDR)).toBe(OTHER_ADDR)
+    } finally {
+      stringProto['split'] = originalSplit
+    }
+  })
+
+  test('parseCashAddr and canonicalizeEcashAddress immune to monkeypatched String.prototype.toLowerCase', () => {
+    const originalLower = String.prototype.toLowerCase
+    try {
+      String.prototype.toLowerCase = function (): string {
+        if (typeof this === 'string' && this.includes('ecash:')) {
+          return VALID_ADDR
+        }
+        return originalLower.call(this)
+      }
+
+      // Outside isolated parse, toLowerCase is forged
+      expect('ecash:dummy'.toLowerCase()).toBe(VALID_ADDR)
+
+      // Inside parseCashAddr and canonicalizeEcashAddress, authentic OTHER_ADDR is decoded
+      const parsed = parseCashAddr(OTHER_ADDR)
+      expect(parsed.cash().toString()).toBe(OTHER_ADDR)
+      expect(canonicalizeEcashAddress(OTHER_ADDR)).toBe(OTHER_ADDR)
+    } finally {
+      String.prototype.toLowerCase = originalLower
+    }
+  })
+
+  test('alias helpers are immune to monkeypatched String.prototype.toLowerCase and trim', () => {
+    const originalLower = String.prototype.toLowerCase
+    const originalTrim = String.prototype.trim
+    try {
+      String.prototype.toLowerCase = () => 'tampered'
+      String.prototype.trim = () => 'tampered'
+
+      expect(normalizeAliasInput('  Alice  ')).toBe('alice')
+      expect(isValidAliasName('alice')).toBe(true)
+      expect(isLikelyAlias('alice.xec')).toBe(true)
+      expect(toXecAlias('alice')).toBe('alice.xec')
+      expect(isValidEcashAddress(VALID_ADDR)).toBe(true)
+    } finally {
+      String.prototype.toLowerCase = originalLower
+      String.prototype.trim = originalTrim
+    }
+  })
+})
