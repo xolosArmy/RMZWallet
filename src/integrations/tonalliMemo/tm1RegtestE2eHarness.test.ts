@@ -47,6 +47,7 @@ const {
   assertWitnessReservationResponseBinding,
   assertTm1CommittedDispatchIntentBinding,
   computeCanonicalWholeStoreRoot,
+  deepEqual,
   deriveStoreSlotId,
   isStoreNonEmpty,
   assertStoreConsistentWithWitnessStableHead,
@@ -1028,6 +1029,23 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
         assertTm1CommittedDispatchIntentBinding(input)
       }).not.toThrow()
 
+      // deepEqual helper works correctly
+      expect(deepEqual(mockRecord, mockRecord)).toBe(true)
+      expect(deepEqual({ a: 1, b: 'x' }, { a: 1, b: 'x' })).toBe(true)
+      expect(deepEqual({ a: 1 }, { a: 2 })).toBe(false)
+      expect(deepEqual({ a: 1 }, { b: 1 })).toBe(false)
+      expect(deepEqual(null, null)).toBe(true)
+      expect(deepEqual(null, {})).toBe(false)
+
+      // Valid passes with expectedCommittedAt and expectedRecord
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          expectedCommittedAt: 600,
+          expectedRecord: mockRecord
+        })
+      }).not.toThrow()
+
       // Wrong phase
       expect(() => {
         assertTm1CommittedDispatchIntentBinding({
@@ -1057,6 +1075,109 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
         assertTm1CommittedDispatchIntentBinding({
           ...input,
           submissionId: 'sub:wrong'
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      // Mismatched signingAuthorization contentHash
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          committedRecord: {
+            ...mockRecord,
+            signingAuthorization: {
+              ...mockRecord.signingAuthorization!,
+              contentHash: `sha256:${'cc'.repeat(32)}` as any
+            }
+          }
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      // Mismatched signingAuthorization expiresAt
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          committedRecord: {
+            ...mockRecord,
+            signingAuthorization: {
+              ...mockRecord.signingAuthorization!,
+              expiresAt: 9999
+            }
+          }
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      // Mismatched signingAuthorization consumedAt
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          committedRecord: {
+            ...mockRecord,
+            signingAuthorization: {
+              ...mockRecord.signingAuthorization!,
+              consumedAt: 9999
+            }
+          }
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      // Mismatched broadcastAuthorization contentHash
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          committedRecord: {
+            ...mockRecord,
+            broadcastAuthorization: {
+              ...mockRecord.broadcastAuthorization!,
+              contentHash: `sha256:${'dd'.repeat(32)}` as any
+            }
+          }
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      // Mismatched broadcastAuthorization expiresAt
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          committedRecord: {
+            ...mockRecord,
+            broadcastAuthorization: {
+              ...mockRecord.broadcastAuthorization!,
+              expiresAt: 8888
+            }
+          }
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      // Mismatched broadcastAuthorization consumedAt
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          committedRecord: {
+            ...mockRecord,
+            broadcastAuthorization: {
+              ...mockRecord.broadcastAuthorization!,
+              consumedAt: 8888
+            }
+          }
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      // Mismatched dispatchIntent committedAt precision
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          expectedCommittedAt: 700
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD: Dispatch intent committedAt mismatch/)
+
+      // Mismatched expectedRecord deep equality
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          expectedRecord: {
+            ...mockRecord,
+            ownerEpoch: 2
+          }
         })
       }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
     })
@@ -1641,6 +1762,217 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
       expect(utxos[0].sats).toBe(100_000n)
       expect(Object.isFrozen(utxos)).toBe(true)
       expect(Object.isFrozen(utxos[0])).toBe(true)
+    })
+    test('Generates cryptographically unique publication IDs across harness restarts without collisions (Finding 1)', async () => {
+      const sharedStore = new Tm1HarnessRecoveryStore()
+      const sharedWitness = new Tm1InMemoryRollbackWitness()
+
+      // Instance 1
+      const harness1 = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: sharedStore,
+        witness: sharedWitness
+      })
+
+      const h1Step4 = await harness1.executeStep4PrepareMemoAndUnsignedTx()
+      const h1Step5 = await harness1.executeStep5DualAuthorizeAndSign(h1Step4.preparedReview)
+      const h1Step6 = await harness1.executeStep6ReserveRecoveryAndDispatch(
+        h1Step4.preparedReview,
+        h1Step5.signedReview
+      )
+      const h1Step7 = await harness1.executeStep7VerifyFinalSuccess(
+        h1Step4.preparedReview,
+        h1Step5.signedReview,
+        h1Step6.submissionReceipt,
+        h1Step6.witnessReservationSnapshot
+      )
+      expect(h1Step7.transportAcknowledgedRecord.phase).toBe('submittedObserved')
+
+      // Instance 2 (restarted against durable shared store and witness)
+      const harness2 = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: sharedStore,
+        witness: sharedWitness
+      })
+
+      const h2Step4 = await harness2.executeStep4PrepareMemoAndUnsignedTx()
+      // IDs must be distinct and collision-free
+      expect(h2Step4.preparedReview.preparedId).not.toBe(h1Step4.preparedReview.preparedId)
+
+      const h2Step5 = await harness2.executeStep5DualAuthorizeAndSign(h2Step4.preparedReview)
+      // Step 6 must succeed in creating the record without DUPLICATE_PUBLICATION_ID
+      const h2Step6 = await harness2.executeStep6ReserveRecoveryAndDispatch(
+        h2Step4.preparedReview,
+        h2Step5.signedReview
+      )
+      expect(h2Step6.submissionReceipt.txid).toBe(h2Step5.signedReview.txid)
+
+      const h2Step7 = await harness2.executeStep7VerifyFinalSuccess(
+        h2Step4.preparedReview,
+        h2Step5.signedReview,
+        h2Step6.submissionReceipt,
+        h2Step6.witnessReservationSnapshot
+      )
+      expect(h2Step7.transportAcknowledgedRecord.phase).toBe('submittedObserved')
+
+      // Both records exist in store
+      const list = (await sharedStore.listRecoverable()) as Tm1PublicationRecoveryRecord[]
+      expect(list.length).toBe(2)
+      expect(list.map(r => r.publicationId)).toContain(`pub:${h1Step4.preparedReview.preparedId}`)
+      expect(list.map(r => r.publicationId)).toContain(`pub:${h2Step4.preparedReview.preparedId}`)
+    })
+
+    test('Preserves existing capabilities in projected roots for injected store without computeWitnessLogicalRoot (Finding 2)', async () => {
+      // Injected store that implements basic Tm1PublicationRecoveryStore WITHOUT computeWitnessLogicalRoot
+      const underlying = new Tm1HarnessRecoveryStore()
+      const injectedStore = {
+        storeId: underlying.storeId,
+        load: (id: string) => underlying.load(id),
+        listRecoverable: () => underlying.listRecoverable(),
+        create: (input: any) => underlying.create(input),
+        commitExecutionEvidence: (input: any) => underlying.commitExecutionEvidence(input),
+        commitDispatchIntent: (input: any) => underlying.commitDispatchIntent(input),
+        commitTransportAcknowledgement: (input: any) => underlying.commitTransportAcknowledgement(input),
+        commitRecoveryTransition: (input: any) => underlying.commitRecoveryTransition(input),
+        claimOwnership: (input: any) => underlying.claimOwnership(input)
+      }
+      expect('computeWitnessLogicalRoot' in injectedStore).toBe(false)
+
+      const witness = new Tm1InMemoryRollbackWitness()
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: injectedStore as any,
+        witness
+      })
+
+      // Run publication 1
+      const p1Step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const p1Step5 = await harness.executeStep5DualAuthorizeAndSign(p1Step4.preparedReview)
+      const p1Step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        p1Step4.preparedReview,
+        p1Step5.signedReview
+      )
+      await harness.executeStep7VerifyFinalSuccess(
+        p1Step4.preparedReview,
+        p1Step5.signedReview,
+        p1Step6.submissionReceipt,
+        p1Step6.witnessReservationSnapshot
+      )
+
+      // Run publication 2 on non-empty store
+      const harness2 = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: injectedStore as any,
+        witness
+      })
+      const p2Step4 = await harness2.executeStep4PrepareMemoAndUnsignedTx()
+      const p2Step5 = await harness2.executeStep5DualAuthorizeAndSign(p2Step4.preparedReview)
+      // Step 6 computes projected root preserving publication 1 capabilities and finalizes witness
+      const p2Step6 = await harness2.executeStep6ReserveRecoveryAndDispatch(
+        p2Step4.preparedReview,
+        p2Step5.signedReview
+      )
+      // Step 7 checks stable head and commits 2PC without STORE_ROLLBACK_DETECTED
+      const p2Step7 = await harness2.executeStep7VerifyFinalSuccess(
+        p2Step4.preparedReview,
+        p2Step5.signedReview,
+        p2Step6.submissionReceipt,
+        p2Step6.witnessReservationSnapshot
+      )
+      expect(p2Step7.transportAcknowledgedRecord.phase).toBe('submittedObserved')
+    })
+
+    test('Rejects Step 6 dispatch intent if recovery store tampers with authorization fields or committedAt (Finding 3)', async () => {
+      // 1. Recovery store returns tampered signing authorization contentHash
+      const tamperedSigningStore = new Tm1HarnessRecoveryStore()
+      const originalCommit1 = tamperedSigningStore.commitDispatchIntent.bind(tamperedSigningStore)
+      tamperedSigningStore.commitDispatchIntent = async (input: any) => {
+        const res = (await originalCommit1(input)) as Tm1PublicationRecoveryRecord
+        return {
+          ...res,
+          signingAuthorization: {
+            ...res.signingAuthorization!,
+            contentHash: `sha256:${'00'.repeat(32)}`
+          }
+        }
+      }
+
+      const harnessTamperedSigning = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: tamperedSigningStore
+      })
+      const s4 = await harnessTamperedSigning.executeStep4PrepareMemoAndUnsignedTx()
+      const s5 = await harnessTamperedSigning.executeStep5DualAuthorizeAndSign(s4.preparedReview)
+      await expect(
+        harnessTamperedSigning.executeStep6ReserveRecoveryAndDispatch(
+          s4.preparedReview,
+          s5.signedReview
+        )
+      ).rejects.toThrow(/INVALID_DISPATCH_INTENT_RECORD: Signing authorization/)
+      expect(harnessTamperedSigning.getDispatchCount()).toBe(0)
+
+      // 2. Recovery store returns tampered broadcast authorization expiresAt
+      const tamperedBroadcastStore = new Tm1HarnessRecoveryStore()
+      const originalCommit2 = tamperedBroadcastStore.commitDispatchIntent.bind(tamperedBroadcastStore)
+      tamperedBroadcastStore.commitDispatchIntent = async (input: any) => {
+        const res = (await originalCommit2(input)) as Tm1PublicationRecoveryRecord
+        return {
+          ...res,
+          broadcastAuthorization: {
+            ...res.broadcastAuthorization!,
+            expiresAt: res.broadcastAuthorization!.expiresAt + 10_000
+          }
+        }
+      }
+
+      const harnessTamperedBroadcast = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: tamperedBroadcastStore
+      })
+      const b4 = await harnessTamperedBroadcast.executeStep4PrepareMemoAndUnsignedTx()
+      const b5 = await harnessTamperedBroadcast.executeStep5DualAuthorizeAndSign(b4.preparedReview)
+      await expect(
+        harnessTamperedBroadcast.executeStep6ReserveRecoveryAndDispatch(
+          b4.preparedReview,
+          b5.signedReview
+        )
+      ).rejects.toThrow(/INVALID_DISPATCH_INTENT_RECORD: Broadcast authorization/)
+      expect(harnessTamperedBroadcast.getDispatchCount()).toBe(0)
+
+      // 3. Recovery store returns tampered dispatch intent committedAt
+      const tamperedCommittedAtStore = new Tm1HarnessRecoveryStore()
+      const originalCommit3 = tamperedCommittedAtStore.commitDispatchIntent.bind(tamperedCommittedAtStore)
+      tamperedCommittedAtStore.commitDispatchIntent = async (input: any) => {
+        const res = (await originalCommit3(input)) as Tm1PublicationRecoveryRecord
+        return {
+          ...res,
+          dispatchIntent: {
+            ...res.dispatchIntent!,
+            committedAt: res.dispatchIntent!.committedAt + 1000
+          }
+        }
+      }
+
+      const harnessTamperedCommittedAt = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: tamperedCommittedAtStore
+      })
+      const c4 = await harnessTamperedCommittedAt.executeStep4PrepareMemoAndUnsignedTx()
+      const c5 = await harnessTamperedCommittedAt.executeStep5DualAuthorizeAndSign(c4.preparedReview)
+      await expect(
+        harnessTamperedCommittedAt.executeStep6ReserveRecoveryAndDispatch(
+          c4.preparedReview,
+          c5.signedReview
+        )
+      ).rejects.toThrow(/INVALID_DISPATCH_INTENT_RECORD: Dispatch intent committedAt mismatch/)
+      expect(harnessTamperedCommittedAt.getDispatchCount()).toBe(0)
     })
   })
 })

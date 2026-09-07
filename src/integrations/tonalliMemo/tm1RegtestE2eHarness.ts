@@ -261,8 +261,11 @@ export function computeCanonicalWholeStoreRoot(input: {
     })
   })
 
+  const recordCapabilities = sortedRecords.flatMap(consumedCapabilityIds)
   const rawCapabilities =
-    input.capabilityIds ?? sortedRecords.flatMap(consumedCapabilityIds)
+    input.capabilityIds !== undefined
+      ? [...new Set([...recordCapabilities, ...input.capabilityIds])]
+      : recordCapabilities
   const uniqueCapabilities = [...new Set(rawCapabilities)].sort()
   const sortedCapabilities = uniqueCapabilities.map(id =>
     Object.freeze({ capabilityId: id })
@@ -412,6 +415,28 @@ export function assertWitnessReservationResponseBinding(
   }
 }
 
+export function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (a === null || typeof a !== 'object' || b === null || typeof b !== 'object') {
+    return false
+  }
+  const keysA = Object.keys(a as object)
+  const keysB = Object.keys(b as object)
+  if (keysA.length !== keysB.length) return false
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false
+    if (
+      !deepEqual(
+        (a as Record<string, unknown>)[key],
+        (b as Record<string, unknown>)[key]
+      )
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
 export function assertTm1CommittedDispatchIntentBinding(input: {
   committedRecord: Tm1PublicationRecoveryRecord
   publicationId: string
@@ -422,6 +447,8 @@ export function assertTm1CommittedDispatchIntentBinding(input: {
   signingGrant: ApprovalConsumption
   broadcastGrant: ApprovalConsumption
   submissionId: string
+  expectedCommittedAt?: number
+  expectedRecord?: Tm1PublicationRecoveryRecord
 }): void {
   const {
     committedRecord,
@@ -432,7 +459,9 @@ export function assertTm1CommittedDispatchIntentBinding(input: {
     signedReview,
     signingGrant,
     broadcastGrant,
-    submissionId
+    submissionId,
+    expectedCommittedAt,
+    expectedRecord
   } = input
 
   if (committedRecord.publicationId !== publicationId) {
@@ -470,25 +499,62 @@ export function assertTm1CommittedDispatchIntentBinding(input: {
   ) {
     throw new Error('INVALID_DISPATCH_INTENT_RECORD: Signed evidence mismatch')
   }
+
+  // Strict deep verification of signing authorization fields (Finding 3)
   if (
     !committedRecord.signingAuthorization ||
     committedRecord.signingAuthorization.capabilityId !== signingGrant.capabilityId ||
     committedRecord.signingAuthorization.operationId !== signingGrant.operationId ||
     committedRecord.signingAuthorization.preparedId !== preparedReview.preparedId ||
-    committedRecord.signingAuthorization.bindingHash !== preparedReview.bindingHash
+    committedRecord.signingAuthorization.bindingHash !== preparedReview.bindingHash ||
+    committedRecord.signingAuthorization.contentHash !== signingGrant.contentHash ||
+    committedRecord.signingAuthorization.expiresAt !== signingGrant.expiresAt ||
+    committedRecord.signingAuthorization.consumedAt !== signingGrant.consumedAt
   ) {
     throw new Error('INVALID_DISPATCH_INTENT_RECORD: Signing authorization evidence mismatch')
   }
+  const expectedSigningAuth = {
+    operationId: signingGrant.operationId,
+    capabilityId: signingGrant.capabilityId,
+    contentHash: signingGrant.contentHash,
+    expiresAt: signingGrant.expiresAt,
+    consumedAt: signingGrant.consumedAt,
+    preparedId: preparedReview.preparedId,
+    bindingHash: preparedReview.bindingHash
+  }
+  if (!deepEqual(committedRecord.signingAuthorization, expectedSigningAuth)) {
+    throw new Error('INVALID_DISPATCH_INTENT_RECORD: Signing authorization deep equality mismatch')
+  }
+
+  // Strict deep verification of broadcast authorization fields (Finding 3)
   if (
     !committedRecord.broadcastAuthorization ||
     committedRecord.broadcastAuthorization.capabilityId !== broadcastGrant.capabilityId ||
     committedRecord.broadcastAuthorization.operationId !== broadcastGrant.operationId ||
     committedRecord.broadcastAuthorization.signedId !== signedReview.signedId ||
     committedRecord.broadcastAuthorization.txid !== signedReview.txid ||
-    committedRecord.broadcastAuthorization.signedArtifactHash !== signedReview.signedArtifactHash
+    committedRecord.broadcastAuthorization.signedArtifactHash !== signedReview.signedArtifactHash ||
+    committedRecord.broadcastAuthorization.contentHash !== broadcastGrant.contentHash ||
+    committedRecord.broadcastAuthorization.expiresAt !== broadcastGrant.expiresAt ||
+    committedRecord.broadcastAuthorization.consumedAt !== broadcastGrant.consumedAt
   ) {
     throw new Error('INVALID_DISPATCH_INTENT_RECORD: Broadcast authorization evidence mismatch')
   }
+  const expectedBroadcastAuth = {
+    operationId: broadcastGrant.operationId,
+    capabilityId: broadcastGrant.capabilityId,
+    contentHash: broadcastGrant.contentHash,
+    expiresAt: broadcastGrant.expiresAt,
+    consumedAt: broadcastGrant.consumedAt,
+    signedId: signedReview.signedId,
+    txid: signedReview.txid,
+    signedArtifactHash: signedReview.signedArtifactHash
+  }
+  if (!deepEqual(committedRecord.broadcastAuthorization, expectedBroadcastAuth)) {
+    throw new Error('INVALID_DISPATCH_INTENT_RECORD: Broadcast authorization deep equality mismatch')
+  }
+
+  // Dispatch intent evidence and committedAt precision validation (Finding 3)
   if (
     !committedRecord.dispatchIntent ||
     committedRecord.dispatchIntent.submissionId !== submissionId ||
@@ -499,6 +565,23 @@ export function assertTm1CommittedDispatchIntentBinding(input: {
     committedRecord.dispatchIntent.committedAt <= 0
   ) {
     throw new Error('INVALID_DISPATCH_INTENT_RECORD: Dispatch intent evidence mismatch')
+  }
+  if (
+    expectedCommittedAt !== undefined &&
+    committedRecord.dispatchIntent.committedAt !== expectedCommittedAt
+  ) {
+    throw new Error(
+      `INVALID_DISPATCH_INTENT_RECORD: Dispatch intent committedAt mismatch (expected ${expectedCommittedAt}, got ${committedRecord.dispatchIntent.committedAt})`
+    )
+  }
+
+  if (
+    expectedRecord !== undefined &&
+    !deepEqual(committedRecord, expectedRecord)
+  ) {
+    throw new Error(
+      'INVALID_DISPATCH_INTENT_RECORD: Committed record deep equality mismatch against expected record'
+    )
   }
 }
 
@@ -839,7 +922,6 @@ export class Tm1RegtestE2eHarness {
 
     this.broadcastAuthorizationPort = dualPorts.broadcastAuthorization
 
-    let idSeq = 0
     const clock: Tm1PublicationClock = {
       createId: (prefix: 'prepared' | 'signed' | 'submission') => {
         if (prefix === 'submission' && this.plannedSubmissionId !== null) {
@@ -847,7 +929,11 @@ export class Tm1RegtestE2eHarness {
           this.plannedSubmissionId = null
           return id
         }
-        return `${prefix}-e2e-${++idSeq}`
+        const uuid =
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
+        return `${prefix}-e2e-${uuid}`
       }
     }
 
@@ -959,6 +1045,27 @@ export class Tm1RegtestE2eHarness {
     return isStoreNonEmpty(this.recoveryStore)
   }
 
+  async getStoreCapabilityIds(): Promise<string[]> {
+    if (
+      'getAllCapabilityIds' in this.recoveryStore &&
+      typeof (this.recoveryStore as { getAllCapabilityIds?: unknown })
+        .getAllCapabilityIds === 'function'
+    ) {
+      const caps = (
+        this.recoveryStore as { getAllCapabilityIds: () => unknown }
+      ).getAllCapabilityIds()
+      if (Array.isArray(caps)) {
+        return [...new Set(caps.filter((c): c is string => typeof c === 'string'))]
+      }
+    }
+    const list = await this.recoveryStore.listRecoverable()
+    if (Array.isArray(list)) {
+      const parsed = list.map(r => parseTm1PublicationRecoveryRecord(r))
+      return [...new Set(parsed.flatMap(consumedCapabilityIds))]
+    }
+    return []
+  }
+
   async deriveStoreRoot(input: {
     slotId: string
     generation: number
@@ -989,12 +1096,21 @@ export class Tm1RegtestE2eHarness {
           input.projectedRecord
         ]
       : records
+    const storeCapabilities = await this.getStoreCapabilityIds()
+    const recordCapabilities = effectiveRecords.flatMap(consumedCapabilityIds)
+    const mergedCapabilities = [
+      ...new Set([
+        ...storeCapabilities,
+        ...recordCapabilities,
+        ...(input.projectedCapabilities ?? [])
+      ])
+    ]
     return computeCanonicalWholeStoreRoot({
       storeId: input.storeId,
       slotId: input.slotId,
       generation: input.generation,
       records: effectiveRecords,
-      capabilityIds: input.projectedCapabilities
+      capabilityIds: mergedCapabilities
     })
   }
 
@@ -1356,14 +1472,22 @@ export class Tm1RegtestE2eHarness {
       }
     })
 
-    // 3. Derive canonical whole-store root for the proposed dispatch intent checkpoint (Finding 1)
+    // 3. Derive canonical whole-store root for the proposed dispatch intent checkpoint (Finding 1 & 2)
     const nextGeneration = enrolledSnapshot.stable.generation + 1
+    const existingCapabilities = await this.getStoreCapabilityIds()
+    const cumulativeCapabilities = [
+      ...new Set([
+        ...existingCapabilities,
+        signingGrant.capabilityId,
+        broadcastGrant.capabilityId
+      ])
+    ]
     const nextLogicalRoot = await this.deriveStoreRoot({
       slotId,
       storeId,
       generation: nextGeneration,
       projectedRecord: outcomeUnknownRecord,
-      projectedCapabilities: [signingGrant.capabilityId, broadcastGrant.capabilityId]
+      projectedCapabilities: cumulativeCapabilities
     })
 
     // 4. Reserve witness slot for dispatch intent
@@ -1441,7 +1565,9 @@ export class Tm1RegtestE2eHarness {
       signedReview,
       signingGrant,
       broadcastGrant,
-      submissionId
+      submissionId,
+      expectedCommittedAt: now,
+      expectedRecord: outcomeUnknownRecord
     })
 
     // 8. Finalize witness checkpoint for dispatch intent BEFORE transport execution (Finding 4)
