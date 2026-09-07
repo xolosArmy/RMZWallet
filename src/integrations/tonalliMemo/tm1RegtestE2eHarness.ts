@@ -1,4 +1,6 @@
 import {
+  sha256,
+  toHex,
   Tx
 } from 'ecash-lib'
 import {
@@ -72,6 +74,8 @@ import {
 import {
   parseTm1RollbackWitnessSnapshot,
   type Tm1RollbackWitness,
+  type Tm1RollbackWitnessRecord,
+  type Tm1RollbackWitnessReservation,
   type Tm1RollbackWitnessSnapshot
 } from './recovery/tm1RollbackWitness'
 import {
@@ -205,14 +209,327 @@ export class Tm1HarnessApprovalLedger implements ApprovalConsumptionLedger {
   }
 }
 
+export function encodeCanonicalJson(value: unknown): string {
+  if (value === null) return 'null'
+  if (typeof value === 'string' || typeof value === 'boolean') {
+    return JSON.stringify(value)
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value)) {
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(encodeCanonicalJson).join(',')}]`
+  }
+  if (typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error('CANONICAL_JSON_ERROR: Object prototype must be Object.prototype or null')
+    }
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record)
+      .filter(key => record[key] !== undefined)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${encodeCanonicalJson(record[key])}`)
+      .join(',')}}`
+  }
+  throw new Error(`CANONICAL_JSON_ERROR: Unsupported type ${typeof value}`)
+}
+
+export function sha256Hex(data: string | Uint8Array): string {
+  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
+  return toHex(sha256(bytes))
+}
+
+export function computeCanonicalWholeStoreRoot(input: {
+  storeId: string
+  slotId: string
+  generation: number
+  createdAt?: number
+  records: readonly Tm1PublicationRecoveryRecord[]
+  capabilityIds?: readonly string[]
+}): string {
+  const sortedRecords = [...input.records]
+    .map(r => parseTm1PublicationRecoveryRecord(r))
+    .sort((a, b) => a.publicationId.localeCompare(b.publicationId))
+
+  const publications = sortedRecords.map(record => {
+    const recordJson = encodeCanonicalJson(record)
+    return Object.freeze({
+      publicationId: record.publicationId,
+      recordJson,
+      recordSha256: sha256Hex(recordJson)
+    })
+  })
+
+  const rawCapabilities =
+    input.capabilityIds ?? sortedRecords.flatMap(consumedCapabilityIds)
+  const uniqueCapabilities = [...new Set(rawCapabilities)].sort()
+  const sortedCapabilities = uniqueCapabilities.map(id =>
+    Object.freeze({ capabilityId: id })
+  )
+
+  const logicalState = Object.freeze({
+    schema: 'tonalli.tm1-logical-state-root',
+    schemaVersion: 1,
+    witnessProtocolVersion: 1,
+    physicalSchemaVersion: 1,
+    storeId: input.storeId,
+    slotId: input.slotId,
+    generation: input.generation,
+    createdAt: input.createdAt ?? 0,
+    publications: Object.freeze(publications),
+    consumedCapabilities: Object.freeze(sortedCapabilities)
+  })
+
+  return sha256Hex(encodeCanonicalJson(logicalState))
+}
+
+export function extractStoreId(store: Tm1PublicationRecoveryStore): string {
+  if (
+    'storeId' in store &&
+    typeof (store as { storeId?: unknown }).storeId === 'string'
+  ) {
+    const id = (store as { storeId: string }).storeId
+    if (/^tm1-store:v1:[0-9a-f]{64}$/.test(id)) {
+      return id
+    }
+  }
+  if (
+    'getStoreId' in store &&
+    typeof (store as { getStoreId?: unknown }).getStoreId === 'function'
+  ) {
+    const id = (store as { getStoreId: () => unknown }).getStoreId()
+    if (typeof id === 'string' && /^tm1-store:v1:[0-9a-f]{64}$/.test(id)) {
+      return id
+    }
+  }
+  return `tm1-store:v1:${sha256Hex('tonalli.tm1-harness-recovery-store:default')}`
+}
+
+export function assertWitnessReservationResponseBinding(
+  snapshot: Tm1RollbackWitnessSnapshot,
+  request: Tm1RollbackWitnessReservation,
+  expectedStable: Tm1RollbackWitnessRecord
+): void {
+  // Stable head vs last read
+  if (
+    snapshot.stable.slotId !== expectedStable.slotId ||
+    snapshot.stable.storeId !== expectedStable.storeId ||
+    snapshot.stable.generation !== expectedStable.generation ||
+    snapshot.stable.logicalRoot !== expectedStable.logicalRoot ||
+    snapshot.stable.receiptHash !== expectedStable.receiptHash ||
+    snapshot.stable.witnessKeyId !== expectedStable.witnessKeyId ||
+    snapshot.stable.generation !== request.expectedStableGeneration ||
+    snapshot.stable.logicalRoot !== request.expectedStableLogicalRoot ||
+    snapshot.stable.receiptHash !== request.expectedStableReceiptHash
+  ) {
+    throw new Error(
+      'WITNESS_RESERVATION_BINDING_MISMATCH: Stable head does not match last read stable record or expected reservation parameters'
+    )
+  }
+
+  // Pending record slot, store, generation, root and operation ID against request
+  if (!snapshot.pending) {
+    throw new Error(
+      'WITNESS_RESERVATION_MISSING_PENDING: Reservation snapshot must contain pending record'
+    )
+  }
+
+  const pending = snapshot.pending
+  if (pending.slotId !== request.slotId) {
+    throw new Error(
+      `WITNESS_RESERVATION_BINDING_MISMATCH: Pending slotId mismatch (expected ${request.slotId}, got ${pending.slotId})`
+    )
+  }
+  if (pending.storeId !== request.storeId) {
+    throw new Error(
+      `WITNESS_RESERVATION_BINDING_MISMATCH: Pending storeId mismatch (expected ${request.storeId}, got ${pending.storeId})`
+    )
+  }
+  if (pending.generation !== request.nextGeneration) {
+    throw new Error(
+      `WITNESS_RESERVATION_BINDING_MISMATCH: Pending generation mismatch (expected ${request.nextGeneration}, got ${pending.generation})`
+    )
+  }
+  if (pending.logicalRoot !== request.nextLogicalRoot) {
+    throw new Error(
+      `WITNESS_RESERVATION_BINDING_MISMATCH: Pending logicalRoot mismatch (expected ${request.nextLogicalRoot}, got ${pending.logicalRoot})`
+    )
+  }
+  if (pending.operationId !== request.operationId) {
+    throw new Error(
+      `WITNESS_RESERVATION_BINDING_MISMATCH: Pending operationId mismatch (expected ${request.operationId}, got ${pending.operationId})`
+    )
+  }
+  if (pending.previousStableReceiptHash !== request.expectedStableReceiptHash) {
+    throw new Error(
+      `WITNESS_RESERVATION_BINDING_MISMATCH: Pending previousStableReceiptHash mismatch (expected ${request.expectedStableReceiptHash}, got ${pending.previousStableReceiptHash})`
+    )
+  }
+  if (pending.state !== 'pending') {
+    throw new Error(
+      `WITNESS_RESERVATION_BINDING_MISMATCH: Pending record state must be 'pending', got '${pending.state}'`
+    )
+  }
+}
+
+export function assertTm1CommittedDispatchIntentBinding(input: {
+  committedRecord: Tm1PublicationRecoveryRecord
+  publicationId: string
+  expectedRevision: number
+  expectedOwnerEpoch: number
+  preparedReview: Tm1PreparedReview
+  signedReview: Tm1SignedReview
+  signingGrant: ApprovalConsumption
+  broadcastGrant: ApprovalConsumption
+  submissionId: string
+}): void {
+  const {
+    committedRecord,
+    publicationId,
+    expectedRevision,
+    expectedOwnerEpoch,
+    preparedReview,
+    signedReview,
+    signingGrant,
+    broadcastGrant,
+    submissionId
+  } = input
+
+  if (committedRecord.publicationId !== publicationId) {
+    throw new Error(
+      `INVALID_DISPATCH_INTENT_RECORD: Publication ID mismatch (expected ${publicationId}, got ${committedRecord.publicationId})`
+    )
+  }
+  if (committedRecord.revision !== expectedRevision) {
+    throw new Error(
+      `INVALID_DISPATCH_INTENT_RECORD: Revision mismatch (expected ${expectedRevision}, got ${committedRecord.revision})`
+    )
+  }
+  if (committedRecord.ownerEpoch !== expectedOwnerEpoch) {
+    throw new Error(
+      `INVALID_DISPATCH_INTENT_RECORD: Owner epoch mismatch (expected ${expectedOwnerEpoch}, got ${committedRecord.ownerEpoch})`
+    )
+  }
+  if (committedRecord.phase !== 'outcomeUnknown') {
+    throw new Error(
+      `INVALID_DISPATCH_INTENT_RECORD: Phase mismatch (expected 'outcomeUnknown', got '${committedRecord.phase}')`
+    )
+  }
+  if (
+    !committedRecord.prepared ||
+    committedRecord.prepared.preparedId !== preparedReview.preparedId ||
+    committedRecord.prepared.bindingHash !== preparedReview.bindingHash
+  ) {
+    throw new Error('INVALID_DISPATCH_INTENT_RECORD: Prepared evidence mismatch')
+  }
+  if (
+    !committedRecord.signed ||
+    committedRecord.signed.signedId !== signedReview.signedId ||
+    committedRecord.signed.txid !== signedReview.txid ||
+    committedRecord.signed.signedArtifactHash !== signedReview.signedArtifactHash
+  ) {
+    throw new Error('INVALID_DISPATCH_INTENT_RECORD: Signed evidence mismatch')
+  }
+  if (
+    !committedRecord.signingAuthorization ||
+    committedRecord.signingAuthorization.capabilityId !== signingGrant.capabilityId ||
+    committedRecord.signingAuthorization.operationId !== signingGrant.operationId ||
+    committedRecord.signingAuthorization.preparedId !== preparedReview.preparedId ||
+    committedRecord.signingAuthorization.bindingHash !== preparedReview.bindingHash
+  ) {
+    throw new Error('INVALID_DISPATCH_INTENT_RECORD: Signing authorization evidence mismatch')
+  }
+  if (
+    !committedRecord.broadcastAuthorization ||
+    committedRecord.broadcastAuthorization.capabilityId !== broadcastGrant.capabilityId ||
+    committedRecord.broadcastAuthorization.operationId !== broadcastGrant.operationId ||
+    committedRecord.broadcastAuthorization.signedId !== signedReview.signedId ||
+    committedRecord.broadcastAuthorization.txid !== signedReview.txid ||
+    committedRecord.broadcastAuthorization.signedArtifactHash !== signedReview.signedArtifactHash
+  ) {
+    throw new Error('INVALID_DISPATCH_INTENT_RECORD: Broadcast authorization evidence mismatch')
+  }
+  if (
+    !committedRecord.dispatchIntent ||
+    committedRecord.dispatchIntent.submissionId !== submissionId ||
+    committedRecord.dispatchIntent.txid !== signedReview.txid ||
+    committedRecord.dispatchIntent.signedArtifactHash !== signedReview.signedArtifactHash ||
+    committedRecord.dispatchIntent.broadcastCapabilityId !== broadcastGrant.capabilityId ||
+    !Number.isSafeInteger(committedRecord.dispatchIntent.committedAt) ||
+    committedRecord.dispatchIntent.committedAt <= 0
+  ) {
+    throw new Error('INVALID_DISPATCH_INTENT_RECORD: Dispatch intent evidence mismatch')
+  }
+}
+
 export class Tm1HarnessRecoveryStore implements Tm1PublicationRecoveryStore {
+  readonly storeId: string
+  readonly createdAt: number
   private readonly records = new Map<string, Tm1PublicationRecoveryRecord>()
   private readonly capabilityIds = new Set<string>()
 
-  constructor(...initialRecords: readonly Tm1PublicationRecoveryRecord[]) {
-    for (const record of initialRecords) {
-      this.insertInitial(record)
+  constructor(
+    storeIdOrRecord?: string | Tm1PublicationRecoveryRecord,
+    ...remainingRecords: readonly Tm1PublicationRecoveryRecord[]
+  ) {
+    this.createdAt = Date.now()
+    if (typeof storeIdOrRecord === 'string') {
+      this.storeId = storeIdOrRecord
+      for (const record of remainingRecords) {
+        this.insertInitial(record)
+      }
+    } else {
+      this.storeId = `tm1-store:v1:${sha256Hex(`tm1-harness-recovery-store:${this.createdAt}`)}`
+      if (storeIdOrRecord) {
+        this.insertInitial(storeIdOrRecord)
+      }
+      for (const record of remainingRecords) {
+        this.insertInitial(record)
+      }
     }
+  }
+
+  getStoreId(): string {
+    return this.storeId
+  }
+
+  getAllRecords(): readonly Tm1PublicationRecoveryRecord[] {
+    return Object.freeze([...this.records.values()])
+  }
+
+  getAllCapabilityIds(): readonly string[] {
+    return Object.freeze([...this.capabilityIds.values()])
+  }
+
+  computeWitnessLogicalRoot(input: {
+    slotId: string
+    generation: number
+    storeId?: string
+    projectedRecord?: Tm1PublicationRecoveryRecord
+    projectedCapabilities?: readonly string[]
+  }): string {
+    const effectiveRecords = input.projectedRecord
+      ? [
+          ...[...this.records.values()].filter(
+            r => r.publicationId !== input.projectedRecord!.publicationId
+          ),
+          input.projectedRecord
+        ]
+      : [...this.records.values()]
+
+    const effectiveCapabilities = input.projectedCapabilities
+      ? [...new Set([...this.capabilityIds, ...input.projectedCapabilities])]
+      : [...this.capabilityIds]
+
+    return computeCanonicalWholeStoreRoot({
+      storeId: input.storeId ?? this.storeId,
+      slotId: input.slotId,
+      generation: input.generation,
+      createdAt: this.createdAt,
+      records: effectiveRecords,
+      capabilityIds: effectiveCapabilities
+    })
   }
 
   async load(publicationId: string): Promise<unknown | null> {
@@ -369,6 +686,8 @@ export type Tm1ProgrammaticE2eStepResults = Readonly<{
   signingAuthorizationDecision: Tm1PublicationAuthorizationDecision
   signedReview: Tm1SignedReview
   witnessReservationSnapshot: Tm1RollbackWitnessSnapshot
+  witnessFinalizedDispatchSnapshot?: Tm1RollbackWitnessSnapshot
+  witnessAcknowledgementSnapshot?: Tm1RollbackWitnessSnapshot
   dispatchIntentRecord: Tm1PublicationRecoveryRecord
   submissionReceipt: Tm1SubmissionReceipt
   dispatchCount: number
@@ -589,6 +908,49 @@ export class Tm1RegtestE2eHarness {
     return this.dispatchCalls
   }
 
+  getStoreId(): string {
+    return extractStoreId(this.recoveryStore)
+  }
+
+  async deriveStoreRoot(input: {
+    slotId: string
+    generation: number
+    storeId: string
+    projectedRecord?: Tm1PublicationRecoveryRecord
+    projectedCapabilities?: readonly string[]
+  }): Promise<string> {
+    if (
+      'computeWitnessLogicalRoot' in this.recoveryStore &&
+      typeof (this.recoveryStore as { computeWitnessLogicalRoot?: unknown })
+        .computeWitnessLogicalRoot === 'function'
+    ) {
+      return (
+        this.recoveryStore as {
+          computeWitnessLogicalRoot: (arg: typeof input) => string
+        }
+      ).computeWitnessLogicalRoot(input)
+    }
+    const list = await this.recoveryStore.listRecoverable()
+    const records = Array.isArray(list)
+      ? list.map(r => parseTm1PublicationRecoveryRecord(r))
+      : []
+    const effectiveRecords = input.projectedRecord
+      ? [
+          ...records.filter(
+            r => r.publicationId !== input.projectedRecord!.publicationId
+          ),
+          input.projectedRecord
+        ]
+      : records
+    return computeCanonicalWholeStoreRoot({
+      storeId: input.storeId,
+      slotId: input.slotId,
+      generation: input.generation,
+      records: effectiveRecords,
+      capabilityIds: input.projectedCapabilities
+    })
+  }
+
   /**
    * Step 1: Resolver un alias .xec simulado y observar el ownership a traves de tm1AliasOwnershipVerificationPort.
    */
@@ -768,8 +1130,10 @@ export class Tm1RegtestE2eHarness {
   }
 
   /**
-   * Step 6: Ejecutar la reserva de recuperacion (recovery reservation) y
-   * realizar exactamente un despacho (exactly-once dispatch) a traves del Orquestador.
+   * Step 6: Ejecutar la reserva de recuperacion (recovery reservation), validar la respuesta,
+   * asentar duraderamente el intent en el recoveryStore, validar el intent devuelto,
+   * asentar (finalize) el checkpoint del witness ANTES de la llamada de transporte,
+   * y realizar exactamente un despacho (exactly-once dispatch) a traves del Orquestador.
    */
   async executeStep6ReserveRecoveryAndDispatch(
     preparedReview: Tm1PreparedReview,
@@ -777,15 +1141,15 @@ export class Tm1RegtestE2eHarness {
     signal?: AbortSignal
   ): Promise<{
     witnessReservationSnapshot: Tm1RollbackWitnessSnapshot
+    witnessFinalizedDispatchSnapshot: Tm1RollbackWitnessSnapshot
     dispatchIntentRecord: Tm1PublicationRecoveryRecord
     submissionReceipt: Tm1SubmissionReceipt
   }> {
     const slotId = `slot:${preparedReview.preparedId}`
-    const storeId = `tm1-store:v1:${'44'.repeat(32)}`
-    const logicalRoot = '00'.repeat(32)
-    const nextLogicalRoot = '01'.repeat(32)
+    const storeId = this.getStoreId()
     const operationId = `op:${signedReview.signedId}`
 
+    // 1. Read witness slot; enroll if not enrolled
     let enrolledSnapshot: Tm1RollbackWitnessSnapshot
     const rawRead = await this.witness.read({
       slotId,
@@ -793,6 +1157,11 @@ export class Tm1RegtestE2eHarness {
     })
 
     if (rawRead === null) {
+      const logicalRoot = await this.deriveStoreRoot({
+        slotId,
+        storeId,
+        generation: 0
+      })
       const rawEnroll = await this.witness.enroll({
         slotId,
         storeId,
@@ -816,7 +1185,9 @@ export class Tm1RegtestE2eHarness {
         )
       }
       if (enrolledSnapshot.pending !== null) {
-        const isPendingAuthentic = await this.witness.verifyRecord(enrolledSnapshot.pending)
+        const isPendingAuthentic = await this.witness.verifyRecord(
+          enrolledSnapshot.pending
+        )
         if (!isPendingAuthentic) {
           throw new Error(
             'UNAUTHENTICATED_WITNESS_READ: Pending record signature/hash verification failed'
@@ -825,41 +1196,7 @@ export class Tm1RegtestE2eHarness {
       }
     }
 
-    const rawReserve = await this.witness.reserve({
-      slotId,
-      storeId,
-      expectedStableGeneration: enrolledSnapshot.stable.generation,
-      expectedStableLogicalRoot: enrolledSnapshot.stable.logicalRoot,
-      expectedStableReceiptHash: enrolledSnapshot.stable.receiptHash,
-      nextGeneration: enrolledSnapshot.stable.generation + 1,
-      nextLogicalRoot,
-      operationId,
-      signal
-    })
-    const witnessReservationSnapshot = parseTm1RollbackWitnessSnapshot(rawReserve)
-    const isReservationStableAuthentic = await this.witness.verifyRecord(
-      witnessReservationSnapshot.stable
-    )
-    if (!isReservationStableAuthentic) {
-      throw new Error(
-        'UNAUTHENTICATED_WITNESS_RESERVATION: Stable record signature/hash verification failed'
-      )
-    }
-    if (!witnessReservationSnapshot.pending) {
-      throw new Error(
-        'WITNESS_RESERVATION_MISSING_PENDING: Reservation snapshot must contain pending record'
-      )
-    }
-    const isReservationPendingAuthentic = await this.witness.verifyRecord(
-      witnessReservationSnapshot.pending
-    )
-    if (!isReservationPendingAuthentic) {
-      throw new Error(
-        'UNAUTHENTICATED_WITNESS_RESERVATION: Pending record signature/hash verification failed'
-      )
-    }
-
-    // Request broadcast authorization decision before persisting recovery intent
+    // 2. Request broadcast authorization before creating/reserving recovery intent
     const broadcastDecision =
       await this.broadcastAuthorizationPort.requestBroadcastAuthorization(
         signedReview,
@@ -881,12 +1218,16 @@ export class Tm1RegtestE2eHarness {
 
     this.cachedBroadcastDecision = broadcastDecision
 
-    const broadcastGrant = this.ledger.getConsumption(broadcastDecision.authorizationId)
+    const broadcastGrant = this.ledger.getConsumption(
+      broadcastDecision.authorizationId
+    )
     if (!broadcastGrant) {
       throw new Error('BROADCAST_GRANT_NOT_RECORDED_IN_LEDGER')
     }
 
-    const signingGrant = this.ledger.getConsumption(signedReview.signingAuthorizationId)
+    const signingGrant = this.ledger.getConsumption(
+      signedReview.signingAuthorizationId
+    )
     if (!signingGrant) {
       throw new Error('SIGNING_GRANT_NOT_RECORDED_IN_LEDGER')
     }
@@ -938,8 +1279,6 @@ export class Tm1RegtestE2eHarness {
       terminal: null
     })
 
-    await this.recoveryStore.create({ record: preDispatchRecord })
-
     const outcomeUnknownRecord = parseTm1PublicationRecoveryRecord({
       ...preDispatchRecord,
       revision: 2,
@@ -954,13 +1293,133 @@ export class Tm1RegtestE2eHarness {
       }
     })
 
-    await this.recoveryStore.commitDispatchIntent({
+    // 3. Derive canonical whole-store root for the proposed dispatch intent checkpoint (Finding 1)
+    const nextGeneration = enrolledSnapshot.stable.generation + 1
+    const nextLogicalRoot = await this.deriveStoreRoot({
+      slotId,
+      storeId,
+      generation: nextGeneration,
+      projectedRecord: outcomeUnknownRecord,
+      projectedCapabilities: [signingGrant.capabilityId, broadcastGrant.capabilityId]
+    })
+
+    // 4. Reserve witness slot for dispatch intent
+    const reservationRequest: Tm1RollbackWitnessReservation = {
+      slotId,
+      storeId,
+      expectedStableGeneration: enrolledSnapshot.stable.generation,
+      expectedStableLogicalRoot: enrolledSnapshot.stable.logicalRoot,
+      expectedStableReceiptHash: enrolledSnapshot.stable.receiptHash,
+      nextGeneration,
+      nextLogicalRoot,
+      operationId,
+      signal
+    }
+
+    const rawReserve = await this.witness.reserve(reservationRequest)
+    const witnessReservationSnapshot = parseTm1RollbackWitnessSnapshot(rawReserve)
+
+    // Verify cryptographic authenticity of reservation snapshot
+    const isReservationStableAuthentic = await this.witness.verifyRecord(
+      witnessReservationSnapshot.stable
+    )
+    if (!isReservationStableAuthentic) {
+      throw new Error(
+        'UNAUTHENTICATED_WITNESS_RESERVATION: Stable record signature/hash verification failed'
+      )
+    }
+    if (!witnessReservationSnapshot.pending) {
+      throw new Error(
+        'WITNESS_RESERVATION_MISSING_PENDING: Reservation snapshot must contain pending record'
+      )
+    }
+    const isReservationPendingAuthentic = await this.witness.verifyRecord(
+      witnessReservationSnapshot.pending
+    )
+    if (!isReservationPendingAuthentic) {
+      throw new Error(
+        'UNAUTHENTICATED_WITNESS_RESERVATION: Pending record signature/hash verification failed'
+      )
+    }
+
+    // 5. Strict binding of reservation response to request (Finding 2)
+    assertWitnessReservationResponseBinding(
+      witnessReservationSnapshot,
+      reservationRequest,
+      enrolledSnapshot.stable
+    )
+
+    // 6. Persist preDispatch and outcomeUnknown records to recovery store
+    await this.recoveryStore.create({ record: preDispatchRecord })
+
+    const rawCommitted = await this.recoveryStore.commitDispatchIntent({
       publicationId,
       expectedRevision: 1,
       expectedOwnerEpoch: 1,
       nextRecord: outcomeUnknownRecord
     })
 
+    // 7. Validate committed dispatch intent return value (Finding 3)
+    let committedRecord: Tm1PublicationRecoveryRecord
+    try {
+      committedRecord = parseTm1PublicationRecoveryRecord(rawCommitted)
+    } catch (error) {
+      throw new Error(
+        `INVALID_DISPATCH_INTENT_RECORD: Malformed recovery record (${error instanceof Error ? error.message : String(error)})`
+      )
+    }
+
+    assertTm1CommittedDispatchIntentBinding({
+      committedRecord,
+      publicationId,
+      expectedRevision: 2,
+      expectedOwnerEpoch: 1,
+      preparedReview,
+      signedReview,
+      signingGrant,
+      broadcastGrant,
+      submissionId
+    })
+
+    // 8. Finalize witness checkpoint for dispatch intent BEFORE transport execution (Finding 4)
+    const rawFinalizeDispatch = await this.witness.finalize({
+      slotId,
+      storeId,
+      generation: witnessReservationSnapshot.pending.generation,
+      logicalRoot: witnessReservationSnapshot.pending.logicalRoot,
+      pendingReceiptHash: witnessReservationSnapshot.pending.receiptHash,
+      operationId: witnessReservationSnapshot.pending.operationId,
+      signal
+    })
+    const finalizedDispatchSnapshot =
+      parseTm1RollbackWitnessSnapshot(rawFinalizeDispatch)
+    const isFinalizedAuthentic = await this.witness.verifyRecord(
+      finalizedDispatchSnapshot.stable
+    )
+    if (!isFinalizedAuthentic) {
+      throw new Error(
+        'UNAUTHENTICATED_WITNESS_FINALIZATION: Dispatch intent stable record signature/hash verification failed'
+      )
+    }
+    if (
+      finalizedDispatchSnapshot.stable.slotId !==
+        witnessReservationSnapshot.pending.slotId ||
+      finalizedDispatchSnapshot.stable.storeId !==
+        witnessReservationSnapshot.pending.storeId ||
+      finalizedDispatchSnapshot.stable.generation !==
+        witnessReservationSnapshot.pending.generation ||
+      finalizedDispatchSnapshot.stable.logicalRoot !==
+        witnessReservationSnapshot.pending.logicalRoot ||
+      finalizedDispatchSnapshot.stable.operationId !==
+        witnessReservationSnapshot.pending.operationId ||
+      finalizedDispatchSnapshot.pending !== null
+    ) {
+      throw new Error(
+        'WITNESS_FINALIZATION_MISMATCH: Finalized dispatch intent stable head mismatch'
+      )
+    }
+
+    // 9. Execute transport call ONLY after witness checkpoint is stable
     const initialDispatchCount = this.dispatchCalls
     this.plannedSubmissionId = submissionId
 
@@ -992,27 +1451,30 @@ export class Tm1RegtestE2eHarness {
 
     return {
       witnessReservationSnapshot,
-      dispatchIntentRecord: outcomeUnknownRecord,
+      witnessFinalizedDispatchSnapshot: finalizedDispatchSnapshot,
+      dispatchIntentRecord: committedRecord,
       submissionReceipt
     }
   }
 
   /**
-   * Step 7: Comprobar el estado final de exito.
+   * Step 7: Comprobar el estado final de exito y asentar duraderamente el checkpoint
+   * separado de acknowledgement en el witness (nueva reserva + finalizacion).
    */
   async executeStep7VerifyFinalSuccess(
     preparedReview: Tm1PreparedReview,
     signedReview: Tm1SignedReview,
     submissionReceipt: Tm1SubmissionReceipt,
-    witnessReservationSnapshot: Tm1RollbackWitnessSnapshot,
+    _witnessReservationSnapshot?: Tm1RollbackWitnessSnapshot,
     signal?: AbortSignal
   ): Promise<{
     transportAcknowledgedRecord: Tm1PublicationRecoveryRecord
     finalOrchestratorState: Tm1PublicationState
     confirmedReceipt?: Tm1Confirmation
+    witnessAcknowledgementSnapshot: Tm1RollbackWitnessSnapshot
   }> {
     const publicationId = `pub:${preparedReview.preparedId}`
-    const storeId = `tm1-store:v1:${'44'.repeat(32)}`
+    const storeId = this.getStoreId()
     const slotId = `slot:${preparedReview.preparedId}`
 
     const rawRecord = await this.recoveryStore.commitTransportAcknowledgement({
@@ -1029,7 +1491,14 @@ export class Tm1RegtestE2eHarness {
       }
     })
 
-    const transportAcknowledgedRecord = parseTm1PublicationRecoveryRecord(rawRecord)
+    let transportAcknowledgedRecord: Tm1PublicationRecoveryRecord
+    try {
+      transportAcknowledgedRecord = parseTm1PublicationRecoveryRecord(rawRecord)
+    } catch (error) {
+      throw new Error(
+        `MALFORMED_RECOVERY_RECORD: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
 
     // 1. Revision & phase verification
     if (transportAcknowledgedRecord.phase !== 'submittedObserved') {
@@ -1054,7 +1523,9 @@ export class Tm1RegtestE2eHarness {
     }
 
     // 2. Identities verification
-    if (transportAcknowledgedRecord.prepared?.preparedId !== preparedReview.preparedId) {
+    if (
+      transportAcknowledgedRecord.prepared?.preparedId !== preparedReview.preparedId
+    ) {
       throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Prepared ID mismatch')
     }
     if (transportAcknowledgedRecord.signed?.signedId !== signedReview.signedId) {
@@ -1063,33 +1534,61 @@ export class Tm1RegtestE2eHarness {
     if (transportAcknowledgedRecord.signed?.txid !== submissionReceipt.txid) {
       throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed txid mismatch')
     }
-    if (transportAcknowledgedRecord.signed?.signedArtifactHash !== signedReview.signedArtifactHash) {
+    if (
+      transportAcknowledgedRecord.signed?.signedArtifactHash !==
+      signedReview.signedArtifactHash
+    ) {
       throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed artifact hash mismatch')
     }
 
     // 3. Dispatch intent verification
     if (!transportAcknowledgedRecord.dispatchIntent) {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Missing dispatch intent in acknowledgement record')
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Missing dispatch intent in acknowledgement record'
+      )
     }
-    if (transportAcknowledgedRecord.dispatchIntent.submissionId !== submissionReceipt.submissionId) {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent submission ID mismatch')
+    if (
+      transportAcknowledgedRecord.dispatchIntent.submissionId !==
+      submissionReceipt.submissionId
+    ) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent submission ID mismatch'
+      )
     }
-    if (transportAcknowledgedRecord.dispatchIntent.txid !== submissionReceipt.txid) {
+    if (
+      transportAcknowledgedRecord.dispatchIntent.txid !== submissionReceipt.txid
+    ) {
       throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent txid mismatch')
     }
-    if (transportAcknowledgedRecord.dispatchIntent.signedArtifactHash !== signedReview.signedArtifactHash) {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent signed artifact hash mismatch')
+    if (
+      transportAcknowledgedRecord.dispatchIntent.signedArtifactHash !==
+      signedReview.signedArtifactHash
+    ) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent signed artifact hash mismatch'
+      )
     }
 
     // 4. Transport receipt verification
     if (!transportAcknowledgedRecord.transportAcknowledgement) {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Missing transport acknowledgement evidence')
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Missing transport acknowledgement evidence'
+      )
     }
-    if (transportAcknowledgedRecord.transportAcknowledgement.txid !== submissionReceipt.txid) {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement txid mismatch')
+    if (
+      transportAcknowledgedRecord.transportAcknowledgement.txid !==
+      submissionReceipt.txid
+    ) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement txid mismatch'
+      )
     }
-    if (transportAcknowledgedRecord.transportAcknowledgement.disposition !== 'accepted') {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement disposition not accepted')
+    if (
+      transportAcknowledgedRecord.transportAcknowledgement.disposition !== 'accepted'
+    ) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement disposition not accepted'
+      )
     }
 
     // 5. Orchestrator state verification
@@ -1104,29 +1603,120 @@ export class Tm1RegtestE2eHarness {
       throw new Error('Orchestrator receipt txid does not match submission receipt')
     }
 
-    // 6. Witness finalization only after all verifications succeed
-    if (witnessReservationSnapshot.pending) {
-      const rawFinalize = await this.witness.finalize({
-        slotId,
-        storeId,
-        generation: witnessReservationSnapshot.pending.generation,
-        logicalRoot: witnessReservationSnapshot.pending.logicalRoot,
-        pendingReceiptHash: witnessReservationSnapshot.pending.receiptHash,
-        operationId: witnessReservationSnapshot.pending.operationId,
-        signal
-      })
-      const finalizedSnapshot = parseTm1RollbackWitnessSnapshot(rawFinalize)
-      const isFinalizedAuthentic = await this.witness.verifyRecord(finalizedSnapshot.stable)
-      if (!isFinalizedAuthentic) {
-        throw new Error(
-          'UNAUTHENTICATED_WITNESS_FINALIZATION: Stable record signature/hash verification failed'
-        )
-      }
+    // 6. Separate witness checkpoint for acknowledgement (Finding 4):
+    // Read current stable head (from dispatch intent finalization)
+    const rawReadWitness = await this.witness.read({ slotId, signal })
+    if (rawReadWitness === null) {
+      throw new Error('WITNESS_NOT_ENROLLED: Cannot persist acknowledgement checkpoint')
+    }
+    const currentWitnessSnapshot = parseTm1RollbackWitnessSnapshot(rawReadWitness)
+    const isCurrentStableAuthentic = await this.witness.verifyRecord(
+      currentWitnessSnapshot.stable
+    )
+    if (!isCurrentStableAuthentic) {
+      throw new Error(
+        'UNAUTHENTICATED_WITNESS: Current stable record signature/hash verification failed'
+      )
+    }
+    if (currentWitnessSnapshot.pending !== null) {
+      throw new Error(
+        'WITNESS_CONFLICT: Pending reservation already exists before acknowledgement checkpoint'
+      )
+    }
+
+    // Derive canonical whole-store root for acknowledgement checkpoint (generation 2)
+    const ackGeneration = currentWitnessSnapshot.stable.generation + 1
+    const ackLogicalRoot = await this.deriveStoreRoot({
+      slotId,
+      storeId,
+      generation: ackGeneration
+    })
+
+    const ackOperationId = `op:ack:${submissionReceipt.submissionId}`
+    const ackReservationRequest: Tm1RollbackWitnessReservation = {
+      slotId,
+      storeId,
+      expectedStableGeneration: currentWitnessSnapshot.stable.generation,
+      expectedStableLogicalRoot: currentWitnessSnapshot.stable.logicalRoot,
+      expectedStableReceiptHash: currentWitnessSnapshot.stable.receiptHash,
+      nextGeneration: ackGeneration,
+      nextLogicalRoot: ackLogicalRoot,
+      operationId: ackOperationId,
+      signal
+    }
+
+    const rawAckReserve = await this.witness.reserve(ackReservationRequest)
+    const ackReservationSnapshot = parseTm1RollbackWitnessSnapshot(rawAckReserve)
+    const isAckStableAuthentic = await this.witness.verifyRecord(
+      ackReservationSnapshot.stable
+    )
+    if (!isAckStableAuthentic) {
+      throw new Error(
+        'UNAUTHENTICATED_WITNESS_RESERVATION: Acknowledgement stable record signature/hash verification failed'
+      )
+    }
+    if (!ackReservationSnapshot.pending) {
+      throw new Error(
+        'WITNESS_RESERVATION_MISSING_PENDING: Acknowledgement reservation snapshot must contain pending record'
+      )
+    }
+    const isAckPendingAuthentic = await this.witness.verifyRecord(
+      ackReservationSnapshot.pending
+    )
+    if (!isAckPendingAuthentic) {
+      throw new Error(
+        'UNAUTHENTICATED_WITNESS_RESERVATION: Acknowledgement pending record signature/hash verification failed'
+      )
+    }
+
+    // Strict binding of reservation response to request (Finding 2)
+    assertWitnessReservationResponseBinding(
+      ackReservationSnapshot,
+      ackReservationRequest,
+      currentWitnessSnapshot.stable
+    )
+
+    // Finalize acknowledgement checkpoint
+    const rawAckFinalize = await this.witness.finalize({
+      slotId,
+      storeId,
+      generation: ackReservationSnapshot.pending.generation,
+      logicalRoot: ackReservationSnapshot.pending.logicalRoot,
+      pendingReceiptHash: ackReservationSnapshot.pending.receiptHash,
+      operationId: ackReservationSnapshot.pending.operationId,
+      signal
+    })
+    const finalizedAckSnapshot = parseTm1RollbackWitnessSnapshot(rawAckFinalize)
+    const isFinalizedAckAuthentic = await this.witness.verifyRecord(
+      finalizedAckSnapshot.stable
+    )
+    if (!isFinalizedAckAuthentic) {
+      throw new Error(
+        'UNAUTHENTICATED_WITNESS_FINALIZATION: Acknowledgement stable record signature/hash verification failed'
+      )
+    }
+    if (
+      finalizedAckSnapshot.stable.slotId !==
+        ackReservationSnapshot.pending.slotId ||
+      finalizedAckSnapshot.stable.storeId !==
+        ackReservationSnapshot.pending.storeId ||
+      finalizedAckSnapshot.stable.generation !==
+        ackReservationSnapshot.pending.generation ||
+      finalizedAckSnapshot.stable.logicalRoot !==
+        ackReservationSnapshot.pending.logicalRoot ||
+      finalizedAckSnapshot.stable.operationId !==
+        ackReservationSnapshot.pending.operationId ||
+      finalizedAckSnapshot.pending !== null
+    ) {
+      throw new Error(
+        'WITNESS_FINALIZATION_MISMATCH: Finalized acknowledgement stable head mismatch'
+      )
     }
 
     return {
       transportAcknowledgedRecord,
-      finalOrchestratorState
+      finalOrchestratorState,
+      witnessAcknowledgementSnapshot: finalizedAckSnapshot
     }
   }
 
@@ -1160,9 +1750,10 @@ export class Tm1RegtestE2eHarness {
     const { signedReview, signingAuthorizationDecision } =
       await this.executeStep5DualAuthorizeAndSign(preparedReview, signal)
 
-    // Step 6: Recovery reservation & exactly-once dispatch
+    // Step 6: Recovery reservation, finalization of dispatch intent & exactly-once dispatch
     const {
       witnessReservationSnapshot,
+      witnessFinalizedDispatchSnapshot,
       dispatchIntentRecord,
       submissionReceipt
     } = await this.executeStep6ReserveRecoveryAndDispatch(
@@ -1171,15 +1762,18 @@ export class Tm1RegtestE2eHarness {
       signal
     )
 
-    // Step 7: Final success verification
-    const { transportAcknowledgedRecord, finalOrchestratorState } =
-      await this.executeStep7VerifyFinalSuccess(
-        preparedReview,
-        signedReview,
-        submissionReceipt,
-        witnessReservationSnapshot,
-        signal
-      )
+    // Step 7: Final success verification & acknowledgement witness checkpoint
+    const {
+      transportAcknowledgedRecord,
+      finalOrchestratorState,
+      witnessAcknowledgementSnapshot
+    } = await this.executeStep7VerifyFinalSuccess(
+      preparedReview,
+      signedReview,
+      submissionReceipt,
+      witnessReservationSnapshot,
+      signal
+    )
 
     return Object.freeze({
       success: true,
@@ -1199,6 +1793,8 @@ export class Tm1RegtestE2eHarness {
         signingAuthorizationDecision,
         signedReview,
         witnessReservationSnapshot,
+        witnessFinalizedDispatchSnapshot,
+        witnessAcknowledgementSnapshot,
         dispatchIntentRecord,
         submissionReceipt,
         dispatchCount: this.getDispatchCount(),

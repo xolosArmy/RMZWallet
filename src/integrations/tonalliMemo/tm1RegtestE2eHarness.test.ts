@@ -44,6 +44,10 @@ const {
   Tm1HarnessApprovalLedger,
   Tm1HarnessOperationLock,
   Tm1HarnessRecoveryStore,
+  assertWitnessReservationResponseBinding,
+  assertTm1CommittedDispatchIntentBinding,
+  computeCanonicalWholeStoreRoot,
+  extractStoreId,
   createDefaultFixtureUtxos,
   createTm1RegtestE2eHarness,
   executeTm1ProgrammaticE2ePipeline
@@ -74,6 +78,10 @@ const {
   parseTm1PublicationRecoveryRecord
 } = await import('./recovery/tm1PublicationRecoveryModel')
 import type { Tm1PublicationRecoveryRecord } from './recovery/tm1PublicationRecoveryModel'
+
+const {
+  parseTm1RollbackWitnessSnapshot
+} = await import('./recovery/tm1RollbackWitness')
 
 const {
   Tm1InMemoryRollbackWitness
@@ -549,6 +557,505 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
 
       // Witness finalization MUST NOT have been called
       expect(finalizeCalled).toBe(false)
+    })
+
+    test('Step 6: rejects witness reservation response if pending record is not bound to request parameters (Finding 2)', async () => {
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        witness: {
+          read: (args) => realWitness.read(args),
+          enroll: (args) => realWitness.enroll(args),
+          reserve: async (args) => {
+            const authentic = parseTm1RollbackWitnessSnapshot(await realWitness.reserve(args))
+            // Tamper with reservation snapshot: modify pending logicalRoot
+            return {
+              ...authentic,
+              pending: {
+                ...authentic.pending!,
+                logicalRoot: 'ff'.repeat(32)
+              }
+            }
+          },
+          finalize: (args) => realWitness.finalize(args),
+          // Simulation: witness signatures pass verification, but returned parameters are mismatched
+          verifyRecord: async () => true
+        }
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/WITNESS_RESERVATION_BINDING_MISMATCH/)
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects witness reservation response if stable head does not match last read (Finding 2)', async () => {
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        witness: {
+          read: (args) => realWitness.read(args),
+          enroll: (args) => realWitness.enroll(args),
+          reserve: async (args) => {
+            const authentic = parseTm1RollbackWitnessSnapshot(await realWitness.reserve(args))
+            const otherStoreId = `tm1-store:v1:${'99'.repeat(32)}`
+            // Tamper with reservation snapshot: modify stable and pending storeId to mismatch last read
+            return {
+              stable: {
+                ...authentic.stable,
+                storeId: otherStoreId
+              },
+              pending: {
+                ...authentic.pending!,
+                storeId: otherStoreId
+              }
+            }
+          },
+          finalize: (args) => realWitness.finalize(args),
+          // Simulation: witness signatures pass verification, but returned stable head is mismatched
+          verifyRecord: async () => true
+        }
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/WITNESS_RESERVATION_BINDING_MISMATCH/)
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: validates returned intent from commitDispatchIntent and blocks broadcast if tampered (Finding 3)', async () => {
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      // Tamper commitDispatchIntent to return invalid record (tampered revision)
+      const originalCommit =
+        harness.recoveryStore.commitDispatchIntent.bind(harness.recoveryStore)
+      harness.recoveryStore.commitDispatchIntent = async (args) => {
+        const authentic = (await originalCommit(args)) as Tm1PublicationRecoveryRecord
+        return {
+          ...authentic,
+          revision: 999
+        }
+      }
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: validates returned intent from commitDispatchIntent rejects malformed payload and blocks broadcast (Finding 3)', async () => {
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      // Tamper commitDispatchIntent to return unparseable record
+      harness.recoveryStore.commitDispatchIntent = async () => 'not-a-valid-record'
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: finalizes dispatch intent checkpoint BEFORE broadcast and blocks broadcast if finalization fails (Finding 4)', async () => {
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      let finalizeInvocationCount = 0
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        witness: {
+          read: (args) => realWitness.read(args),
+          enroll: (args) => realWitness.enroll(args),
+          reserve: (args) => realWitness.reserve(args),
+          finalize: async () => {
+            finalizeInvocationCount += 1
+            // Simulate witness outage or refusal during dispatch intent finalization
+            throw new Error('WITNESS_UNAVAILABLE_DURING_FINALIZE')
+          },
+          verifyRecord: (args) => realWitness.verifyRecord(args)
+        }
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow('WITNESS_UNAVAILABLE_DURING_FINALIZE')
+
+      expect(finalizeInvocationCount).toBe(1)
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Full double checkpoint flow: dispatch intent checkpoint (gen 1) before broadcast, acknowledgement checkpoint (gen 2) after broadcast with dynamic canonical roots (Findings 1 & 4)', async () => {
+      const recordedCheckpoints: Array<{
+        action: string
+        generation: number
+        logicalRoot: string
+      }> = []
+      const realWitness = new Tm1InMemoryRollbackWitness()
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        witness: {
+          read: (args) => realWitness.read(args),
+          enroll: async (args) => {
+            recordedCheckpoints.push({
+              action: 'enroll',
+              generation: 0,
+              logicalRoot: args.logicalRoot
+            })
+            return realWitness.enroll(args)
+          },
+          reserve: async (args) => {
+            recordedCheckpoints.push({
+              action: 'reserve',
+              generation: args.nextGeneration,
+              logicalRoot: args.nextLogicalRoot
+            })
+            return realWitness.reserve(args)
+          },
+          finalize: async (args) => {
+            recordedCheckpoints.push({
+              action: 'finalize',
+              generation: args.generation,
+              logicalRoot: args.logicalRoot
+            })
+            return realWitness.finalize(args)
+          },
+          verifyRecord: (args) => realWitness.verifyRecord(args)
+        }
+      })
+
+      const result = await harness.executePipeline()
+      expect(result.success).toBe(true)
+
+      // Verify sequence of witness operations:
+      // 1. enroll generation 0
+      // 2. reserve generation 1 (dispatch intent)
+      // 3. finalize generation 1 (dispatch intent) -> BEFORE broadcast
+      // 4. reserve generation 2 (acknowledgement)
+      // 5. finalize generation 2 (acknowledgement)
+      expect(recordedCheckpoints).toHaveLength(5)
+      expect(recordedCheckpoints[0]).toMatchObject({ action: 'enroll', generation: 0 })
+      expect(recordedCheckpoints[1]).toMatchObject({ action: 'reserve', generation: 1 })
+      expect(recordedCheckpoints[2]).toMatchObject({ action: 'finalize', generation: 1 })
+      expect(recordedCheckpoints[3]).toMatchObject({ action: 'reserve', generation: 2 })
+      expect(recordedCheckpoints[4]).toMatchObject({ action: 'finalize', generation: 2 })
+
+      // Verify roots are dynamically computed (64-char sha256 hex, NOT hardcoded 00... or 01...)
+      expect(recordedCheckpoints[0].logicalRoot).not.toBe('00'.repeat(32))
+      expect(recordedCheckpoints[0].logicalRoot).not.toBe('01'.repeat(32))
+      expect(recordedCheckpoints[1].logicalRoot).not.toBe('00'.repeat(32))
+      expect(recordedCheckpoints[1].logicalRoot).not.toBe('01'.repeat(32))
+      expect(recordedCheckpoints[0].logicalRoot).toHaveLength(64)
+      expect(recordedCheckpoints[1].logicalRoot).toHaveLength(64)
+      expect(recordedCheckpoints[3].logicalRoot).toHaveLength(64)
+
+      // Generation 1 root must match finalized dispatch intent root
+      expect(recordedCheckpoints[1].logicalRoot).toBe(recordedCheckpoints[2].logicalRoot)
+      // Generation 2 root must match finalized acknowledgement root
+      expect(recordedCheckpoints[3].logicalRoot).toBe(recordedCheckpoints[4].logicalRoot)
+      // Generation 1 and 2 roots must differ because store transitioned
+      expect(recordedCheckpoints[1].logicalRoot).not.toBe(
+        recordedCheckpoints[3].logicalRoot
+      )
+
+      // Verify step results contain both snapshots
+      expect(result.steps.witnessReservationSnapshot.pending?.generation).toBe(1)
+      expect(result.steps.witnessFinalizedDispatchSnapshot?.stable.generation).toBe(1)
+      expect(result.steps.witnessAcknowledgementSnapshot?.stable.generation).toBe(2)
+      expect(result.steps.witnessAcknowledgementSnapshot?.pending).toBeNull()
+    })
+
+    test('Dynamic root calculation and storeId extraction handle custom store and canonical identity (Finding 1)', async () => {
+      const customStoreId = `tm1-store:v1:${'77'.repeat(32)}`
+      const store = new Tm1HarnessRecoveryStore(customStoreId)
+      expect(extractStoreId(store)).toBe(customStoreId)
+      const emptyCanonicalRoot = computeCanonicalWholeStoreRoot({
+        storeId: customStoreId,
+        slotId: 'slot:test',
+        generation: 0,
+        records: [],
+        capabilityIds: []
+      })
+      expect(emptyCanonicalRoot).toMatch(/^[0-9a-f]{64}$/)
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: store
+      })
+      expect(harness.getStoreId()).toBe(customStoreId)
+
+      const rootGen0 = await harness.deriveStoreRoot({
+        slotId: 'slot:test',
+        generation: 0,
+        storeId: customStoreId
+      })
+      expect(rootGen0).toMatch(/^[0-9a-f]{64}$/)
+      expect(rootGen0).not.toBe('00'.repeat(32))
+      expect(rootGen0).not.toBe('01'.repeat(32))
+    })
+
+    test('Direct assertion helper test: assertWitnessReservationResponseBinding checks all mismatch cases', () => {
+      const mockStable = {
+        protocol: 'tonalli.tm1-rollback-witness' as const,
+        protocolVersion: 1 as const,
+        slotId: 'slot:1',
+        storeId: `tm1-store:v1:${'11'.repeat(32)}`,
+        generation: 0,
+        logicalRoot: '00'.repeat(32),
+        receiptHash: 'aa'.repeat(32),
+        witnessKeyId: 'wk-1',
+        state: 'stable' as const,
+        operationId: 'op:0',
+        previousStableReceiptHash: null,
+        authenticatedReceipt: 'auth-0'
+      }
+      const mockReq = {
+        slotId: 'slot:1',
+        storeId: `tm1-store:v1:${'11'.repeat(32)}`,
+        expectedStableGeneration: 0,
+        expectedStableLogicalRoot: '00'.repeat(32),
+        expectedStableReceiptHash: 'aa'.repeat(32),
+        nextGeneration: 1,
+        nextLogicalRoot: '11'.repeat(32),
+        operationId: 'op:1'
+      }
+      const validPending = {
+        protocol: 'tonalli.tm1-rollback-witness' as const,
+        protocolVersion: 1 as const,
+        slotId: 'slot:1',
+        storeId: `tm1-store:v1:${'11'.repeat(32)}`,
+        generation: 1,
+        logicalRoot: '11'.repeat(32),
+        receiptHash: 'bb'.repeat(32),
+        witnessKeyId: 'wk-1',
+        state: 'pending' as const,
+        operationId: 'op:1',
+        previousStableReceiptHash: 'aa'.repeat(32),
+        authenticatedReceipt: 'auth-1'
+      }
+
+      // Valid snapshot passes
+      expect(() => {
+        assertWitnessReservationResponseBinding(
+          { stable: mockStable, pending: validPending },
+          mockReq,
+          mockStable
+        )
+      }).not.toThrow()
+
+      // Missing pending
+      expect(() => {
+        assertWitnessReservationResponseBinding(
+          { stable: mockStable, pending: null },
+          mockReq,
+          mockStable
+        )
+      }).toThrow(/WITNESS_RESERVATION_MISSING_PENDING/)
+
+      // Mismatched pending generation
+      expect(() => {
+        assertWitnessReservationResponseBinding(
+          { stable: mockStable, pending: { ...validPending, generation: 2 } },
+          mockReq,
+          mockStable
+        )
+      }).toThrow(/WITNESS_RESERVATION_BINDING_MISMATCH/)
+
+      // Mismatched pending root
+      expect(() => {
+        assertWitnessReservationResponseBinding(
+          {
+            stable: mockStable,
+            pending: { ...validPending, logicalRoot: '22'.repeat(32) }
+          },
+          mockReq,
+          mockStable
+        )
+      }).toThrow(/WITNESS_RESERVATION_BINDING_MISMATCH/)
+
+      // Mismatched pending operationId
+      expect(() => {
+        assertWitnessReservationResponseBinding(
+          { stable: mockStable, pending: { ...validPending, operationId: 'op:wrong' } },
+          mockReq,
+          mockStable
+        )
+      }).toThrow(/WITNESS_RESERVATION_BINDING_MISMATCH/)
+
+      // Mismatched pending previousStableReceiptHash
+      expect(() => {
+        assertWitnessReservationResponseBinding(
+          {
+            stable: mockStable,
+            pending: { ...validPending, previousStableReceiptHash: 'ff'.repeat(32) }
+          },
+          mockReq,
+          mockStable
+        )
+      }).toThrow(/WITNESS_RESERVATION_BINDING_MISMATCH/)
+    })
+
+    test('Direct assertion helper test: assertTm1CommittedDispatchIntentBinding checks mismatch cases', () => {
+      const mockRecord: Tm1PublicationRecoveryRecord = {
+        schema: 'tonalli.tm1-publication-recovery',
+        schemaVersion: 1,
+        publicationId: 'pub:1',
+        revision: 2,
+        ownerEpoch: 1,
+        phase: 'outcomeUnknown',
+        preDispatchStage: null,
+        prepared: {
+          preparedId: 'prep:1',
+          bindingHash: 'bh-1',
+          preparedDigest: 'bh-1'
+        },
+        signed: {
+          signedId: 'signed:1',
+          txid: 'tx-1',
+          signedArtifactHash: 'hash-1'
+        },
+        signingAuthorization: {
+          operationId: 'op:sign',
+          capabilityId: 'cap:sign',
+          contentHash: `sha256:${'aa'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500,
+          preparedId: 'prep:1',
+          bindingHash: 'bh-1'
+        },
+        broadcastAuthorization: {
+          operationId: 'op:bcast',
+          capabilityId: 'cap:bcast',
+          contentHash: `sha256:${'bb'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500,
+          signedId: 'signed:1',
+          txid: 'tx-1',
+          signedArtifactHash: 'hash-1'
+        },
+        dispatchIntent: {
+          submissionId: 'sub:1',
+          txid: 'tx-1',
+          signedArtifactHash: 'hash-1',
+          broadcastCapabilityId: 'cap:bcast',
+          committedAt: 600
+        },
+        transportAcknowledgement: null,
+        lastObservation: null,
+        terminal: null
+      }
+
+      const input = {
+        committedRecord: mockRecord,
+        publicationId: 'pub:1',
+        expectedRevision: 2,
+        expectedOwnerEpoch: 1,
+        preparedReview: {
+          preparedId: 'prep:1',
+          bindingHash: 'bh-1',
+          preparedDigest: 'bh-1'
+        } as any,
+        signedReview: {
+          signedId: 'signed:1',
+          txid: 'tx-1',
+          signedArtifactHash: 'hash-1',
+          preparedId: 'prep:1',
+          signingAuthorizationId: 'auth:sign'
+        } as any,
+        signingGrant: {
+          operationId: 'op:sign',
+          capabilityId: 'cap:sign',
+          contentHash: `sha256:${'aa'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500
+        } as any,
+        broadcastGrant: {
+          operationId: 'op:bcast',
+          capabilityId: 'cap:bcast',
+          contentHash: `sha256:${'bb'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500
+        } as any,
+        submissionId: 'sub:1'
+      }
+
+      // Valid passes
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding(input)
+      }).not.toThrow()
+
+      // Wrong phase
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          committedRecord: { ...mockRecord, phase: 'preDispatch' }
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      // Wrong revision
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          committedRecord: { ...mockRecord, revision: 3 }
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      // Missing dispatch intent
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          committedRecord: { ...mockRecord, dispatchIntent: null }
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+
+      // Mismatched submissionId
+      expect(() => {
+        assertTm1CommittedDispatchIntentBinding({
+          ...input,
+          submissionId: 'sub:wrong'
+        })
+      }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
     })
   })
 
