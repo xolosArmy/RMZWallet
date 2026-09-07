@@ -18,6 +18,7 @@ import Nfts from './routes/Nfts'
 import MemoFeed from './routes/MemoFeed'
 import MemoTx from './routes/MemoTx'
 import MemoDraftPreview from './routes/MemoDraftPreview'
+import MemoCompose from './routes/MemoCompose'
 import SendNft from './routes/SendNft'
 import ConnectRequest from './routes/ConnectRequest'
 import WalletConnect from './routes/WalletConnect'
@@ -62,6 +63,7 @@ function App() {
           <Route path="/dex" element={<DEX />} />
           <Route path="/nfts" element={<Nfts />} />
           <Route path="/memo" element={<MemoFeed />} />
+          <Route path="/memo/compose" element={<MemoCompose />} />
           <Route path="/memo/draft/tm1" element={<MemoDraftPreview />} />
           <Route path="/memo/tx/:txid" element={<MemoTx />} />
           <Route path="/send-nft" element={<SendNft />} />
