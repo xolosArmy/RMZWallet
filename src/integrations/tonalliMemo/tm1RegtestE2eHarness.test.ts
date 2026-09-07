@@ -340,6 +340,54 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
       )
     })
 
+    test('Step 6: rejects signedReview with mismatched preparedId (SIGNED_REVIEW_MISMATCH)', async () => {
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      const mismatchedSignedReview = {
+        ...step5.signedReview,
+        preparedId: 'mismatched-prep-id'
+      }
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          mismatchedSignedReview
+        )
+      ).rejects.toThrow(/SIGNED_REVIEW_MISMATCH: preparedId mismatch/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects signedReview with mismatched bindingHash (SIGNED_REVIEW_MISMATCH)', async () => {
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      const mismatchedSignedReview = {
+        ...step5.signedReview,
+        bindingHash: '00'.repeat(32)
+      }
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          mismatchedSignedReview
+        )
+      ).rejects.toThrow(/SIGNED_REVIEW_MISMATCH: bindingHash mismatch/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
     test('Step 6: enforces exactly-once dispatch (blocks secondary dispatch)', async () => {
       const harness = createTm1RegtestE2eHarness({
         alias: TEST_ALIAS,

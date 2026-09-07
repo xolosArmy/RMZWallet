@@ -1308,6 +1308,18 @@ export class Tm1RegtestE2eHarness {
     dispatchIntentRecord: Tm1PublicationRecoveryRecord
     submissionReceipt: Tm1SubmissionReceipt
   }> {
+    // 0. Bind Step 6 inputs: verify signedReview strictly matches preparedReview (Finding 1)
+    if (signedReview.preparedId !== preparedReview.preparedId) {
+      throw new Error(
+        `SIGNED_REVIEW_MISMATCH: preparedId mismatch (expected ${preparedReview.preparedId}, got ${signedReview.preparedId})`
+      )
+    }
+    if (signedReview.bindingHash !== preparedReview.bindingHash) {
+      throw new Error(
+        `SIGNED_REVIEW_MISMATCH: bindingHash mismatch (expected ${preparedReview.bindingHash}, got ${signedReview.bindingHash})`
+      )
+    }
+
     const slotId = this.getSlotId()
     const storeId = this.getStoreId()
     const operationId = `op:${signedReview.signedId}`
