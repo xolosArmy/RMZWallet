@@ -45,6 +45,7 @@ const {
   Tm1HarnessOperationLock,
   Tm1HarnessRecoveryStore,
   assertWitnessReservationResponseBinding,
+  assertWitnessEnrollmentBinding,
   assertWitnessFinalizationBinding,
   assertTm1CommittedDispatchIntentBinding,
   computeCanonicalWholeStoreRoot,
@@ -411,6 +412,44 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
 
       // Transport dispatch counter remains exactly 1
       expect(harness.getDispatchCount()).toBe(1)
+    })
+
+    test('Step 6: rejects when witness enroll returns mismatched snapshot (WITNESS_ENROLLMENT_BINDING_MISMATCH)', async () => {
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      const byzantineWitness = {
+        read: (req: any) => realWitness.read(req),
+        enroll: async (req: any) => {
+          const snapshot = parseTm1RollbackWitnessSnapshot(await realWitness.enroll(req))
+          return {
+            ...snapshot,
+            stable: {
+              ...snapshot.stable,
+              operationId: 'byzantine-wrong-op'
+            }
+          }
+        },
+        reserve: (req: any) => realWitness.reserve(req),
+        finalize: (req: any) => realWitness.finalize(req),
+        verifyRecord: async () => true
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        witness: byzantineWitness as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH.*operationId mismatch/)
+
+      expect(harness.getDispatchCount()).toBe(0)
     })
 
     test('Step 6: rejects when recovery store returns success but fails durable persistence (false positive)', async () => {
@@ -1390,6 +1429,89 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
           pendingRecord
         )
       }).toThrow(/WITNESS_FINALIZATION_MISMATCH: witnessKeyId mismatch/)
+    })
+
+    test('Direct assertion helper test: assertWitnessEnrollmentBinding checks all mismatch cases', () => {
+      const mockReq = {
+        slotId: 'slot:test',
+        storeId: `tm1-store:v1:${'11'.repeat(32)}`,
+        logicalRoot: '00'.repeat(32),
+        operationId: 'enroll:slot:test'
+      }
+
+      const validStable = {
+        protocol: 'tonalli.tm1-rollback-witness' as const,
+        protocolVersion: 1 as const,
+        slotId: mockReq.slotId,
+        storeId: mockReq.storeId,
+        generation: 0,
+        logicalRoot: mockReq.logicalRoot,
+        receiptHash: 'aa'.repeat(32),
+        witnessKeyId: 'wk-1',
+        state: 'stable' as const,
+        operationId: mockReq.operationId,
+        previousStableReceiptHash: null,
+        authenticatedReceipt: 'auth-0'
+      }
+
+      // Valid pass
+      expect(() => {
+        assertWitnessEnrollmentBinding(
+          { stable: validStable, pending: null },
+          mockReq
+        )
+      }).not.toThrow()
+
+      // Non-null pending
+      expect(() => {
+        assertWitnessEnrollmentBinding(
+          {
+            stable: validStable,
+            pending: { ...validStable, state: 'pending' as const }
+          },
+          mockReq
+        )
+      }).toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH: Enrolled snapshot must have null pending record/)
+
+      // Generation mismatch
+      expect(() => {
+        assertWitnessEnrollmentBinding(
+          { stable: { ...validStable, generation: 1 }, pending: null },
+          mockReq
+        )
+      }).toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH: generation mismatch/)
+
+      // SlotId mismatch
+      expect(() => {
+        assertWitnessEnrollmentBinding(
+          { stable: { ...validStable, slotId: 'slot:diff' }, pending: null },
+          mockReq
+        )
+      }).toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH: slotId mismatch/)
+
+      // StoreId mismatch
+      expect(() => {
+        assertWitnessEnrollmentBinding(
+          { stable: { ...validStable, storeId: 'tm1-store:v1:diff' }, pending: null },
+          mockReq
+        )
+      }).toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH: storeId mismatch/)
+
+      // LogicalRoot mismatch
+      expect(() => {
+        assertWitnessEnrollmentBinding(
+          { stable: { ...validStable, logicalRoot: 'ff'.repeat(32) }, pending: null },
+          mockReq
+        )
+      }).toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH: logicalRoot mismatch/)
+
+      // OperationId mismatch
+      expect(() => {
+        assertWitnessEnrollmentBinding(
+          { stable: { ...validStable, operationId: 'wrong:op' }, pending: null },
+          mockReq
+        )
+      }).toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH: operationId mismatch/)
     })
 
     test('Direct assertion helper test: assertTm1CommittedDispatchIntentBinding checks mismatch cases', () => {
@@ -2425,6 +2547,93 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
         )
       ).rejects.toThrow(/INVALID_DISPATCH_INTENT_RECORD: Dispatch intent committedAt mismatch/)
       expect(harnessTamperedCommittedAt.getDispatchCount()).toBe(0)
+    })
+
+    test('Tm1HarnessRecoveryStore.computeWitnessLogicalRoot strictly expects numeric generation (Finding 1)', () => {
+      const store = new Tm1HarnessRecoveryStore()
+
+      // Valid numeric generations return 64-character hex roots
+      const root0 = store.computeWitnessLogicalRoot(0)
+      expect(root0).toMatch(/^[0-9a-f]{64}$/)
+      const root1 = store.computeWitnessLogicalRoot(1)
+      expect(root1).toMatch(/^[0-9a-f]{64}$/)
+      expect(root1).not.toBe(root0)
+
+      // Rejects legacy object argument with INVALID_GENERATION
+      expect(() => {
+        ;(store as any).computeWitnessLogicalRoot({
+          slotId: 'slot:test',
+          generation: 0,
+          storeId: store.getStoreId()
+        })
+      }).toThrow(/INVALID_GENERATION: computeWitnessLogicalRoot expects non-negative safe integer generation/)
+
+      // Rejects non-numbers, negative numbers, and non-integers
+      expect(() => (store as any).computeWitnessLogicalRoot(undefined)).toThrow(/INVALID_GENERATION/)
+      expect(() => (store as any).computeWitnessLogicalRoot('0')).toThrow(/INVALID_GENERATION/)
+      expect(() => (store as any).computeWitnessLogicalRoot(-1)).toThrow(/INVALID_GENERATION/)
+      expect(() => (store as any).computeWitnessLogicalRoot(1.5)).toThrow(/INVALID_GENERATION/)
+    })
+
+    test('Harness deriveStoreRoot delegates numeric generation to store.computeWitnessLogicalRoot (Finding 1)', async () => {
+      const underlying = new Tm1HarnessRecoveryStore()
+      const callLog: unknown[] = []
+      const trackingStore = {
+        storeId: underlying.storeId,
+        createdAt: underlying.createdAt,
+        load: (id: string) => underlying.load(id),
+        listRecoverable: () => underlying.listRecoverable(),
+        create: (input: any) => underlying.create(input),
+        commitExecutionEvidence: (input: any) => underlying.commitExecutionEvidence(input),
+        commitDispatchIntent: (input: any) => underlying.commitDispatchIntent(input),
+        commitTransportAcknowledgement: (input: any) => underlying.commitTransportAcknowledgement(input),
+        commitRecoveryTransition: (input: any) => underlying.commitRecoveryTransition(input),
+        claimOwnership: (input: any) => underlying.claimOwnership(input),
+        computeWitnessLogicalRoot: (generation: number) => {
+          callLog.push(generation)
+          if (typeof generation !== 'number' || !Number.isSafeInteger(generation)) {
+            throw new Error(`SQLITE_CONTRACT_VIOLATION: generation must be number, got ${typeof generation}`)
+          }
+          return underlying.computeWitnessLogicalRoot(generation)
+        }
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: trackingStore as any
+      })
+
+      // Calling deriveStoreRoot without projected records delegates to computeWitnessLogicalRoot passing integer
+      const rootGen0 = await harness.deriveStoreRoot({
+        slotId: deriveStoreSlotId(underlying.storeId),
+        storeId: underlying.storeId,
+        generation: 0
+      })
+      expect(rootGen0).toMatch(/^[0-9a-f]{64}$/)
+      expect(callLog).toEqual([0])
+      expect(typeof callLog[0]).toBe('number')
+
+      // Run full Step 4-7 to ensure computeWitnessLogicalRoot is called with numbers during re-attestations
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+      const step7 = await harness.executeStep7VerifyFinalSuccess(
+        step4.preparedReview,
+        step5.signedReview,
+        step6.submissionReceipt,
+        step6.witnessReservationSnapshot
+      )
+      expect(step7.transportAcknowledgedRecord.phase).toBe('submittedObserved')
+
+      // Every invocation of computeWitnessLogicalRoot received a primitive number
+      expect(callLog.length).toBeGreaterThan(1)
+      for (const callArg of callLog) {
+        expect(typeof callArg).toBe('number')
+      }
     })
   })
 })

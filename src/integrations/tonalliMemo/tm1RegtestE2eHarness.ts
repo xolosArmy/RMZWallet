@@ -74,6 +74,7 @@ import {
 import {
   parseTm1RollbackWitnessSnapshot,
   type Tm1RollbackWitness,
+  type Tm1RollbackWitnessEnrollment,
   type Tm1RollbackWitnessRecord,
   type Tm1RollbackWitnessReservation,
   type Tm1RollbackWitnessSnapshot
@@ -415,6 +416,48 @@ export function assertWitnessReservationResponseBinding(
   }
 }
 
+export function assertWitnessEnrollmentBinding(
+  enrolledSnapshot: Tm1RollbackWitnessSnapshot,
+  request: {
+    slotId: string
+    storeId: string
+    logicalRoot: string
+    operationId: string
+  }
+): void {
+  if (enrolledSnapshot.pending !== null) {
+    throw new Error(
+      'WITNESS_ENROLLMENT_BINDING_MISMATCH: Enrolled snapshot must have null pending record'
+    )
+  }
+  const stable = enrolledSnapshot.stable
+  if (stable.generation !== 0) {
+    throw new Error(
+      `WITNESS_ENROLLMENT_BINDING_MISMATCH: generation mismatch (expected 0, got ${stable.generation})`
+    )
+  }
+  if (stable.slotId !== request.slotId) {
+    throw new Error(
+      `WITNESS_ENROLLMENT_BINDING_MISMATCH: slotId mismatch (expected ${request.slotId}, got ${stable.slotId})`
+    )
+  }
+  if (stable.storeId !== request.storeId) {
+    throw new Error(
+      `WITNESS_ENROLLMENT_BINDING_MISMATCH: storeId mismatch (expected ${request.storeId}, got ${stable.storeId})`
+    )
+  }
+  if (stable.logicalRoot !== request.logicalRoot) {
+    throw new Error(
+      `WITNESS_ENROLLMENT_BINDING_MISMATCH: logicalRoot mismatch (expected ${request.logicalRoot}, got ${stable.logicalRoot})`
+    )
+  }
+  if (stable.operationId !== request.operationId) {
+    throw new Error(
+      `WITNESS_ENROLLMENT_BINDING_MISMATCH: operationId mismatch (expected ${request.operationId}, got ${stable.operationId})`
+    )
+  }
+}
+
 export function assertWitnessFinalizationBinding(
   finalizedSnapshot: Tm1RollbackWitnessSnapshot,
   pendingReservation: Tm1RollbackWitnessRecord
@@ -674,33 +717,23 @@ export class Tm1HarnessRecoveryStore implements Tm1PublicationRecoveryStore {
     return Object.freeze([...this.capabilityIds.values()])
   }
 
-  computeWitnessLogicalRoot(input: {
-    slotId: string
-    generation: number
-    storeId?: string
-    projectedRecord?: Tm1PublicationRecoveryRecord
-    projectedCapabilities?: readonly string[]
-  }): string {
-    const effectiveRecords = input.projectedRecord
-      ? [
-          ...[...this.records.values()].filter(
-            r => r.publicationId !== input.projectedRecord!.publicationId
-          ),
-          input.projectedRecord
-        ]
-      : [...this.records.values()]
-
-    const effectiveCapabilities = input.projectedCapabilities
-      ? [...new Set([...this.capabilityIds, ...input.projectedCapabilities])]
-      : [...this.capabilityIds]
-
+  computeWitnessLogicalRoot(generation: number): string {
+    if (
+      typeof generation !== 'number' ||
+      !Number.isSafeInteger(generation) ||
+      generation < 0
+    ) {
+      throw new Error(
+        `INVALID_GENERATION: computeWitnessLogicalRoot expects non-negative safe integer generation, got ${typeof generation} (${generation})`
+      )
+    }
     return computeCanonicalWholeStoreRoot({
-      storeId: input.storeId ?? this.storeId,
-      slotId: input.slotId,
-      generation: input.generation,
+      storeId: this.storeId,
+      slotId: deriveStoreSlotId(this.storeId),
+      generation,
       createdAt: this.createdAt,
-      records: effectiveRecords,
-      capabilityIds: effectiveCapabilities
+      records: [...this.records.values()],
+      capabilityIds: [...this.capabilityIds]
     })
   }
 
@@ -1124,15 +1157,17 @@ export class Tm1RegtestE2eHarness {
     projectedCapabilities?: readonly string[]
   }): Promise<string> {
     if (
+      !input.projectedRecord &&
+      (!input.projectedCapabilities || input.projectedCapabilities.length === 0) &&
       'computeWitnessLogicalRoot' in this.recoveryStore &&
       typeof (this.recoveryStore as { computeWitnessLogicalRoot?: unknown })
         .computeWitnessLogicalRoot === 'function'
     ) {
       return (
         this.recoveryStore as {
-          computeWitnessLogicalRoot: (arg: typeof input) => string
+          computeWitnessLogicalRoot: (generation: number) => string
         }
-      ).computeWitnessLogicalRoot(input)
+      ).computeWitnessLogicalRoot(input.generation)
     }
     const list = await this.recoveryStore.listRecoverable()
     const records = Array.isArray(list)
@@ -1155,10 +1190,16 @@ export class Tm1RegtestE2eHarness {
         ...(input.projectedCapabilities ?? [])
       ])
     ]
+    const createdAt =
+      'createdAt' in this.recoveryStore &&
+      typeof (this.recoveryStore as { createdAt?: unknown }).createdAt === 'number'
+        ? (this.recoveryStore as { createdAt: number }).createdAt
+        : 0
     return computeCanonicalWholeStoreRoot({
       storeId: input.storeId,
       slotId: input.slotId,
       generation: input.generation,
+      createdAt,
       records: effectiveRecords,
       capabilityIds: mergedCapabilities
     })
@@ -1392,13 +1433,15 @@ export class Tm1RegtestE2eHarness {
         storeId,
         generation: 0
       })
-      const rawEnroll = await this.witness.enroll({
+      const operationId = `enroll:${slotId}`
+      const enrollRequest: Tm1RollbackWitnessEnrollment = {
         slotId,
         storeId,
         logicalRoot,
-        operationId: `enroll:${slotId}`,
+        operationId,
         signal
-      })
+      }
+      const rawEnroll = await this.witness.enroll(enrollRequest)
       enrolledSnapshot = parseTm1RollbackWitnessSnapshot(rawEnroll)
       const isAuthentic = await this.witness.verifyRecord(enrolledSnapshot.stable)
       if (!isAuthentic) {
@@ -1406,6 +1449,12 @@ export class Tm1RegtestE2eHarness {
           'UNAUTHENTICATED_WITNESS_ENROLLMENT: Stable record signature/hash verification failed'
         )
       }
+      assertWitnessEnrollmentBinding(enrolledSnapshot, {
+        slotId,
+        storeId,
+        logicalRoot,
+        operationId
+      })
     } else {
       enrolledSnapshot = parseTm1RollbackWitnessSnapshot(rawRead)
       const isAuthentic = await this.witness.verifyRecord(enrolledSnapshot.stable)
