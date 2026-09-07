@@ -47,6 +47,9 @@ const {
   assertWitnessReservationResponseBinding,
   assertTm1CommittedDispatchIntentBinding,
   computeCanonicalWholeStoreRoot,
+  deriveStoreSlotId,
+  isStoreNonEmpty,
+  assertStoreConsistentWithWitnessStableHead,
   extractStoreId,
   createDefaultFixtureUtxos,
   createTm1RegtestE2eHarness,
@@ -1056,6 +1059,445 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
           submissionId: 'sub:wrong'
         })
       }).toThrow(/INVALID_DISPATCH_INTENT_RECORD/)
+    })
+
+    test('Slot ID is store-scoped and uniquely bound to store identity (Finding 1)', async () => {
+      const customStoreId = `tm1-store:v1:${'44'.repeat(32)}`
+      expect(deriveStoreSlotId(customStoreId)).toBe(`slot:${customStoreId}`)
+
+      const store = new Tm1HarnessRecoveryStore(customStoreId)
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: store
+      })
+      expect(harness.getSlotId()).toBe(`slot:${customStoreId}`)
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+      // Witness slot is storeId-scoped, NOT preparedId-scoped
+      expect(step6.witnessReservationSnapshot.stable.slotId).toBe(`slot:${customStoreId}`)
+      expect(step6.witnessFinalizedDispatchSnapshot.stable.slotId).toBe(`slot:${customStoreId}`)
+      expect(step6.witnessReservationSnapshot.stable.slotId).not.toBe(
+        `slot:${step4.preparedReview.preparedId}`
+      )
+    })
+
+    test('Rejects with UNENROLLED_NONEMPTY_STORE when store has records but witness slot is null (Finding 1)', async () => {
+      const store = new Tm1HarnessRecoveryStore()
+      expect(await isStoreNonEmpty(store)).toBe(false)
+
+      // Seed store with an existing record
+      const fakeRecord = parseTm1PublicationRecoveryRecord({
+        schema: 'tonalli.tm1-publication-recovery',
+        schemaVersion: 1,
+        publicationId: 'pub:seed-1',
+        revision: 1,
+        ownerEpoch: 1,
+        phase: 'preDispatch',
+        preDispatchStage: 'broadcastAuthorizationConsumed',
+        prepared: {
+          preparedId: 'prep:seed',
+          bindingHash: '11'.repeat(32),
+          preparedDigest: '11'.repeat(32)
+        },
+        signed: {
+          signedId: 'signed:seed',
+          txid: '22'.repeat(32),
+          signedArtifactHash: '33'.repeat(32)
+        },
+        signingAuthorization: {
+          operationId: 'op:s',
+          capabilityId: 'cap:s',
+          contentHash: `sha256:${'11'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500,
+          preparedId: 'prep:seed',
+          bindingHash: '11'.repeat(32)
+        },
+        broadcastAuthorization: {
+          operationId: 'op:b',
+          capabilityId: 'cap:b',
+          contentHash: `sha256:${'22'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500,
+          signedId: 'signed:seed',
+          txid: '22'.repeat(32),
+          signedArtifactHash: '33'.repeat(32)
+        },
+        dispatchIntent: null,
+        transportAcknowledgement: null,
+        lastObservation: null,
+        terminal: null
+      })
+      await store.create({ record: fakeRecord })
+      expect(await isStoreNonEmpty(store)).toBe(true)
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: store
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      // In Step 6: witness slot is unenrolled (read returns null), but store is non-empty -> abort
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/UNENROLLED_NONEMPTY_STORE/)
+    })
+
+    test('Rejects with STORE_ROLLBACK_DETECTED in Step 6 if store root differs from witness stable head (Finding 2)', async () => {
+      // Unit test of assertion helper
+      const mockStable = {
+        protocol: 'tonalli.tm1-rollback-witness' as const,
+        protocolVersion: 1 as const,
+        slotId: 'slot:test',
+        storeId: `tm1-store:v1:${'11'.repeat(32)}`,
+        generation: 0,
+        logicalRoot: '00'.repeat(32),
+        receiptHash: 'aa'.repeat(32),
+        witnessKeyId: 'wk-1',
+        state: 'stable' as const,
+        operationId: 'op:0',
+        previousStableReceiptHash: null,
+        authenticatedReceipt: 'auth-0'
+      }
+      expect(() => {
+        assertStoreConsistentWithWitnessStableHead('00'.repeat(32), mockStable)
+      }).not.toThrow()
+      expect(() => {
+        assertStoreConsistentWithWitnessStableHead('ff'.repeat(32), mockStable)
+      }).toThrow(/STORE_ROLLBACK_DETECTED/)
+
+      // Step 6 integration test: witness has enrolled root X, but store derives root Y
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      const storeId = `tm1-store:v1:${'55'.repeat(32)}`
+      const slotId = deriveStoreSlotId(storeId)
+      // Pre-enroll slot on witness with a mismatched root
+      await realWitness.enroll({
+        slotId,
+        storeId,
+        logicalRoot: 'fe'.repeat(32),
+        operationId: 'op:enroll'
+      })
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: new Tm1HarnessRecoveryStore(storeId),
+        witness: realWitness
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/STORE_ROLLBACK_DETECTED/)
+    })
+
+    test('Rejects with STORE_ROLLBACK_DETECTED in Step 7 if store is modified/rolled back before acknowledgement (Finding 2)', async () => {
+      const store = new Tm1HarnessRecoveryStore()
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: store
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      // Step 6 succeeded: witness is at generation 1, store has outcomeUnknownRecord (rev 2)
+      // Now simulate a store rollback: store was wiped or rolled back to an earlier empty state
+      ;(store as any).records.clear()
+
+      await expect(
+        harness.executeStep7VerifyFinalSuccess(
+          step4.preparedReview,
+          step5.signedReview,
+          step6.submissionReceipt
+        )
+      ).rejects.toThrow(/STORE_ROLLBACK_DETECTED/)
+    })
+
+    test('Rejects with STORE_ROLLBACK_DETECTED in Step 7 if store is reverted to an earlier revision (Finding 2)', async () => {
+      const store = new Tm1HarnessRecoveryStore()
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: store
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      // Step 6 succeeded: witness is at generation 1, store has outcomeUnknownRecord (rev 2)
+      // Simulate rollback to a pre-dispatch revision 1 record
+      const pubId = `pub:${step4.preparedReview.preparedId}`
+      const rev1Record = parseTm1PublicationRecoveryRecord({
+        schema: 'tonalli.tm1-publication-recovery',
+        schemaVersion: 1,
+        publicationId: pubId,
+        revision: 1,
+        ownerEpoch: 1,
+        phase: 'preDispatch',
+        preDispatchStage: 'broadcastAuthorizationConsumed',
+        prepared: {
+          preparedId: step4.preparedReview.preparedId,
+          bindingHash: '11'.repeat(32),
+          preparedDigest: '11'.repeat(32)
+        },
+        signed: {
+          signedId: step5.signedReview.signedId,
+          txid: step6.submissionReceipt.txid,
+          signedArtifactHash: step5.signedReview.signedArtifactHash
+        },
+        signingAuthorization: {
+          operationId: 'op:s',
+          capabilityId: 'cap:s',
+          contentHash: `sha256:${'11'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500,
+          preparedId: step4.preparedReview.preparedId,
+          bindingHash: '11'.repeat(32)
+        },
+        broadcastAuthorization: {
+          operationId: 'op:b',
+          capabilityId: 'cap:b',
+          contentHash: `sha256:${'22'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500,
+          signedId: step5.signedReview.signedId,
+          txid: step6.submissionReceipt.txid,
+          signedArtifactHash: step5.signedReview.signedArtifactHash
+        },
+        dispatchIntent: null,
+        transportAcknowledgement: null,
+        lastObservation: null,
+        terminal: null
+      })
+      ;(store as any).records.set(pubId, rev1Record)
+
+      await expect(
+        harness.executeStep7VerifyFinalSuccess(
+          step4.preparedReview,
+          step5.signedReview,
+          step6.submissionReceipt
+        )
+      ).rejects.toThrow(/STORE_ROLLBACK_DETECTED/)
+    })
+
+    test('Rejects with UNENROLLED_NONEMPTY_STORE in Step 7 if witness read returns null for non-empty store (Finding 1)', async () => {
+      const store = new Tm1HarnessRecoveryStore()
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: store,
+        witness: {
+          read: async () => null,
+          enroll: async () => {
+            throw new Error('should not enroll')
+          },
+          reserve: async () => {
+            throw new Error('should not reserve')
+          },
+          finalize: async () => {
+            throw new Error('should not finalize')
+          },
+          verifyRecord: async () => true
+        }
+      })
+
+      // Add a record to store so it is non-empty
+      const pubId = 'pub:dummy'
+      const fakeRecord = parseTm1PublicationRecoveryRecord({
+        schema: 'tonalli.tm1-publication-recovery',
+        schemaVersion: 1,
+        publicationId: pubId,
+        revision: 1,
+        ownerEpoch: 1,
+        phase: 'preDispatch',
+        preDispatchStage: 'broadcastAuthorizationConsumed',
+        prepared: {
+          preparedId: 'prep:dummy',
+          bindingHash: '11'.repeat(32),
+          preparedDigest: '11'.repeat(32)
+        },
+        signed: {
+          signedId: 'signed:dummy',
+          txid: '22'.repeat(32),
+          signedArtifactHash: '33'.repeat(32)
+        },
+        signingAuthorization: {
+          operationId: 'op:s',
+          capabilityId: 'cap:s',
+          contentHash: `sha256:${'11'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500,
+          preparedId: 'prep:dummy',
+          bindingHash: '11'.repeat(32)
+        },
+        broadcastAuthorization: {
+          operationId: 'op:b',
+          capabilityId: 'cap:b',
+          contentHash: `sha256:${'22'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500,
+          signedId: 'signed:dummy',
+          txid: '22'.repeat(32),
+          signedArtifactHash: '33'.repeat(32)
+        },
+        dispatchIntent: null,
+        transportAcknowledgement: null,
+        lastObservation: null,
+        terminal: null
+      })
+      await store.create({ record: fakeRecord })
+
+      await expect(
+        harness.executeStep7VerifyFinalSuccess(
+          { preparedId: 'dummy' } as any,
+          { signedId: 'dummy', signedArtifactHash: '33'.repeat(32) } as any,
+          { submissionId: 'sub:dummy', txid: '22'.repeat(32) } as any
+        )
+      ).rejects.toThrow(/UNENROLLED_NONEMPTY_STORE/)
+    })
+
+    test('Step 7 executes witness reservation before local store commit in strict 2PC order (Finding 3)', async () => {
+      const store = new Tm1HarnessRecoveryStore()
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      const orderOfOperations: string[] = []
+
+      const witnessProxy = {
+        read: (args: any) => realWitness.read(args),
+        enroll: (args: any) => realWitness.enroll(args),
+        reserve: async (args: any) => {
+          orderOfOperations.push('witness.reserve')
+          return realWitness.reserve(args)
+        },
+        finalize: async (args: any) => {
+          orderOfOperations.push('witness.finalize')
+          return realWitness.finalize(args)
+        },
+        verifyRecord: (args: any) => realWitness.verifyRecord(args)
+      }
+
+      // Spy on store commitTransportAcknowledgement
+      const originalCommitAck = store.commitTransportAcknowledgement.bind(store)
+      store.commitTransportAcknowledgement = async (args: any) => {
+        orderOfOperations.push('store.commitAck')
+        return originalCommitAck(args)
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: store,
+        witness: witnessProxy
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      // Reset order log before Step 7
+      orderOfOperations.length = 0
+
+      const step7 = await harness.executeStep7VerifyFinalSuccess(
+        step4.preparedReview,
+        step5.signedReview,
+        step6.submissionReceipt
+      )
+
+      expect(step7.transportAcknowledgedRecord.revision).toBe(3)
+      expect(orderOfOperations).toEqual([
+        'witness.reserve',
+        'store.commitAck',
+        'witness.finalize'
+      ])
+    })
+
+    test('Step 7 aborts without mutating local store if witness reservation fails (Finding 3)', async () => {
+      const store = new Tm1HarnessRecoveryStore()
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      let failAckReservation = false
+
+      const witnessProxy = {
+        read: (args: any) => realWitness.read(args),
+        enroll: (args: any) => realWitness.enroll(args),
+        reserve: async (args: any) => {
+          if (failAckReservation) {
+            throw new Error('WITNESS_RESERVATION_FAILED: Network timeout')
+          }
+          return realWitness.reserve(args)
+        },
+        finalize: (args: any) => realWitness.finalize(args),
+        verifyRecord: (args: any) => realWitness.verifyRecord(args)
+      }
+
+      let commitAckCalled = false
+      const originalCommitAck = store.commitTransportAcknowledgement.bind(store)
+      store.commitTransportAcknowledgement = async (args: any) => {
+        commitAckCalled = true
+        return originalCommitAck(args)
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: store,
+        witness: witnessProxy
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      // Now enable failure for Step 7 reservation
+      failAckReservation = true
+
+      await expect(
+        harness.executeStep7VerifyFinalSuccess(
+          step4.preparedReview,
+          step5.signedReview,
+          step6.submissionReceipt
+        )
+      ).rejects.toThrow(/WITNESS_RESERVATION_FAILED/)
+
+      // Ensure store was NOT mutated
+      expect(commitAckCalled).toBe(false)
+      const pubId = `pub:${step4.preparedReview.preparedId}`
+      const rawAfterFailure = await store.load(pubId)
+      expect(rawAfterFailure).not.toBeNull()
+      const recordAfterFailure = parseTm1PublicationRecoveryRecord(rawAfterFailure)
+      expect(recordAfterFailure.revision).toBe(2)
+      expect(recordAfterFailure.phase).toBe('outcomeUnknown')
     })
   })
 

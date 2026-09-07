@@ -306,6 +306,45 @@ export function extractStoreId(store: Tm1PublicationRecoveryStore): string {
   return `tm1-store:v1:${sha256Hex('tonalli.tm1-harness-recovery-store:default')}`
 }
 
+export function deriveStoreSlotId(storeId: string): string {
+  return `slot:${storeId}`
+}
+
+export async function isStoreNonEmpty(
+  store: Tm1PublicationRecoveryStore
+): Promise<boolean> {
+  if (
+    'getAllRecords' in store &&
+    typeof (store as { getAllRecords?: unknown }).getAllRecords === 'function'
+  ) {
+    const records = (store as { getAllRecords: () => unknown }).getAllRecords()
+    if (Array.isArray(records) && records.length > 0) {
+      return true
+    }
+  }
+  if ('records' in store && (store as { records?: unknown }).records instanceof Map) {
+    if ((store as { records: Map<unknown, unknown> }).records.size > 0) {
+      return true
+    }
+  }
+  const recoverable = await store.listRecoverable()
+  if (Array.isArray(recoverable) && recoverable.length > 0) {
+    return true
+  }
+  return false
+}
+
+export function assertStoreConsistentWithWitnessStableHead(
+  localStoreRoot: string,
+  stable: Tm1RollbackWitnessRecord
+): void {
+  if (localStoreRoot !== stable.logicalRoot) {
+    throw new Error(
+      `STORE_ROLLBACK_DETECTED: Local store canonical root (${localStoreRoot}) does not match witness stable head logical root (${stable.logicalRoot}) at generation ${stable.generation}`
+    )
+  }
+}
+
 export function assertWitnessReservationResponseBinding(
   snapshot: Tm1RollbackWitnessSnapshot,
   request: Tm1RollbackWitnessReservation,
@@ -912,6 +951,14 @@ export class Tm1RegtestE2eHarness {
     return extractStoreId(this.recoveryStore)
   }
 
+  getSlotId(): string {
+    return deriveStoreSlotId(this.getStoreId())
+  }
+
+  async isStoreNonEmpty(): Promise<boolean> {
+    return isStoreNonEmpty(this.recoveryStore)
+  }
+
   async deriveStoreRoot(input: {
     slotId: string
     generation: number
@@ -1145,7 +1192,7 @@ export class Tm1RegtestE2eHarness {
     dispatchIntentRecord: Tm1PublicationRecoveryRecord
     submissionReceipt: Tm1SubmissionReceipt
   }> {
-    const slotId = `slot:${preparedReview.preparedId}`
+    const slotId = this.getSlotId()
     const storeId = this.getStoreId()
     const operationId = `op:${signedReview.signedId}`
 
@@ -1157,6 +1204,11 @@ export class Tm1RegtestE2eHarness {
     })
 
     if (rawRead === null) {
+      if (await this.isStoreNonEmpty()) {
+        throw new Error(
+          'UNENROLLED_NONEMPTY_STORE: Cannot enroll an existing non-empty store as generation 0 on a missing witness slot'
+        )
+      }
       const logicalRoot = await this.deriveStoreRoot({
         slotId,
         storeId,
@@ -1194,6 +1246,17 @@ export class Tm1RegtestE2eHarness {
           )
         }
       }
+
+      // Verify store against stable head (Finding 2)
+      const localStoreRoot = await this.deriveStoreRoot({
+        slotId,
+        storeId,
+        generation: enrolledSnapshot.stable.generation
+      })
+      assertStoreConsistentWithWitnessStableHead(
+        localStoreRoot,
+        enrolledSnapshot.stable
+      )
     }
 
     // 2. Request broadcast authorization before creating/reserving recovery intent
@@ -1475,138 +1538,16 @@ export class Tm1RegtestE2eHarness {
   }> {
     const publicationId = `pub:${preparedReview.preparedId}`
     const storeId = this.getStoreId()
-    const slotId = `slot:${preparedReview.preparedId}`
+    const slotId = this.getSlotId()
 
-    const rawRecord = await this.recoveryStore.commitTransportAcknowledgement({
-      publicationId,
-      expectedRevision: 2,
-      expectedOwnerEpoch: 1,
-      acknowledgement: {
-        submissionId: submissionReceipt.submissionId,
-        signedId: signedReview.signedId,
-        txid: submissionReceipt.txid,
-        signedArtifactHash: signedReview.signedArtifactHash,
-        disposition: 'accepted',
-        acknowledgedAt: Date.now()
-      }
-    })
-
-    let transportAcknowledgedRecord: Tm1PublicationRecoveryRecord
-    try {
-      transportAcknowledgedRecord = parseTm1PublicationRecoveryRecord(rawRecord)
-    } catch (error) {
-      throw new Error(
-        `MALFORMED_RECOVERY_RECORD: ${error instanceof Error ? error.message : String(error)}`
-      )
-    }
-
-    // 1. Revision & phase verification
-    if (transportAcknowledgedRecord.phase !== 'submittedObserved') {
-      throw new Error(
-        `INVALID_ACKNOWLEDGEMENT_RECORD: Expected phase 'submittedObserved', got '${transportAcknowledgedRecord.phase}'`
-      )
-    }
-    if (transportAcknowledgedRecord.revision !== 3) {
-      throw new Error(
-        `INVALID_ACKNOWLEDGEMENT_RECORD: Expected revision 3, got ${transportAcknowledgedRecord.revision}`
-      )
-    }
-    if (transportAcknowledgedRecord.publicationId !== publicationId) {
-      throw new Error(
-        `INVALID_ACKNOWLEDGEMENT_RECORD: Publication ID mismatch (expected ${publicationId}, got ${transportAcknowledgedRecord.publicationId})`
-      )
-    }
-    if (transportAcknowledgedRecord.ownerEpoch !== 1) {
-      throw new Error(
-        `INVALID_ACKNOWLEDGEMENT_RECORD: Owner epoch mismatch (expected 1, got ${transportAcknowledgedRecord.ownerEpoch})`
-      )
-    }
-
-    // 2. Identities verification
-    if (
-      transportAcknowledgedRecord.prepared?.preparedId !== preparedReview.preparedId
-    ) {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Prepared ID mismatch')
-    }
-    if (transportAcknowledgedRecord.signed?.signedId !== signedReview.signedId) {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed ID mismatch')
-    }
-    if (transportAcknowledgedRecord.signed?.txid !== submissionReceipt.txid) {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed txid mismatch')
-    }
-    if (
-      transportAcknowledgedRecord.signed?.signedArtifactHash !==
-      signedReview.signedArtifactHash
-    ) {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed artifact hash mismatch')
-    }
-
-    // 3. Dispatch intent verification
-    if (!transportAcknowledgedRecord.dispatchIntent) {
-      throw new Error(
-        'INVALID_ACKNOWLEDGEMENT_RECORD: Missing dispatch intent in acknowledgement record'
-      )
-    }
-    if (
-      transportAcknowledgedRecord.dispatchIntent.submissionId !==
-      submissionReceipt.submissionId
-    ) {
-      throw new Error(
-        'INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent submission ID mismatch'
-      )
-    }
-    if (
-      transportAcknowledgedRecord.dispatchIntent.txid !== submissionReceipt.txid
-    ) {
-      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent txid mismatch')
-    }
-    if (
-      transportAcknowledgedRecord.dispatchIntent.signedArtifactHash !==
-      signedReview.signedArtifactHash
-    ) {
-      throw new Error(
-        'INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent signed artifact hash mismatch'
-      )
-    }
-
-    // 4. Transport receipt verification
-    if (!transportAcknowledgedRecord.transportAcknowledgement) {
-      throw new Error(
-        'INVALID_ACKNOWLEDGEMENT_RECORD: Missing transport acknowledgement evidence'
-      )
-    }
-    if (
-      transportAcknowledgedRecord.transportAcknowledgement.txid !==
-      submissionReceipt.txid
-    ) {
-      throw new Error(
-        'INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement txid mismatch'
-      )
-    }
-    if (
-      transportAcknowledgedRecord.transportAcknowledgement.disposition !== 'accepted'
-    ) {
-      throw new Error(
-        'INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement disposition not accepted'
-      )
-    }
-
-    // 5. Orchestrator state verification
-    const finalOrchestratorState = this.orchestrator.getState()
-    if (finalOrchestratorState.status !== 'submitted') {
-      throw new Error(
-        `Final orchestrator state expected 'submitted', got '${finalOrchestratorState.status}'`
-      )
-    }
-
-    if (finalOrchestratorState.receipt.txid !== submissionReceipt.txid) {
-      throw new Error('Orchestrator receipt txid does not match submission receipt')
-    }
-
-    // 6. Separate witness checkpoint for acknowledgement (Finding 4):
-    // Read current stable head (from dispatch intent finalization)
+    // 1. Read current stable head (from dispatch intent finalization) & verify store against stable head FIRST (Finding 2)
     const rawReadWitness = await this.witness.read({ slotId, signal })
     if (rawReadWitness === null) {
+      if (await this.isStoreNonEmpty()) {
+        throw new Error(
+          'UNENROLLED_NONEMPTY_STORE: Cannot commit acknowledgement for an unenrolled non-empty store'
+        )
+      }
       throw new Error('WITNESS_NOT_ENROLLED: Cannot persist acknowledgement checkpoint')
     }
     const currentWitnessSnapshot = parseTm1RollbackWitnessSnapshot(rawReadWitness)
@@ -1624,12 +1565,73 @@ export class Tm1RegtestE2eHarness {
       )
     }
 
-    // Derive canonical whole-store root for acknowledgement checkpoint (generation 2)
+    // Verify store against stable head (Finding 2)
+    const localStoreRootBeforeAck = await this.deriveStoreRoot({
+      slotId,
+      storeId,
+      generation: currentWitnessSnapshot.stable.generation
+    })
+    assertStoreConsistentWithWitnessStableHead(
+      localStoreRootBeforeAck,
+      currentWitnessSnapshot.stable
+    )
+
+    // 2. Load current recovery record to validate pre-conditions and project acknowledgement
+    const rawCurrentRecord = await this.recoveryStore.load(publicationId)
+    if (!rawCurrentRecord) {
+      throw new Error(
+        `PUBLICATION_NOT_FOUND: Record for ${publicationId} not found in recovery store`
+      )
+    }
+    const currentRecord = parseTm1PublicationRecoveryRecord(rawCurrentRecord)
+    if (currentRecord.phase !== 'outcomeUnknown' || !currentRecord.dispatchIntent) {
+      throw new Error(
+        'INVALID_RECOVERY_STORE_STATE: Expected outcomeUnknown phase with dispatchIntent before acknowledgement'
+      )
+    }
+    if (
+      currentRecord.dispatchIntent.submissionId !== submissionReceipt.submissionId
+    ) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent submission ID mismatch'
+      )
+    }
+    if (currentRecord.dispatchIntent.txid !== submissionReceipt.txid) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent txid mismatch'
+      )
+    }
+    if (
+      currentRecord.dispatchIntent.signedArtifactHash !==
+      signedReview.signedArtifactHash
+    ) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent signed artifact hash mismatch'
+      )
+    }
+
+    const acknowledgedAt = Date.now()
+    const ackEvidence = {
+      submissionId: submissionReceipt.submissionId,
+      signedId: signedReview.signedId,
+      txid: submissionReceipt.txid,
+      signedArtifactHash: signedReview.signedArtifactHash,
+      disposition: 'accepted' as const,
+      acknowledgedAt
+    }
+
+    const projectedAckRecord = createTm1TransportAcknowledgedRecord(
+      currentRecord,
+      ackEvidence
+    )
+
+    // 3. Two-Phase Commit Phase 1 (Finding 3): Reserve acknowledgement checkpoint on witness FIRST
     const ackGeneration = currentWitnessSnapshot.stable.generation + 1
     const ackLogicalRoot = await this.deriveStoreRoot({
       slotId,
       storeId,
-      generation: ackGeneration
+      generation: ackGeneration,
+      projectedRecord: projectedAckRecord
     })
 
     const ackOperationId = `op:ack:${submissionReceipt.submissionId}`
@@ -1669,14 +1671,122 @@ export class Tm1RegtestE2eHarness {
       )
     }
 
-    // Strict binding of reservation response to request (Finding 2)
+    // Strict binding of reservation response to request
     assertWitnessReservationResponseBinding(
       ackReservationSnapshot,
       ackReservationRequest,
       currentWitnessSnapshot.stable
     )
 
-    // Finalize acknowledgement checkpoint
+    // 4. Two-Phase Commit Phase 2 (Finding 3): Commit acknowledgement in local recovery store AFTER reservation
+    const rawRecord = await this.recoveryStore.commitTransportAcknowledgement({
+      publicationId,
+      expectedRevision: 2,
+      expectedOwnerEpoch: 1,
+      acknowledgement: ackEvidence
+    })
+
+    let transportAcknowledgedRecord: Tm1PublicationRecoveryRecord
+    try {
+      transportAcknowledgedRecord = parseTm1PublicationRecoveryRecord(rawRecord)
+    } catch (error) {
+      throw new Error(
+        `MALFORMED_RECOVERY_RECORD: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+
+    // Revision & phase verification
+    if (transportAcknowledgedRecord.phase !== 'submittedObserved') {
+      throw new Error(
+        `INVALID_ACKNOWLEDGEMENT_RECORD: Expected phase 'submittedObserved', got '${transportAcknowledgedRecord.phase}'`
+      )
+    }
+    if (transportAcknowledgedRecord.revision !== 3) {
+      throw new Error(
+        `INVALID_ACKNOWLEDGEMENT_RECORD: Expected revision 3, got ${transportAcknowledgedRecord.revision}`
+      )
+    }
+    if (transportAcknowledgedRecord.publicationId !== publicationId) {
+      throw new Error(
+        `INVALID_ACKNOWLEDGEMENT_RECORD: Publication ID mismatch (expected ${publicationId}, got ${transportAcknowledgedRecord.publicationId})`
+      )
+    }
+    if (transportAcknowledgedRecord.ownerEpoch !== 1) {
+      throw new Error(
+        `INVALID_ACKNOWLEDGEMENT_RECORD: Owner epoch mismatch (expected 1, got ${transportAcknowledgedRecord.ownerEpoch})`
+      )
+    }
+
+    // Identities verification
+    if (
+      transportAcknowledgedRecord.prepared?.preparedId !== preparedReview.preparedId
+    ) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Prepared ID mismatch')
+    }
+    if (transportAcknowledgedRecord.signed?.signedId !== signedReview.signedId) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed ID mismatch')
+    }
+    if (transportAcknowledgedRecord.signed?.txid !== submissionReceipt.txid) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed txid mismatch')
+    }
+    if (
+      transportAcknowledgedRecord.signed?.signedArtifactHash !==
+      signedReview.signedArtifactHash
+    ) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed artifact hash mismatch')
+    }
+
+    // Dispatch intent verification
+    if (!transportAcknowledgedRecord.dispatchIntent) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Missing dispatch intent in acknowledgement record'
+      )
+    }
+    if (
+      transportAcknowledgedRecord.dispatchIntent.submissionId !==
+      submissionReceipt.submissionId
+    ) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent submission ID mismatch'
+      )
+    }
+    if (
+      transportAcknowledgedRecord.dispatchIntent.txid !== submissionReceipt.txid
+    ) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent txid mismatch')
+    }
+    if (
+      transportAcknowledgedRecord.dispatchIntent.signedArtifactHash !==
+      signedReview.signedArtifactHash
+    ) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent signed artifact hash mismatch'
+      )
+    }
+
+    // Transport receipt verification
+    if (!transportAcknowledgedRecord.transportAcknowledgement) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Missing transport acknowledgement evidence'
+      )
+    }
+    if (
+      transportAcknowledgedRecord.transportAcknowledgement.txid !==
+      submissionReceipt.txid
+    ) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement txid mismatch'
+      )
+    }
+    if (
+      transportAcknowledgedRecord.transportAcknowledgement.disposition !== 'accepted'
+    ) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement disposition not accepted'
+      )
+    }
+
+    // 5. Two-Phase Commit Phase 3 (Finding 3): Finalize acknowledgement checkpoint on witness
     const rawAckFinalize = await this.witness.finalize({
       slotId,
       storeId,
@@ -1711,6 +1821,18 @@ export class Tm1RegtestE2eHarness {
       throw new Error(
         'WITNESS_FINALIZATION_MISMATCH: Finalized acknowledgement stable head mismatch'
       )
+    }
+
+    // 6. Orchestrator state verification
+    const finalOrchestratorState = this.orchestrator.getState()
+    if (finalOrchestratorState.status !== 'submitted') {
+      throw new Error(
+        `Final orchestrator state expected 'submitted', got '${finalOrchestratorState.status}'`
+      )
+    }
+
+    if (finalOrchestratorState.receipt.txid !== submissionReceipt.txid) {
+      throw new Error('Orchestrator receipt txid does not match submission receipt')
     }
 
     return {
