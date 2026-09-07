@@ -56,6 +56,8 @@ import type {
 import {
   Tm1PublicationError,
   Tm1RegtestPublicationOrchestratorImpl,
+  type Tm1BroadcastAuthorizationDecision,
+  type Tm1BroadcastAuthorizationPort,
   type Tm1Confirmation,
   type Tm1ConfirmationObserverPort,
   type Tm1PreparedReview,
@@ -68,6 +70,7 @@ import {
   type Tm1SubmissionReceipt
 } from './tm1RegtestPublicationOrchestrator'
 import {
+  parseTm1RollbackWitnessSnapshot,
   type Tm1RollbackWitness,
   type Tm1RollbackWitnessSnapshot
 } from './recovery/tm1RollbackWitness'
@@ -106,6 +109,10 @@ import type {
   UniversalOperationLease,
   UniversalOperationLock
 } from '../../features/externalSign/lock'
+import {
+  parseCashAddr,
+  canonicalizeEcashAddress
+} from '../../utils/alias'
 
 export const TM1_PROGRAMMATIC_E2E_FIXTURE_ADDRESS =
   'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
@@ -174,7 +181,7 @@ export class Tm1HarnessOperationLock implements UniversalOperationLock {
 }
 
 export class Tm1HarnessApprovalLedger implements ApprovalConsumptionLedger {
-  private readonly consumedIds = new Set<string>()
+  private readonly consumed = new Map<string, ApprovalConsumption>()
 
   async consume(
     consumption: ApprovalConsumption,
@@ -183,10 +190,18 @@ export class Tm1HarnessApprovalLedger implements ApprovalConsumptionLedger {
     if (signal.aborted) {
       throw new UniversalAuthorizationError('OPERATION_ABORTED')
     }
-    if (this.consumedIds.has(consumption.capabilityId)) {
+    if (this.consumed.has(consumption.capabilityId)) {
       throw new UniversalAuthorizationError('APPROVAL_ALREADY_CONSUMED')
     }
-    this.consumedIds.add(consumption.capabilityId)
+    this.consumed.set(consumption.capabilityId, Object.freeze({ ...consumption }))
+  }
+
+  getConsumption(capabilityId: string): ApprovalConsumption | undefined {
+    return this.consumed.get(capabilityId)
+  }
+
+  getAllConsumptions(): readonly ApprovalConsumption[] {
+    return Object.freeze(Array.from(this.consumed.values()))
   }
 }
 
@@ -384,8 +399,14 @@ export class Tm1RegtestE2eHarness {
   readonly recoveryStore: Tm1PublicationRecoveryStore
   readonly deliveryTransport: Tm1RegtestDeliveryTransport
   readonly orchestrator: Tm1RegtestPublicationOrchestrator
+  readonly ledger: Tm1HarnessApprovalLedger
+  readonly broadcastAuthorizationPort: Tm1BroadcastAuthorizationPort
   private dispatchCalls = 0
   private plannedSubmissionId: string | null = null
+  private cachedBroadcastDecision: Extract<
+    Tm1BroadcastAuthorizationDecision,
+    { status: 'approved' }
+  > | null = null
 
   constructor(options: Tm1ProgrammaticE2eOptions = {}) {
     this.alias = options.alias ?? 'satoshi.xec'
@@ -415,6 +436,7 @@ export class Tm1RegtestE2eHarness {
 
     const lock = new Tm1HarnessOperationLock()
     const ledger = new Tm1HarnessApprovalLedger()
+    this.ledger = ledger
 
     const signingDecisionProvider: Tm1RegtestAuthorizationDecisionProvider =
       options.signingDecisionProvider ?? {
@@ -456,6 +478,8 @@ export class Tm1RegtestE2eHarness {
         }
       }
     })
+
+    this.broadcastAuthorizationPort = dualPorts.broadcastAuthorization
 
     let idSeq = 0
     const clock: Tm1PublicationClock = {
@@ -525,7 +549,28 @@ export class Tm1RegtestE2eHarness {
           return input.signedArtifact
         }
       },
-      broadcastAuthorization: dualPorts.broadcastAuthorization,
+      broadcastAuthorization: {
+        requestBroadcastAuthorization: async (
+          signedReview: Tm1SignedReview,
+          signal?: AbortSignal
+        ): Promise<Tm1BroadcastAuthorizationDecision> => {
+          if (signal?.aborted) throw new Tm1PublicationError('ABORTED')
+          if (
+            this.cachedBroadcastDecision &&
+            this.cachedBroadcastDecision.signedId === signedReview.signedId &&
+            this.cachedBroadcastDecision.txid === signedReview.txid &&
+            this.cachedBroadcastDecision.signedArtifactHash === signedReview.signedArtifactHash
+          ) {
+            const decision = this.cachedBroadcastDecision
+            this.cachedBroadcastDecision = null
+            return decision
+          }
+          return this.broadcastAuthorizationPort.requestBroadcastAuthorization(
+            signedReview,
+            signal
+          )
+        }
+      },
       deliveryTransport: {
         broadcast: async (
           artifact: RegtestSignedTransaction
@@ -594,13 +639,63 @@ export class Tm1RegtestE2eHarness {
   /**
    * Step 4: Preparar el memo TM1 canonico y la transaccion sin firmar (unsigned tx).
    */
-  async executeStep4PrepareMemoAndUnsignedTx(signal?: AbortSignal): Promise<{
+  async executeStep4PrepareMemoAndUnsignedTx(
+    ownerAddressOrEvidence?:
+      | string
+      | Tm1VerifiedAliasOwnershipSnapshot
+      | Tm1AliasPublicationAuthorization
+      | AbortSignal,
+    signal?: AbortSignal
+  ): Promise<{
     memoPreview: Tm1Draft02PostPreview
     candidate: Tm1Draft02Candidate
     unsignedTransactionBytes: Uint8Array
     unsignedTransactionAudit: AuditedTm1Draft02UnsignedTransaction
     preparedReview: Tm1PreparedReview
   }> {
+    let effectiveSignal: AbortSignal | undefined = signal
+    let ownerInput:
+      | string
+      | Tm1VerifiedAliasOwnershipSnapshot
+      | Tm1AliasPublicationAuthorization
+      | undefined
+
+    if (ownerAddressOrEvidence instanceof AbortSignal) {
+      effectiveSignal = ownerAddressOrEvidence
+      ownerInput = undefined
+    } else {
+      ownerInput = ownerAddressOrEvidence
+    }
+
+    let rawOwnerAddress: string
+    if (typeof ownerInput === 'string') {
+      rawOwnerAddress = ownerInput
+    } else if (ownerInput && 'address' in ownerInput) {
+      rawOwnerAddress = ownerInput.address
+    } else if (ownerInput && 'ownerAddress' in ownerInput) {
+      rawOwnerAddress = ownerInput.ownerAddress
+    } else {
+      rawOwnerAddress = this.ownerAddress
+    }
+
+    const canonicalOwner = canonicalizeEcashAddress(rawOwnerAddress)
+    if (!canonicalOwner) {
+      throw new Error(`INVALID_OWNER_ADDRESS: ${rawOwnerAddress}`)
+    }
+
+    let ownerScriptHex: string
+    try {
+      ownerScriptHex = parseCashAddr(canonicalOwner).toScriptHex()
+    } catch (err) {
+      throw new Error(`FAILED_TO_DERIVE_SCRIPT: ${String(err)}`)
+    }
+
+    if (ownerScriptHex !== this.activeLockingScriptHex) {
+      throw new Error(
+        `AUTHOR_OWNER_BINDING_MISMATCH: Verified owner address ${canonicalOwner} (script: ${ownerScriptHex}) does not match author locking script ${this.activeLockingScriptHex}`
+      )
+    }
+
     const memoPreview = encodeTm1Draft02Post({
       eventData: this.message,
       authorInputIndex: TM1_DRAFT_02_STANDARD_AUTHOR_INPUT_INDEX
@@ -612,8 +707,14 @@ export class Tm1RegtestE2eHarness {
         activeLockingScriptHex: this.activeLockingScriptHex,
         maxFeeSats: this.maxFeeSats
       },
-      signal
+      effectiveSignal
     )
+
+    if (preparedReview.candidate.authorLockingScriptHex !== ownerScriptHex) {
+      throw new Error(
+        `AUTHOR_OWNER_BINDING_MISMATCH: Prepared candidate author locking script ${preparedReview.candidate.authorLockingScriptHex} does not match verified owner script ${ownerScriptHex}`
+      )
+    }
 
     const candidate = preparedReview.candidate
     const unsignedTransactionBytes = serializeTm1Draft02UnsignedTransaction(candidate)
@@ -641,6 +742,12 @@ export class Tm1RegtestE2eHarness {
     signedReview: Tm1SignedReview
     signingAuthorizationDecision: Tm1PublicationAuthorizationDecision
   }> {
+    if (preparedReview.candidate.authorLockingScriptHex !== this.activeLockingScriptHex) {
+      throw new Error(
+        `AUTHOR_LOCKING_SCRIPT_MISMATCH: Candidate author locking script ${preparedReview.candidate.authorLockingScriptHex} does not match active locking script ${this.activeLockingScriptHex}`
+      )
+    }
+
     const signedReview = await this.orchestrator.authorizeAndSign(
       preparedReview.preparedId,
       signal
@@ -680,24 +787,45 @@ export class Tm1RegtestE2eHarness {
     const operationId = `op:${signedReview.signedId}`
 
     let enrolledSnapshot: Tm1RollbackWitnessSnapshot
-    const existingRead = (await this.witness.read({
+    const rawRead = await this.witness.read({
       slotId,
       signal
-    })) as Tm1RollbackWitnessSnapshot | null
+    })
 
-    if (!existingRead) {
-      enrolledSnapshot = (await this.witness.enroll({
+    if (rawRead === null) {
+      const rawEnroll = await this.witness.enroll({
         slotId,
         storeId,
         logicalRoot,
         operationId: `enroll:${slotId}`,
         signal
-      })) as Tm1RollbackWitnessSnapshot
+      })
+      enrolledSnapshot = parseTm1RollbackWitnessSnapshot(rawEnroll)
+      const isAuthentic = await this.witness.verifyRecord(enrolledSnapshot.stable)
+      if (!isAuthentic) {
+        throw new Error(
+          'UNAUTHENTICATED_WITNESS_ENROLLMENT: Stable record signature/hash verification failed'
+        )
+      }
     } else {
-      enrolledSnapshot = existingRead
+      enrolledSnapshot = parseTm1RollbackWitnessSnapshot(rawRead)
+      const isAuthentic = await this.witness.verifyRecord(enrolledSnapshot.stable)
+      if (!isAuthentic) {
+        throw new Error(
+          'UNAUTHENTICATED_WITNESS_READ: Stable record signature/hash verification failed'
+        )
+      }
+      if (enrolledSnapshot.pending !== null) {
+        const isPendingAuthentic = await this.witness.verifyRecord(enrolledSnapshot.pending)
+        if (!isPendingAuthentic) {
+          throw new Error(
+            'UNAUTHENTICATED_WITNESS_READ: Pending record signature/hash verification failed'
+          )
+        }
+      }
     }
 
-    const witnessReservationSnapshot = (await this.witness.reserve({
+    const rawReserve = await this.witness.reserve({
       slotId,
       storeId,
       expectedStableGeneration: enrolledSnapshot.stable.generation,
@@ -707,9 +835,64 @@ export class Tm1RegtestE2eHarness {
       nextLogicalRoot,
       operationId,
       signal
-    })) as Tm1RollbackWitnessSnapshot
+    })
+    const witnessReservationSnapshot = parseTm1RollbackWitnessSnapshot(rawReserve)
+    const isReservationStableAuthentic = await this.witness.verifyRecord(
+      witnessReservationSnapshot.stable
+    )
+    if (!isReservationStableAuthentic) {
+      throw new Error(
+        'UNAUTHENTICATED_WITNESS_RESERVATION: Stable record signature/hash verification failed'
+      )
+    }
+    if (!witnessReservationSnapshot.pending) {
+      throw new Error(
+        'WITNESS_RESERVATION_MISSING_PENDING: Reservation snapshot must contain pending record'
+      )
+    }
+    const isReservationPendingAuthentic = await this.witness.verifyRecord(
+      witnessReservationSnapshot.pending
+    )
+    if (!isReservationPendingAuthentic) {
+      throw new Error(
+        'UNAUTHENTICATED_WITNESS_RESERVATION: Pending record signature/hash verification failed'
+      )
+    }
+
+    // Request broadcast authorization decision before persisting recovery intent
+    const broadcastDecision =
+      await this.broadcastAuthorizationPort.requestBroadcastAuthorization(
+        signedReview,
+        signal
+      )
+
+    if (broadcastDecision.status === 'rejected') {
+      throw new Tm1PublicationError(
+        'BROADCAST_REJECTED',
+        broadcastDecision.reason ?? 'BROADCAST_REJECTED'
+      )
+    }
+    if (broadcastDecision.status === 'expired') {
+      throw new Tm1PublicationError(
+        'BROADCAST_AUTHORIZATION_EXPIRED',
+        broadcastDecision.reason ?? 'BROADCAST_AUTHORIZATION_EXPIRED'
+      )
+    }
+
+    this.cachedBroadcastDecision = broadcastDecision
+
+    const broadcastGrant = this.ledger.getConsumption(broadcastDecision.authorizationId)
+    if (!broadcastGrant) {
+      throw new Error('BROADCAST_GRANT_NOT_RECORDED_IN_LEDGER')
+    }
+
+    const signingGrant = this.ledger.getConsumption(signedReview.signingAuthorizationId)
+    if (!signingGrant) {
+      throw new Error('SIGNING_GRANT_NOT_RECORDED_IN_LEDGER')
+    }
 
     const publicationId = `pub:${preparedReview.preparedId}`
+    const submissionId = `submission:${signedReview.signedId}`
     const now = Date.now()
 
     const preDispatchRecord = parseTm1PublicationRecoveryRecord({
@@ -731,20 +914,20 @@ export class Tm1RegtestE2eHarness {
         signedArtifactHash: signedReview.signedArtifactHash
       },
       signingAuthorization: {
-        operationId: `sign-op:${preparedReview.preparedId}`,
-        capabilityId: signedReview.signingAuthorizationId,
-        contentHash: `sha256:${signedReview.bindingHash}` as `sha256:${string}`,
-        expiresAt: now + 300_000,
-        consumedAt: now,
+        operationId: signingGrant.operationId,
+        capabilityId: signingGrant.capabilityId,
+        contentHash: signingGrant.contentHash,
+        expiresAt: signingGrant.expiresAt,
+        consumedAt: signingGrant.consumedAt,
         preparedId: preparedReview.preparedId,
         bindingHash: preparedReview.bindingHash
       },
       broadcastAuthorization: {
-        operationId: `broadcast-op:${signedReview.signedId}`,
-        capabilityId: `broadcast-cap:${signedReview.signedId}`,
-        contentHash: `sha256:${signedReview.signedArtifactHash}` as `sha256:${string}`,
-        expiresAt: now + 300_000,
-        consumedAt: now,
+        operationId: broadcastGrant.operationId,
+        capabilityId: broadcastGrant.capabilityId,
+        contentHash: broadcastGrant.contentHash,
+        expiresAt: broadcastGrant.expiresAt,
+        consumedAt: broadcastGrant.consumedAt,
         signedId: signedReview.signedId,
         txid: signedReview.txid,
         signedArtifactHash: signedReview.signedArtifactHash
@@ -757,7 +940,6 @@ export class Tm1RegtestE2eHarness {
 
     await this.recoveryStore.create({ record: preDispatchRecord })
 
-    const submissionId = `submission:${signedReview.signedId}`
     const outcomeUnknownRecord = parseTm1PublicationRecoveryRecord({
       ...preDispatchRecord,
       revision: 2,
@@ -767,7 +949,7 @@ export class Tm1RegtestE2eHarness {
         submissionId,
         txid: signedReview.txid,
         signedArtifactHash: signedReview.signedArtifactHash,
-        broadcastCapabilityId: preDispatchRecord.broadcastAuthorization!.capabilityId,
+        broadcastCapabilityId: broadcastGrant.capabilityId,
         committedAt: now
       }
     })
@@ -833,27 +1015,84 @@ export class Tm1RegtestE2eHarness {
     const storeId = `tm1-store:v1:${'44'.repeat(32)}`
     const slotId = `slot:${preparedReview.preparedId}`
 
-    const transportAcknowledgedRecord =
-      (await this.recoveryStore.commitTransportAcknowledgement({
-        publicationId,
-        expectedRevision: 2,
-        expectedOwnerEpoch: 1,
-        acknowledgement: {
-          submissionId: submissionReceipt.submissionId,
-          signedId: signedReview.signedId,
-          txid: submissionReceipt.txid,
-          signedArtifactHash: signedReview.signedArtifactHash,
-          disposition: 'accepted',
-          acknowledgedAt: Date.now()
-        }
-      })) as Tm1PublicationRecoveryRecord
+    const rawRecord = await this.recoveryStore.commitTransportAcknowledgement({
+      publicationId,
+      expectedRevision: 2,
+      expectedOwnerEpoch: 1,
+      acknowledgement: {
+        submissionId: submissionReceipt.submissionId,
+        signedId: signedReview.signedId,
+        txid: submissionReceipt.txid,
+        signedArtifactHash: signedReview.signedArtifactHash,
+        disposition: 'accepted',
+        acknowledgedAt: Date.now()
+      }
+    })
 
+    const transportAcknowledgedRecord = parseTm1PublicationRecoveryRecord(rawRecord)
+
+    // 1. Revision & phase verification
     if (transportAcknowledgedRecord.phase !== 'submittedObserved') {
       throw new Error(
-        `Recovery record expected phase 'submittedObserved', got '${transportAcknowledgedRecord.phase}'`
+        `INVALID_ACKNOWLEDGEMENT_RECORD: Expected phase 'submittedObserved', got '${transportAcknowledgedRecord.phase}'`
+      )
+    }
+    if (transportAcknowledgedRecord.revision !== 3) {
+      throw new Error(
+        `INVALID_ACKNOWLEDGEMENT_RECORD: Expected revision 3, got ${transportAcknowledgedRecord.revision}`
+      )
+    }
+    if (transportAcknowledgedRecord.publicationId !== publicationId) {
+      throw new Error(
+        `INVALID_ACKNOWLEDGEMENT_RECORD: Publication ID mismatch (expected ${publicationId}, got ${transportAcknowledgedRecord.publicationId})`
+      )
+    }
+    if (transportAcknowledgedRecord.ownerEpoch !== 1) {
+      throw new Error(
+        `INVALID_ACKNOWLEDGEMENT_RECORD: Owner epoch mismatch (expected 1, got ${transportAcknowledgedRecord.ownerEpoch})`
       )
     }
 
+    // 2. Identities verification
+    if (transportAcknowledgedRecord.prepared?.preparedId !== preparedReview.preparedId) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Prepared ID mismatch')
+    }
+    if (transportAcknowledgedRecord.signed?.signedId !== signedReview.signedId) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed ID mismatch')
+    }
+    if (transportAcknowledgedRecord.signed?.txid !== submissionReceipt.txid) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed txid mismatch')
+    }
+    if (transportAcknowledgedRecord.signed?.signedArtifactHash !== signedReview.signedArtifactHash) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Signed artifact hash mismatch')
+    }
+
+    // 3. Dispatch intent verification
+    if (!transportAcknowledgedRecord.dispatchIntent) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Missing dispatch intent in acknowledgement record')
+    }
+    if (transportAcknowledgedRecord.dispatchIntent.submissionId !== submissionReceipt.submissionId) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent submission ID mismatch')
+    }
+    if (transportAcknowledgedRecord.dispatchIntent.txid !== submissionReceipt.txid) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent txid mismatch')
+    }
+    if (transportAcknowledgedRecord.dispatchIntent.signedArtifactHash !== signedReview.signedArtifactHash) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Dispatch intent signed artifact hash mismatch')
+    }
+
+    // 4. Transport receipt verification
+    if (!transportAcknowledgedRecord.transportAcknowledgement) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Missing transport acknowledgement evidence')
+    }
+    if (transportAcknowledgedRecord.transportAcknowledgement.txid !== submissionReceipt.txid) {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement txid mismatch')
+    }
+    if (transportAcknowledgedRecord.transportAcknowledgement.disposition !== 'accepted') {
+      throw new Error('INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement disposition not accepted')
+    }
+
+    // 5. Orchestrator state verification
     const finalOrchestratorState = this.orchestrator.getState()
     if (finalOrchestratorState.status !== 'submitted') {
       throw new Error(
@@ -865,8 +1104,9 @@ export class Tm1RegtestE2eHarness {
       throw new Error('Orchestrator receipt txid does not match submission receipt')
     }
 
+    // 6. Witness finalization only after all verifications succeed
     if (witnessReservationSnapshot.pending) {
-      await this.witness.finalize({
+      const rawFinalize = await this.witness.finalize({
         slotId,
         storeId,
         generation: witnessReservationSnapshot.pending.generation,
@@ -875,6 +1115,13 @@ export class Tm1RegtestE2eHarness {
         operationId: witnessReservationSnapshot.pending.operationId,
         signal
       })
+      const finalizedSnapshot = parseTm1RollbackWitnessSnapshot(rawFinalize)
+      const isFinalizedAuthentic = await this.witness.verifyRecord(finalizedSnapshot.stable)
+      if (!isFinalizedAuthentic) {
+        throw new Error(
+          'UNAUTHENTICATED_WITNESS_FINALIZATION: Stable record signature/hash verification failed'
+        )
+      }
     }
 
     return {
@@ -904,7 +1151,10 @@ export class Tm1RegtestE2eHarness {
       unsignedTransactionBytes,
       unsignedTransactionAudit,
       preparedReview
-    } = await this.executeStep4PrepareMemoAndUnsignedTx(signal)
+    } = await this.executeStep4PrepareMemoAndUnsignedTx(
+      aliasPublicationAuthorization,
+      signal
+    )
 
     // Step 5: Execute dual authorization
     const { signedReview, signingAuthorizationDecision } =

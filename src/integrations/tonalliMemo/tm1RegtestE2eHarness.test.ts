@@ -73,6 +73,11 @@ const {
 const {
   parseTm1PublicationRecoveryRecord
 } = await import('./recovery/tm1PublicationRecoveryModel')
+import type { Tm1PublicationRecoveryRecord } from './recovery/tm1PublicationRecoveryModel'
+
+const {
+  Tm1InMemoryRollbackWitness
+} = await import('./recovery/tm1InMemoryRollbackWitness')
 
 const TEST_ALIAS = 'satoshi.xec'
 const TEST_OWNER = TM1_PROGRAMMATIC_E2E_FIXTURE_ADDRESS
@@ -345,6 +350,205 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
 
       // Transport dispatch counter remains exactly 1
       expect(harness.getDispatchCount()).toBe(1)
+    })
+
+    test('Step 4: rejects preparation when verified owner address does not match author locking script', async () => {
+      const OTHER_OWNER = 'ecash:qrrd3y2cmg6m2vxlng9h3djh889pmwffhqv9yym2p4'
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      await expect(
+        harness.executeStep4PrepareMemoAndUnsignedTx(OTHER_OWNER)
+      ).rejects.toThrow(/AUTHOR_OWNER_BINDING_MISMATCH/)
+    })
+
+    test('Pipeline: rejects if verified alias owner does not match author locking script', async () => {
+      const OTHER_OWNER = 'ecash:qrrd3y2cmg6m2vxlng9h3djh889pmwffhqv9yym2p4'
+      setupMockFetch('other.xec', OTHER_OWNER, nextTxid())
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: 'other.xec',
+        ownerAddress: OTHER_OWNER
+      })
+
+      await expect(harness.executePipeline()).rejects.toThrow(/AUTHOR_OWNER_BINDING_MISMATCH/)
+    })
+
+    test('Step 6: persists actual consumed grants into recovery store and leaves store empty on broadcast rejection', async () => {
+      // 1. Broadcast rejection: no recovery record is committed
+      const rejectingHarness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        broadcastDecisionProvider: {
+          requestDecision: async () => ({
+            status: 'rejected',
+            reason: 'Broadcast authorization rejected'
+          })
+        }
+      })
+      const rStep4 = await rejectingHarness.executeStep4PrepareMemoAndUnsignedTx()
+      const rStep5 = await rejectingHarness.executeStep5DualAuthorizeAndSign(rStep4.preparedReview)
+      await expect(
+        rejectingHarness.executeStep6ReserveRecoveryAndDispatch(
+          rStep4.preparedReview,
+          rStep5.signedReview
+        )
+      ).rejects.toThrowError(
+        expect.objectContaining({
+          code: 'BROADCAST_REJECTED'
+        })
+      )
+      const publicationId = `pub:${rStep4.preparedReview.preparedId}`
+      expect(await rejectingHarness.recoveryStore.load(publicationId)).toBeNull()
+
+      // 2. Success path: recovery store contains actual consumed grants from ledger
+      const successHarness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+      const sStep4 = await successHarness.executeStep4PrepareMemoAndUnsignedTx()
+      const sStep5 = await successHarness.executeStep5DualAuthorizeAndSign(sStep4.preparedReview)
+      await successHarness.executeStep6ReserveRecoveryAndDispatch(
+        sStep4.preparedReview,
+        sStep5.signedReview
+      )
+
+      const stored = (await successHarness.recoveryStore.load(
+        `pub:${sStep4.preparedReview.preparedId}`
+      )) as Tm1PublicationRecoveryRecord | null
+      expect(stored).not.toBeNull()
+
+      // Check signing authorization grant binding
+      expect(stored?.signingAuthorization?.capabilityId).toBe(
+        sStep5.signedReview.signingAuthorizationId
+      )
+      const signingConsumption = successHarness.ledger.getConsumption(
+        sStep5.signedReview.signingAuthorizationId
+      )
+      expect(signingConsumption).toBeDefined()
+      expect(stored?.signingAuthorization?.operationId).toBe(signingConsumption?.operationId)
+      expect(stored?.signingAuthorization?.consumedAt).toBe(signingConsumption?.consumedAt)
+
+      // Check broadcast authorization grant binding
+      const broadcastCapId = stored?.broadcastAuthorization?.capabilityId
+      expect(broadcastCapId).toBeDefined()
+      const broadcastConsumption = successHarness.ledger.getConsumption(broadcastCapId!)
+      expect(broadcastConsumption).toBeDefined()
+      expect(stored?.broadcastAuthorization?.operationId).toBe(broadcastConsumption?.operationId)
+      expect(stored?.broadcastAuthorization?.consumedAt).toBe(broadcastConsumption?.consumedAt)
+    })
+
+    test('Step 6: rejects unauthenticated witness snapshot during reservation', async () => {
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        witness: {
+          read: (args) => realWitness.read(args),
+          enroll: (args) => realWitness.enroll(args),
+          reserve: (args) => realWitness.reserve(args),
+          finalize: (args) => realWitness.finalize(args),
+          verifyRecord: async () => false // Simulation of unauthenticated / forged witness record
+        }
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/UNAUTHENTICATED_WITNESS/)
+    })
+
+    test('Step 7: validates acknowledgement before finalizing witness (rejects forged/tampered acknowledgement)', async () => {
+      let finalizeCalled = false
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      // Spy on witness finalize to guarantee it is NOT called when acknowledgement is forged
+      const originalFinalize = harness.witness.finalize.bind(harness.witness)
+      harness.witness.finalize = async (args) => {
+        finalizeCalled = true
+        return originalFinalize(args)
+      }
+
+      // Intercept recoveryStore.commitTransportAcknowledgement to return a record with mismatched publicationId
+      const originalCommitAck =
+        harness.recoveryStore.commitTransportAcknowledgement.bind(harness.recoveryStore)
+      harness.recoveryStore.commitTransportAcknowledgement = async (args) => {
+        const authenticRecord = (await originalCommitAck(args)) as Tm1PublicationRecoveryRecord
+        // Tamper with record: inject mismatched publicationId
+        return {
+          ...authenticRecord,
+          publicationId: 'pub:forged-publication-id-999'
+        }
+      }
+
+      await expect(
+        harness.executeStep7VerifyFinalSuccess(
+          step4.preparedReview,
+          step5.signedReview,
+          step6.submissionReceipt,
+          step6.witnessReservationSnapshot
+        )
+      ).rejects.toThrow(/INVALID_ACKNOWLEDGEMENT_RECORD/)
+
+      // Witness finalization MUST NOT have been called
+      expect(finalizeCalled).toBe(false)
+    })
+
+    test('Step 7: rejects malformed recovery record and aborts before witness finalization', async () => {
+      let finalizeCalled = false
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      // Spy on witness finalize
+      const originalFinalize = harness.witness.finalize.bind(harness.witness)
+      harness.witness.finalize = async (args) => {
+        finalizeCalled = true
+        return originalFinalize(args)
+      }
+
+      // Intercept recoveryStore.commitTransportAcknowledgement to return a completely malformed object
+      harness.recoveryStore.commitTransportAcknowledgement = async () => ({
+        untrusted: true,
+        forged: 'malformed-payload'
+      })
+
+      await expect(
+        harness.executeStep7VerifyFinalSuccess(
+          step4.preparedReview,
+          step5.signedReview,
+          step6.submissionReceipt,
+          step6.witnessReservationSnapshot
+        )
+      ).rejects.toThrow(/MALFORMED_RECOVERY_RECORD/)
+
+      // Witness finalization MUST NOT have been called
+      expect(finalizeCalled).toBe(false)
     })
   })
 
