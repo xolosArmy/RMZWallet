@@ -104,4 +104,19 @@ export interface Tm1PublicationRecoveryStore {
   ): Promise<unknown>
   commitRecoveryTransition(input: Tm1RecoveryStoreRecoveryCommit): Promise<unknown>
   claimOwnership(input: Tm1RecoveryStoreOwnershipClaim): Promise<unknown>
+  computeEnrollmentLogicalRoot?(identity: Readonly<{
+    slotId: string
+    storeId: string
+  }>): string
+  enrollWitnessBinding?(binding: Readonly<{
+    slotId: string
+    storeId: string
+    logicalRoot: string
+  }>): unknown
+  inspectWitnessBinding?(): unknown | null
+  computeWitnessLogicalRoot?(generation: number): string
+  computeProjectedWitnessLogicalRoot?(
+    projectedRecord: unknown,
+    generation?: number
+  ): string
 }
