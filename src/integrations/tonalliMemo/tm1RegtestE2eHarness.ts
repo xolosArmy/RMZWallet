@@ -415,6 +415,56 @@ export function assertWitnessReservationResponseBinding(
   }
 }
 
+export function assertWitnessFinalizationBinding(
+  finalizedSnapshot: Tm1RollbackWitnessSnapshot,
+  pendingReservation: Tm1RollbackWitnessRecord
+): void {
+  if (finalizedSnapshot.pending !== null) {
+    throw new Error(
+      'WITNESS_FINALIZATION_MISMATCH: Finalized snapshot must have null pending record'
+    )
+  }
+  const stable = finalizedSnapshot.stable
+  if (stable.slotId !== pendingReservation.slotId) {
+    throw new Error(
+      `WITNESS_FINALIZATION_MISMATCH: slotId mismatch (expected ${pendingReservation.slotId}, got ${stable.slotId})`
+    )
+  }
+  if (stable.storeId !== pendingReservation.storeId) {
+    throw new Error(
+      `WITNESS_FINALIZATION_MISMATCH: storeId mismatch (expected ${pendingReservation.storeId}, got ${stable.storeId})`
+    )
+  }
+  if (stable.generation !== pendingReservation.generation) {
+    throw new Error(
+      `WITNESS_FINALIZATION_MISMATCH: generation mismatch (expected ${pendingReservation.generation}, got ${stable.generation})`
+    )
+  }
+  if (stable.logicalRoot !== pendingReservation.logicalRoot) {
+    throw new Error(
+      `WITNESS_FINALIZATION_MISMATCH: logicalRoot mismatch (expected ${pendingReservation.logicalRoot}, got ${stable.logicalRoot})`
+    )
+  }
+  if (stable.operationId !== pendingReservation.operationId) {
+    throw new Error(
+      `WITNESS_FINALIZATION_MISMATCH: operationId mismatch (expected ${pendingReservation.operationId}, got ${stable.operationId})`
+    )
+  }
+  if (
+    stable.previousStableReceiptHash !==
+    pendingReservation.previousStableReceiptHash
+  ) {
+    throw new Error(
+      `WITNESS_FINALIZATION_MISMATCH: previousStableReceiptHash mismatch (expected ${pendingReservation.previousStableReceiptHash}, got ${stable.previousStableReceiptHash})`
+    )
+  }
+  if (stable.witnessKeyId !== pendingReservation.witnessKeyId) {
+    throw new Error(
+      `WITNESS_FINALIZATION_MISMATCH: witnessKeyId mismatch (expected ${pendingReservation.witnessKeyId}, got ${stable.witnessKeyId})`
+    )
+  }
+}
+
 export function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true
   if (a === null || typeof a !== 'object' || b === null || typeof b !== 'object') {
@@ -1582,7 +1632,39 @@ export class Tm1RegtestE2eHarness {
       expectedRecord: outcomeUnknownRecord
     })
 
-    // 8. Finalize witness checkpoint for dispatch intent BEFORE transport execution (Finding 4)
+    // 8. Re-attest durable store before witness finalization (Finding 1)
+    const storedRecordRaw = await this.recoveryStore.load(publicationId)
+    if (!storedRecordRaw) {
+      throw new Error(
+        'DURABLE_STORE_PERSISTENCE_MISMATCH: Record missing from recovery store after commitDispatchIntent'
+      )
+    }
+    let storedRecord: Tm1PublicationRecoveryRecord
+    try {
+      storedRecord = parseTm1PublicationRecoveryRecord(storedRecordRaw)
+    } catch (error) {
+      throw new Error(
+        `DURABLE_STORE_PERSISTENCE_MISMATCH: Stored record is malformed (${error instanceof Error ? error.message : String(error)})`
+      )
+    }
+    if (!deepEqual(storedRecord, committedRecord)) {
+      throw new Error(
+        'DURABLE_STORE_PERSISTENCE_MISMATCH: Persisted store record does not match committed dispatch intent record'
+      )
+    }
+
+    const reAttestedStoreRoot = await this.deriveStoreRoot({
+      slotId,
+      storeId,
+      generation: witnessReservationSnapshot.pending.generation
+    })
+    if (reAttestedStoreRoot !== witnessReservationSnapshot.pending.logicalRoot) {
+      throw new Error(
+        `DURABLE_STORE_PERSISTENCE_MISMATCH: Re-attested whole-store root mismatch (expected ${witnessReservationSnapshot.pending.logicalRoot}, got ${reAttestedStoreRoot})`
+      )
+    }
+
+    // 9. Finalize witness checkpoint for dispatch intent BEFORE transport execution (Finding 4)
     const rawFinalizeDispatch = await this.witness.finalize({
       slotId,
       storeId,
@@ -1602,21 +1684,16 @@ export class Tm1RegtestE2eHarness {
         'UNAUTHENTICATED_WITNESS_FINALIZATION: Dispatch intent stable record signature/hash verification failed'
       )
     }
-    if (
-      finalizedDispatchSnapshot.stable.slotId !==
-        witnessReservationSnapshot.pending.slotId ||
-      finalizedDispatchSnapshot.stable.storeId !==
-        witnessReservationSnapshot.pending.storeId ||
-      finalizedDispatchSnapshot.stable.generation !==
-        witnessReservationSnapshot.pending.generation ||
-      finalizedDispatchSnapshot.stable.logicalRoot !==
-        witnessReservationSnapshot.pending.logicalRoot ||
-      finalizedDispatchSnapshot.stable.operationId !==
-        witnessReservationSnapshot.pending.operationId ||
-      finalizedDispatchSnapshot.pending !== null
-    ) {
+
+    // Bind finalization to receipt chain and pending reservation (Finding 2)
+    assertWitnessFinalizationBinding(
+      finalizedDispatchSnapshot,
+      witnessReservationSnapshot.pending
+    )
+
+    if (finalizedDispatchSnapshot.stable.logicalRoot !== reAttestedStoreRoot) {
       throw new Error(
-        'WITNESS_FINALIZATION_MISMATCH: Finalized dispatch intent stable head mismatch'
+        'WITNESS_FINALIZATION_MISMATCH: Finalized dispatch intent root does not match actual store root'
       )
     }
 
@@ -1923,6 +2000,53 @@ export class Tm1RegtestE2eHarness {
         'INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement disposition not accepted'
       )
     }
+    if (
+      transportAcknowledgedRecord.transportAcknowledgement.acknowledgedAt !==
+      acknowledgedAt
+    ) {
+      throw new Error(
+        `INVALID_ACKNOWLEDGEMENT_RECORD: Transport acknowledgement acknowledgedAt mismatch (expected ${acknowledgedAt}, got ${transportAcknowledgedRecord.transportAcknowledgement.acknowledgedAt})`
+      )
+    }
+
+    // Strict comparison between committed record and projectedAckRecord (Finding 3)
+    if (!deepEqual(transportAcknowledgedRecord, projectedAckRecord)) {
+      throw new Error(
+        'INVALID_ACKNOWLEDGEMENT_RECORD: Committed acknowledgement record does not match projected record'
+      )
+    }
+
+    // Re-attest durable store for acknowledgement: reload from store and recompute whole-store root (Finding 1 & 3)
+    const storedAckRaw = await this.recoveryStore.load(publicationId)
+    if (!storedAckRaw) {
+      throw new Error(
+        'DURABLE_STORE_PERSISTENCE_MISMATCH: Record missing from recovery store after commitTransportAcknowledgement'
+      )
+    }
+    let storedAckRecord: Tm1PublicationRecoveryRecord
+    try {
+      storedAckRecord = parseTm1PublicationRecoveryRecord(storedAckRaw)
+    } catch (error) {
+      throw new Error(
+        `DURABLE_STORE_PERSISTENCE_MISMATCH: Stored acknowledgement record is malformed (${error instanceof Error ? error.message : String(error)})`
+      )
+    }
+    if (!deepEqual(storedAckRecord, projectedAckRecord)) {
+      throw new Error(
+        'DURABLE_STORE_PERSISTENCE_MISMATCH: Persisted store record does not match projected acknowledgement record'
+      )
+    }
+
+    const reAttestedAckStoreRoot = await this.deriveStoreRoot({
+      slotId,
+      storeId,
+      generation: ackReservationSnapshot.pending.generation
+    })
+    if (reAttestedAckStoreRoot !== ackReservationSnapshot.pending.logicalRoot) {
+      throw new Error(
+        `DURABLE_STORE_PERSISTENCE_MISMATCH: Re-attested whole-store root mismatch for acknowledgement (expected ${ackReservationSnapshot.pending.logicalRoot}, got ${reAttestedAckStoreRoot})`
+      )
+    }
 
     // 5. Two-Phase Commit Phase 3 (Finding 3): Finalize acknowledgement checkpoint on witness
     const rawAckFinalize = await this.witness.finalize({
@@ -1943,21 +2067,16 @@ export class Tm1RegtestE2eHarness {
         'UNAUTHENTICATED_WITNESS_FINALIZATION: Acknowledgement stable record signature/hash verification failed'
       )
     }
-    if (
-      finalizedAckSnapshot.stable.slotId !==
-        ackReservationSnapshot.pending.slotId ||
-      finalizedAckSnapshot.stable.storeId !==
-        ackReservationSnapshot.pending.storeId ||
-      finalizedAckSnapshot.stable.generation !==
-        ackReservationSnapshot.pending.generation ||
-      finalizedAckSnapshot.stable.logicalRoot !==
-        ackReservationSnapshot.pending.logicalRoot ||
-      finalizedAckSnapshot.stable.operationId !==
-        ackReservationSnapshot.pending.operationId ||
-      finalizedAckSnapshot.pending !== null
-    ) {
+
+    // Bind finalization to receipt chain and pending reservation (Finding 2)
+    assertWitnessFinalizationBinding(
+      finalizedAckSnapshot,
+      ackReservationSnapshot.pending
+    )
+
+    if (finalizedAckSnapshot.stable.logicalRoot !== reAttestedAckStoreRoot) {
       throw new Error(
-        'WITNESS_FINALIZATION_MISMATCH: Finalized acknowledgement stable head mismatch'
+        'WITNESS_FINALIZATION_MISMATCH: Finalized acknowledgement root does not match actual store root'
       )
     }
 

@@ -45,6 +45,7 @@ const {
   Tm1HarnessOperationLock,
   Tm1HarnessRecoveryStore,
   assertWitnessReservationResponseBinding,
+  assertWitnessFinalizationBinding,
   assertTm1CommittedDispatchIntentBinding,
   computeCanonicalWholeStoreRoot,
   deepEqual,
@@ -410,6 +411,299 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
 
       // Transport dispatch counter remains exactly 1
       expect(harness.getDispatchCount()).toBe(1)
+    })
+
+    test('Step 6: rejects when recovery store returns success but fails durable persistence (false positive)', async () => {
+      const realStore = new Tm1HarnessRecoveryStore()
+      const byzantineStore = {
+        storeId: realStore.getStoreId(),
+        getStoreId: () => realStore.getStoreId(),
+        listRecoverable: () => realStore.listRecoverable(),
+        create: (input: any) => realStore.create(input),
+        commitExecutionEvidence: (input: any) => realStore.commitExecutionEvidence(input),
+        commitDispatchIntent: async (input: any) => {
+          const res = await realStore.commitDispatchIntent(input)
+          // Byzantine false positive: record is not persisted in durable storage
+          ;(realStore as any).records.delete(input.publicationId)
+          return res
+        },
+        load: (pubId: string) => realStore.load(pubId),
+        commitTransportAcknowledgement: (input: any) => realStore.commitTransportAcknowledgement(input),
+        commitRecoveryTransition: (input: any) => realStore.commitRecoveryTransition(input),
+        claimOwnership: (input: any) => realStore.claimOwnership(input)
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: byzantineStore as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/DURABLE_STORE_PERSISTENCE_MISMATCH/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects when durable store root diverges from reserved root before finalization', async () => {
+      const realStore = new Tm1HarnessRecoveryStore()
+      const byzantineStore = {
+        storeId: realStore.getStoreId(),
+        getStoreId: () => realStore.getStoreId(),
+        listRecoverable: () => realStore.listRecoverable(),
+        create: (input: any) => realStore.create(input),
+        commitExecutionEvidence: (input: any) => realStore.commitExecutionEvidence(input),
+        commitDispatchIntent: async (input: any) => {
+          const res = await realStore.commitDispatchIntent(input)
+          const rec = (realStore as any).records.get(input.publicationId)
+          if (rec) {
+            ;(realStore as any).records.set(input.publicationId, {
+              ...rec,
+              ownerEpoch: 999
+            })
+          }
+          return res
+        },
+        load: (pubId: string) => realStore.load(pubId),
+        commitTransportAcknowledgement: (input: any) => realStore.commitTransportAcknowledgement(input),
+        commitRecoveryTransition: (input: any) => realStore.commitRecoveryTransition(input),
+        claimOwnership: (input: any) => realStore.claimOwnership(input)
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: byzantineStore as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/DURABLE_STORE_PERSISTENCE_MISMATCH/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects when witness finalize returns forked previousStableReceiptHash', async () => {
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      const byzantineWitness = {
+        read: (req: any) => realWitness.read(req),
+        enroll: (req: any) => realWitness.enroll(req),
+        reserve: (req: any) => realWitness.reserve(req),
+        finalize: async (req: any) => {
+          const snapshot = parseTm1RollbackWitnessSnapshot(await realWitness.finalize(req))
+          return {
+            ...snapshot,
+            stable: {
+              ...snapshot.stable,
+              previousStableReceiptHash: 'ff'.repeat(32)
+            }
+          }
+        },
+        verifyRecord: async () => true
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        witness: byzantineWitness as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/WITNESS_FINALIZATION_MISMATCH.*previousStableReceiptHash mismatch/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects when witness finalize returns mismatched witnessKeyId', async () => {
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      const byzantineWitness = {
+        read: (req: any) => realWitness.read(req),
+        enroll: (req: any) => realWitness.enroll(req),
+        reserve: (req: any) => realWitness.reserve(req),
+        finalize: async (req: any) => {
+          const snapshot = parseTm1RollbackWitnessSnapshot(await realWitness.finalize(req))
+          return {
+            ...snapshot,
+            stable: {
+              ...snapshot.stable,
+              witnessKeyId: 'wk-byzantine-unauthorized'
+            }
+          }
+        },
+        verifyRecord: async () => true
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        witness: byzantineWitness as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/WITNESS_FINALIZATION_MISMATCH.*witnessKeyId mismatch/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 7: rejects when witness finalize returns forked previousStableReceiptHash in acknowledgement', async () => {
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      let finalizeCount = 0
+      const byzantineWitness = {
+        read: (req: any) => realWitness.read(req),
+        enroll: (req: any) => realWitness.enroll(req),
+        reserve: (req: any) => realWitness.reserve(req),
+        finalize: async (req: any) => {
+          finalizeCount++
+          const snapshot = parseTm1RollbackWitnessSnapshot(await realWitness.finalize(req))
+          if (finalizeCount === 2) {
+            return {
+              ...snapshot,
+              stable: {
+                ...snapshot.stable,
+                previousStableReceiptHash: 'ee'.repeat(32)
+              }
+            }
+          }
+          return snapshot
+        },
+        verifyRecord: async () => true
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        witness: byzantineWitness as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      await expect(
+        harness.executeStep7VerifyFinalSuccess(
+          step4.preparedReview,
+          step5.signedReview,
+          step6.submissionReceipt
+        )
+      ).rejects.toThrow(/WITNESS_FINALIZATION_MISMATCH.*previousStableReceiptHash mismatch/)
+    })
+
+    test('Step 7: rejects when recovery store returns altered acknowledgedAt timestamp in acknowledgement', async () => {
+      const realStore = new Tm1HarnessRecoveryStore()
+      const byzantineStore = {
+        storeId: realStore.getStoreId(),
+        getStoreId: () => realStore.getStoreId(),
+        listRecoverable: () => realStore.listRecoverable(),
+        create: (input: any) => realStore.create(input),
+        commitExecutionEvidence: (input: any) => realStore.commitExecutionEvidence(input),
+        commitDispatchIntent: (input: any) => realStore.commitDispatchIntent(input),
+        load: (pubId: string) => realStore.load(pubId),
+        commitTransportAcknowledgement: async (input: any) => {
+          const res: any = await realStore.commitTransportAcknowledgement(input)
+          return {
+            ...res,
+            transportAcknowledgement: {
+              ...res.transportAcknowledgement,
+              acknowledgedAt: res.transportAcknowledgement.acknowledgedAt + 99999
+            }
+          }
+        },
+        commitRecoveryTransition: (input: any) => realStore.commitRecoveryTransition(input),
+        claimOwnership: (input: any) => realStore.claimOwnership(input)
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: byzantineStore as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      await expect(
+        harness.executeStep7VerifyFinalSuccess(
+          step4.preparedReview,
+          step5.signedReview,
+          step6.submissionReceipt
+        )
+      ).rejects.toThrow(/INVALID_ACKNOWLEDGEMENT_RECORD.*acknowledgedAt mismatch/)
+    })
+
+    test('Step 7: rejects when durable store persistence fails after acknowledgement commit', async () => {
+      const realStore = new Tm1HarnessRecoveryStore()
+      const byzantineStore = {
+        storeId: realStore.getStoreId(),
+        getStoreId: () => realStore.getStoreId(),
+        listRecoverable: () => realStore.listRecoverable(),
+        create: (input: any) => realStore.create(input),
+        commitExecutionEvidence: (input: any) => realStore.commitExecutionEvidence(input),
+        commitDispatchIntent: (input: any) => realStore.commitDispatchIntent(input),
+        load: (pubId: string) => realStore.load(pubId),
+        commitTransportAcknowledgement: async (input: any) => {
+          const res = await realStore.commitTransportAcknowledgement(input)
+          // Byzantine failure to persist: delete record from durable storage
+          ;(realStore as any).records.delete(input.publicationId)
+          return res
+        },
+        commitRecoveryTransition: (input: any) => realStore.commitRecoveryTransition(input),
+        claimOwnership: (input: any) => realStore.claimOwnership(input)
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: byzantineStore as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      await expect(
+        harness.executeStep7VerifyFinalSuccess(
+          step4.preparedReview,
+          step5.signedReview,
+          step6.submissionReceipt
+        )
+      ).rejects.toThrow(/DURABLE_STORE_PERSISTENCE_MISMATCH/)
     })
 
     test('Step 4: rejects preparation when verified owner address does not match author locking script', async () => {
@@ -986,6 +1280,116 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
           mockStable
         )
       }).toThrow(/WITNESS_RESERVATION_BINDING_MISMATCH/)
+    })
+
+    test('Direct assertion helper test: assertWitnessFinalizationBinding checks all mismatch cases', () => {
+      const pendingRecord = {
+        protocol: 'tonalli.tm1-rollback-witness' as const,
+        protocolVersion: 1 as const,
+        slotId: 'slot:1',
+        storeId: `tm1-store:v1:${'11'.repeat(32)}`,
+        generation: 1,
+        logicalRoot: '11'.repeat(32),
+        receiptHash: 'bb'.repeat(32),
+        witnessKeyId: 'wk-1',
+        state: 'pending' as const,
+        operationId: 'op:1',
+        previousStableReceiptHash: 'aa'.repeat(32),
+        authenticatedReceipt: 'auth-1'
+      }
+
+      const validFinalizedStable = {
+        protocol: 'tonalli.tm1-rollback-witness' as const,
+        protocolVersion: 1 as const,
+        slotId: 'slot:1',
+        storeId: `tm1-store:v1:${'11'.repeat(32)}`,
+        generation: 1,
+        logicalRoot: '11'.repeat(32),
+        receiptHash: 'cc'.repeat(32),
+        witnessKeyId: 'wk-1',
+        state: 'stable' as const,
+        operationId: 'op:1',
+        previousStableReceiptHash: 'aa'.repeat(32),
+        authenticatedReceipt: 'auth-final'
+      }
+
+      // Valid pass
+      expect(() => {
+        assertWitnessFinalizationBinding(
+          { stable: validFinalizedStable, pending: null },
+          pendingRecord
+        )
+      }).not.toThrow()
+
+      // Non-null pending
+      expect(() => {
+        assertWitnessFinalizationBinding(
+          { stable: validFinalizedStable, pending: pendingRecord },
+          pendingRecord
+        )
+      }).toThrow(/WITNESS_FINALIZATION_MISMATCH: Finalized snapshot must have null pending record/)
+
+      // SlotId mismatch
+      expect(() => {
+        assertWitnessFinalizationBinding(
+          { stable: { ...validFinalizedStable, slotId: 'slot:diff' }, pending: null },
+          pendingRecord
+        )
+      }).toThrow(/WITNESS_FINALIZATION_MISMATCH: slotId mismatch/)
+
+      // StoreId mismatch
+      expect(() => {
+        assertWitnessFinalizationBinding(
+          { stable: { ...validFinalizedStable, storeId: 'tm1-store:v1:diff' }, pending: null },
+          pendingRecord
+        )
+      }).toThrow(/WITNESS_FINALIZATION_MISMATCH: storeId mismatch/)
+
+      // Generation mismatch
+      expect(() => {
+        assertWitnessFinalizationBinding(
+          { stable: { ...validFinalizedStable, generation: 2 }, pending: null },
+          pendingRecord
+        )
+      }).toThrow(/WITNESS_FINALIZATION_MISMATCH: generation mismatch/)
+
+      // LogicalRoot mismatch
+      expect(() => {
+        assertWitnessFinalizationBinding(
+          { stable: { ...validFinalizedStable, logicalRoot: '99'.repeat(32) }, pending: null },
+          pendingRecord
+        )
+      }).toThrow(/WITNESS_FINALIZATION_MISMATCH: logicalRoot mismatch/)
+
+      // OperationId mismatch
+      expect(() => {
+        assertWitnessFinalizationBinding(
+          { stable: { ...validFinalizedStable, operationId: 'op:diff' }, pending: null },
+          pendingRecord
+        )
+      }).toThrow(/WITNESS_FINALIZATION_MISMATCH: operationId mismatch/)
+
+      // PreviousStableReceiptHash mismatch (receipt chain fork)
+      expect(() => {
+        assertWitnessFinalizationBinding(
+          {
+            stable: {
+              ...validFinalizedStable,
+              previousStableReceiptHash: 'ff'.repeat(32)
+            },
+            pending: null
+          },
+          pendingRecord
+        )
+      }).toThrow(/WITNESS_FINALIZATION_MISMATCH: previousStableReceiptHash mismatch/)
+
+      // WitnessKeyId mismatch
+      expect(() => {
+        assertWitnessFinalizationBinding(
+          { stable: { ...validFinalizedStable, witnessKeyId: 'wk-diff' }, pending: null },
+          pendingRecord
+        )
+      }).toThrow(/WITNESS_FINALIZATION_MISMATCH: witnessKeyId mismatch/)
     })
 
     test('Direct assertion helper test: assertTm1CommittedDispatchIntentBinding checks mismatch cases', () => {
