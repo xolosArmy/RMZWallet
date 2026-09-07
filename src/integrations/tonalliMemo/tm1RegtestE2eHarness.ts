@@ -122,6 +122,8 @@ import {
 export const TM1_PROGRAMMATIC_E2E_FIXTURE_ADDRESS =
   'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
 
+export { TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX } from './tm1Draft02RegtestP2pkhSigner'
+
 export const DEFAULT_TM1_PROGRAMMATIC_E2E_MESSAGE =
   'Tonalli Memo TM1 E2E Programmatic Integration'
 
@@ -229,7 +231,7 @@ export function encodeCanonicalJson(value: unknown): string {
     const record = value as Record<string, unknown>
     return `{${Object.keys(record)
       .filter(key => record[key] !== undefined)
-      .sort()
+      .sort(compareStringsCodeUnit)
       .map(key => `${JSON.stringify(key)}:${encodeCanonicalJson(record[key])}`)
       .join(',')}}`
   }
@@ -239,6 +241,14 @@ export function encodeCanonicalJson(value: unknown): string {
 export function sha256Hex(data: string | Uint8Array): string {
   const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
   return toHex(sha256(bytes))
+}
+
+/**
+ * Locale-independent deterministic string comparator based on JavaScript UTF-16 code units.
+ * Guarantees identical canonical ordering regardless of execution locale or host OS.
+ */
+export function compareStringsCodeUnit(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0
 }
 
 export function computeCanonicalWholeStoreRoot(input: {
@@ -251,7 +261,7 @@ export function computeCanonicalWholeStoreRoot(input: {
 }): string {
   const sortedRecords = [...input.records]
     .map(r => parseTm1PublicationRecoveryRecord(r))
-    .sort((a, b) => a.publicationId.localeCompare(b.publicationId))
+    .sort((a, b) => compareStringsCodeUnit(a.publicationId, b.publicationId))
 
   const publications = sortedRecords.map(record => {
     const recordJson = encodeCanonicalJson(record)
@@ -267,7 +277,7 @@ export function computeCanonicalWholeStoreRoot(input: {
     input.capabilityIds !== undefined
       ? [...new Set([...recordCapabilities, ...input.capabilityIds])]
       : recordCapabilities
-  const uniqueCapabilities = [...new Set(rawCapabilities)].sort()
+  const uniqueCapabilities = [...new Set(rawCapabilities)].sort(compareStringsCodeUnit)
   const sortedCapabilities = uniqueCapabilities.map(id =>
     Object.freeze({ capabilityId: id })
   )
@@ -431,6 +441,11 @@ export function assertWitnessEnrollmentBinding(
     )
   }
   const stable = enrolledSnapshot.stable
+  if (stable.previousStableReceiptHash !== null) {
+    throw new Error(
+      `WITNESS_ENROLLMENT_BINDING_MISMATCH: previousStableReceiptHash mismatch (expected null for genesis enrollment, got ${stable.previousStableReceiptHash})`
+    )
+  }
   if (stable.generation !== 0) {
     throw new Error(
       `WITNESS_ENROLLMENT_BINDING_MISMATCH: generation mismatch (expected 0, got ${stable.generation})`
@@ -454,6 +469,45 @@ export function assertWitnessEnrollmentBinding(
   if (stable.operationId !== request.operationId) {
     throw new Error(
       `WITNESS_ENROLLMENT_BINDING_MISMATCH: operationId mismatch (expected ${request.operationId}, got ${stable.operationId})`
+    )
+  }
+}
+
+export function assertPersistedWitnessBinding(
+  binding: unknown,
+  expected: {
+    slotId: string
+    storeId: string
+    logicalRoot: string
+    generation: number
+    context?: string
+  }
+): void {
+  const ctx = expected.context ? ` (${expected.context})` : ''
+  if (!binding || typeof binding !== 'object') {
+    throw new Error(
+      `PERSISTED_ENROLLMENT_BINDING_MISMATCH: Expected valid binding object, got ${typeof binding}${ctx}`
+    )
+  }
+  const b = binding as Record<string, unknown>
+  if (b.slotId !== expected.slotId) {
+    throw new Error(
+      `PERSISTED_ENROLLMENT_BINDING_MISMATCH: slotId mismatch (expected ${expected.slotId}, got ${String(b.slotId)})${ctx}`
+    )
+  }
+  if (b.storeId !== expected.storeId) {
+    throw new Error(
+      `PERSISTED_ENROLLMENT_BINDING_MISMATCH: storeId mismatch (expected ${expected.storeId}, got ${String(b.storeId)})${ctx}`
+    )
+  }
+  if (b.logicalRoot !== expected.logicalRoot) {
+    throw new Error(
+      `PERSISTED_ENROLLMENT_BINDING_MISMATCH: logicalRoot mismatch (expected ${expected.logicalRoot}, got ${String(b.logicalRoot)})${ctx}`
+    )
+  }
+  if (b.generation !== expected.generation) {
+    throw new Error(
+      `PERSISTED_ENROLLMENT_BINDING_MISMATCH: generation mismatch (expected ${expected.generation}, got ${String(b.generation)})${ctx}`
     )
   }
 }
@@ -750,7 +804,7 @@ export class Tm1HarnessRecoveryStore implements Tm1PublicationRecoveryStore {
     slotId: string
     storeId: string
     logicalRoot: string
-  }): void {
+  }): { slotId: string; storeId: string; generation: number; logicalRoot: string } {
     if (this.witnessBinding !== null) {
       throw new Error('ALREADY_ENROLLED: Witness binding already enrolled')
     }
@@ -766,6 +820,7 @@ export class Tm1HarnessRecoveryStore implements Tm1PublicationRecoveryStore {
       generation: 0,
       logicalRoot: binding.logicalRoot
     })
+    return this.witnessBinding
   }
 
   computeProjectedWitnessLogicalRoot(
@@ -1007,6 +1062,7 @@ export class Tm1RegtestE2eHarness {
   readonly deliveryTransport: Tm1RegtestDeliveryTransport
   readonly orchestrator: Tm1RegtestPublicationOrchestrator & {
     getSignedReview?(preparedId?: string): Tm1SignedReview | null
+    getPreparedReview?(preparedId?: string): Tm1PreparedReview | null
   }
   readonly ledger: Tm1HarnessApprovalLedger
   readonly broadcastAuthorizationPort: Tm1BroadcastAuthorizationPort
@@ -1203,6 +1259,16 @@ export class Tm1RegtestE2eHarness {
             return null
           }
           return state.signedReview
+        }
+        return null
+      },
+      getPreparedReview: (preparedId?: string): Tm1PreparedReview | null => {
+        const state = orchestratorImpl.getState()
+        if ('review' in state && state.review) {
+          if (preparedId && state.review.preparedId !== preparedId) {
+            return null
+          }
+          return state.review
         }
         return null
       }
@@ -1530,8 +1596,40 @@ export class Tm1RegtestE2eHarness {
     dispatchIntentRecord: Tm1PublicationRecoveryRecord
     submissionReceipt: Tm1SubmissionReceipt
   }> {
-    // 0. Bind Step 6 inputs: deep-compare signedReview with orchestrator internal signedReview (Finding 1)
+    // 0. Bind Step 6 inputs: deep-compare preparedReview and signedReview with orchestrator internal reviews (Finding 1)
     const orchState = this.orchestrator.getState()
+
+    const internalPreparedReview =
+      typeof this.orchestrator.getPreparedReview === 'function'
+        ? this.orchestrator.getPreparedReview(preparedReview.preparedId)
+        : 'review' in orchState &&
+          orchState.review &&
+          orchState.review.preparedId === preparedReview.preparedId
+          ? orchState.review
+          : null
+
+    if (!internalPreparedReview) {
+      throw new Error(
+        `PREPARED_REVIEW_MISMATCH: No active prepared review found in orchestrator for preparedId ${preparedReview.preparedId}`
+      )
+    }
+
+    if (preparedReview.preparedId !== internalPreparedReview.preparedId) {
+      throw new Error(
+        `PREPARED_REVIEW_MISMATCH: preparedId mismatch (expected ${internalPreparedReview.preparedId}, got ${preparedReview.preparedId})`
+      )
+    }
+    if (preparedReview.bindingHash !== internalPreparedReview.bindingHash) {
+      throw new Error(
+        `PREPARED_REVIEW_MISMATCH: bindingHash mismatch (expected ${internalPreparedReview.bindingHash}, got ${preparedReview.bindingHash})`
+      )
+    }
+    if (!deepEqual(preparedReview, internalPreparedReview)) {
+      throw new Error(
+        `PREPARED_REVIEW_MISMATCH: Provided preparedReview does not match orchestrator internal preparedReview`
+      )
+    }
+
     const internalSignedReview =
       typeof this.orchestrator.getSignedReview === 'function'
         ? this.orchestrator.getSignedReview(preparedReview.preparedId)
@@ -1637,13 +1735,13 @@ export class Tm1RegtestE2eHarness {
         operationId
       })
 
-      // Commit enrollment into recovery store lifecycle: enrollWitnessBinding (v1 -> v2) (Finding 2)
+      // Commit enrollment into recovery store lifecycle: enrollWitnessBinding (v1 -> v2) and verify persistence (Finding 3)
       if (
         'enrollWitnessBinding' in this.recoveryStore &&
         typeof (this.recoveryStore as { enrollWitnessBinding?: unknown })
           .enrollWitnessBinding === 'function'
       ) {
-        ;(
+        const enrollResult = (
           this.recoveryStore as {
             enrollWitnessBinding: (input: {
               slotId: string
@@ -1656,6 +1754,35 @@ export class Tm1RegtestE2eHarness {
           storeId,
           logicalRoot
         })
+
+        assertPersistedWitnessBinding(enrollResult, {
+          slotId,
+          storeId,
+          logicalRoot,
+          generation: 0,
+          context: 'enrollWitnessBinding result'
+        })
+
+        // Crucially, invoke recoveryStore.inspectWitnessBinding() to re-attest that the database persisted it
+        if (
+          'inspectWitnessBinding' in this.recoveryStore &&
+          typeof (this.recoveryStore as { inspectWitnessBinding?: unknown })
+            .inspectWitnessBinding === 'function'
+        ) {
+          const inspectedBinding = (
+            this.recoveryStore as {
+              inspectWitnessBinding: () => unknown
+            }
+          ).inspectWitnessBinding()
+
+          assertPersistedWitnessBinding(inspectedBinding, {
+            slotId,
+            storeId,
+            logicalRoot,
+            generation: 0,
+            context: 'inspectWitnessBinding post-enrollment snapshot'
+          })
+        }
       }
     } else {
       enrolledSnapshot = parseTm1RollbackWitnessSnapshot(rawRead)

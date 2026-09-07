@@ -47,8 +47,10 @@ const {
   assertWitnessReservationResponseBinding,
   assertWitnessEnrollmentBinding,
   assertWitnessFinalizationBinding,
+  assertPersistedWitnessBinding,
   assertTm1CommittedDispatchIntentBinding,
   computeCanonicalWholeStoreRoot,
+  compareStringsCodeUnit,
   deepEqual,
   deriveStoreSlotId,
   isStoreNonEmpty,
@@ -438,6 +440,78 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
       expect(harness.getDispatchCount()).toBe(0)
     })
 
+    test('Step 6: rejects preparedReview with mismatched preparedId (PREPARED_REVIEW_MISMATCH) (Finding 1)', async () => {
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      const mismatchedPreparedReview = {
+        ...step4.preparedReview,
+        preparedId: 'prepared-e2e-different-id'
+      }
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          mismatchedPreparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/PREPARED_REVIEW_MISMATCH/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects preparedReview with mismatched bindingHash (PREPARED_REVIEW_MISMATCH) (Finding 1)', async () => {
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      const mismatchedPreparedReview = {
+        ...step4.preparedReview,
+        bindingHash: '00'.repeat(32)
+      }
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          mismatchedPreparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/PREPARED_REVIEW_MISMATCH: bindingHash mismatch/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects preparedReview with tampered fields not matching orchestrator internal review (PREPARED_REVIEW_MISMATCH) (Finding 1)', async () => {
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      const tamperedPreparedReview = {
+        ...step4.preparedReview,
+        message: 'tampered memo content'
+      }
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          tamperedPreparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/PREPARED_REVIEW_MISMATCH: Provided preparedReview does not match orchestrator internal preparedReview/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
     test('Step 6: enforces exactly-once dispatch (blocks secondary dispatch)', async () => {
       const harness = createTm1RegtestE2eHarness({
         alias: TEST_ALIAS,
@@ -496,6 +570,127 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
           step5.signedReview
         )
       ).rejects.toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH.*operationId mismatch/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects when witness enroll returns non-genesis snapshot with non-null previousStableReceiptHash (Finding 2)', async () => {
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      const byzantineWitness = {
+        read: (req: any) => realWitness.read(req),
+        enroll: async (req: any) => {
+          const snapshot = parseTm1RollbackWitnessSnapshot(await realWitness.enroll(req))
+          return {
+            ...snapshot,
+            stable: {
+              ...snapshot.stable,
+              generation: 1,
+              previousStableReceiptHash: '99'.repeat(32)
+            }
+          }
+        },
+        reserve: (req: any) => realWitness.reserve(req),
+        finalize: (req: any) => realWitness.finalize(req),
+        verifyRecord: async () => true
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        witness: byzantineWitness as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH: previousStableReceiptHash mismatch/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects when recovery store enrollWitnessBinding returns invalid/corrupted binding (Finding 3)', async () => {
+      const realStore = new Tm1HarnessRecoveryStore()
+      const byzantineStore = {
+        storeId: realStore.getStoreId(),
+        getStoreId: () => realStore.getStoreId(),
+        listRecoverable: () => realStore.listRecoverable(),
+        create: (input: any) => realStore.create(input),
+        commitExecutionEvidence: (input: any) => realStore.commitExecutionEvidence(input),
+        commitDispatchIntent: (input: any) => realStore.commitDispatchIntent(input),
+        load: (pubId: string) => realStore.load(pubId),
+        commitTransportAcknowledgement: (input: any) => realStore.commitTransportAcknowledgement(input),
+        commitRecoveryTransition: (input: any) => realStore.commitRecoveryTransition(input),
+        claimOwnership: (input: any) => realStore.claimOwnership(input),
+        computeEnrollmentLogicalRoot: (id: any) => realStore.computeEnrollmentLogicalRoot(id),
+        enrollWitnessBinding: () => ({
+          slotId: 'slot:corrupted',
+          storeId: realStore.getStoreId(),
+          generation: 0,
+          logicalRoot: '00'.repeat(32)
+        }),
+        inspectWitnessBinding: () => null
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: byzantineStore as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/PERSISTED_ENROLLMENT_BINDING_MISMATCH: slotId mismatch/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects when recovery store fails to persist witness enrollment binding or inspectWitnessBinding diverges (Finding 3)', async () => {
+      const realStore = new Tm1HarnessRecoveryStore()
+      const byzantineStore = {
+        storeId: realStore.getStoreId(),
+        getStoreId: () => realStore.getStoreId(),
+        listRecoverable: () => realStore.listRecoverable(),
+        create: (input: any) => realStore.create(input),
+        commitExecutionEvidence: (input: any) => realStore.commitExecutionEvidence(input),
+        commitDispatchIntent: (input: any) => realStore.commitDispatchIntent(input),
+        load: (pubId: string) => realStore.load(pubId),
+        commitTransportAcknowledgement: (input: any) => realStore.commitTransportAcknowledgement(input),
+        commitRecoveryTransition: (input: any) => realStore.commitRecoveryTransition(input),
+        claimOwnership: (input: any) => realStore.claimOwnership(input),
+        computeEnrollmentLogicalRoot: (id: any) => realStore.computeEnrollmentLogicalRoot(id),
+        enrollWitnessBinding: (binding: any) => {
+          realStore.enrollWitnessBinding(binding)
+          return { ...binding, generation: 0 }
+        },
+        inspectWitnessBinding: () => null // Persistence failure: DB didn't save or returned null
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: byzantineStore as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/PERSISTED_ENROLLMENT_BINDING_MISMATCH: Expected valid binding object, got object/)
 
       expect(harness.getDispatchCount()).toBe(0)
     })
@@ -1268,6 +1463,100 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
       expect(rootGen0).not.toBe('01'.repeat(32))
     })
 
+    test('computeCanonicalWholeStoreRoot: root ordering is deterministic and ignores localeCompare (Finding 4)', () => {
+      const storeId = `tm1-store:v1:${'11'.repeat(32)}`
+      const slotId = 'slot:test'
+
+      const recordA = parseTm1PublicationRecoveryRecord({
+        schema: 'tonalli.tm1-publication-recovery',
+        schemaVersion: 1,
+        publicationId: 'pub:Alpha',
+        revision: 1,
+        ownerEpoch: 1,
+        phase: 'preDispatch',
+        preDispatchStage: 'broadcastAuthorizationConsumed',
+        prepared: {
+          preparedId: 'prep:seed1',
+          bindingHash: '11'.repeat(32),
+          preparedDigest: '11'.repeat(32)
+        },
+        signed: {
+          signedId: 'signed:seed1',
+          txid: '22'.repeat(32),
+          signedArtifactHash: '33'.repeat(32)
+        },
+        signingAuthorization: {
+          operationId: 'op:s',
+          capabilityId: 'cap:s',
+          contentHash: `sha256:${'11'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500,
+          preparedId: 'prep:seed1',
+          bindingHash: '11'.repeat(32)
+        },
+        broadcastAuthorization: {
+          operationId: 'op:b',
+          capabilityId: 'cap:b',
+          contentHash: `sha256:${'22'.repeat(32)}` as const,
+          expiresAt: 1000,
+          consumedAt: 500,
+          signedId: 'signed:seed1',
+          txid: '22'.repeat(32),
+          signedArtifactHash: '33'.repeat(32)
+        },
+        dispatchIntent: null,
+        transportAcknowledgement: null,
+        lastObservation: null,
+        terminal: null
+      })
+
+      const recordB = parseTm1PublicationRecoveryRecord({
+        ...recordA,
+        publicationId: 'pub:alpha'
+      })
+
+      // Root calculated in order [recordA, recordB]
+      const root1 = computeCanonicalWholeStoreRoot({
+        storeId,
+        slotId,
+        generation: 0,
+        records: [recordA, recordB],
+        capabilityIds: ['cap:b', 'cap:Beta']
+      })
+
+      // Root calculated in reverse order [recordB, recordA] must be identical
+      const root2 = computeCanonicalWholeStoreRoot({
+        storeId,
+        slotId,
+        generation: 0,
+        records: [recordB, recordA],
+        capabilityIds: ['cap:Beta', 'cap:b']
+      })
+
+      expect(root1).toBe(root2)
+
+      // Verify that localeCompare is never invoked during computeCanonicalWholeStoreRoot
+      const originalLocaleCompare = String.prototype.localeCompare
+      let localeCompareCalled = false
+      try {
+        String.prototype.localeCompare = function () {
+          localeCompareCalled = true
+          throw new Error('localeCompare should never be called in canonical root computation!')
+        }
+        const rootNoLocale = computeCanonicalWholeStoreRoot({
+          storeId,
+          slotId,
+          generation: 0,
+          records: [recordB, recordA],
+          capabilityIds: ['cap:Beta', 'cap:b']
+        })
+        expect(rootNoLocale).toBe(root1)
+        expect(localeCompareCalled).toBe(false)
+      } finally {
+        String.prototype.localeCompare = originalLocaleCompare
+      }
+    })
+
     test('Direct assertion helper test: assertWitnessReservationResponseBinding checks all mismatch cases', () => {
       const mockStable = {
         protocol: 'tonalli.tm1-rollback-witness' as const,
@@ -1560,6 +1849,72 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
           mockReq
         )
       }).toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH: operationId mismatch/)
+
+      // Non-null previousStableReceiptHash (Finding 2)
+      expect(() => {
+        assertWitnessEnrollmentBinding(
+          {
+            stable: { ...validStable, previousStableReceiptHash: '88'.repeat(32) },
+            pending: null
+          },
+          mockReq
+        )
+      }).toThrow(/WITNESS_ENROLLMENT_BINDING_MISMATCH: previousStableReceiptHash mismatch/)
+    })
+
+    test('Direct assertion helper test: assertPersistedWitnessBinding checks all mismatch cases (Finding 3)', () => {
+      const expected = {
+        slotId: 'slot:test',
+        storeId: `tm1-store:v1:${'11'.repeat(32)}`,
+        logicalRoot: '00'.repeat(32),
+        generation: 0
+      }
+      const valid = { ...expected }
+
+      // Valid pass
+      expect(() => {
+        assertPersistedWitnessBinding(valid, expected)
+      }).not.toThrow()
+
+      // Null or primitive binding
+      expect(() => {
+        assertPersistedWitnessBinding(null, expected)
+      }).toThrow(/PERSISTED_ENROLLMENT_BINDING_MISMATCH: Expected valid binding object, got object/)
+      expect(() => {
+        assertPersistedWitnessBinding(undefined, expected)
+      }).toThrow(/PERSISTED_ENROLLMENT_BINDING_MISMATCH: Expected valid binding object, got undefined/)
+
+      // SlotId mismatch
+      expect(() => {
+        assertPersistedWitnessBinding({ ...valid, slotId: 'slot:diff' }, expected)
+      }).toThrow(/PERSISTED_ENROLLMENT_BINDING_MISMATCH: slotId mismatch/)
+
+      // StoreId mismatch
+      expect(() => {
+        assertPersistedWitnessBinding({ ...valid, storeId: 'store:diff' }, expected)
+      }).toThrow(/PERSISTED_ENROLLMENT_BINDING_MISMATCH: storeId mismatch/)
+
+      // LogicalRoot mismatch
+      expect(() => {
+        assertPersistedWitnessBinding({ ...valid, logicalRoot: 'ff'.repeat(32) }, expected)
+      }).toThrow(/PERSISTED_ENROLLMENT_BINDING_MISMATCH: logicalRoot mismatch/)
+
+      // Generation mismatch
+      expect(() => {
+        assertPersistedWitnessBinding({ ...valid, generation: 1 }, expected)
+      }).toThrow(/PERSISTED_ENROLLMENT_BINDING_MISMATCH: generation mismatch/)
+    })
+
+    test('Direct comparator test: compareStringsCodeUnit enforces deterministic code-unit ordering (Finding 4)', () => {
+      expect(compareStringsCodeUnit('a', 'b')).toBe(-1)
+      expect(compareStringsCodeUnit('b', 'a')).toBe(1)
+      expect(compareStringsCodeUnit('a', 'a')).toBe(0)
+      // Uppercase ASCII code units vs lowercase
+      expect(compareStringsCodeUnit('A', 'a')).toBe(-1)
+      expect(compareStringsCodeUnit('a', 'A')).toBe(1)
+      // Numeric code units
+      expect(compareStringsCodeUnit('10', '2')).toBe(-1)
+      expect(compareStringsCodeUnit('2', '10')).toBe(1)
     })
 
     test('Direct assertion helper test: assertTm1CommittedDispatchIntentBinding checks mismatch cases', () => {
@@ -2688,7 +3043,7 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
       const underlying = new Tm1HarnessRecoveryStore()
       let schema: 'v1' | 'v2' = 'v1'
       const lifecycleCalls: string[] = []
-      let storedBinding: { slotId: string; storeId: string; logicalRoot: string } | null = null
+      let storedBinding: { slotId: string; storeId: string; logicalRoot: string; generation: number } | null = null
 
       const sqliteStore = {
         storeId: underlying.storeId,
@@ -2715,8 +3070,8 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
             throw new Error(`SQLITE_LIFECYCLE_ERROR: enrollWitnessBinding requires schema v1, current is ${schema}`)
           }
           schema = 'v2'
-          storedBinding = { ...binding }
-          underlying.enrollWitnessBinding(binding)
+          storedBinding = { ...binding, generation: 0 }
+          return underlying.enrollWitnessBinding(binding)
         },
         computeWitnessLogicalRoot: (generation: number) => {
           if (schema !== 'v2') {
