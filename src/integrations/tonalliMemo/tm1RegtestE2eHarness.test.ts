@@ -390,6 +390,54 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
       expect(harness.getDispatchCount()).toBe(0)
     })
 
+    test('Step 6: rejects signedReview with mismatched signedArtifactHash (SIGNED_REVIEW_MISMATCH) (Finding 1)', async () => {
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      const mismatchedSignedReview = {
+        ...step5.signedReview,
+        signedArtifactHash: '11'.repeat(32)
+      }
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          mismatchedSignedReview
+        )
+      ).rejects.toThrow(/SIGNED_REVIEW_MISMATCH: signedArtifactHash mismatch/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Step 6: rejects signedReview with tampered fields not matching orchestrator internal review (Finding 1)', async () => {
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      const tamperedSignedReview = {
+        ...step5.signedReview,
+        signedId: 'tampered-signed-id'
+      }
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          tamperedSignedReview
+        )
+      ).rejects.toThrow(/SIGNED_REVIEW_MISMATCH: Provided signedReview does not match orchestrator internal signedReview/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
     test('Step 6: enforces exactly-once dispatch (blocks secondary dispatch)', async () => {
       const harness = createTm1RegtestE2eHarness({
         alias: TEST_ALIAS,
@@ -2634,6 +2682,152 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
       for (const callArg of callLog) {
         expect(typeof callArg).toBe('number')
       }
+    })
+
+    test('Step 6 executes sequential SQLite enrollment lifecycle (computeEnrollmentLogicalRoot -> enroll -> enrollWitnessBinding) transitioning v1 to v2 (Finding 2)', async () => {
+      const underlying = new Tm1HarnessRecoveryStore()
+      let schema: 'v1' | 'v2' = 'v1'
+      const lifecycleCalls: string[] = []
+      let storedBinding: { slotId: string; storeId: string; logicalRoot: string } | null = null
+
+      const sqliteStore = {
+        storeId: underlying.storeId,
+        createdAt: underlying.createdAt,
+        load: (id: string) => underlying.load(id),
+        listRecoverable: () => underlying.listRecoverable(),
+        create: (input: any) => underlying.create(input),
+        commitExecutionEvidence: (input: any) => underlying.commitExecutionEvidence(input),
+        commitDispatchIntent: (input: any) => underlying.commitDispatchIntent(input),
+        commitTransportAcknowledgement: (input: any) => underlying.commitTransportAcknowledgement(input),
+        commitRecoveryTransition: (input: any) => underlying.commitRecoveryTransition(input),
+        claimOwnership: (input: any) => underlying.claimOwnership(input),
+        inspectWitnessBinding: () => storedBinding,
+        computeEnrollmentLogicalRoot: (identity: { slotId: string; storeId: string }) => {
+          lifecycleCalls.push(`computeEnrollmentLogicalRoot:${identity.slotId}`)
+          if (schema !== 'v1') {
+            throw new Error(`SQLITE_LIFECYCLE_ERROR: computeEnrollmentLogicalRoot requires schema v1, current is ${schema}`)
+          }
+          return underlying.computeEnrollmentLogicalRoot(identity)
+        },
+        enrollWitnessBinding: (binding: { slotId: string; storeId: string; logicalRoot: string }) => {
+          lifecycleCalls.push(`enrollWitnessBinding:${binding.slotId}`)
+          if (schema !== 'v1') {
+            throw new Error(`SQLITE_LIFECYCLE_ERROR: enrollWitnessBinding requires schema v1, current is ${schema}`)
+          }
+          schema = 'v2'
+          storedBinding = { ...binding }
+          underlying.enrollWitnessBinding(binding)
+        },
+        computeWitnessLogicalRoot: (generation: number) => {
+          if (schema !== 'v2') {
+            throw new Error(`STORE_FAILURE: cannot compute logical root on v1 unenrolled store (generation ${generation})`)
+          }
+          return underlying.computeWitnessLogicalRoot(generation)
+        },
+        computeProjectedWitnessLogicalRoot: (projectedRecord: any, generation?: number) => {
+          return underlying.computeProjectedWitnessLogicalRoot(projectedRecord, generation)
+        }
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: sqliteStore as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      // Step 6 should have cleanly called computeEnrollmentLogicalRoot first, then enrolled on witness, then enrollWitnessBinding
+      const expectedSlotId = deriveStoreSlotId(underlying.storeId)
+      expect(lifecycleCalls).toEqual([
+        `computeEnrollmentLogicalRoot:${expectedSlotId}`,
+        `enrollWitnessBinding:${expectedSlotId}`
+      ])
+      expect(schema).toBe('v2')
+      expect(storedBinding).not.toBeNull()
+      expect(harness.getDispatchCount()).toBe(1)
+
+      // And Step 7 should succeed on the enrolled v2 store
+      const step7 = await harness.executeStep7VerifyFinalSuccess(
+        step4.preparedReview,
+        step5.signedReview,
+        step6.submissionReceipt,
+        step6.witnessReservationSnapshot
+      )
+      expect(step7.transportAcknowledgedRecord.phase).toBe('submittedObserved')
+    })
+
+    test('Step 6 and Step 7 delegate projected roots calculation to store.computeProjectedWitnessLogicalRoot (Finding 3)', async () => {
+      const underlying = new Tm1HarnessRecoveryStore()
+      const projectedCalls: Array<{
+        phase: string
+        publicationId: string
+        generation?: number
+      }> = []
+
+      const delegatingStore = {
+        storeId: underlying.storeId,
+        createdAt: underlying.createdAt,
+        load: (id: string) => underlying.load(id),
+        listRecoverable: () => underlying.listRecoverable(),
+        create: (input: any) => underlying.create(input),
+        commitExecutionEvidence: (input: any) => underlying.commitExecutionEvidence(input),
+        commitDispatchIntent: (input: any) => underlying.commitDispatchIntent(input),
+        commitTransportAcknowledgement: (input: any) => underlying.commitTransportAcknowledgement(input),
+        commitRecoveryTransition: (input: any) => underlying.commitRecoveryTransition(input),
+        claimOwnership: (input: any) => underlying.claimOwnership(input),
+        inspectWitnessBinding: () => underlying.inspectWitnessBinding(),
+        computeEnrollmentLogicalRoot: (identity: any) => underlying.computeEnrollmentLogicalRoot(identity),
+        enrollWitnessBinding: (binding: any) => underlying.enrollWitnessBinding(binding),
+        computeWitnessLogicalRoot: (generation: number) => underlying.computeWitnessLogicalRoot(generation),
+        computeProjectedWitnessLogicalRoot: (projectedRecord: any, generation?: number) => {
+          projectedCalls.push({
+            phase: projectedRecord.phase,
+            publicationId: projectedRecord.publicationId,
+            generation
+          })
+          return underlying.computeProjectedWitnessLogicalRoot(projectedRecord, generation)
+        }
+      }
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: delegatingStore as any
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+
+      // Step 6 projected reservation must have called computeProjectedWitnessLogicalRoot
+      expect(projectedCalls.length).toBe(1)
+      expect(projectedCalls[0].phase).toBe('outcomeUnknown')
+      expect(projectedCalls[0].publicationId).toBe(step6.dispatchIntentRecord.publicationId)
+      expect(projectedCalls[0].generation).toBe(1)
+
+      const step7 = await harness.executeStep7VerifyFinalSuccess(
+        step4.preparedReview,
+        step5.signedReview,
+        step6.submissionReceipt,
+        step6.witnessReservationSnapshot
+      )
+
+      // Step 7 projected acknowledgement reservation must have called computeProjectedWitnessLogicalRoot
+      expect(projectedCalls.length).toBe(2)
+      expect(projectedCalls[1].phase).toBe('submittedObserved')
+      expect(projectedCalls[1].publicationId).toBe(step6.dispatchIntentRecord.publicationId)
+      expect(projectedCalls[1].generation).toBe(2)
+
+      expect(step7.transportAcknowledgedRecord.phase).toBe('submittedObserved')
     })
   })
 })

@@ -683,6 +683,12 @@ export class Tm1HarnessRecoveryStore implements Tm1PublicationRecoveryStore {
   readonly createdAt: number
   private readonly records = new Map<string, Tm1PublicationRecoveryRecord>()
   private readonly capabilityIds = new Set<string>()
+  private witnessBinding: {
+    slotId: string
+    storeId: string
+    generation: number
+    logicalRoot: string
+  } | null = null
 
   constructor(
     storeIdOrRecord?: string | Tm1PublicationRecoveryRecord,
@@ -715,6 +721,83 @@ export class Tm1HarnessRecoveryStore implements Tm1PublicationRecoveryStore {
 
   getAllCapabilityIds(): readonly string[] {
     return Object.freeze([...this.capabilityIds.values()])
+  }
+
+  inspectWitnessBinding(): {
+    slotId: string
+    storeId: string
+    generation: number
+    logicalRoot: string
+  } | null {
+    return this.witnessBinding ? { ...this.witnessBinding } : null
+  }
+
+  computeEnrollmentLogicalRoot(identity: {
+    slotId: string
+    storeId: string
+  }): string {
+    return computeCanonicalWholeStoreRoot({
+      storeId: identity.storeId ?? this.storeId,
+      slotId: identity.slotId,
+      generation: 0,
+      createdAt: this.createdAt,
+      records: [...this.records.values()],
+      capabilityIds: [...this.capabilityIds]
+    })
+  }
+
+  enrollWitnessBinding(binding: {
+    slotId: string
+    storeId: string
+    logicalRoot: string
+  }): void {
+    if (this.witnessBinding !== null) {
+      throw new Error('ALREADY_ENROLLED: Witness binding already enrolled')
+    }
+    const expectedRoot = this.computeEnrollmentLogicalRoot(binding)
+    if (binding.logicalRoot !== expectedRoot) {
+      throw new Error(
+        `ENROLLMENT_ROOT_MISMATCH: Provided logicalRoot ${binding.logicalRoot} does not match expected ${expectedRoot}`
+      )
+    }
+    this.witnessBinding = Object.freeze({
+      slotId: binding.slotId,
+      storeId: binding.storeId,
+      generation: 0,
+      logicalRoot: binding.logicalRoot
+    })
+  }
+
+  computeProjectedWitnessLogicalRoot(
+    projectedRecord: Tm1PublicationRecoveryRecord,
+    generation?: number
+  ): string {
+    const effectiveRecords = [
+      ...[...this.records.values()].filter(
+        r => r.publicationId !== projectedRecord.publicationId
+      ),
+      projectedRecord
+    ]
+    const storeCapabilities = [...this.capabilityIds]
+    const recordCapabilities = effectiveRecords.flatMap(consumedCapabilityIds)
+    const mergedCapabilities = [
+      ...new Set([...storeCapabilities, ...recordCapabilities])
+    ]
+    const gen =
+      typeof generation === 'number'
+        ? generation
+        : this.witnessBinding
+          ? this.witnessBinding.generation + 1
+          : 1
+
+    return computeCanonicalWholeStoreRoot({
+      storeId: this.storeId,
+      slotId: deriveStoreSlotId(this.storeId),
+      generation: gen,
+      createdAt: this.createdAt,
+      records: effectiveRecords,
+      capabilityIds: mergedCapabilities
+    })
   }
 
   computeWitnessLogicalRoot(generation: number): string {
@@ -922,7 +1005,9 @@ export class Tm1RegtestE2eHarness {
   readonly witness: Tm1RollbackWitness
   readonly recoveryStore: Tm1PublicationRecoveryStore
   readonly deliveryTransport: Tm1RegtestDeliveryTransport
-  readonly orchestrator: Tm1RegtestPublicationOrchestrator
+  readonly orchestrator: Tm1RegtestPublicationOrchestrator & {
+    getSignedReview?(preparedId?: string): Tm1SignedReview | null
+  }
   readonly ledger: Tm1HarnessApprovalLedger
   readonly broadcastAuthorizationPort: Tm1BroadcastAuthorizationPort
   private dispatchCalls = 0
@@ -1109,7 +1194,19 @@ export class Tm1RegtestE2eHarness {
       clock
     }
 
-    this.orchestrator = new Tm1RegtestPublicationOrchestratorImpl(orchestratorDeps)
+    const orchestratorImpl = new Tm1RegtestPublicationOrchestratorImpl(orchestratorDeps)
+    this.orchestrator = Object.assign(orchestratorImpl, {
+      getSignedReview: (preparedId?: string): Tm1SignedReview | null => {
+        const state = orchestratorImpl.getState()
+        if (state.status === 'signedReviewReady') {
+          if (preparedId && state.signedReview.preparedId !== preparedId) {
+            return null
+          }
+          return state.signedReview
+        }
+        return null
+      }
+    })
   }
 
   getDispatchCount(): number {
@@ -1157,17 +1254,51 @@ export class Tm1RegtestE2eHarness {
     projectedCapabilities?: readonly string[]
   }): Promise<string> {
     if (
-      !input.projectedRecord &&
-      (!input.projectedCapabilities || input.projectedCapabilities.length === 0) &&
-      'computeWitnessLogicalRoot' in this.recoveryStore &&
-      typeof (this.recoveryStore as { computeWitnessLogicalRoot?: unknown })
-        .computeWitnessLogicalRoot === 'function'
+      input.projectedRecord &&
+      'computeProjectedWitnessLogicalRoot' in this.recoveryStore &&
+      typeof (this.recoveryStore as { computeProjectedWitnessLogicalRoot?: unknown })
+        .computeProjectedWitnessLogicalRoot === 'function'
     ) {
       return (
         this.recoveryStore as {
-          computeWitnessLogicalRoot: (generation: number) => string
+          computeProjectedWitnessLogicalRoot: (
+            projectedRecord: Tm1PublicationRecoveryRecord,
+            generation?: number
+          ) => string
         }
-      ).computeWitnessLogicalRoot(input.generation)
+      ).computeProjectedWitnessLogicalRoot(input.projectedRecord, input.generation)
+    }
+
+    if (
+      !input.projectedRecord &&
+      (!input.projectedCapabilities || input.projectedCapabilities.length === 0)
+    ) {
+      if (
+        input.generation === 0 &&
+        'computeEnrollmentLogicalRoot' in this.recoveryStore &&
+        typeof (this.recoveryStore as { computeEnrollmentLogicalRoot?: unknown })
+          .computeEnrollmentLogicalRoot === 'function' &&
+        (!('inspectWitnessBinding' in this.recoveryStore) ||
+          (this.recoveryStore as { inspectWitnessBinding?: () => unknown }).inspectWitnessBinding?.() === null)
+      ) {
+        return (
+          this.recoveryStore as {
+            computeEnrollmentLogicalRoot: (arg: { slotId: string; storeId: string }) => string
+          }
+        ).computeEnrollmentLogicalRoot({ slotId: input.slotId, storeId: input.storeId })
+      }
+
+      if (
+        'computeWitnessLogicalRoot' in this.recoveryStore &&
+        typeof (this.recoveryStore as { computeWitnessLogicalRoot?: unknown })
+          .computeWitnessLogicalRoot === 'function'
+      ) {
+        return (
+          this.recoveryStore as {
+            computeWitnessLogicalRoot: (generation: number) => string
+          }
+        ).computeWitnessLogicalRoot(input.generation)
+      }
     }
     const list = await this.recoveryStore.listRecoverable()
     const records = Array.isArray(list)
@@ -1399,15 +1530,40 @@ export class Tm1RegtestE2eHarness {
     dispatchIntentRecord: Tm1PublicationRecoveryRecord
     submissionReceipt: Tm1SubmissionReceipt
   }> {
-    // 0. Bind Step 6 inputs: verify signedReview strictly matches preparedReview (Finding 1)
-    if (signedReview.preparedId !== preparedReview.preparedId) {
+    // 0. Bind Step 6 inputs: deep-compare signedReview with orchestrator internal signedReview (Finding 1)
+    const orchState = this.orchestrator.getState()
+    const internalSignedReview =
+      typeof this.orchestrator.getSignedReview === 'function'
+        ? this.orchestrator.getSignedReview(preparedReview.preparedId)
+        : orchState.status === 'signedReviewReady' &&
+          orchState.signedReview.preparedId === preparedReview.preparedId
+          ? orchState.signedReview
+          : null
+
+    if (!internalSignedReview) {
       throw new Error(
-        `SIGNED_REVIEW_MISMATCH: preparedId mismatch (expected ${preparedReview.preparedId}, got ${signedReview.preparedId})`
+        `SIGNED_REVIEW_MISMATCH: No active signed review found in orchestrator for preparedId ${preparedReview.preparedId}`
       )
     }
-    if (signedReview.bindingHash !== preparedReview.bindingHash) {
+
+    if (signedReview.preparedId !== internalSignedReview.preparedId) {
       throw new Error(
-        `SIGNED_REVIEW_MISMATCH: bindingHash mismatch (expected ${preparedReview.bindingHash}, got ${signedReview.bindingHash})`
+        `SIGNED_REVIEW_MISMATCH: preparedId mismatch (expected ${internalSignedReview.preparedId}, got ${signedReview.preparedId})`
+      )
+    }
+    if (signedReview.bindingHash !== internalSignedReview.bindingHash) {
+      throw new Error(
+        `SIGNED_REVIEW_MISMATCH: bindingHash mismatch (expected ${internalSignedReview.bindingHash}, got ${signedReview.bindingHash})`
+      )
+    }
+    if (signedReview.signedArtifactHash !== internalSignedReview.signedArtifactHash) {
+      throw new Error(
+        `SIGNED_REVIEW_MISMATCH: signedArtifactHash mismatch (expected ${internalSignedReview.signedArtifactHash}, got ${signedReview.signedArtifactHash})`
+      )
+    }
+    if (!deepEqual(signedReview, internalSignedReview)) {
+      throw new Error(
+        `SIGNED_REVIEW_MISMATCH: Provided signedReview does not match orchestrator internal signedReview`
       )
     }
 
@@ -1428,11 +1584,36 @@ export class Tm1RegtestE2eHarness {
           'UNENROLLED_NONEMPTY_STORE: Cannot enroll an existing non-empty store as generation 0 on a missing witness slot'
         )
       }
-      const logicalRoot = await this.deriveStoreRoot({
-        slotId,
-        storeId,
-        generation: 0
-      })
+      if (
+        'inspectWitnessBinding' in this.recoveryStore &&
+        typeof (this.recoveryStore as { inspectWitnessBinding?: unknown }).inspectWitnessBinding === 'function' &&
+        (this.recoveryStore as { inspectWitnessBinding: () => unknown }).inspectWitnessBinding() !== null
+      ) {
+        throw new Error(
+          'UNENROLLED_NONEMPTY_STORE: Store is already enrolled in v2 but witness slot is missing'
+        )
+      }
+
+      // SQLite enrollment-root path: computeEnrollmentLogicalRoot before witness enroll (Finding 2)
+      let logicalRoot: string
+      if (
+        'computeEnrollmentLogicalRoot' in this.recoveryStore &&
+        typeof (this.recoveryStore as { computeEnrollmentLogicalRoot?: unknown })
+          .computeEnrollmentLogicalRoot === 'function'
+      ) {
+        logicalRoot = (
+          this.recoveryStore as {
+            computeEnrollmentLogicalRoot: (input: { slotId: string; storeId: string }) => string
+          }
+        ).computeEnrollmentLogicalRoot({ slotId, storeId })
+      } else {
+        logicalRoot = await this.deriveStoreRoot({
+          slotId,
+          storeId,
+          generation: 0
+        })
+      }
+
       const operationId = `enroll:${slotId}`
       const enrollRequest: Tm1RollbackWitnessEnrollment = {
         slotId,
@@ -1455,6 +1636,27 @@ export class Tm1RegtestE2eHarness {
         logicalRoot,
         operationId
       })
+
+      // Commit enrollment into recovery store lifecycle: enrollWitnessBinding (v1 -> v2) (Finding 2)
+      if (
+        'enrollWitnessBinding' in this.recoveryStore &&
+        typeof (this.recoveryStore as { enrollWitnessBinding?: unknown })
+          .enrollWitnessBinding === 'function'
+      ) {
+        ;(
+          this.recoveryStore as {
+            enrollWitnessBinding: (input: {
+              slotId: string
+              storeId: string
+              logicalRoot: string
+            }) => unknown
+          }
+        ).enrollWitnessBinding({
+          slotId,
+          storeId,
+          logicalRoot
+        })
+      }
     } else {
       enrolledSnapshot = parseTm1RollbackWitnessSnapshot(rawRead)
       const isAuthentic = await this.witness.verifyRecord(enrolledSnapshot.stable)
