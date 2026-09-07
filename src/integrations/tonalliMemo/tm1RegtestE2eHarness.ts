@@ -116,7 +116,8 @@ import type {
 } from '../../features/externalSign/lock'
 import {
   parseCashAddr,
-  canonicalizeEcashAddress
+  canonicalizeEcashAddress,
+  toXecAlias
 } from '../../utils/alias'
 
 export const TM1_PROGRAMMATIC_E2E_FIXTURE_ADDRESS =
@@ -126,6 +127,39 @@ export { TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX } from './tm1Draft02RegtestP2pkh
 
 export const DEFAULT_TM1_PROGRAMMATIC_E2E_MESSAGE =
   'Tonalli Memo TM1 E2E Programmatic Integration'
+
+/**
+ * Canonicalizes an alias option by trimming, lowercasing, and ensuring the `.xec` suffix.
+ */
+export function canonicalizeHarnessAlias(rawAlias: string): string {
+  const normalized = toXecAlias(rawAlias)
+  if (normalized !== null) {
+    return normalized
+  }
+  const trimmed = rawAlias.trim().toLowerCase()
+  return trimmed.endsWith('.xec') ? trimmed : `${trimmed}.xec`
+}
+
+/**
+ * Canonicalizes an owner address using strict CashAddr format (`ecash:<payload>`).
+ */
+export function canonicalizeHarnessOwnerAddress(rawAddress: string): string {
+  const trimmed = rawAddress.trim()
+  try {
+    return parseCashAddr(trimmed).cash().toString()
+  } catch {
+    const canonical = canonicalizeEcashAddress(trimmed)
+    if (canonical !== null) {
+      return canonical
+    }
+    if (!trimmed.toLowerCase().startsWith('ecash:')) {
+      try {
+        return parseCashAddr(`ecash:${trimmed}`).cash().toString()
+      } catch {}
+    }
+    return trimmed
+  }
+}
 
 export function createDefaultFixtureUtxos(
   lockingScriptHex: string = TM1_REGTEST_FIXTURE_LOCKING_SCRIPT_HEX,
@@ -1074,8 +1108,10 @@ export class Tm1RegtestE2eHarness {
   > | null = null
 
   constructor(options: Tm1ProgrammaticE2eOptions = {}) {
-    this.alias = options.alias ?? 'satoshi.xec'
-    this.ownerAddress = options.ownerAddress ?? TM1_PROGRAMMATIC_E2E_FIXTURE_ADDRESS
+    this.alias = canonicalizeHarnessAlias(options.alias ?? 'satoshi.xec')
+    this.ownerAddress = canonicalizeHarnessOwnerAddress(
+      options.ownerAddress ?? TM1_PROGRAMMATIC_E2E_FIXTURE_ADDRESS
+    )
     this.message = options.message ?? DEFAULT_TM1_PROGRAMMATIC_E2E_MESSAGE
     this.maxFeeSats = options.maxFeeSats ?? 10_000n
     this.activeLockingScriptHex =
@@ -1491,8 +1527,8 @@ export class Tm1RegtestE2eHarness {
       rawOwnerAddress = this.ownerAddress
     }
 
-    const canonicalOwner = canonicalizeEcashAddress(rawOwnerAddress)
-    if (!canonicalOwner) {
+    const canonicalOwner = canonicalizeHarnessOwnerAddress(rawOwnerAddress)
+    if (!canonicalOwner || !canonicalOwner.startsWith('ecash:')) {
       throw new Error(`INVALID_OWNER_ADDRESS: ${rawOwnerAddress}`)
     }
 
@@ -1799,6 +1835,25 @@ export class Tm1RegtestE2eHarness {
         if (!isPendingAuthentic) {
           throw new Error(
             'UNAUTHENTICATED_WITNESS_READ: Pending record signature/hash verification failed'
+          )
+        }
+      }
+
+      // Reject witness head when durable store is unbound (Finding 1 / P1)
+      if (
+        'inspectWitnessBinding' in this.recoveryStore &&
+        typeof (this.recoveryStore as { inspectWitnessBinding?: unknown })
+          .inspectWitnessBinding === 'function'
+      ) {
+        const localBinding = (
+          this.recoveryStore as {
+            inspectWitnessBinding: () => unknown
+          }
+        ).inspectWitnessBinding()
+
+        if (localBinding === null || localBinding === undefined) {
+          throw new Error(
+            'UNBOUND_LOCAL_STORE_WITH_ENROLLED_WITNESS: Local store has no persisted witness binding despite witness having an enrolled state'
           )
         }
       }

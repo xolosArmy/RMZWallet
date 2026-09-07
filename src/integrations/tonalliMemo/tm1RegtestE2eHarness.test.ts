@@ -58,6 +58,8 @@ const {
   extractStoreId,
   createDefaultFixtureUtxos,
   createTm1RegtestE2eHarness,
+  canonicalizeHarnessAlias,
+  canonicalizeHarnessOwnerAddress,
   executeTm1ProgrammaticE2ePipeline
 } = await import('./tm1RegtestE2eHarness')
 
@@ -2280,6 +2282,13 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
       const realWitness = new Tm1InMemoryRollbackWitness()
       const storeId = `tm1-store:v1:${'55'.repeat(32)}`
       const slotId = deriveStoreSlotId(storeId)
+      const store = new Tm1HarnessRecoveryStore(storeId)
+      const storeRoot = store.computeEnrollmentLogicalRoot({ slotId, storeId })
+      store.enrollWitnessBinding({
+        slotId,
+        storeId,
+        logicalRoot: storeRoot
+      })
       // Pre-enroll slot on witness with a mismatched root
       await realWitness.enroll({
         slotId,
@@ -2291,7 +2300,7 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
       const harness = createTm1RegtestE2eHarness({
         alias: TEST_ALIAS,
         ownerAddress: TEST_OWNER,
-        recoveryStore: new Tm1HarnessRecoveryStore(storeId),
+        recoveryStore: store,
         witness: realWitness
       })
 
@@ -2304,6 +2313,103 @@ describe('Tm1RegtestE2eHarness — Gate C Programmatic E2E Integration', () => {
           step5.signedReview
         )
       ).rejects.toThrow(/STORE_ROLLBACK_DETECTED/)
+    })
+
+    test('Step 6: rejects with UNBOUND_LOCAL_STORE_WITH_ENROLLED_WITNESS when witness is enrolled but local store is unbound (Finding 1 / P1)', async () => {
+      const realWitness = new Tm1InMemoryRollbackWitness()
+      const storeId = `tm1-store:v1:${'77'.repeat(32)}`
+      const slotId = deriveStoreSlotId(storeId)
+
+      // Pre-enroll slot on witness (simulating remote witness was enrolled)
+      await realWitness.enroll({
+        slotId,
+        storeId,
+        logicalRoot: '00'.repeat(32),
+        operationId: 'op:enroll'
+      })
+
+      // Store is fresh and unbound (simulating crash before enrollWitnessBinding was persisted)
+      const unboundStore = new Tm1HarnessRecoveryStore(storeId)
+      expect(unboundStore.inspectWitnessBinding()).toBeNull()
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: TEST_ALIAS,
+        ownerAddress: TEST_OWNER,
+        recoveryStore: unboundStore,
+        witness: realWitness
+      })
+
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx()
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+
+      await expect(
+        harness.executeStep6ReserveRecoveryAndDispatch(
+          step4.preparedReview,
+          step5.signedReview
+        )
+      ).rejects.toThrow(/UNBOUND_LOCAL_STORE_WITH_ENROLLED_WITNESS/)
+
+      expect(harness.getDispatchCount()).toBe(0)
+    })
+
+    test('Successfully accepts and canonicalizes alias without .xec and uppercase owner address (Finding 2 / P2)', async () => {
+      const bareAlias = 'satoshi'
+      const uppercaseOwner = TEST_OWNER.toUpperCase()
+      expect(bareAlias.endsWith('.xec')).toBe(false)
+      expect(uppercaseOwner).not.toBe(TEST_OWNER)
+
+      const harness = createTm1RegtestE2eHarness({
+        alias: bareAlias,
+        ownerAddress: uppercaseOwner
+      })
+
+      // Harness fields must be stored canonicalized
+      expect(harness.alias).toBe('satoshi.xec')
+      expect(harness.ownerAddress).toBe(TEST_OWNER)
+
+      // Step 1: verify alias (mock fetch responds to canonical satoshi.xec)
+      setupMockFetch('satoshi.xec', TEST_OWNER)
+      const evidenceToken = await harness.executeStep1VerifyAlias()
+
+      // Step 2: produce evidence must match canonical alias and owner without ALIAS_EVIDENCE_UNTRUSTED
+      const verifiedSnapshot = harness.executeStep2ProduceEvidence(evidenceToken)
+      expect(verifiedSnapshot.alias).toBe('satoshi.xec')
+      expect(verifiedSnapshot.address).toBe(TEST_OWNER)
+
+      // Step 3: authorize publication
+      const auth = harness.executeStep3AuthorizePublication(evidenceToken)
+      expect(auth.alias).toBe('satoshi.xec')
+      expect(auth.ownerAddress).toBe(TEST_OWNER)
+
+      // Steps 4 to 7 run through end-to-end without error
+      const step4 = await harness.executeStep4PrepareMemoAndUnsignedTx(auth)
+      const step5 = await harness.executeStep5DualAuthorizeAndSign(step4.preparedReview)
+      const step6 = await harness.executeStep6ReserveRecoveryAndDispatch(
+        step4.preparedReview,
+        step5.signedReview
+      )
+      const step7 = await harness.executeStep7VerifyFinalSuccess(
+        step4.preparedReview,
+        step5.signedReview,
+        step6.submissionReceipt,
+        step6.witnessReservationSnapshot
+      )
+      expect(step7.transportAcknowledgedRecord.phase).toBe('submittedObserved')
+    })
+
+    test('Unit tests for canonicalizeHarnessAlias and canonicalizeHarnessOwnerAddress (Finding 2 / P2)', () => {
+      expect(canonicalizeHarnessAlias('satoshi')).toBe('satoshi.xec')
+      expect(canonicalizeHarnessAlias('satoshi.xec')).toBe('satoshi.xec')
+      expect(canonicalizeHarnessAlias('SATOSHI')).toBe('satoshi.xec')
+      expect(canonicalizeHarnessAlias('SATOSHI.XEC')).toBe('satoshi.xec')
+      expect(canonicalizeHarnessAlias('  alice  ')).toBe('alice.xec')
+      expect(canonicalizeHarnessAlias('  alice.xec  ')).toBe('alice.xec')
+
+      expect(canonicalizeHarnessOwnerAddress(TEST_OWNER.toUpperCase())).toBe(TEST_OWNER)
+      expect(canonicalizeHarnessOwnerAddress(`  ${TEST_OWNER.toUpperCase()}  `)).toBe(TEST_OWNER)
+      const bareAddress = TEST_OWNER.replace(/^ecash:/, '')
+      expect(canonicalizeHarnessOwnerAddress(bareAddress)).toBe(TEST_OWNER)
+      expect(canonicalizeHarnessOwnerAddress(bareAddress.toUpperCase())).toBe(TEST_OWNER)
     })
 
     test('Rejects with STORE_ROLLBACK_DETECTED in Step 7 if store is modified/rolled back before acknowledgement (Finding 2)', async () => {
