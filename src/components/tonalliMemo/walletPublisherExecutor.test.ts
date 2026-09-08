@@ -6,6 +6,7 @@ import {
   fromHex,
   P2PKHSignatory,
   shaRmd160,
+  toHex,
   Tx
 } from 'ecash-lib'
 import type { ScriptUtxo } from 'chronik-client'
@@ -350,6 +351,10 @@ describe('walletPublisherExecutor components', () => {
     })
 
     it('resolves HD signatories via walletService.getHdSignatoryForOwner for multi-path UTXOs', async () => {
+      const skActive = fromHex('55'.repeat(32))
+      const pkActive = ecc.derivePubkey(skActive)
+      const sigActive = P2PKHSignatory(skActive, pkActive, ALL_BIP143)
+
       const skChange = fromHex('66'.repeat(32))
       const pkChange = ecc.derivePubkey(skChange)
       const addrChange = Address.p2pkh(shaRmd160(pkChange)).toString()
@@ -357,6 +362,22 @@ describe('walletPublisherExecutor components', () => {
 
       const mockWalletService = {
         getHdOwnedUtxos: vi.fn().mockResolvedValue([
+          {
+            utxo: {
+              outpoint: { txid: '88'.repeat(32), outIdx: 0 },
+              blockHeight: 800000,
+              sats: 100n,
+              isCoinbase: false,
+              isFinal: true
+            },
+            owner: {
+              address: testAddress,
+              hdPath: "m/44'/899'/0'/0/0",
+              branch: 'receive' as const,
+              index: 0,
+              signatory: sigActive
+            }
+          },
           {
             utxo: {
               outpoint: { txid: '77'.repeat(32), outIdx: 0 },
@@ -388,6 +409,118 @@ describe('walletPublisherExecutor components', () => {
         expect.objectContaining({ hdPath: "m/44'/899'/0'/1/2" })
       )
       expect(signed.rawTxBytes).toBeDefined()
+    })
+
+    it('places activeAddress UTXO at input zero even when a change address has a giant UTXO', async () => {
+      const skActive = fromHex('11'.repeat(32))
+      const pkActive = ecc.derivePubkey(skActive)
+      const sigActive = P2PKHSignatory(skActive, pkActive, ALL_BIP143)
+
+      const skChange = fromHex('22'.repeat(32))
+      const pkChange = ecc.derivePubkey(skChange)
+      const addrChange = Address.p2pkh(shaRmd160(pkChange)).toString()
+      const sigChange = P2PKHSignatory(skChange, pkChange, ALL_BIP143)
+
+      const smallActiveUtxo = {
+        outpoint: { txid: 'aa'.repeat(32), outIdx: 0 },
+        blockHeight: 800000,
+        sats: 100n, // small UTXO: less than network fee, forcing multi-input selection
+        isCoinbase: false,
+        isFinal: true
+      }
+
+      const giantChangeUtxo = {
+        outpoint: { txid: 'bb'.repeat(32), outIdx: 1 },
+        blockHeight: 800000,
+        sats: 10_000_000n, // giant UTXO on change address
+        isCoinbase: false,
+        isFinal: true
+      }
+
+      // Pass giant UTXO first in the array to guarantee it isn't an array-ordering coincidence
+      const hdUtxos = [
+        {
+          utxo: giantChangeUtxo,
+          owner: {
+            address: addrChange,
+            hdPath: "m/44'/899'/0'/1/0",
+            branch: 'change' as const,
+            index: 0,
+            signatory: sigChange
+          }
+        },
+        {
+          utxo: smallActiveUtxo,
+          owner: {
+            address: testAddress,
+            hdPath: "m/44'/899'/0'/0/0",
+            branch: 'receive' as const,
+            index: 0,
+            signatory: sigActive
+          }
+        }
+      ]
+
+      const signer = new WalletSigner({
+        address: testAddress,
+        hdUtxos
+      })
+
+      const signed = await signer.sign({ message: 'input-zero-guarantee' })
+      expect(typeof signed.rawTxBytes).toBe('string')
+
+      const tx = Tx.deser(fromHex(signed.rawTxBytes))
+      expect(tx.inputs.length).toBe(2)
+      // Input 0 MUST strictly be the activeAddress small UTXO
+      const input0Txid =
+        typeof tx.inputs[0].prevOut.txid === 'string'
+          ? tx.inputs[0].prevOut.txid
+          : toHex(tx.inputs[0].prevOut.txid)
+      expect(input0Txid).toBe('aa'.repeat(32))
+      expect(tx.inputs[0].prevOut.outIdx).toBe(0)
+
+      // Input 1 is the giant change UTXO added afterwards to cover the transaction
+      const input1Txid =
+        typeof tx.inputs[1].prevOut.txid === 'string'
+          ? tx.inputs[1].prevOut.txid
+          : toHex(tx.inputs[1].prevOut.txid)
+      expect(input1Txid).toBe('bb'.repeat(32))
+      expect(tx.inputs[1].prevOut.outIdx).toBe(1)
+    })
+
+    it('aborts with NO_UTXO_FOR_ACTIVE_ADDRESS when activeAddress has 0 UTXOs even if other HD addresses have funds', async () => {
+      const skChange = fromHex('22'.repeat(32))
+      const pkChange = ecc.derivePubkey(skChange)
+      const addrChange = Address.p2pkh(shaRmd160(pkChange)).toString()
+      const sigChange = P2PKHSignatory(skChange, pkChange, ALL_BIP143)
+
+      const hdUtxosOnlyChange = [
+        {
+          utxo: {
+            outpoint: { txid: 'cc'.repeat(32), outIdx: 0 },
+            blockHeight: 800000,
+            sats: 5_000_000n,
+            isCoinbase: false,
+            isFinal: true
+          },
+          owner: {
+            address: addrChange,
+            hdPath: "m/44'/899'/0'/1/0",
+            branch: 'change' as const,
+            index: 0,
+            signatory: sigChange
+          }
+        }
+      ]
+
+      const signer = new WalletSigner({
+        address: testAddress,
+        hdUtxos: hdUtxosOnlyChange
+      })
+
+      await expect(signer.sign({ message: 'fail-no-active-utxo' })).rejects.toThrow(
+        /NO_UTXO_FOR_ACTIVE_ADDRESS/
+      )
     })
   })
 })

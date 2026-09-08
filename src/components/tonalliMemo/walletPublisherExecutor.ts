@@ -276,13 +276,39 @@ export class WalletSigner {
       }
     })
 
-    const spendableUtxos = normalizedUtxos
-      .filter((item) => !item.utxo.token)
-      .sort((a, b) => (a.utxo.sats > b.utxo.sats ? -1 : 1))
+    const isSameAddress = (a: string, b: string): boolean => {
+      if (a === b) return true
+      return a.toLowerCase().replace(/^ecash:/, '') === b.toLowerCase().replace(/^ecash:/, '')
+    }
 
-    if (spendableUtxos.length === 0) {
+    const spendableUtxosTotal = normalizedUtxos.filter((item) => !item.utxo.token)
+
+    if (spendableUtxosTotal.length === 0) {
       throw new Error('INSUFFICIENT_FUNDS: No spendable XEC UTXOs found for address')
     }
+
+    // Author input (input[0]) must strictly belong to activeAddress (alias owner)
+    const activeAddressUtxos = spendableUtxosTotal
+      .filter((item) => isSameAddress(item.address, activeAddress))
+      .sort((a, b) => (a.utxo.sats > b.utxo.sats ? -1 : 1))
+
+    if (activeAddressUtxos.length === 0) {
+      throw new Error(
+        'NO_UTXO_FOR_ACTIVE_ADDRESS: La dirección activa no tiene ningún UTXO disponible para firmar como autor en input[0]'
+      )
+    }
+
+    // Place an activeAddress UTXO unconditionally at input position 0
+    const primaryAuthorUtxo = activeAddressUtxos[0]
+    const remainingActiveUtxos = activeAddressUtxos.slice(1)
+    const otherUtxos = spendableUtxosTotal.filter((item) => !isSameAddress(item.address, activeAddress))
+
+    // Remaining UTXOs sorted by value descending to cover fees/amounts if needed
+    const remainingUtxos = [...remainingActiveUtxos, ...otherUtxos].sort((a, b) =>
+      a.utxo.sats > b.utxo.sats ? -1 : 1
+    )
+
+    const spendableUtxos = [primaryAuthorUtxo, ...remainingUtxos]
 
     // 4. Construct outputs: OP_RETURN at index 0, change to activeAddress
     const opReturnScript = new Script(fromHex(scriptHex))
