@@ -34,7 +34,6 @@ export function TonalliMemoComposer({
     setMessage,
     verifyOwnership,
     reconcilePending,
-    dismissPending,
     publish,
     reset
   } = useTm1PublishMachine({
@@ -87,14 +86,6 @@ export function TonalliMemoComposer({
               data-testid="reconcile-chronik-btn"
             >
               Verificar en Chronik
-            </button>
-            <button
-              type="button"
-              className="cta outline small"
-              onClick={dismissPending}
-              data-testid="dismiss-pending-btn"
-            >
-              Descartar registro expirado
             </button>
           </div>
         </div>

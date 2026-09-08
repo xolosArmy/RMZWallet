@@ -583,6 +583,25 @@ export class WalletPublisherExecutor implements Tm1PublisherExecutor {
     if (signal?.aborted) {
       throw new Error('OPERATION_ABORTED')
     }
+    const existingNonce = (evidenceToken as { nonce?: string }).nonce
+    const nonce =
+      existingNonce ??
+      (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`)
+    const timestamp = (evidenceToken as { timestamp?: number }).timestamp ?? Date.now()
+    const evidenceHash =
+      (evidenceToken as { evidenceHash?: string }).evidenceHash ??
+      toHex(sha256(new TextEncoder().encode(`${nonce}:${timestamp}`)))
+
+    const presentedEvidence = {
+      ...evidenceToken,
+      nonce,
+      timestamp,
+      evidenceHash,
+      attemptId: nonce
+    }
+
     const auth = this.authorizer as Tm1PublicationAuthorizerLike
     if (typeof auth.issue === 'function') {
       const raw =
@@ -596,33 +615,13 @@ export class WalletPublisherExecutor implements Tm1PublisherExecutor {
         (evidenceToken as { ownerAddress?: string; address?: string }).ownerAddress ??
         (evidenceToken as { address?: string }).address ??
         ''
-      const evidenceToPass = snapshot !== undefined ? raw : evidenceToken
       return auth.issue({
         alias,
         ownerAddress,
-        evidence: evidenceToPass
+        evidence: presentedEvidence
       })
     }
     if (typeof auth.authorizePublication === 'function') {
-      const existingNonce = (evidenceToken as { nonce?: string }).nonce
-      const nonce =
-        existingNonce ??
-        (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-          ? crypto.randomUUID()
-          : `${Date.now()}-${Math.random().toString(36).slice(2)}`)
-      const timestamp = (evidenceToken as { timestamp?: number }).timestamp ?? Date.now()
-      const evidenceHash =
-        (evidenceToken as { evidenceHash?: string }).evidenceHash ??
-        toHex(sha256(new TextEncoder().encode(`${nonce}:${timestamp}`)))
-
-      const presentedEvidence = {
-        ...evidenceToken,
-        nonce,
-        timestamp,
-        evidenceHash,
-        attemptId: nonce
-      }
-
       return auth.authorizePublication(
         {
           verifiedAliasEvidenceToken: presentedEvidence

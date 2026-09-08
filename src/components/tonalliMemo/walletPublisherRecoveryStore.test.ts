@@ -222,7 +222,7 @@ describe('Tm1WebStoragePublicationRecoveryStore durability and error propagation
   it('filters recoverable publications by address and returns all recoverable if no address query provided', async () => {
     const storeA = new Tm1ProductionRecoveryStore({
       address: 'ecash:qzaddressA',
-      storage: null
+      storage: window.localStorage
     })
 
     const preA = createSamplePreDispatchRecord('pub-a')
@@ -248,6 +248,70 @@ describe('Tm1WebStoragePublicationRecoveryStore durability and error propagation
     // Query without address filter returns all
     const listAll = (await storeA.listRecoverable()) as Tm1PublicationRecoveryRecord[]
     expect(listAll).toHaveLength(1)
+  })
+
+  it('fails closed and throws Durable storage unavailable on any mutation when storage is null', async () => {
+    const store = new Tm1ProductionRecoveryStore({
+      address: 'ecash:qznullstorage',
+      storage: null
+    })
+
+    const record = createSamplePreDispatchRecord('pub-fail-closed')
+
+    // create() must fail closed
+    await expect(store.create({ record })).rejects.toThrow('Durable storage unavailable')
+
+    // commitDispatchIntent() must fail closed
+    await expect(
+      store.commitDispatchIntent({
+        publicationId: 'pub-fail-closed',
+        expectedRevision: 1,
+        expectedOwnerEpoch: 1,
+        nextRecord: record
+      })
+    ).rejects.toThrow('Durable storage unavailable')
+
+    // remove() must fail closed
+    await expect(store.remove('pub-fail-closed')).rejects.toThrow('Durable storage unavailable')
+
+    // clear() must fail closed
+    await expect(store.clear()).rejects.toThrow('Durable storage unavailable')
+
+    // In-memory state must remain completely unaltered and empty
+    expect(await store.load('pub-fail-closed')).toBeNull()
+    expect(store.getAllRecords()).toHaveLength(0)
+    expect(store.getAllCapabilityIds()).toHaveLength(0)
+  })
+
+  it('serializes cross-tab updates using Read-Modify-Write to avoid overwriting concurrent tab records', async () => {
+    const testAddress = 'ecash:qztabuser'
+    // Tab A initializes its store
+    const storeTabA = new Tm1ProductionRecoveryStore({
+      address: testAddress,
+      storage: window.localStorage
+    })
+    const storageKey = storeTabA.getStorageKey()
+
+    // Simulate Tab B writing a publication record directly into localStorage concurrently
+    const recordFromTabB = createSamplePreDispatchRecord('pub-from-tab-b')
+    window.localStorage.setItem(storageKey, JSON.stringify([recordFromTabB]))
+
+    // Tab A creates its own publication record 'pub-from-tab-a'
+    const recordFromTabA = createSamplePreDispatchRecord('pub-from-tab-a')
+    await storeTabA.create({ record: recordFromTabA })
+
+    // Verify localStorage contains BOTH records (Tab B was not clobbered by Tab A)
+    const rawStorage = window.localStorage.getItem(storageKey)
+    expect(rawStorage).toBeDefined()
+    const storedRecords = JSON.parse(rawStorage!)
+    expect(storedRecords).toHaveLength(2)
+
+    const storedIds = storedRecords.map((r: any) => r.publicationId).sort()
+    expect(storedIds).toEqual(['pub-from-tab-a', 'pub-from-tab-b'])
+
+    // Verify Tab A's store can also load Tab B's record seamlessly
+    expect(await storeTabA.load('pub-from-tab-b')).toBeDefined()
+    expect(await storeTabA.load('pub-from-tab-a')).toBeDefined()
   })
 
   it('allows removing and clearing records with durable persistence', async () => {

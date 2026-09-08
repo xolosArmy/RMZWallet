@@ -200,7 +200,17 @@ export function lookupTm1VerifiedAliasOwnershipToken(
   value: unknown
 ): Tm1VerifiedAliasOwnershipSnapshot | undefined {
   if (value === null || typeof value !== 'object') return undefined
-  return weakMapGet(verifiedEvidenceSnapshots, value)
+  const direct = weakMapGet(verifiedEvidenceSnapshots, value)
+  if (direct !== undefined) return direct
+  try {
+    const raw = (value as { rawEvidence?: unknown }).rawEvidence
+    if (raw !== null && typeof raw === 'object') {
+      return weakMapGet(verifiedEvidenceSnapshots, raw)
+    }
+  } catch {
+    // ignore
+  }
+  return undefined
 }
 
 export class Tm1AliasOwnershipVerificationPort {

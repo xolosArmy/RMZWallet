@@ -617,6 +617,74 @@ describe('walletPublisherExecutor components', () => {
       expect(consumedProofs.size).toBe(2)
     })
 
+    it('passes wrapped evidence with fresh nonce and evidenceHash to authorizer.issue() on successive retries to avoid ALIAS_PROOF_REPLAYED', async () => {
+      const consumedProofs = new Set<string>()
+      const mockAuthorizer = {
+        issue: vi.fn().mockImplementation((request: any) => {
+          const evidence = request.evidence
+          if (!evidence || !evidence.evidenceHash || !evidence.nonce) {
+            throw new Error('EVIDENCE_NOT_WRAPPED: Missing fresh nonce or evidenceHash')
+          }
+          if (consumedProofs.has(evidence.evidenceHash)) {
+            throw new Error('ALIAS_PROOF_REPLAYED: Evidence proof was already consumed')
+          }
+          consumedProofs.add(evidence.evidenceHash)
+          return { authorized: true, authorizationId: `auth-${evidence.evidenceHash.slice(0, 8)}` }
+        })
+      }
+      const mockVerificationPort = {
+        verifyAliasOwnership: vi.fn().mockResolvedValue({
+          verified: true,
+          alias: 'alice.xec',
+          address: testAddress,
+          txid: '11'.repeat(32),
+          blockHeight: 800000,
+          status: 'confirmed',
+          expiresAt: Date.now() + 3600000
+        })
+      }
+      const executor = new WalletPublisherExecutor({
+        verificationPort: mockVerificationPort,
+        authorizer: mockAuthorizer
+      })
+
+      // Attempt 1
+      const evidence1 = await executor.verifyOwnership('alice.xec', testAddress)
+      const auth1 = await executor.requestAuthorization(evidence1)
+      expect(auth1).toHaveProperty('authorized', true)
+      expect(consumedProofs.size).toBe(1)
+      expect(mockAuthorizer.issue).toHaveBeenCalledWith(
+        expect.objectContaining({
+          alias: 'alice.xec',
+          ownerAddress: testAddress,
+          evidence: expect.objectContaining({
+            evidenceHash: (evidence1 as any).evidenceHash,
+            nonce: (evidence1 as any).nonce
+          })
+        })
+      )
+
+      // Attempt 2 (retry after failure/timeout)
+      const evidence2 = await executor.verifyOwnership('alice.xec', testAddress)
+      expect((evidence2 as any).evidenceHash).not.toBe((evidence1 as any).evidenceHash)
+      expect((evidence2 as any).nonce).not.toBe((evidence1 as any).nonce)
+
+      // Attempt 2 must pass authorizer.issue() with fresh wrapped evidence without ALIAS_PROOF_REPLAYED
+      const auth2 = await executor.requestAuthorization(evidence2)
+      expect(auth2).toHaveProperty('authorized', true)
+      expect(consumedProofs.size).toBe(2)
+      expect(mockAuthorizer.issue).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          alias: 'alice.xec',
+          ownerAddress: testAddress,
+          evidence: expect.objectContaining({
+            evidenceHash: (evidence2 as any).evidenceHash,
+            nonce: (evidence2 as any).nonce
+          })
+        })
+      )
+    })
+
     it('handles HD wallet inputs from multiple derivation indices with their exact keys', async () => {
       // Input 1: receive/0 (5,000 sats)
       const sk1 = fromHex('33'.repeat(32))

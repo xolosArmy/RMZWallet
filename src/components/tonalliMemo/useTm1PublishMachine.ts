@@ -177,39 +177,89 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
         (typeof getChronik === 'function' ? getChronik() : undefined)
 
       if (chronik && typeof chronik.tx === 'function') {
-        const tx = await chronik.tx(txid)
-        if (tx && tx.txid) {
-          if (typeof recoveryStore.commitTransportAcknowledgement === 'function') {
-            await recoveryStore.commitTransportAcknowledgement({
-              publicationId: pendingRecord.publicationId,
-              expectedRevision: pendingRecord.revision,
-              expectedOwnerEpoch: pendingRecord.ownerEpoch,
-              acknowledgement: {
-                submissionId: pendingRecord.dispatchIntent.submissionId,
-                signedId:
-                  (pendingRecord.signed as any)?.signedId ??
-                  pendingRecord.dispatchIntent.submissionId,
-                txid: tx.txid,
-                signedArtifactHash: pendingRecord.dispatchIntent.signedArtifactHash,
-                disposition: 'accepted',
-                acknowledgedAt: Date.now()
-              } as any
-            })
+        try {
+          const tx = await chronik.tx(txid)
+          if (tx && tx.txid) {
+            if (typeof recoveryStore.commitTransportAcknowledgement === 'function') {
+              await recoveryStore.commitTransportAcknowledgement({
+                publicationId: pendingRecord.publicationId,
+                expectedRevision: pendingRecord.revision,
+                expectedOwnerEpoch: pendingRecord.ownerEpoch,
+                acknowledgement: {
+                  submissionId: pendingRecord.dispatchIntent.submissionId,
+                  signedId:
+                    (pendingRecord.signed as any)?.signedId ??
+                    pendingRecord.dispatchIntent.submissionId,
+                  txid: tx.txid,
+                  signedArtifactHash: pendingRecord.dispatchIntent.signedArtifactHash,
+                  disposition: 'accepted',
+                  acknowledgedAt: Date.now()
+                } as any
+              })
+            }
+            setPendingRecord(null)
+            setPhase('idle')
+            return
           }
-          setPendingRecord(null)
-          setPhase('idle')
+        } catch (err: any) {
+          const errMsg = err?.message ?? String(err)
+          const isNotFound = /not found|404/i.test(errMsg)
+
+          const expiresAt =
+            pendingRecord.broadcastAuthorization?.expiresAt ??
+            pendingRecord.signingAuthorization?.expiresAt ??
+            (pendingRecord.dispatchIntent?.committedAt
+              ? pendingRecord.dispatchIntent.committedAt + 2 * 60 * 60 * 1000
+              : null)
+
+          const isExpired = expiresAt !== null && Date.now() > expiresAt
+
+          if (isNotFound && isExpired) {
+            // Proven absent on Chronik and safe expiration passed
+            if (typeof (recoveryStore as any).remove === 'function') {
+              await (recoveryStore as any).remove(pendingRecord.publicationId)
+            } else if (typeof recoveryStore.commitRecoveryTransition === 'function') {
+              await recoveryStore.commitRecoveryTransition({
+                publicationId: pendingRecord.publicationId,
+                expectedRevision: pendingRecord.revision,
+                expectedOwnerEpoch: pendingRecord.ownerEpoch,
+                nextRecord: {
+                  ...pendingRecord,
+                  revision: pendingRecord.revision + 1,
+                  phase: 'abandoned',
+                  terminal: {
+                    status: 'abandoned',
+                    stage: 'outcomeUnknown',
+                    code: 'PROVEN_ABSENT_ON_CHAIN',
+                    recordedAt: Date.now()
+                  }
+                }
+              })
+            }
+            setPendingRecord(null)
+            setPhase('idle')
+            return
+          }
+          // If not proven absent or not expired, keep pendingRecord protected
+          throw err
         }
       }
     } catch {
-      // Transaction not observed or chronik query failed
+      // Transaction not observed or chronik query failed without proof of absence
     }
   }, [pendingRecord, recoveryStore])
 
   /**
    * Dismiss or abandon an expired unresolvable pending publication.
+   * Arbitrary dismissal of outcomeUnknown records without network proof is strictly forbidden.
    */
   const dismissPending = useCallback(async () => {
     if (!pendingRecord || !recoveryStore) return
+    if (pendingRecord.phase === 'outcomeUnknown') {
+      throw new Error(
+        'CANNOT_DISCARD_OUTCOME_UNKNOWN: outcomeUnknown records cannot be dismissed arbitrarily without proof'
+      )
+    }
     if (typeof (recoveryStore as any).remove === 'function') {
       await (recoveryStore as any).remove(pendingRecord.publicationId)
     } else if (typeof recoveryStore.commitRecoveryTransition === 'function') {
@@ -224,7 +274,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
             phase: 'abandoned',
             terminal: {
               status: 'abandoned',
-              stage: 'outcomeUnknown',
+              stage: 'preDispatch',
               code: 'DISMISSED_BY_USER',
               recordedAt: Date.now()
             }

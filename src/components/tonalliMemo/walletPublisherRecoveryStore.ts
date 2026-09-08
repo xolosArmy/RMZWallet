@@ -178,22 +178,78 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
 
   private applyAndPersist(
     tentativeRecords: Map<string, Tm1PublicationRecoveryRecord>,
-    tentativeCapabilities: Set<string>
+    tentativeCapabilities: Set<string>,
+    deletedPublicationId?: string
   ): void {
-    if (this.storage) {
-      const allRecords = [...tentativeRecords.values()]
-      // Note: Do NOT catch errors here. If storage write throws (e.g. QuotaExceededError or
-      // privacy restriction), let it propagate to the caller. The in-memory state will NOT
-      // be mutated if persistence fails.
-      this.storage.setItem(this.storageKey, JSON.stringify(allRecords))
+    if (!this.storage) {
+      throw new Error('Durable storage unavailable')
     }
-    // Only commit tentative state to in-memory fields if setItem succeeded
-    this.records = tentativeRecords
-    this.capabilityIds = tentativeCapabilities
+
+    // Pattern: Read-Modify-Write across tabs
+    // Read current state from storage to avoid overwriting records added/modified by another tab
+    const mergedRecords = new Map<string, Tm1PublicationRecoveryRecord>()
+    const mergedCapabilities = new Set<string>()
+
+    try {
+      const raw = this.storage.getItem(this.storageKey)
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            try {
+              const parsedRecord = parseTm1PublicationRecoveryRecord(item)
+              mergedRecords.set(parsedRecord.publicationId, parsedRecord)
+              for (const capId of consumedCapabilityIds(parsedRecord)) {
+                mergedCapabilities.add(capId)
+              }
+            } catch {
+              // ignore malformed external record
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore storage read issues, fall back to merging with tentative state
+    }
+
+    if (deletedPublicationId) {
+      mergedRecords.delete(deletedPublicationId)
+    }
+
+    // Overlay tentative local mutations onto the storage state
+    for (const [pubId, tentRec] of tentativeRecords.entries()) {
+      const existing = mergedRecords.get(pubId)
+      // Keep newer revision or tentative mutation
+      if (!existing || tentRec.revision >= existing.revision) {
+        mergedRecords.set(pubId, tentRec)
+      }
+    }
+    for (const capId of tentativeCapabilities) {
+      mergedCapabilities.add(capId)
+    }
+
+    const allRecords = [...mergedRecords.values()]
+    // Propagate write errors (e.g. QuotaExceededError).
+    // In-memory state will NOT be mutated if setItem throws.
+    this.storage.setItem(this.storageKey, JSON.stringify(allRecords))
+
+    // Commit only after setItem succeeded
+    this.records = mergedRecords
+    this.capabilityIds = mergedCapabilities
+  }
+
+  getStorageKey(): string {
+    return this.storageKey
   }
 
   getStoreId(): string {
     return this.storeId
+  }
+
+  private ensureStorageAvailable(): void {
+    if (!this.storage) {
+      throw new Error('Durable storage unavailable')
+    }
   }
 
   getAllRecords(): readonly Tm1PublicationRecoveryRecord[] {
@@ -304,11 +360,35 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
   }
 
   async load(publicationId: string): Promise<unknown | null> {
-    const record = this.records.get(publicationId)
+    let record = this.records.get(publicationId)
+    if (!record && this.storage) {
+      try {
+        const raw = this.storage.getItem(this.storageKey)
+        if (raw) {
+          const parsed = JSON.parse(raw)
+          if (Array.isArray(parsed)) {
+            const found = parsed.find((p: any) => p && p.publicationId === publicationId)
+            if (found) {
+              const rec = parseTm1PublicationRecoveryRecord(found)
+              this.records.set(rec.publicationId, rec)
+              for (const cap of consumedCapabilityIds(rec)) {
+                this.capabilityIds.add(cap)
+              }
+              record = rec
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
     return record ? deepClone(record) : null
   }
 
   async listRecoverable(query?: { address?: string | null }): Promise<unknown> {
+    if (this.storage) {
+      this.loadFromStorage()
+    }
     if (query?.address && this.address) {
       const target = query.address.toLowerCase().replace(/^ecash:/, '').replace(/[^a-z0-9]/g, '')
       const current = this.address.toLowerCase().replace(/^ecash:/, '').replace(/[^a-z0-9]/g, '')
@@ -322,6 +402,7 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
   }
 
   async create(input: Tm1RecoveryStoreCreate): Promise<unknown> {
+    this.ensureStorageAvailable()
     const record = parseTm1PublicationRecoveryRecord(input.record)
     if (this.records.has(record.publicationId)) {
       throw new Tm1PublicationRecoveryStoreError('DUPLICATE_PUBLICATION_ID')
@@ -339,6 +420,7 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
   async commitExecutionEvidence(
     input: Tm1RecoveryStoreExecutionCommit
   ): Promise<unknown> {
+    this.ensureStorageAvailable()
     const current = this.current(input)
     const next = parseTm1PublicationRecoveryRecord(input.nextRecord)
     assertTm1ExecutionEvidenceTransition(current, next)
@@ -358,6 +440,7 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
   async commitDispatchIntent(
     input: Tm1RecoveryStoreDispatchIntentCommit
   ): Promise<unknown> {
+    this.ensureStorageAvailable()
     const current = this.current(input)
     const next = parseTm1PublicationRecoveryRecord(input.nextRecord)
     assertTm1DispatchIntentTransition(current, next)
@@ -373,6 +456,7 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
   async commitTransportAcknowledgement(
     input: Tm1RecoveryStoreTransportAcknowledgementCommit
   ): Promise<unknown> {
+    this.ensureStorageAvailable()
     const current = this.current(input)
     const next = createTm1TransportAcknowledgedRecord(
       current,
@@ -391,6 +475,7 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
   async commitRecoveryTransition(
     input: Tm1RecoveryStoreRecoveryCommit
   ): Promise<unknown> {
+    this.ensureStorageAvailable()
     const current = this.current(input)
     const next = parseTm1PublicationRecoveryRecord(input.nextRecord)
     assertTm1RecoveryTransition(current, next)
@@ -406,6 +491,7 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
   async claimOwnership(
     input: Tm1RecoveryStoreOwnershipClaim
   ): Promise<unknown> {
+    this.ensureStorageAvailable()
     const current = this.current(input)
     if (
       !Number.isSafeInteger(input.nextOwnerEpoch) ||
@@ -429,7 +515,23 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
   }
 
   async remove(publicationId: string): Promise<boolean> {
-    if (!this.records.has(publicationId)) {
+    if (!this.storage) {
+      throw new Error('Durable storage unavailable')
+    }
+    const hadLocal = this.records.has(publicationId)
+    let hadInStorage = false
+    try {
+      const raw = this.storage.getItem(this.storageKey)
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed) && parsed.some((p: any) => p && p.publicationId === publicationId)) {
+          hadInStorage = true
+        }
+      }
+    } catch {
+      // ignore
+    }
+    if (!hadLocal && !hadInStorage) {
       return false
     }
     const tentativeRecords = new Map(this.records)
@@ -437,14 +539,17 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
     const remainingCapabilities = new Set(
       [...tentativeRecords.values()].flatMap(consumedCapabilityIds)
     )
-    this.applyAndPersist(tentativeRecords, remainingCapabilities)
+    this.applyAndPersist(tentativeRecords, remainingCapabilities, publicationId)
     return true
   }
 
   async clear(): Promise<void> {
-    const tentativeRecords = new Map<string, Tm1PublicationRecoveryRecord>()
-    const tentativeCapabilities = new Set<string>()
-    this.applyAndPersist(tentativeRecords, tentativeCapabilities)
+    if (!this.storage) {
+      throw new Error('Durable storage unavailable')
+    }
+    this.storage.removeItem(this.storageKey)
+    this.records = new Map()
+    this.capabilityIds = new Set()
   }
 
   private insertInitial(

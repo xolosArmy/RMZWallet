@@ -271,4 +271,172 @@ describe('useTm1PublishMachine Hook', () => {
       expect(result.current.state.txid).toBeNull()
     })
   })
+
+  describe('Finding 2: Do not discard outcome-unknown without proof', () => {
+    const createOutcomeUnknownPendingRecord = (overrides: Partial<any> = {}) => ({
+      publicationId: 'pending-pub-outcome-unknown',
+      phase: 'outcomeUnknown',
+      revision: 2,
+      ownerEpoch: 1,
+      dispatchIntent: {
+        submissionId: 'sub-test',
+        txid: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
+        signedArtifactHash: '11'.repeat(32),
+        broadcastCapabilityId: 'cap-broadcast-1',
+        committedAt: Date.now()
+      },
+      broadcastAuthorization: {
+        expiresAt: Date.now() + 3600000 // expires in 1 hour (not expired)
+      },
+      ...overrides
+    })
+
+    it('rejects arbitrary manual removal of outcomeUnknown records without network proof', async () => {
+      const mockRemove = vi.fn()
+      const mockRecoveryStore = {
+        storeId: 'test-store',
+        createdAt: Date.now(),
+        load: vi.fn(),
+        listRecoverable: vi.fn().mockResolvedValue([createOutcomeUnknownPendingRecord()]),
+        create: vi.fn(),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn(),
+        commitTransportAcknowledgement: vi.fn(),
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn(),
+        remove: mockRemove,
+        clear: vi.fn()
+      }
+      const mockExecutor = createMockExecutor()
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          recoveryStore: mockRecoveryStore as any,
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+        })
+      )
+
+      // Wait for reconciliation check to mount pendingRecord
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(result.current.state.phase).toBe('reconciling')
+      expect(result.current.state.pendingRecord).toBeDefined()
+      expect((result.current.state.pendingRecord as any)?.phase).toBe('outcomeUnknown')
+
+      // Attempting to arbitrarily dismiss/remove an outcomeUnknown record must throw and NOT call remove()
+      await expect(
+        act(async () => {
+          await result.current.dismissPending()
+        })
+      ).rejects.toThrow(/CANNOT_DISCARD_OUTCOME_UNKNOWN/)
+
+      expect(mockRemove).not.toHaveBeenCalled()
+      expect(result.current.state.phase).toBe('reconciling')
+      expect(result.current.state.pendingRecord).not.toBeNull()
+    })
+
+    it('does not remove outcomeUnknown record if Chronik reports 404 but safe expiration has not elapsed', async () => {
+      const mockRemove = vi.fn()
+      const pendingRec = createOutcomeUnknownPendingRecord({
+        broadcastAuthorization: { expiresAt: Date.now() + 60000 } // Not expired
+      })
+      const mockRecoveryStore = {
+        storeId: 'test-store',
+        createdAt: Date.now(),
+        load: vi.fn(),
+        listRecoverable: vi.fn().mockResolvedValue([pendingRec]),
+        create: vi.fn(),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn(),
+        commitTransportAcknowledgement: vi.fn(),
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn(),
+        remove: mockRemove,
+        clear: vi.fn()
+      }
+      const mockChronik = {
+        tx: vi.fn().mockRejectedValue(new Error('404 Not Found'))
+      }
+      const mockExecutor = createMockExecutor({
+        signer: { chronik: mockChronik }
+      } as any)
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          recoveryStore: mockRecoveryStore as any,
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+        })
+      )
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      // Attempt reconcile
+      await act(async () => {
+        await result.current.reconcilePending()
+      })
+
+      // Must NOT remove record because it is not expired yet
+      expect(mockRemove).not.toHaveBeenCalled()
+      expect(result.current.state.phase).toBe('reconciling')
+    })
+
+    it('removes outcomeUnknown record only when proven absent on Chronik AND safely expired', async () => {
+      const mockRemove = vi.fn().mockResolvedValue(true)
+      const pastTime = Date.now() - 10000 // expired 10s ago
+      const pendingRec = createOutcomeUnknownPendingRecord({
+        broadcastAuthorization: { expiresAt: pastTime },
+        signingAuthorization: { expiresAt: pastTime }
+      })
+      const mockRecoveryStore = {
+        storeId: 'test-store',
+        createdAt: Date.now(),
+        load: vi.fn(),
+        listRecoverable: vi.fn().mockResolvedValue([pendingRec]),
+        create: vi.fn(),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn(),
+        commitTransportAcknowledgement: vi.fn(),
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn(),
+        remove: mockRemove,
+        clear: vi.fn()
+      }
+      const mockChronik = {
+        tx: vi.fn().mockRejectedValue(new Error('404 Not Found'))
+      }
+      const mockExecutor = createMockExecutor({
+        signer: { chronik: mockChronik }
+      } as any)
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          recoveryStore: mockRecoveryStore as any,
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+        })
+      )
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(result.current.state.phase).toBe('reconciling')
+
+      // Attempt reconcile with proven absence + expired
+      await act(async () => {
+        await result.current.reconcilePending()
+      })
+
+      // remove() must have been called with publicationId
+      expect(mockRemove).toHaveBeenCalledWith('pending-pub-outcome-unknown')
+      expect(result.current.state.phase).toBe('idle')
+      expect(result.current.state.pendingRecord).toBeNull()
+    })
+  })
 })
