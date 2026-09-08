@@ -75,6 +75,7 @@ import type {
   DerivationDiscovery,
   DiscoveredTokenAsset
 } from './dualDerivationDiscovery'
+export type { FirmaInputOwner, FirmaOwnedUtxo } from './firmaAlphaSend'
 
 // The package ships a UMD/CJS build without an ES default export; grab whatever
 // is available (named export, default from CJS transform, or browser global).
@@ -1771,6 +1772,28 @@ export class XolosWalletService {
 
   signTxBuilder(builder: TxBuilder, options?: { feePerKb?: bigint; dustSats?: bigint }) {
     return builder.sign(options)
+  }
+
+  getHdSpendOwners(): FirmaInputOwner[] {
+    if (this.scanCache?.owners.length) {
+      return this.scanCache.owners
+    }
+    if (this.hdAddressCache.length === 0) {
+      this.ensureHdAddressCache(this.getEffectiveGapLimit())
+    }
+    return this.hdAddressCache
+  }
+
+  async getHdOwnedUtxos(): Promise<FirmaOwnedUtxo[]> {
+    const owners = this.getHdSpendOwners()
+    if (owners.length === 0) {
+      return []
+    }
+    return this.refreshFirmaOwnedUtxos(owners)
+  }
+
+  getHdSignatoryForOwner(owner: FirmaInputOwner): WalletSignatory {
+    return this.deriveHdSignatory(owner)
   }
 
 

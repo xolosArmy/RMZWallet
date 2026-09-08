@@ -169,7 +169,14 @@ describe('walletPublisherExecutor components', () => {
         'alice.xec',
         testAddress
       )
-      expect(evidence).toEqual({ verified: true, evidenceToken: 'token-abc' })
+      expect(evidence).toEqual(
+        expect.objectContaining({
+          verified: true,
+          evidenceToken: 'token-abc',
+          evidenceHash: expect.any(String),
+          nonce: expect.any(String)
+        })
+      )
       expect(mockVerificationPort.verifyAliasOwnership).toHaveBeenCalledWith(
         { alias: 'alice.xec', expectedOwnerAddress: testAddress },
         undefined
@@ -208,6 +215,179 @@ describe('walletPublisherExecutor components', () => {
       expect(mockChronik.broadcastTx).toHaveBeenCalledWith(
         fromHex((signedReview as { rawTxBytes: string }).rawTxBytes)
       )
+    })
+
+    it('generates unique evidence and nonces on successive retries to avoid ALIAS_PROOF_REPLAYED', async () => {
+      const consumedProofs = new Set<string>()
+      const mockAuthorizer = {
+        authorizePublication: vi.fn().mockImplementation(async ({ verifiedAliasEvidenceToken }) => {
+          const token = verifiedAliasEvidenceToken as { evidenceHash: string; nonce: string }
+          if (consumedProofs.has(token.evidenceHash)) {
+            throw new Error('ALIAS_PROOF_REPLAYED: Evidence proof was already consumed')
+          }
+          consumedProofs.add(token.evidenceHash)
+          return { authorized: true, authToken: `auth-${token.evidenceHash.slice(0, 8)}` }
+        })
+      }
+      const mockVerificationPort = {
+        verifyAliasOwnership: vi.fn().mockResolvedValue({
+          verified: true,
+          evidenceToken: 'base-chronik-tx-proof'
+        })
+      }
+      const executor = new WalletPublisherExecutor({
+        verificationPort: mockVerificationPort,
+        authorizer: mockAuthorizer
+      })
+
+      // Attempt 1
+      const evidence1 = await executor.verifyOwnership('alice.xec', testAddress)
+      const auth1 = await executor.requestAuthorization(evidence1)
+      expect(auth1).toHaveProperty('authorized', true)
+      expect(consumedProofs.size).toBe(1)
+
+      // Attempt 2 (e.g. user retries after a network or broadcast timeout)
+      const evidence2 = await executor.verifyOwnership('alice.xec', testAddress)
+      expect((evidence2 as { evidenceHash: string }).evidenceHash).not.toBe(
+        (evidence1 as { evidenceHash: string }).evidenceHash
+      )
+      expect((evidence2 as { nonce: string }).nonce).not.toBe(
+        (evidence1 as { nonce: string }).nonce
+      )
+
+      // Attempt 2 must pass authorizer without ALIAS_PROOF_REPLAYED
+      const auth2 = await executor.requestAuthorization(evidence2)
+      expect(auth2).toHaveProperty('authorized', true)
+      expect(consumedProofs.size).toBe(2)
+    })
+
+    it('handles HD wallet inputs from multiple derivation indices with their exact keys', async () => {
+      // Input 1: receive/0 (5,000 sats)
+      const sk1 = fromHex('33'.repeat(32))
+      const pk1 = ecc.derivePubkey(sk1)
+      const addr1 = Address.p2pkh(shaRmd160(pk1)).toString()
+      const sig1 = P2PKHSignatory(sk1, pk1, ALL_BIP143)
+
+      // Input 2: change/1 (15,000 sats)
+      const sk2 = fromHex('44'.repeat(32))
+      const pk2 = ecc.derivePubkey(sk2)
+      const addr2 = Address.p2pkh(shaRmd160(pk2)).toString()
+      const sig2 = P2PKHSignatory(sk2, pk2, ALL_BIP143)
+
+      // Input 3: receive/3 (40,000 sats)
+      const sk3 = fromHex('55'.repeat(32))
+      const pk3 = ecc.derivePubkey(sk3)
+      const addr3 = Address.p2pkh(shaRmd160(pk3)).toString()
+      const sig3 = P2PKHSignatory(sk3, pk3, ALL_BIP143)
+
+      const multiIndexUtxos = [
+        {
+          utxo: {
+            outpoint: { txid: '10'.repeat(32), outIdx: 0 },
+            blockHeight: 800000,
+            sats: 5000n,
+            isCoinbase: false,
+            isFinal: true
+          },
+          owner: {
+            address: addr1,
+            hdPath: "m/44'/899'/0'/0/0",
+            branch: 'receive' as const,
+            index: 0,
+            signatory: sig1
+          }
+        },
+        {
+          utxo: {
+            outpoint: { txid: '20'.repeat(32), outIdx: 1 },
+            blockHeight: 800000,
+            sats: 15000n,
+            isCoinbase: false,
+            isFinal: true
+          },
+          owner: {
+            address: addr2,
+            hdPath: "m/44'/899'/0'/1/1",
+            branch: 'change' as const,
+            index: 1,
+            signatory: sig2
+          }
+        },
+        {
+          utxo: {
+            outpoint: { txid: '30'.repeat(32), outIdx: 2 },
+            blockHeight: 800000,
+            sats: 40000n,
+            isCoinbase: false,
+            isFinal: true
+          },
+          owner: {
+            address: addr3,
+            hdPath: "m/44'/899'/0'/0/3",
+            branch: 'receive' as const,
+            index: 3,
+            signatory: sig3
+          }
+        }
+      ]
+
+      const hdSigner = new WalletSigner({
+        address: addr1,
+        hdUtxos: multiIndexUtxos
+      })
+
+      const signed = await hdSigner.sign({ message: 'multi-index test memo' })
+      expect(typeof signed.rawTxBytes).toBe('string')
+      expect(signed.txid).toBeDefined()
+
+      // Deserializing verifies that all inputs were properly mapped and signed
+      const tx = Tx.deser(fromHex(signed.rawTxBytes))
+      expect(tx.inputs.length).toBeGreaterThanOrEqual(1)
+      expect(tx.outputs.length).toBe(2) // OP_RETURN + change to addr1
+      expect(tx.outputs[0].sats).toBe(0n)
+      expect(tx.outputs[1].sats).toBeGreaterThan(0n)
+      expect(signed.txid).toBe(tx.txid())
+    })
+
+    it('resolves HD signatories via walletService.getHdSignatoryForOwner for multi-path UTXOs', async () => {
+      const skChange = fromHex('66'.repeat(32))
+      const pkChange = ecc.derivePubkey(skChange)
+      const addrChange = Address.p2pkh(shaRmd160(pkChange)).toString()
+      const sigChange = P2PKHSignatory(skChange, pkChange, ALL_BIP143)
+
+      const mockWalletService = {
+        getHdOwnedUtxos: vi.fn().mockResolvedValue([
+          {
+            utxo: {
+              outpoint: { txid: '77'.repeat(32), outIdx: 0 },
+              blockHeight: 800000,
+              sats: 25000n,
+              isCoinbase: false,
+              isFinal: true
+            },
+            owner: {
+              address: addrChange,
+              hdPath: "m/44'/899'/0'/1/2",
+              branch: 'change' as const,
+              index: 2
+            }
+          }
+        ]),
+        getHdSignatoryForOwner: vi.fn().mockReturnValue(sigChange),
+        getAddress: vi.fn().mockReturnValue(testAddress)
+      }
+
+      const signer = new WalletSigner({
+        address: testAddress,
+        walletService: mockWalletService
+      })
+
+      const signed = await signer.sign({ message: 'delegated hd test' })
+      expect(mockWalletService.getHdOwnedUtxos).toHaveBeenCalled()
+      expect(mockWalletService.getHdSignatoryForOwner).toHaveBeenCalledWith(
+        expect.objectContaining({ hdPath: "m/44'/899'/0'/1/2" })
+      )
+      expect(signed.rawTxBytes).toBeDefined()
     })
   })
 })

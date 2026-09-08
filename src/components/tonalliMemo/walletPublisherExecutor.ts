@@ -1,7 +1,7 @@
 import type { ChronikClient, ScriptUtxo } from 'chronik-client'
 import { getChronik } from '../../services/ChronikClient'
-import { fromHex, toHex, Script, Tx, TxBuilder } from 'ecash-lib'
-import { xolosWalletService } from '../../services/XolosWalletService'
+import { fromHex, toHex, Script, Tx, TxBuilder, sha256 } from 'ecash-lib'
+import { xolosWalletService, type FirmaInputOwner } from '../../services/XolosWalletService'
 import { FEE_RATE_SATS_PER_BYTE, XEC_DUST_SATS } from '../../config/xecFees'
 import type { Tm1PublisherExecutor } from './types'
 import type { Tm1PublicationRecoveryStore } from '../../integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
@@ -31,7 +31,7 @@ export interface Tm1OwnershipVerificationPortLike {
  * Interface compatible with real Tm1AliasPublicationAuthorizer and test mocks.
  */
 export interface Tm1PublicationAuthorizerLike {
-  issue?(request: { alias: string; ownerAddress: string; evidence: object }): object | Promise<object>
+  issue?(request: unknown): object
   authorizePublication?(
     request: { verifiedAliasEvidenceToken: unknown },
     signal?: AbortSignal
@@ -71,7 +71,7 @@ export class ChronikNetworkTransport {
 }
 
 /**
- * Result returned by WalletSigner after building and signing an eCash transaction.
+ * Signature result returned by WalletSigner.
  */
 export interface WalletSignatureResult {
   signedArtifact: unknown
@@ -82,6 +82,26 @@ export interface WalletSignatureResult {
 }
 
 /**
+ * HD derivation owner information for a spendable UTXO.
+ */
+export interface HdInputOwner extends Partial<FirmaInputOwner> {
+  address: string
+  hdPath?: string
+  branch?: 'receive' | 'change'
+  index?: number
+  publicKeyHex?: string
+  signatory?: unknown
+}
+
+/**
+ * An owned UTXO mapped to its derivation owner and key info.
+ */
+export type OwnedUtxo = {
+  utxo: ScriptUtxo
+  owner: HdInputOwner
+}
+
+/**
  * Options for configuring the active session wallet signer.
  */
 export interface WalletSignerOptions {
@@ -89,12 +109,18 @@ export interface WalletSignerOptions {
   chronik?: ChronikClient
   walletService?: {
     getSignatory?: () => unknown
+    getHdOwnedUtxos?: () => Promise<Array<{ utxo: ScriptUtxo; owner: unknown }>>
+    getHdSignatoryForOwner?: (owner: unknown) => unknown
+    deriveHdSignatory?: (owner: unknown) => unknown
     signTxBuilder?: (builder: TxBuilder, options?: { feePerKb?: bigint; dustSats?: bigint }) => Tx
     getAddress?: () => string | null
   }
   signatory?: unknown
+  hdUtxos?: Array<OwnedUtxo | ScriptUtxo>
+  getHdUtxos?: () => Promise<Array<OwnedUtxo | ScriptUtxo>>
+  deriveHdSignatory?: (owner: HdInputOwner) => unknown
   getUtxos?: (address: string) => Promise<ScriptUtxo[]>
-  utxos?: ScriptUtxo[]
+  utxos?: Array<OwnedUtxo | ScriptUtxo>
   feePerKb?: bigint
   dustSats?: bigint
   signCandidate?: (
@@ -112,10 +138,10 @@ export interface WalletSignerOptions {
 /**
  * Active wallet session signer adapter.
  * Eliminates the stub and builds real eCash transactions using ecash-lib:
- * - Obtains spendable UTXOs for the active user address
+ * - Obtains spendable UTXOs across owned HD accounts/addresses (receive and change)
  * - Adds OP_RETURN output with canonical TM1 payload
  * - Calculates network fees with dynamic change
- * - Signs inputs with user's active key
+ * - Signs each input with its exact derivation private key
  * - Serializes transaction to rawTxBytes in hex ready for Chronik broadcast
  */
 export class WalletSigner {
@@ -123,8 +149,11 @@ export class WalletSigner {
   private readonly chronik?: ChronikClient
   private readonly walletService?: WalletSignerOptions['walletService']
   private readonly signatory?: unknown
+  private readonly hdUtxos?: Array<OwnedUtxo | ScriptUtxo>
+  private readonly getHdUtxos?: () => Promise<Array<OwnedUtxo | ScriptUtxo>>
+  private readonly deriveHdSignatoryOption?: (owner: HdInputOwner) => unknown
   private readonly getUtxos?: (address: string) => Promise<ScriptUtxo[]>
-  private readonly utxos?: ScriptUtxo[]
+  private readonly utxos?: Array<OwnedUtxo | ScriptUtxo>
   private readonly feePerKb?: bigint
   private readonly dustSats?: bigint
   private readonly customSign?: WalletSignerOptions['signCandidate']
@@ -134,6 +163,9 @@ export class WalletSigner {
     this.chronik = options.chronik
     this.walletService = options.walletService
     this.signatory = options.signatory
+    this.hdUtxos = options.hdUtxos
+    this.getHdUtxos = options.getHdUtxos
+    this.deriveHdSignatoryOption = options.deriveHdSignatory
     this.getUtxos = options.getUtxos
     this.utxos = options.utxos
     this.feePerKb = options.feePerKb
@@ -197,47 +229,113 @@ export class WalletSigner {
       throw new Error('INVALID_CANDIDATE: Missing TM1 payload script for signing')
     }
 
-    // 3. Fetch and filter spendable UTXOs
-    let candidateUtxos: ScriptUtxo[]
-    if (this.getUtxos) {
-      candidateUtxos = await this.getUtxos(activeAddress)
+    // 3. Fetch and filter spendable UTXOs across all owned HD addresses (receive and change)
+    let rawCandidateUtxos: Array<OwnedUtxo | ScriptUtxo> = []
+    if (this.hdUtxos) {
+      rawCandidateUtxos = this.hdUtxos
+    } else if (this.getHdUtxos) {
+      rawCandidateUtxos = await this.getHdUtxos()
     } else if (this.utxos) {
-      candidateUtxos = this.utxos
+      rawCandidateUtxos = this.utxos
+    } else if (this.getUtxos) {
+      rawCandidateUtxos = await this.getUtxos(activeAddress)
     } else {
-      const chronikClient = this.chronik ?? getChronik()
-      const utxosResponse = await chronikClient.address(activeAddress).utxos()
-      candidateUtxos = utxosResponse.utxos ?? []
+      const ws = this.walletService ?? xolosWalletService
+      if (typeof ws?.getHdOwnedUtxos === 'function') {
+        try {
+          rawCandidateUtxos = (await ws.getHdOwnedUtxos()) as Array<OwnedUtxo | ScriptUtxo>
+        } catch {
+          rawCandidateUtxos = []
+        }
+      }
+
+      if (rawCandidateUtxos.length === 0) {
+        const chronikClient = this.chronik ?? getChronik()
+        const utxosResponse = await chronikClient.address(activeAddress).utxos()
+        rawCandidateUtxos = utxosResponse.utxos ?? []
+      }
     }
 
-    const spendableUtxos = (candidateUtxos ?? [])
-      .filter((utxo) => !utxo.token)
-      .sort((a, b) => (a.sats > b.sats ? -1 : 1))
+    type NormalizedUtxo = {
+      utxo: ScriptUtxo
+      owner?: HdInputOwner
+      address: string
+    }
+
+    const normalizedUtxos: NormalizedUtxo[] = (rawCandidateUtxos ?? []).map((item) => {
+      const isOwned = item && typeof item === 'object' && 'utxo' in item && 'owner' in item
+      const utxo: ScriptUtxo = isOwned ? (item as OwnedUtxo).utxo : (item as ScriptUtxo)
+      const owner: HdInputOwner | undefined = isOwned
+        ? ((item as OwnedUtxo).owner as HdInputOwner)
+        : undefined
+      const utxoAddress = owner?.address ?? activeAddress
+      return {
+        utxo,
+        owner,
+        address: utxoAddress
+      }
+    })
+
+    const spendableUtxos = normalizedUtxos
+      .filter((item) => !item.utxo.token)
+      .sort((a, b) => (a.utxo.sats > b.utxo.sats ? -1 : 1))
 
     if (spendableUtxos.length === 0) {
       throw new Error('INSUFFICIENT_FUNDS: No spendable XEC UTXOs found for address')
     }
 
-    // 4. Construct outputs: OP_RETURN at index 0, change to address
+    // 4. Construct outputs: OP_RETURN at index 0, change to activeAddress
     const opReturnScript = new Script(fromHex(scriptHex))
     const addressScript = Script.fromAddress(activeAddress)
     const fixedOutputs = [{ sats: 0n, script: opReturnScript }]
 
-    // 5. Resolve active signatory
-    let activeSignatory: unknown
+    // 5. Resolve default active signatory as fallback
+    let defaultSignatory: unknown
     if (this.signatory) {
-      activeSignatory = this.signatory
+      defaultSignatory = this.signatory
     } else {
       const ws = this.walletService ?? xolosWalletService
-      if (typeof ws?.getSignatory !== 'function') {
-        throw new Error('WALLET_SIGNER_UNAVAILABLE: No wallet signatory available')
+      if (typeof ws?.getSignatory === 'function') {
+        try {
+          defaultSignatory = ws.getSignatory()
+        } catch {
+          // If wallet is locked or unavailable, may throw below if needed
+        }
       }
-      activeSignatory = ws.getSignatory()
     }
 
-    const rawSignatory =
-      activeSignatory && typeof activeSignatory === 'object' && 'signatory' in activeSignatory
-        ? (activeSignatory as { signatory: unknown }).signatory
-        : activeSignatory
+    const rawDefaultSignatory =
+      defaultSignatory && typeof defaultSignatory === 'object' && 'signatory' in defaultSignatory
+        ? (defaultSignatory as { signatory: unknown }).signatory
+        : defaultSignatory
+
+    // Helper to resolve specific signatory for an HD owner / derivation path
+    const resolveSignatoryForOwner = (owner?: HdInputOwner): unknown => {
+      if (owner?.signatory) {
+        const sig = (owner.signatory as { signatory?: unknown }).signatory ?? owner.signatory
+        return sig
+      }
+      if (owner && this.deriveHdSignatoryOption) {
+        const derived = this.deriveHdSignatoryOption(owner)
+        return (derived as { signatory?: unknown })?.signatory ?? derived
+      }
+      const ws = (this.walletService ?? xolosWalletService) as {
+        getHdSignatoryForOwner?: (owner: unknown) => unknown
+        deriveHdSignatory?: (owner: unknown) => unknown
+      }
+      if (owner && typeof ws?.getHdSignatoryForOwner === 'function') {
+        const derived = ws.getHdSignatoryForOwner(owner)
+        return (derived as { signatory?: unknown })?.signatory ?? derived
+      }
+      if (owner && typeof ws?.deriveHdSignatory === 'function') {
+        const derived = ws.deriveHdSignatory(owner)
+        return (derived as { signatory?: unknown })?.signatory ?? derived
+      }
+      if (!rawDefaultSignatory) {
+        throw new Error('WALLET_SIGNER_UNAVAILABLE: No wallet signatory available')
+      }
+      return rawDefaultSignatory
+    }
 
     // 6. Select UTXOs and sign using TxBuilder
     const feePerKb = this.feePerKb ?? BigInt(Math.ceil(FEE_RATE_SATS_PER_BYTE * 1000))
@@ -248,17 +346,21 @@ export class WalletSigner {
       if (signal?.aborted) {
         throw new Error('OPERATION_ABORTED')
       }
-      const selectedUtxos = spendableUtxos.slice(0, count)
-      const inputs = selectedUtxos.map((utxo) => ({
-        input: {
-          prevOut: utxo.outpoint,
-          signData: {
-            sats: utxo.sats,
-            outputScript: addressScript
-          }
-        },
-        signatory: rawSignatory as never
-      }))
+      const selectedItems = spendableUtxos.slice(0, count)
+      const inputs = selectedItems.map((item) => {
+        const inputScript = Script.fromAddress(item.address)
+        const signatory = resolveSignatoryForOwner(item.owner)
+        return {
+          input: {
+            prevOut: item.utxo.outpoint,
+            signData: {
+              sats: item.utxo.sats,
+              outputScript: inputScript
+            }
+          },
+          signatory: signatory as never
+        }
+      })
 
       const txBuilder = new TxBuilder({
         inputs,
@@ -346,14 +448,33 @@ export class WalletPublisherExecutor implements Tm1PublisherExecutor {
     if (signal?.aborted) {
       throw new Error('OPERATION_ABORTED')
     }
+    const nonce =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const timestamp = Date.now()
+
     const port = this.verificationPort as Tm1OwnershipVerificationPortLike
+    let rawEvidence: object
     if (typeof port.verify === 'function') {
-      return port.verify({ alias, ownerAddress, signal })
+      rawEvidence = await port.verify({ alias, ownerAddress, signal })
+    } else if (typeof port.verifyAliasOwnership === 'function') {
+      rawEvidence = await port.verifyAliasOwnership({ alias, expectedOwnerAddress: ownerAddress }, signal)
+    } else {
+      throw new Error('VERIFICATION_PORT_INVALID')
     }
-    if (typeof port.verifyAliasOwnership === 'function') {
-      return port.verifyAliasOwnership({ alias, expectedOwnerAddress: ownerAddress }, signal)
+
+    const evidencePayload = `${alias}:${ownerAddress}:${nonce}:${timestamp}`
+    const evidenceHash = toHex(sha256(new TextEncoder().encode(evidencePayload)))
+
+    return {
+      ...(typeof rawEvidence === 'object' && rawEvidence !== null ? rawEvidence : {}),
+      nonce,
+      timestamp,
+      evidenceHash,
+      attemptId: nonce,
+      rawEvidence
     }
-    throw new Error('VERIFICATION_PORT_INVALID')
   }
 
   async requestAuthorization(
@@ -365,23 +486,47 @@ export class WalletPublisherExecutor implements Tm1PublisherExecutor {
     }
     const auth = this.authorizer as Tm1PublicationAuthorizerLike
     if (typeof auth.issue === 'function') {
-      const snapshot = lookupTm1VerifiedAliasOwnershipToken(evidenceToken)
+      const raw =
+        (evidenceToken as { rawEvidence?: object }).rawEvidence ?? evidenceToken
+      const snapshot =
+        lookupTm1VerifiedAliasOwnershipToken(raw) ??
+        lookupTm1VerifiedAliasOwnershipToken(evidenceToken)
       const alias = snapshot?.alias ?? (evidenceToken as { alias?: string }).alias ?? ''
       const ownerAddress =
         snapshot?.address ??
         (evidenceToken as { ownerAddress?: string; address?: string }).ownerAddress ??
         (evidenceToken as { address?: string }).address ??
         ''
+      const evidenceToPass = snapshot !== undefined ? raw : evidenceToken
       return auth.issue({
         alias,
         ownerAddress,
-        evidence: evidenceToken
+        evidence: evidenceToPass
       })
     }
     if (typeof auth.authorizePublication === 'function') {
+      const existingNonce = (evidenceToken as { nonce?: string }).nonce
+      const nonce =
+        existingNonce ??
+        (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`)
+      const timestamp = (evidenceToken as { timestamp?: number }).timestamp ?? Date.now()
+      const evidenceHash =
+        (evidenceToken as { evidenceHash?: string }).evidenceHash ??
+        toHex(sha256(new TextEncoder().encode(`${nonce}:${timestamp}`)))
+
+      const presentedEvidence = {
+        ...evidenceToken,
+        nonce,
+        timestamp,
+        evidenceHash,
+        attemptId: nonce
+      }
+
       return auth.authorizePublication(
         {
-          verifiedAliasEvidenceToken: evidenceToken
+          verifiedAliasEvidenceToken: presentedEvidence
         },
         signal
       )

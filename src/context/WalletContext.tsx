@@ -144,7 +144,13 @@ const buildXecPlan = (amountSats: number, utxos: SpendableUtxo[], opReturnOutput
 }
 
 export function WalletProvider({ children }: { children: ReactNode }) {
-  const [address, setAddress] = useState<string | null>(null)
+  const [address, setAddress] = useState<string | null>(() => {
+    try {
+      return xolosWalletService.getAddress() ?? null
+    } catch {
+      return null
+    }
+  })
   const [balance, setBalance] = useState<WalletBalance | null>(null)
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
@@ -153,20 +159,48 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     if (typeof window === 'undefined') return false
     return localStorage.getItem(BACKUP_KEY) === 'true'
   })
+  const getAliasStorageKey = useCallback((addr: string | null) => {
+    return addr ? `rmzwallet_alias_${addr}` : 'rmzwallet_alias'
+  }, [])
+
   const [alias, setAliasState] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null
-    return localStorage.getItem('rmzwallet_alias') || null
+    try {
+      const initialAddr = xolosWalletService.getAddress()
+      if (initialAddr) {
+        return localStorage.getItem(`rmzwallet_alias_${initialAddr}`) || null
+      }
+    } catch {
+      // ignore
+    }
+    return null
   })
 
-  const updateAlias = useCallback((newAlias: string | null) => {
-    setAliasState(newAlias)
+  // Synchronize alias whenever the active wallet address changes (e.g. account switch)
+  useEffect(() => {
     if (typeof window === 'undefined') return
-    if (newAlias) {
-      localStorage.setItem('rmzwallet_alias', newAlias)
-    } else {
-      localStorage.removeItem('rmzwallet_alias')
+    if (!address) {
+      setAliasState(null)
+      return
     }
-  }, [])
+    const key = `rmzwallet_alias_${address}`
+    const stored = localStorage.getItem(key)
+    setAliasState(stored || null)
+  }, [address])
+
+  const updateAlias = useCallback(
+    (newAlias: string | null) => {
+      setAliasState(newAlias)
+      if (typeof window === 'undefined') return
+      const key = getAliasStorageKey(address)
+      if (newAlias) {
+        localStorage.setItem(key, newAlias)
+      } else {
+        localStorage.removeItem(key)
+      }
+    },
+    [address, getAliasStorageKey]
+  )
 
   useEffect(() => {
     if (typeof window === 'undefined') return
