@@ -204,6 +204,7 @@ export function PublishStateMachineButton({
               type="button"
               className="cta primary"
               onClick={onPublish}
+              disabled={disabled}
               data-testid="publish-retry-button"
             >
               Reintentar publicación

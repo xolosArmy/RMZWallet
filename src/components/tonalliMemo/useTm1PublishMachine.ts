@@ -169,7 +169,11 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       // 4. Success
       setPhase('success')
       setTxid(result.txid)
-      options.onSuccess?.(result.txid)
+      try {
+        options.onSuccess?.(result.txid)
+      } catch (uiError) {
+        console.error('Error executing onSuccess callback:', uiError)
+      }
     } catch (err) {
       if (signal.aborted) {
         setPhase('idle')

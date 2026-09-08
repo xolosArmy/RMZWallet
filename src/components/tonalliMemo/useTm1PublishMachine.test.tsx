@@ -187,6 +187,41 @@ describe('useTm1PublishMachine Hook', () => {
       )
     })
 
+    it('preserves success phase and txid when onSuccess callback throws an error', async () => {
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const mockExecutor = createMockExecutor()
+      const throwingOnSuccess = vi.fn().mockImplementation(() => {
+        throw new Error('UI callback runtime failure')
+      })
+      const onError = vi.fn()
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialMessage: 'Test callback error isolation',
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq',
+          onSuccess: throwingOnSuccess,
+          onError
+        })
+      )
+
+      await act(async () => {
+        await result.current.publish()
+      })
+
+      expect(throwingOnSuccess).toHaveBeenCalledWith(
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+      )
+      expect(result.current.state.phase).toBe('success')
+      expect(result.current.state.txid).toBe(
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+      )
+      expect(result.current.state.error).toBeNull()
+      expect(onError).not.toHaveBeenCalled()
+      consoleSpy.mockRestore()
+    })
+
     it('transitions to error phase when an executor step throws', async () => {
       const mockExecutor = createMockExecutor({
         verifyOwnership: vi.fn().mockRejectedValue(new Error('ALIAS_NOT_FOUND'))

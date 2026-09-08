@@ -157,4 +157,23 @@ describe('PublishStateMachineButton Component', () => {
     fireEvent.click(cancelBtn)
     expect(handleCancel).toHaveBeenCalledTimes(1)
   })
+
+  it('disables retry button in error phase when disabled prop is true', () => {
+    const handleRetry = vi.fn()
+
+    render(
+      <PublishStateMachineButton
+        phase="error"
+        onPublish={handleRetry}
+        disabled={true}
+        error="Fallo de validación o red"
+      />
+    )
+
+    const retryBtn = screen.getByTestId('publish-retry-button') as HTMLButtonElement
+    expect(retryBtn.disabled).toBe(true)
+
+    fireEvent.click(retryBtn)
+    expect(handleRetry).not.toHaveBeenCalled()
+  })
 })
