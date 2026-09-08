@@ -92,7 +92,8 @@ export interface Tm1PublishState {
   readonly txid: string | null
   readonly error: string | null
   readonly preview: Tm1Draft02PostPreview | null
-  readonly previewError: string | null
+  readonly previewData?: Tm1Draft02PostPreview | null
+  readonly previewError?: string | null
   readonly byteLength: number
   readonly maxBytes: number
   readonly isOverLimit: boolean

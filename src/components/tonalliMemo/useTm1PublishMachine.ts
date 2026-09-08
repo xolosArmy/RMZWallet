@@ -10,25 +10,26 @@ import {
   type Tm1PublishState,
   type Tm1VerificationStatus
 } from './types'
-import { createHarnessPublisherExecutor } from './tm1PublisherRunner'
 
 export interface UseTm1PublishMachineOptions {
   initialMessage?: string
   initialAlias?: string
   initialOwnerAddress?: string
   maxBytes?: number
-  executor?: Tm1PublisherExecutor
+  executor: Tm1PublisherExecutor
   onSuccess?: (txid: string) => void
   onError?: (error: Error) => void
 }
 
-export function useTm1PublishMachine(options: UseTm1PublishMachineOptions = {}) {
+export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
+  if (!options?.executor) {
+    throw new Error('EXECUTOR_REQUIRED: useTm1PublishMachine requires an explicit Tm1PublisherExecutor')
+  }
+
   const maxBytes = options.maxBytes ?? TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES
   const [message, setMessage] = useState(options.initialMessage ?? '')
-  const [alias, setAlias] = useState(options.initialAlias ?? 'satoshi.xec')
-  const [ownerAddress, setOwnerAddress] = useState(
-    options.initialOwnerAddress ?? 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
-  )
+  const [alias, setAlias] = useState(options.initialAlias ?? '')
+  const [ownerAddress, setOwnerAddress] = useState(options.initialOwnerAddress ?? '')
   const [phase, setPhase] = useState<Tm1PublishPhase>('idle')
   const [verificationStatus, setVerificationStatus] =
     useState<Tm1VerificationStatus>('unverified')
@@ -37,9 +38,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions = {}) 
   const [error, setError] = useState<string | null>(null)
 
   const abortControllerRef = useRef<AbortController | null>(null)
-  const activeExecutorRef = useRef<Tm1PublisherExecutor>(
-    options.executor ?? createHarnessPublisherExecutor({ alias, ownerAddress })
-  )
+  const activeExecutorRef = useRef<Tm1PublisherExecutor>(options.executor)
 
   // Update active executor if option changes
   useEffect(() => {
@@ -54,37 +53,38 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions = {}) 
   }, [message])
 
   const isOverLimit = byteLength > maxBytes
-  const isValid = byteLength > 0 && !isOverLimit
 
-  // Canonical payload preview calculation in real time
-  const { preview, previewError } = useMemo(() => {
-    if (byteLength === 0) {
-      return { preview: null, previewError: null }
-    }
-    if (isOverLimit) {
-      return {
-        preview: null,
-        previewError: `El mensaje excede el límite permitido (${byteLength}/${maxBytes} bytes UTF-8).`
-      }
+  // Canonical payload preview calculation in real time using the canonical encoder as sole authority
+  const { preview, previewError } = useMemo<{
+    preview: ReturnType<typeof encodeTm1Draft02Post> | null
+    previewError: string | undefined
+  }>(() => {
+    if (!message || message.length === 0) {
+      return { preview: null, previewError: undefined }
     }
     try {
       const encoded = encodeTm1Draft02Post({
         eventData: message,
         authorInputIndex: 0
       })
-      return { preview: encoded, previewError: null }
+      return { preview: encoded, previewError: undefined }
     } catch (err) {
+      const msg =
+        err instanceof Tm1Draft02EncodingError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : 'Error al codificar el mensaje canónico TM1.'
       return {
         preview: null,
-        previewError:
-          err instanceof Tm1Draft02EncodingError
-            ? err.message
-            : err instanceof Error
-              ? err.message
-              : 'Error al codificar el mensaje canónico TM1.'
+        previewError: msg
       }
     }
-  }, [message, byteLength, isOverLimit, maxBytes])
+  }, [message])
+
+  // Finding 3: The publish action must be enabled ONLY if canonical preview generation succeeded:
+  // previewData !== null and previewError === undefined
+  const isValid = preview !== null && previewError === undefined
 
   // Cleanup abort controller on unmount
   useEffect(() => {
@@ -203,7 +203,8 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions = {}) 
     txid,
     error,
     preview,
-    previewError,
+    previewData: preview,
+    previewError: previewError ?? null,
     byteLength,
     maxBytes,
     isOverLimit,

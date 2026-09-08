@@ -29,7 +29,7 @@ function createMockExecutor(overrides: Partial<Tm1PublisherExecutor> = {}): Tm1P
 describe('TonalliMemoComposer Integration', () => {
   it('renders initial state with empty editor, unverified identity, and disabled publish button', () => {
     const mockExecutor = createMockExecutor()
-    render(<TonalliMemoComposer executor={mockExecutor} />)
+    render(<TonalliMemoComposer executor={mockExecutor} initialAlias="satoshi.xec" />)
 
     // Identity context
     expect(screen.getByTestId('identity-alias').textContent).toBe('satoshi.xec')
@@ -49,7 +49,7 @@ describe('TonalliMemoComposer Integration', () => {
 
   it('updates preview and enables publish button when user types a message', () => {
     const mockExecutor = createMockExecutor()
-    render(<TonalliMemoComposer executor={mockExecutor} />)
+    render(<TonalliMemoComposer executor={mockExecutor} initialAlias="satoshi.xec" />)
 
     const textarea = screen.getByRole('textbox', { name: /mensaje de tonalli memo/i })
     fireEvent.change(textarea, { target: { value: 'Hola Mundo TM1' } })
@@ -70,7 +70,7 @@ describe('TonalliMemoComposer Integration', () => {
 
   it('allows manual verification of ownership via IdentityContext', async () => {
     const mockExecutor = createMockExecutor()
-    render(<TonalliMemoComposer executor={mockExecutor} />)
+    render(<TonalliMemoComposer executor={mockExecutor} initialAlias="satoshi.xec" />)
 
     const verifyBtn = screen.getByTestId('identity-verify-button')
     fireEvent.click(verifyBtn)

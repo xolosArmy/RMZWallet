@@ -153,6 +153,20 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     if (typeof window === 'undefined') return false
     return localStorage.getItem(BACKUP_KEY) === 'true'
   })
+  const [alias, setAliasState] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null
+    return localStorage.getItem('rmzwallet_alias') || null
+  })
+
+  const updateAlias = useCallback((newAlias: string | null) => {
+    setAliasState(newAlias)
+    if (typeof window === 'undefined') return
+    if (newAlias) {
+      localStorage.setItem('rmzwallet_alias', newAlias)
+    } else {
+      localStorage.removeItem('rmzwallet_alias')
+    }
+  }, [])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -508,6 +522,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const value = useMemo(
     () => ({
       address,
+      alias,
       balance,
       loading,
       error,
@@ -530,10 +545,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       estimateXecSend,
       getMnemonic,
       unlockEncryptedWallet,
-      setBackupVerified: setBackupVerifiedState
+      setBackupVerified: setBackupVerifiedState,
+      setAlias: updateAlias
     }),
     [
       address,
+      alias,
       balance,
       loading,
       error,
@@ -555,7 +572,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       registerAliasOnChain,
       estimateXecSend,
       getMnemonic,
-      unlockEncryptedWallet
+      unlockEncryptedWallet,
+      updateAlias
     ]
   )
 

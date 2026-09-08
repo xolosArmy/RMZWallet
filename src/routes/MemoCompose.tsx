@@ -1,10 +1,33 @@
+import { useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import TonalliMemoComposer from '../components/tonalliMemo/TonalliMemoComposer'
+import {
+  ChronikNetworkTransport,
+  WalletPublisherExecutor,
+  WalletSigner
+} from '../components/tonalliMemo/walletPublisherExecutor'
+import type { Tm1PublisherExecutor } from '../components/tonalliMemo/types'
 
-export function MemoCompose() {
-  const { address } = useWallet()
+export interface MemoComposeProps {
+  executor?: Tm1PublisherExecutor
+}
+
+export function MemoCompose({ executor: customExecutor }: MemoComposeProps = {}) {
+  const { address, alias } = useWallet()
+
+  // Construct production publisher executor wired to real context dependencies
+  const productionExecutor = useMemo(() => {
+    const transport = new ChronikNetworkTransport()
+    const signer = new WalletSigner({ address })
+    return new WalletPublisherExecutor({
+      transport,
+      signer
+    })
+  }, [address])
+
+  const executor = customExecutor ?? productionExecutor
 
   return (
     <div className="page memo-compose-page">
@@ -27,10 +50,26 @@ export function MemoCompose() {
         </div>
       </header>
 
-      <TonalliMemoComposer
-        initialOwnerAddress={address || undefined}
-        initialAlias="satoshi.xec"
-      />
+      {!alias ? (
+        <div className="card memo-no-alias-state" data-testid="memo-no-alias-state">
+          <div className="state-badge warning">Sin Alias Configurado</div>
+          <h2 className="card-title">Se requiere un alias .xec activo</h2>
+          <p className="muted">
+            Para componer y publicar Tonalli Memos en la red eCash, tu billetera debe tener un alias .xec registrado y verificado.
+          </p>
+          <div className="action-buttons" style={{ marginTop: '1.5rem' }}>
+            <Link to="/register-alias" className="cta primary" data-testid="register-alias-cta">
+              Registrar o vincular alias .xec
+            </Link>
+          </div>
+        </div>
+      ) : (
+        <TonalliMemoComposer
+          initialOwnerAddress={address || undefined}
+          initialAlias={alias}
+          executor={executor}
+        />
+      )}
     </div>
   )
 }

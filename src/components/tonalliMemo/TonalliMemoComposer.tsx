@@ -10,7 +10,7 @@ export interface TonalliMemoComposerProps {
   initialAlias?: string
   initialOwnerAddress?: string
   maxBytes?: number
-  executor?: Tm1PublisherExecutor
+  executor: Tm1PublisherExecutor
   onSuccess?: (txid: string) => void
   onError?: (error: Error) => void
   explorerBaseUrl?: string
@@ -18,8 +18,8 @@ export interface TonalliMemoComposerProps {
 
 export function TonalliMemoComposer({
   initialMessage = '',
-  initialAlias = 'satoshi.xec',
-  initialOwnerAddress = 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq',
+  initialAlias = '',
+  initialOwnerAddress = '',
   maxBytes,
   executor,
   onSuccess,

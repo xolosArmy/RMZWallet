@@ -35,6 +35,7 @@ vi.mock('../context/useWallet', () => ({
   useWallet: () => ({
     initialized: true,
     address: 'ecash:qptestaddress',
+    alias: 'satoshixec.xec',
     balance: { rmzFormatted: '1', xecFormatted: '2', xec: 2n },
     refreshBalances: vi.fn(),
     rescanWallet: vi.fn(),
