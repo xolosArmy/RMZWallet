@@ -184,4 +184,116 @@ describe('MemoCompose Route', () => {
       expect(screen.getByTestId('preview-error-state').textContent).toContain('85 bytes UTF-8')
     })
   })
+
+  describe('P1 Finding: Refresh composer identity after wallet switch', () => {
+    it('remounts composer with fresh state and updated identity when wallet switches account and alias', () => {
+      mockWallet.address = 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+      mockWallet.alias = 'alice.xec'
+      const mockExecutor = createMockExecutor()
+
+      const { rerender } = render(
+        <MemoryRouter initialEntries={['/memo/compose']}>
+          <Routes>
+            <Route
+              path="/memo/compose"
+              element={<MemoCompose executor={mockExecutor} />}
+            />
+          </Routes>
+        </MemoryRouter>
+      )
+
+      expect(screen.getByTestId('identity-alias').textContent).toBe('alice.xec')
+      expect(screen.getByTestId('identity-address').textContent).toBe(
+        'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+      )
+
+      const textarea = screen.getByRole('textbox', {
+        name: /mensaje de tonalli memo/i
+      }) as HTMLTextAreaElement
+      fireEvent.change(textarea, { target: { value: 'Borrador confidencial de Alice' } })
+      expect(textarea.value).toBe('Borrador confidencial de Alice')
+
+      const publishBtn = screen.getByTestId('publish-button-idle') as HTMLButtonElement
+      expect(publishBtn.disabled).toBe(false)
+
+      // Switch wallet context to Bob
+      mockWallet.address = 'ecash:qqe9guxz2kswm8vdhe7s3768m64k6s679sf6l3q55r'
+      mockWallet.alias = 'bob.xec'
+
+      rerender(
+        <MemoryRouter initialEntries={['/memo/compose']}>
+          <Routes>
+            <Route
+              path="/memo/compose"
+              element={<MemoCompose executor={mockExecutor} />}
+            />
+          </Routes>
+        </MemoryRouter>
+      )
+
+      // Identity reflects Bob's alias and address
+      expect(screen.getByTestId('identity-alias').textContent).toBe('bob.xec')
+      expect(screen.getByTestId('identity-address').textContent).toBe(
+        'ecash:qqe9guxz2kswm8vdhe7s3768m64k6s679sf6l3q55r'
+      )
+
+      // State is completely reset (unmounted and fresh mount)
+      const freshTextarea = screen.getByRole('textbox', {
+        name: /mensaje de tonalli memo/i
+      }) as HTMLTextAreaElement
+      expect(freshTextarea.value).toBe('')
+
+      const freshPublishBtn = screen.getByTestId('publish-button-idle') as HTMLButtonElement
+      expect(freshPublishBtn.disabled).toBe(true)
+    })
+
+    it('resets composer when active address changes even if alias remains unchanged', () => {
+      mockWallet.address = 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+      mockWallet.alias = 'sharedalias.xec'
+      const mockExecutor = createMockExecutor()
+
+      const { rerender } = render(
+        <MemoryRouter initialEntries={['/memo/compose']}>
+          <Routes>
+            <Route
+              path="/memo/compose"
+              element={<MemoCompose executor={mockExecutor} />}
+            />
+          </Routes>
+        </MemoryRouter>
+      )
+
+      expect(screen.getByTestId('identity-address').textContent).toBe(
+        'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+      )
+
+      const textarea = screen.getByRole('textbox', {
+        name: /mensaje de tonalli memo/i
+      }) as HTMLTextAreaElement
+      fireEvent.change(textarea, { target: { value: 'Texto preliminar' } })
+      expect(textarea.value).toBe('Texto preliminar')
+
+      // Switch active address (e.g. secondary HD account)
+      mockWallet.address = 'ecash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a'
+
+      rerender(
+        <MemoryRouter initialEntries={['/memo/compose']}>
+          <Routes>
+            <Route
+              path="/memo/compose"
+              element={<MemoCompose executor={mockExecutor} />}
+            />
+          </Routes>
+        </MemoryRouter>
+      )
+
+      expect(screen.getByTestId('identity-address').textContent).toBe(
+        'ecash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a'
+      )
+      const freshTextarea = screen.getByRole('textbox', {
+        name: /mensaje de tonalli memo/i
+      }) as HTMLTextAreaElement
+      expect(freshTextarea.value).toBe('')
+    })
+  })
 })

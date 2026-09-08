@@ -65,6 +65,7 @@ export function MemoCompose({ executor: customExecutor }: MemoComposeProps = {})
         </div>
       ) : (
         <TonalliMemoComposer
+          key={`${address || 'no-address'}-${alias}`}
           initialOwnerAddress={address || undefined}
           initialAlias={alias}
           executor={executor}
