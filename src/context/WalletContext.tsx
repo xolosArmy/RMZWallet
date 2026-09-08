@@ -505,6 +505,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       try {
         const txid = await xolosWalletService.registerAliasOnChain(registration, reservedUtxos, rmzFeeTxid)
         await syncAddressAndBalance()
+        if (registration?.alias) {
+          const canonicalAlias = registration.alias.endsWith('.xec')
+            ? registration.alias
+            : `${registration.alias}.xec`
+          updateAlias(canonicalAlias)
+        }
         return txid
       } catch (err) {
         const message = (err as Error).message || 'No se pudo registrar el alias.'
@@ -514,7 +520,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setLoading(false)
       }
     },
-    [backupVerified, initialized, syncAddressAndBalance]
+    [backupVerified, initialized, syncAddressAndBalance, updateAlias]
   )
 
   const getMnemonic = useCallback(() => xolosWalletService.getMnemonic(), [])

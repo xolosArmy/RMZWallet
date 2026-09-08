@@ -82,9 +82,8 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     }
   }, [message])
 
-  // Finding 3: The publish action must be enabled ONLY if canonical preview generation succeeded:
-  // previewData !== null and previewError === undefined
-  const isValid = preview !== null && previewError === undefined
+  // Finding 3: The memo is valid ONLY if canonical preview succeeded AND it honors component byte limits:
+  const isValid = preview !== null && previewError === undefined && !isOverLimit
 
   // Cleanup abort controller on unmount
   useEffect(() => {

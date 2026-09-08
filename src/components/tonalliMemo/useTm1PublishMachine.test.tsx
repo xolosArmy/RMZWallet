@@ -97,6 +97,43 @@ describe('useTm1PublishMachine Hook', () => {
       expect(result.current.state.isValid).toBe(false)
     })
 
+    it('marks isValid false if isOverLimit is true, even when canonical preview is non-null', () => {
+      const mockExecutor = createMockExecutor()
+      // Message has 30 bytes, which is valid for TM1 (<=80 bytes), but exceeds custom maxBytes of 20
+      const message = '123456789012345678901234567890'
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialMessage: message,
+          maxBytes: 20
+        })
+      )
+
+      expect(result.current.state.preview).not.toBeNull()
+      expect(result.current.state.previewError).toBeNull()
+      expect(result.current.state.isOverLimit).toBe(true)
+      expect(result.current.state.isValid).toBe(false)
+    })
+
+    it('marks isValid true when message is within custom maxBytes limit and preview is valid', () => {
+      const mockExecutor = createMockExecutor()
+      const message = '1234567890'
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialMessage: message,
+          maxBytes: 20
+        })
+      )
+
+      expect(result.current.state.preview).not.toBeNull()
+      expect(result.current.state.previewError).toBeNull()
+      expect(result.current.state.isOverLimit).toBe(false)
+      expect(result.current.state.isValid).toBe(true)
+    })
+
     it('refuses to invoke publish if isValid is false', async () => {
       const mockExecutor = createMockExecutor()
       const { result } = renderHook(() =>

@@ -41,7 +41,8 @@ function RegisterAlias() {
     estimateAliasRegistration,
     reserveAliasRegistrationUtxos,
     buildAliasRegistrationRawTx,
-    registerAliasOnChain
+    registerAliasOnChain,
+    setAlias
   } = useWallet()
   const [aliasInput, setAliasInput] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
@@ -226,6 +227,10 @@ function RegisterAlias() {
         debug: aliasBroadcast.debug
       }
       setResult(txResult)
+      const canonicalAlias = registration.alias.endsWith('.xec')
+        ? registration.alias
+        : `${registration.alias}.xec`
+      setAlias?.(canonicalAlias)
       setStep('done')
     } catch (err) {
       const aliasError = getErrorMessage(err)

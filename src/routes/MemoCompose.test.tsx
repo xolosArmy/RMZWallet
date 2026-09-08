@@ -93,6 +93,39 @@ describe('MemoCompose Route', () => {
       const ctaLink = screen.getByTestId('register-alias-cta')
       expect(ctaLink.getAttribute('href')).toBe('/register-alias')
     })
+
+    it('transitions out of no-alias-state when registered alias is persisted into wallet context', () => {
+      // Step 1: Wallet starts without alias
+      mockWallet.alias = null
+
+      const { rerender } = render(
+        <MemoryRouter initialEntries={['/memo/compose']}>
+          <Routes>
+            <Route path="/memo/compose" element={<MemoCompose />} />
+          </Routes>
+        </MemoryRouter>
+      )
+
+      expect(screen.getByTestId('memo-no-alias-state')).toBeTruthy()
+      expect(screen.queryByTestId('memo-composer')).toBeNull()
+
+      // Step 2: Alias registration persists new alias in wallet context
+      mockWallet.alias = 'satoshinew.xec'
+
+      rerender(
+        <MemoryRouter initialEntries={['/memo/compose']}>
+          <Routes>
+            <Route path="/memo/compose" element={<MemoCompose />} />
+          </Routes>
+        </MemoryRouter>
+      )
+
+      // Step 3: no-alias-state is dismissed, and composer is active
+      expect(screen.queryByTestId('memo-no-alias-state')).toBeNull()
+      const composer = screen.getByTestId('memo-composer')
+      expect(composer).toBeTruthy()
+      expect(screen.getByTestId('identity-alias').textContent).toBe('satoshinew.xec')
+    })
   })
 
   describe('Finding 1: Injects WalletPublisherExecutor with real dependencies', () => {
