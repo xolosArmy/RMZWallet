@@ -338,56 +338,8 @@ describe('useTm1PublishMachine Hook', () => {
       expect(result.current.state.pendingRecord).not.toBeNull()
     })
 
-    it('does not remove outcomeUnknown record if Chronik reports 404 but safe expiration has not elapsed', async () => {
+    it('does not remove outcomeUnknown record if Chronik reports 404 even when safe expiration has elapsed', async () => {
       const mockRemove = vi.fn()
-      const pendingRec = createOutcomeUnknownPendingRecord({
-        broadcastAuthorization: { expiresAt: Date.now() + 60000 } // Not expired
-      })
-      const mockRecoveryStore = {
-        storeId: 'test-store',
-        createdAt: Date.now(),
-        load: vi.fn(),
-        listRecoverable: vi.fn().mockResolvedValue([pendingRec]),
-        create: vi.fn(),
-        commitExecutionEvidence: vi.fn(),
-        commitDispatchIntent: vi.fn(),
-        commitTransportAcknowledgement: vi.fn(),
-        commitRecoveryTransition: vi.fn(),
-        claimOwnership: vi.fn(),
-        remove: mockRemove,
-        clear: vi.fn()
-      }
-      const mockChronik = {
-        tx: vi.fn().mockRejectedValue(new Error('404 Not Found'))
-      }
-      const mockExecutor = createMockExecutor({
-        signer: { chronik: mockChronik }
-      } as any)
-
-      const { result } = renderHook(() =>
-        useTm1PublishMachine({
-          executor: mockExecutor,
-          recoveryStore: mockRecoveryStore as any,
-          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
-        })
-      )
-
-      await act(async () => {
-        await Promise.resolve()
-      })
-
-      // Attempt reconcile
-      await act(async () => {
-        await result.current.reconcilePending()
-      })
-
-      // Must NOT remove record because it is not expired yet
-      expect(mockRemove).not.toHaveBeenCalled()
-      expect(result.current.state.phase).toBe('reconciling')
-    })
-
-    it('removes outcomeUnknown record only when proven absent on Chronik AND safely expired', async () => {
-      const mockRemove = vi.fn().mockResolvedValue(true)
       const pastTime = Date.now() - 10000 // expired 10s ago
       const pendingRec = createOutcomeUnknownPendingRecord({
         broadcastAuthorization: { expiresAt: pastTime },
@@ -428,15 +380,126 @@ describe('useTm1PublishMachine Hook', () => {
 
       expect(result.current.state.phase).toBe('reconciling')
 
-      // Attempt reconcile with proven absence + expired
+      // Attempt reconcile when tx returns 404 from Chronik
       await act(async () => {
         await result.current.reconcilePending()
       })
 
-      // remove() must have been called with publicationId
-      expect(mockRemove).toHaveBeenCalledWith('pending-pub-outcome-unknown')
+      // Finding 2: Absence of evidence is not evidence of absence.
+      // Must NOT remove the record or transition away from reconciling on 404.
+      expect(mockRemove).not.toHaveBeenCalled()
+      expect(result.current.state.phase).toBe('reconciling')
+      expect(result.current.state.pendingRecord).not.toBeNull()
+    })
+
+    it('acknowledges and clears pending record only when Chronik confirms txid', async () => {
+      const mockAck = vi.fn().mockResolvedValue(true)
+      const pendingRec = createOutcomeUnknownPendingRecord()
+      const mockRecoveryStore = {
+        storeId: 'test-store',
+        createdAt: Date.now(),
+        load: vi.fn(),
+        listRecoverable: vi.fn().mockResolvedValue([pendingRec]),
+        create: vi.fn(),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn(),
+        commitTransportAcknowledgement: mockAck,
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn(),
+        remove: vi.fn(),
+        clear: vi.fn()
+      }
+      const mockChronik = {
+        tx: vi.fn().mockResolvedValue({ txid: pendingRec.dispatchIntent!.txid })
+      }
+      const mockExecutor = createMockExecutor({
+        signer: { chronik: mockChronik }
+      } as any)
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          recoveryStore: mockRecoveryStore as any,
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+        })
+      )
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(result.current.state.phase).toBe('reconciling')
+
+      // Attempt reconcile when Chronik confirms tx
+      await act(async () => {
+        await result.current.reconcilePending()
+      })
+
+      expect(mockAck).toHaveBeenCalled()
       expect(result.current.state.phase).toBe('idle')
       expect(result.current.state.pendingRecord).toBeNull()
+    })
+
+    it('Finding 1: fences retries into reconciling phase when a transport error occurs post-dispatch', async () => {
+      const pendingRec = createOutcomeUnknownPendingRecord()
+      let hasCommittedDispatch = false
+
+      const mockRecoveryStore = {
+        storeId: 'test-store',
+        createdAt: Date.now(),
+        load: vi.fn(),
+        listRecoverable: vi.fn().mockImplementation(() => {
+          return Promise.resolve(hasCommittedDispatch ? [pendingRec] : [])
+        }),
+        create: vi.fn(),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn(),
+        commitTransportAcknowledgement: vi.fn(),
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn(),
+        remove: vi.fn(),
+        clear: vi.fn()
+      }
+
+      const mockExecutor = createMockExecutor({
+        broadcastAndFinalize: vi.fn().mockImplementation(async () => {
+          // Simulate commitDispatchIntent having succeeded in storage before transport fails
+          hasCommittedDispatch = true
+          throw new Error('NETWORK_TIMEOUT: Broadcast timed out')
+        })
+      })
+
+      const onErrorMock = vi.fn()
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          recoveryStore: mockRecoveryStore as any,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq',
+          initialMessage: 'Mensaje de prueba',
+          onError: onErrorMock
+        })
+      )
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(result.current.state.phase).toBe('idle')
+      expect(result.current.state.isValid).toBe(true)
+
+      // Trigger publish which will fail post-dispatch
+      await act(async () => {
+        await result.current.publish()
+      })
+
+      // Finding 1: The machine must NOT be in 'error' phase.
+      // It must transition to 'reconciling' with the pending record, fencing retries.
+      expect(onErrorMock).toHaveBeenCalledWith(expect.any(Error))
+      expect(result.current.state.phase).toBe('reconciling')
+      expect(result.current.state.pendingRecord).toEqual(pendingRec)
+      expect(result.current.state.isValid).toBe(false)
     })
   })
 })

@@ -53,41 +53,47 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     }
   }, [options.executor])
 
+  const checkRecovery = useCallback(async (): Promise<boolean> => {
+    if (!recoveryStore || typeof recoveryStore.listRecoverable !== 'function') {
+      return false
+    }
+    try {
+      const recoverable = await recoveryStore.listRecoverable({ address: ownerAddress })
+      const list = Array.isArray(recoverable) ? recoverable : []
+      const pending = list.find(
+        (rec: any) =>
+          rec &&
+          (rec.phase === 'outcomeUnknown' ||
+            (rec.phase === 'preDispatch' && rec.dispatchIntent))
+      )
+      if (pending) {
+        setPendingRecord(pending)
+        setPhase('reconciling')
+        return true
+      } else {
+        setPendingRecord(null)
+        setPhase((prev) => (prev === 'reconciling' ? 'idle' : prev))
+        return false
+      }
+    } catch {
+      return false
+    }
+  }, [ownerAddress, recoveryStore])
+
   // Reconcile recovery records before allowing publication.
   // If an unfinalized record (such as outcomeUnknown) is present in the durable store,
   // enter 'reconciling' phase to block the editor and prevent duplicate publishes.
   useEffect(() => {
     let active = true
-    async function checkRecovery() {
-      if (!recoveryStore || typeof recoveryStore.listRecoverable !== 'function') {
-        return
+    void (async () => {
+      if (active) {
+        await checkRecovery()
       }
-      try {
-        const recoverable = await recoveryStore.listRecoverable({ address: ownerAddress })
-        if (!active) return
-        const list = Array.isArray(recoverable) ? recoverable : []
-        const pending = list.find(
-          (rec: any) =>
-            rec &&
-            (rec.phase === 'outcomeUnknown' ||
-              (rec.phase === 'preDispatch' && rec.dispatchIntent))
-        )
-        if (pending) {
-          setPendingRecord(pending)
-          setPhase('reconciling')
-        } else {
-          setPendingRecord(null)
-          setPhase((prev) => (prev === 'reconciling' ? 'idle' : prev))
-        }
-      } catch {
-        // Safe fail-closed or silent
-      }
-    }
-    checkRecovery()
+    })()
     return () => {
       active = false
     }
-  }, [ownerAddress, recoveryStore])
+  }, [checkRecovery])
 
   // Real-time byte length calculation via TextEncoder (handles UTF-8 multi-byte characters)
   const byteLength = useMemo(() => {
@@ -155,7 +161,8 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       setVerificationStatus('verified')
       return true
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err)
+      const errMsg =
+        err instanceof Error ? err.message : 'Error al verificar la propiedad del alias.'
       setVerificationStatus('failed')
       setVerificationError(errMsg)
       return false
@@ -164,6 +171,8 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
 
   /**
    * Attempt to reconcile a pending recovery record against Chronik.
+   * Finding 2: Absence of evidence is not evidence of absence. A 404 from Chronik
+   * MUST NOT delete or remove an outcomeUnknown record.
    */
   const reconcilePending = useCallback(async () => {
     if (!pendingRecord || !recoveryStore) return
@@ -177,75 +186,33 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
         (typeof getChronik === 'function' ? getChronik() : undefined)
 
       if (chronik && typeof chronik.tx === 'function') {
-        try {
-          const tx = await chronik.tx(txid)
-          if (tx && tx.txid) {
-            if (typeof recoveryStore.commitTransportAcknowledgement === 'function') {
-              await recoveryStore.commitTransportAcknowledgement({
-                publicationId: pendingRecord.publicationId,
-                expectedRevision: pendingRecord.revision,
-                expectedOwnerEpoch: pendingRecord.ownerEpoch,
-                acknowledgement: {
-                  submissionId: pendingRecord.dispatchIntent.submissionId,
-                  signedId:
-                    (pendingRecord.signed as any)?.signedId ??
-                    pendingRecord.dispatchIntent.submissionId,
-                  txid: tx.txid,
-                  signedArtifactHash: pendingRecord.dispatchIntent.signedArtifactHash,
-                  disposition: 'accepted',
-                  acknowledgedAt: Date.now()
-                } as any
-              })
-            }
-            setPendingRecord(null)
-            setPhase('idle')
-            return
+        const tx = await chronik.tx(txid)
+        if (tx && tx.txid) {
+          if (typeof recoveryStore.commitTransportAcknowledgement === 'function') {
+            await recoveryStore.commitTransportAcknowledgement({
+              publicationId: pendingRecord.publicationId,
+              expectedRevision: pendingRecord.revision,
+              expectedOwnerEpoch: pendingRecord.ownerEpoch,
+              acknowledgement: {
+                submissionId: pendingRecord.dispatchIntent.submissionId,
+                signedId:
+                  (pendingRecord.signed as any)?.signedId ??
+                  pendingRecord.dispatchIntent.submissionId,
+                txid: tx.txid,
+                signedArtifactHash: pendingRecord.dispatchIntent.signedArtifactHash,
+                disposition: 'accepted',
+                acknowledgedAt: Date.now()
+              } as any
+            })
           }
-        } catch (err: any) {
-          const errMsg = err?.message ?? String(err)
-          const isNotFound = /not found|404/i.test(errMsg)
-
-          const expiresAt =
-            pendingRecord.broadcastAuthorization?.expiresAt ??
-            pendingRecord.signingAuthorization?.expiresAt ??
-            (pendingRecord.dispatchIntent?.committedAt
-              ? pendingRecord.dispatchIntent.committedAt + 2 * 60 * 60 * 1000
-              : null)
-
-          const isExpired = expiresAt !== null && Date.now() > expiresAt
-
-          if (isNotFound && isExpired) {
-            // Proven absent on Chronik and safe expiration passed
-            if (typeof (recoveryStore as any).remove === 'function') {
-              await (recoveryStore as any).remove(pendingRecord.publicationId)
-            } else if (typeof recoveryStore.commitRecoveryTransition === 'function') {
-              await recoveryStore.commitRecoveryTransition({
-                publicationId: pendingRecord.publicationId,
-                expectedRevision: pendingRecord.revision,
-                expectedOwnerEpoch: pendingRecord.ownerEpoch,
-                nextRecord: {
-                  ...pendingRecord,
-                  revision: pendingRecord.revision + 1,
-                  phase: 'abandoned',
-                  terminal: {
-                    status: 'abandoned',
-                    stage: 'outcomeUnknown',
-                    code: 'PROVEN_ABSENT_ON_CHAIN',
-                    recordedAt: Date.now()
-                  }
-                }
-              })
-            }
-            setPendingRecord(null)
-            setPhase('idle')
-            return
-          }
-          // If not proven absent or not expired, keep pendingRecord protected
-          throw err
+          setPendingRecord(null)
+          setPhase('idle')
         }
       }
     } catch {
-      // Transaction not observed or chronik query failed without proof of absence
+      // Finding 2 (Keep absent outcome-unknown fenced):
+      // Chronik query failed, returned 404, or tx is not yet confirmed.
+      // Absence of evidence is not evidence of absence. The record MUST remain fenced.
     }
   }, [pendingRecord, recoveryStore])
 
@@ -357,11 +324,30 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
         return
       }
       const errObj = err instanceof Error ? err : new Error(String(err))
+
+      // Finding 1 (Fence retries after dispatch - P1):
+      // If an error occurs after commitDispatchIntent has succeeded,
+      // a pending record (such as outcomeUnknown) exists in durable storage.
+      // Do not transition to plain 'error'. Invoke checkRecovery to transition
+      // to 'reconciling' with the freshly persisted record, blocking the retry button.
+      if (recoveryStore && typeof recoveryStore.listRecoverable === 'function') {
+        try {
+          const hasPending = await checkRecovery()
+          if (hasPending) {
+            setError(errObj.message)
+            options.onError?.(errObj)
+            return
+          }
+        } catch {
+          // fallback to error phase
+        }
+      }
+
       setPhase('error')
       setError(errObj.message)
       options.onError?.(errObj)
     }
-  }, [isValid, phase, alias, ownerAddress, message, options])
+  }, [isValid, phase, alias, ownerAddress, message, options, checkRecovery, recoveryStore])
 
   /**
    * Reset machine back to idle state.

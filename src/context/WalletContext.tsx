@@ -11,6 +11,7 @@ import type { FirmaSendPreview } from '../services/firmaAlphaSend'
 import type { DerivationProfileId } from '../services/derivationProfiles'
 import { WalletContext } from './walletContext'
 import { WALLET_REFRESH_EVENT, type WalletRefreshDetail } from '../utils/walletRefresh'
+import { discoverAliasForAddress } from '../services/aliasDiscovery'
 
 const BACKUP_KEY = 'xoloswallet_backup_verified'
 
@@ -201,6 +202,40 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     },
     [address, getAliasStorageKey]
   )
+
+  // Hydrate alias from blockchain/alias service for existing wallets
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const activeAddr = address
+    if (!activeAddr) return
+
+    let cancelled = false
+    async function hydrateOnChainAlias(targetAddress: string) {
+      try {
+        const discovered = await discoverAliasForAddress(targetAddress, getChronik(), xolosWalletService)
+        if (!cancelled && discovered) {
+          const canonical = discovered.endsWith('.xec') ? discovered : `${discovered}.xec`
+          const key = getAliasStorageKey(targetAddress)
+          const stored = localStorage.getItem(key)
+          if (stored !== canonical) {
+            try {
+              updateAlias(canonical)
+            } catch (storageErr) {
+              console.error('Failed to persist hydrated alias locally:', storageErr)
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Could not hydrate alias for address:', targetAddress, err)
+      }
+    }
+
+    void hydrateOnChainAlias(activeAddr)
+
+    return () => {
+      cancelled = true
+    }
+  }, [address, getAliasStorageKey, updateAlias])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -538,12 +573,20 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setError(null)
       try {
         const txid = await xolosWalletService.registerAliasOnChain(registration, reservedUtxos, rmzFeeTxid)
-        await syncAddressAndBalance()
+        try {
+          await syncAddressAndBalance()
+        } catch (syncErr) {
+          console.warn('Error syncing balance after alias registration:', syncErr)
+        }
         if (registration?.alias) {
-          const canonicalAlias = registration.alias.endsWith('.xec')
-            ? registration.alias
-            : `${registration.alias}.xec`
-          updateAlias(canonicalAlias)
+          try {
+            const canonicalAlias = registration.alias.endsWith('.xec')
+              ? registration.alias
+              : `${registration.alias}.xec`
+            updateAlias(canonicalAlias)
+          } catch (storageErr) {
+            console.error('Failed to persist registered alias locally:', storageErr)
+          }
         }
         return txid
       } catch (err) {

@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { useState } from 'react'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WalletProvider } from './WalletContext'
@@ -24,7 +25,14 @@ const serviceMocks = vi.hoisted(() => ({
     firmaAtoms: 0n,
     firmaFormatted: '0',
     firmaDecimals: 4
-  })
+  }),
+  registerAliasOnChain: vi.fn().mockResolvedValue({
+    txid: 'mock-txid-12345',
+    status: 'broadcast_pending_index' as const,
+    rawTx: '01000000',
+    debug: {} as any
+  }),
+  findAliasForAddress: vi.fn().mockResolvedValue(null)
 }))
 
 vi.mock('../services/XolosWalletService', () => ({
@@ -34,11 +42,15 @@ vi.mock('../services/XolosWalletService', () => ({
 
 function TestHarness() {
   const wallet = useWallet()
+  const [lastRegisterTxid, setLastRegisterTxid] = useState<string | null>(null)
+  const [lastRegisterError, setLastRegisterError] = useState<string | null>(null)
 
   return (
     <div>
       <div data-testid="current-address">{wallet.address ?? 'no-address'}</div>
       <div data-testid="current-alias">{wallet.alias ?? 'no-alias'}</div>
+      <div data-testid="register-txid">{lastRegisterTxid ?? 'no-txid'}</div>
+      <div data-testid="register-error">{lastRegisterError ?? 'no-error'}</div>
       <button
         type="button"
         onClick={() => {
@@ -75,6 +87,23 @@ function TestHarness() {
       >
         Clear Alias
       </button>
+      <button
+        type="button"
+        onClick={async () => {
+          try {
+            const res = await wallet.registerAliasOnChain(
+              { alias: 'charlie' } as any,
+              [],
+              null
+            )
+            setLastRegisterTxid(typeof res === 'string' ? res : (res as any)?.txid ?? null)
+          } catch (err: any) {
+            setLastRegisterError(err.message)
+          }
+        }}
+      >
+        Register Charlie
+      </button>
     </div>
   )
 }
@@ -85,11 +114,13 @@ describe('WalletContext wallet-specific alias persistence', () => {
     currentAddress = addr1
     vi.clearAllMocks()
     serviceMocks.getAddress.mockImplementation(() => currentAddress)
+    serviceMocks.findAliasForAddress.mockResolvedValue(null)
   })
 
   afterEach(() => {
     cleanup()
     localStorage.clear()
+    vi.restoreAllMocks()
   })
 
   it('persists alias under address-specific localStorage key and reads it correctly', async () => {
@@ -175,5 +206,78 @@ describe('WalletContext wallet-specific alias persistence', () => {
     })
 
     expect(localStorage.getItem(`rmzwallet_alias_${addr1}`)).toBeNull()
+  })
+
+  it('Finding 3: isolates local storage persistence errors when registerAliasOnChain succeeds on-chain', async () => {
+    localStorage.setItem('xoloswallet_backup_verified', 'true')
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    render(
+      <WalletProvider>
+        <TestHarness />
+      </WalletProvider>
+    )
+
+    // Initialize wallet
+    fireEvent.click(screen.getByText('Switch to Addr1'))
+    await waitFor(() => {
+      expect(screen.getByTestId('current-address').textContent).toBe(addr1)
+    })
+
+    // Mock localStorage.setItem to throw on alias persistence
+    const originalSetItem = localStorage.setItem.bind(localStorage)
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation((key: string, value: string) => {
+      if (key.startsWith('rmzwallet_alias_')) {
+        throw new Error('QuotaExceededError: LocalStorage quota exceeded')
+      }
+      return originalSetItem(key, value)
+    })
+
+    // Click register alias
+    fireEvent.click(screen.getByText('Register Charlie'))
+
+    // The transaction should succeed and return txid without rethrowing
+    await waitFor(() => {
+      expect(screen.getByTestId('register-txid').textContent).toBe('mock-txid-12345')
+      expect(screen.getByTestId('register-error').textContent).toBe('no-error')
+    })
+
+    // Assert that the error was caught and logged
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      'Failed to persist registered alias locally:',
+      expect.any(Error)
+    )
+
+    consoleErrorSpy.mockRestore()
+  })
+
+  it('Finding 4: hydrates alias asynchronously from blockchain/service when mounting or switching address with empty localStorage', async () => {
+    serviceMocks.findAliasForAddress.mockImplementation(async (addr: string) => {
+      if (addr === addr1) return 'hydrated-alice.xec'
+      if (addr === addr2) return 'hydrated-bob.xec'
+      return null
+    })
+
+    render(
+      <WalletProvider>
+        <TestHarness />
+      </WalletProvider>
+    )
+
+    // Mount hydration for initial address (addr1)
+    await waitFor(() => {
+      expect(screen.getByTestId('current-address').textContent).toBe(addr1)
+      expect(screen.getByTestId('current-alias').textContent).toBe('hydrated-alice.xec')
+    })
+    expect(localStorage.getItem(`rmzwallet_alias_${addr1}`)).toBe('hydrated-alice.xec')
+
+    // Switch to addr2 which also has empty localStorage
+    fireEvent.click(screen.getByText('Switch to Addr2'))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('current-address').textContent).toBe(addr2)
+      expect(screen.getByTestId('current-alias').textContent).toBe('hydrated-bob.xec')
+    })
+    expect(localStorage.getItem(`rmzwallet_alias_${addr2}`)).toBe('hydrated-bob.xec')
   })
 })
