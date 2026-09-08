@@ -197,7 +197,8 @@ describe('walletPublisherExecutor components', () => {
       const signerMempool = new WalletSigner({
         address: testAddress,
         signatory: testSignatory,
-        utxos: [mempoolCoinbase]
+        utxos: [mempoolCoinbase],
+        tipHeight: 800_100
       })
       await expect(signerMempool.sign({ message: 'test' })).rejects.toThrow(/INSUFFICIENT_FUNDS/)
 

@@ -77,6 +77,22 @@ export function PublishStateMachineButton({
         </div>
       )}
 
+      {/* Reconciling state */}
+      {phase === 'reconciling' && (
+        <div className="state-machine-action" role="status">
+          <button
+            type="button"
+            className="cta primary is-loading"
+            disabled
+            aria-busy="true"
+            data-testid="publish-button-reconciling"
+          >
+            <span className="spinner" aria-hidden="true" />
+            Resolviendo publicación pendiente...
+          </button>
+        </div>
+      )}
+
       {/* Idle state */}
       {phase === 'idle' && (
         <div className="state-machine-action">

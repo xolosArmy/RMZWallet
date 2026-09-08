@@ -3,6 +3,8 @@ import {
   encodeTm1Draft02Post,
   Tm1Draft02EncodingError
 } from '../../integrations/tonalliMemo/tm1Draft02'
+import type { Tm1PublicationRecoveryStore } from '../../integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
+import { getChronik } from '../../services/ChronikClient'
 import {
   TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES,
   type Tm1PublisherExecutor,
@@ -17,6 +19,7 @@ export interface UseTm1PublishMachineOptions {
   initialOwnerAddress?: string
   maxBytes?: number
   executor: Tm1PublisherExecutor
+  recoveryStore?: Tm1PublicationRecoveryStore
   onSuccess?: (txid: string) => void
   onError?: (error: Error) => void
 }
@@ -31,6 +34,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
   const [alias, setAlias] = useState(options.initialAlias ?? '')
   const [ownerAddress, setOwnerAddress] = useState(options.initialOwnerAddress ?? '')
   const [phase, setPhase] = useState<Tm1PublishPhase>('idle')
+  const [pendingRecord, setPendingRecord] = useState<any | null>(null)
   const [verificationStatus, setVerificationStatus] =
     useState<Tm1VerificationStatus>('unverified')
   const [verificationError, setVerificationError] = useState<string | null>(null)
@@ -39,6 +43,8 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
 
   const abortControllerRef = useRef<AbortController | null>(null)
   const activeExecutorRef = useRef<Tm1PublisherExecutor>(options.executor)
+  const recoveryStore =
+    options.recoveryStore ?? (options.executor as any)?.recoveryStore
 
   // Update active executor if option changes
   useEffect(() => {
@@ -46,6 +52,42 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       activeExecutorRef.current = options.executor
     }
   }, [options.executor])
+
+  // Reconcile recovery records before allowing publication.
+  // If an unfinalized record (such as outcomeUnknown) is present in the durable store,
+  // enter 'reconciling' phase to block the editor and prevent duplicate publishes.
+  useEffect(() => {
+    let active = true
+    async function checkRecovery() {
+      if (!recoveryStore || typeof recoveryStore.listRecoverable !== 'function') {
+        return
+      }
+      try {
+        const recoverable = await recoveryStore.listRecoverable({ address: ownerAddress })
+        if (!active) return
+        const list = Array.isArray(recoverable) ? recoverable : []
+        const pending = list.find(
+          (rec: any) =>
+            rec &&
+            (rec.phase === 'outcomeUnknown' ||
+              (rec.phase === 'preDispatch' && rec.dispatchIntent))
+        )
+        if (pending) {
+          setPendingRecord(pending)
+          setPhase('reconciling')
+        } else {
+          setPendingRecord(null)
+          setPhase((prev) => (prev === 'reconciling' ? 'idle' : prev))
+        }
+      } catch {
+        // Safe fail-closed or silent
+      }
+    }
+    checkRecovery()
+    return () => {
+      active = false
+    }
+  }, [ownerAddress, recoveryStore])
 
   // Real-time byte length calculation via TextEncoder (handles UTF-8 multi-byte characters)
   const byteLength = useMemo(() => {
@@ -82,8 +124,12 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     }
   }, [message])
 
-  // Finding 3: The memo is valid ONLY if canonical preview succeeded AND it honors component byte limits:
-  const isValid = preview !== null && previewError === undefined && !isOverLimit
+  // Finding 3: The memo is valid ONLY if canonical preview succeeded, it honors component byte limits, and not reconciling:
+  const isValid =
+    preview !== null &&
+    previewError === undefined &&
+    !isOverLimit &&
+    phase !== 'reconciling'
 
   // Cleanup abort controller on unmount
   useEffect(() => {
@@ -117,11 +163,92 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
   }, [alias, ownerAddress])
 
   /**
+   * Attempt to reconcile a pending recovery record against Chronik.
+   */
+  const reconcilePending = useCallback(async () => {
+    if (!pendingRecord || !recoveryStore) return
+    const txid = pendingRecord.dispatchIntent?.txid
+    if (!txid) return
+
+    try {
+      const chronik =
+        (activeExecutorRef.current as any)?.signer?.chronik ??
+        (activeExecutorRef.current as any)?.transport?.chronik ??
+        (typeof getChronik === 'function' ? getChronik() : undefined)
+
+      if (chronik && typeof chronik.tx === 'function') {
+        const tx = await chronik.tx(txid)
+        if (tx && tx.txid) {
+          if (typeof recoveryStore.commitTransportAcknowledgement === 'function') {
+            await recoveryStore.commitTransportAcknowledgement({
+              publicationId: pendingRecord.publicationId,
+              expectedRevision: pendingRecord.revision,
+              expectedOwnerEpoch: pendingRecord.ownerEpoch,
+              acknowledgement: {
+                submissionId: pendingRecord.dispatchIntent.submissionId,
+                signedId:
+                  (pendingRecord.signed as any)?.signedId ??
+                  pendingRecord.dispatchIntent.submissionId,
+                txid: tx.txid,
+                signedArtifactHash: pendingRecord.dispatchIntent.signedArtifactHash,
+                disposition: 'accepted',
+                acknowledgedAt: Date.now()
+              } as any
+            })
+          }
+          setPendingRecord(null)
+          setPhase('idle')
+        }
+      }
+    } catch {
+      // Transaction not observed or chronik query failed
+    }
+  }, [pendingRecord, recoveryStore])
+
+  /**
+   * Dismiss or abandon an expired unresolvable pending publication.
+   */
+  const dismissPending = useCallback(async () => {
+    if (!pendingRecord || !recoveryStore) return
+    if (typeof (recoveryStore as any).remove === 'function') {
+      await (recoveryStore as any).remove(pendingRecord.publicationId)
+    } else if (typeof recoveryStore.commitRecoveryTransition === 'function') {
+      try {
+        await recoveryStore.commitRecoveryTransition({
+          publicationId: pendingRecord.publicationId,
+          expectedRevision: pendingRecord.revision,
+          expectedOwnerEpoch: pendingRecord.ownerEpoch,
+          nextRecord: {
+            ...pendingRecord,
+            revision: pendingRecord.revision + 1,
+            phase: 'abandoned',
+            terminal: {
+              status: 'abandoned',
+              stage: 'outcomeUnknown',
+              code: 'DISMISSED_BY_USER',
+              recordedAt: Date.now()
+            }
+          }
+        })
+      } catch {
+        // fallback
+      }
+    }
+    setPendingRecord(null)
+    setPhase('idle')
+  }, [pendingRecord, recoveryStore])
+
+  /**
    * Execute the publication flow across the state machine:
    * Idle -> Verifying Ownership -> Requesting Authorization -> Broadcasting -> Success / Error.
    */
   const publish = useCallback(async () => {
-    if (!isValid || phase === 'verifying_ownership' || phase === 'requesting_authorization' || phase === 'broadcasting') {
+    if (
+      !isValid ||
+      phase === 'verifying_ownership' ||
+      phase === 'requesting_authorization' ||
+      phase === 'broadcasting'
+    ) {
       return
     }
 
@@ -211,7 +338,8 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     byteLength,
     maxBytes,
     isOverLimit,
-    isValid
+    isValid,
+    pendingRecord
   }
 
   return {
@@ -220,6 +348,8 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     setAlias,
     setOwnerAddress,
     verifyOwnership,
+    reconcilePending,
+    dismissPending,
     publish,
     reset,
     abort: () => abortControllerRef.current?.abort()

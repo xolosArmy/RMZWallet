@@ -24,20 +24,26 @@ export function MemoCompose({
 }: MemoComposeProps = {}) {
   const { address, alias } = useWallet()
 
-  // Construct production publisher executor wired to real context dependencies
+  const productionRecoveryStore = useMemo(() => {
+    return customRecoveryStore ?? new Tm1ProductionRecoveryStore({ address })
+  }, [address, customRecoveryStore])
+
   const productionExecutor = useMemo(() => {
     const chronik = getChronik()
     const transport = new ChronikNetworkTransport({ chronik })
     const signer = new WalletSigner({ address, chronik })
-    const recoveryStore = customRecoveryStore ?? new Tm1ProductionRecoveryStore({ address })
     return createWalletPublisherExecutor({
       transport,
       signer,
-      recoveryStore
+      recoveryStore: productionRecoveryStore
     })
-  }, [address, customRecoveryStore])
+  }, [address, productionRecoveryStore])
 
   const executor = customExecutor ?? productionExecutor
+  const effectiveRecoveryStore =
+    customRecoveryStore ??
+    (customExecutor as any)?.recoveryStore ??
+    productionRecoveryStore
 
   return (
     <div className="page memo-compose-page">
@@ -79,6 +85,7 @@ export function MemoCompose({
           initialOwnerAddress={address || undefined}
           initialAlias={alias}
           executor={executor}
+          recoveryStore={effectiveRecoveryStore}
         />
       )}
     </div>

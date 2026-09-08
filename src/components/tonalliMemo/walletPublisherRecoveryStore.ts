@@ -8,6 +8,7 @@ import {
   assertTm1RecoveryTransition,
   assertTm1OwnershipTransition,
   consumedCapabilityIds,
+  isRecoverablePhase,
   type Tm1PublicationRecoveryRecord
 } from '../../integrations/tonalliMemo/recovery/tm1PublicationRecoveryModel'
 import {
@@ -111,8 +112,9 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
   readonly createdAt: number
   private readonly storage: Storage | null
   private readonly storageKey: string
-  private readonly records = new Map<string, Tm1PublicationRecoveryRecord>()
-  private readonly capabilityIds = new Set<string>()
+  private readonly address: string | null
+  private records = new Map<string, Tm1PublicationRecoveryRecord>()
+  private capabilityIds = new Set<string>()
   private witnessBinding: {
     slotId: string
     storeId: string
@@ -123,6 +125,7 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
   constructor(options: Tm1ProductionRecoveryStoreOptions = {}) {
     this.createdAt = Date.now()
     this.storage = options.storage !== undefined ? options.storage : getSafeStorage()
+    this.address = options.address ?? null
 
     const sanitizedAddress = options.address
       ? options.address.toLowerCase().replace(/^ecash:/, '').replace(/[^a-z0-9]/g, '')
@@ -140,10 +143,12 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
 
     // Insert any initial records passed in options
     if (options.initialRecords) {
+      const tentativeRecords = new Map(this.records)
+      const tentativeCapabilities = new Set(this.capabilityIds)
       for (const rec of options.initialRecords) {
-        this.insertInitial(rec)
+        this.insertInitial(rec, tentativeRecords, tentativeCapabilities)
       }
-      this.persist()
+      this.applyAndPersist(tentativeRecords, tentativeCapabilities)
     }
   }
 
@@ -171,14 +176,20 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
     }
   }
 
-  private persist(): void {
-    if (!this.storage) return
-    try {
-      const allRecords = [...this.records.values()]
+  private applyAndPersist(
+    tentativeRecords: Map<string, Tm1PublicationRecoveryRecord>,
+    tentativeCapabilities: Set<string>
+  ): void {
+    if (this.storage) {
+      const allRecords = [...tentativeRecords.values()]
+      // Note: Do NOT catch errors here. If storage write throws (e.g. QuotaExceededError or
+      // privacy restriction), let it propagate to the caller. The in-memory state will NOT
+      // be mutated if persistence fails.
       this.storage.setItem(this.storageKey, JSON.stringify(allRecords))
-    } catch {
-      // safe fallback on quota or storage write failure
     }
+    // Only commit tentative state to in-memory fields if setItem succeeded
+    this.records = tentativeRecords
+    this.capabilityIds = tentativeCapabilities
   }
 
   getStoreId(): string {
@@ -297,8 +308,17 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
     return record ? deepClone(record) : null
   }
 
-  async listRecoverable(): Promise<unknown> {
-    return [...this.records.values()].map((r) => deepClone(r))
+  async listRecoverable(query?: { address?: string | null }): Promise<unknown> {
+    if (query?.address && this.address) {
+      const target = query.address.toLowerCase().replace(/^ecash:/, '').replace(/[^a-z0-9]/g, '')
+      const current = this.address.toLowerCase().replace(/^ecash:/, '').replace(/[^a-z0-9]/g, '')
+      if (target && current && target !== current) {
+        return []
+      }
+    }
+    const all = [...this.records.values()]
+    const recoverable = all.filter((r) => isRecoverablePhase(r.phase))
+    return recoverable.map((r) => deepClone(r))
   }
 
   async create(input: Tm1RecoveryStoreCreate): Promise<unknown> {
@@ -306,9 +326,13 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
     if (this.records.has(record.publicationId)) {
       throw new Tm1PublicationRecoveryStoreError('DUPLICATE_PUBLICATION_ID')
     }
-    this.reserveCapabilities(consumedCapabilityIds(record))
-    this.records.set(record.publicationId, record)
-    this.persist()
+    const tentativeCapabilities = new Set(this.capabilityIds)
+    this.reserveCapabilities(consumedCapabilityIds(record), tentativeCapabilities)
+
+    const tentativeRecords = new Map(this.records)
+    tentativeRecords.set(record.publicationId, record)
+
+    this.applyAndPersist(tentativeRecords, tentativeCapabilities)
     return deepClone(record)
   }
 
@@ -321,9 +345,13 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
     const expectedNew = consumedCapabilityIds(next).filter(
       (id) => !consumedCapabilityIds(current).includes(id)
     )
-    this.reserveCapabilities(expectedNew)
-    this.records.set(current.publicationId, next)
-    this.persist()
+    const tentativeCapabilities = new Set(this.capabilityIds)
+    this.reserveCapabilities(expectedNew, tentativeCapabilities)
+
+    const tentativeRecords = new Map(this.records)
+    tentativeRecords.set(current.publicationId, next)
+
+    this.applyAndPersist(tentativeRecords, tentativeCapabilities)
     return deepClone(next)
   }
 
@@ -333,8 +361,12 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
     const current = this.current(input)
     const next = parseTm1PublicationRecoveryRecord(input.nextRecord)
     assertTm1DispatchIntentTransition(current, next)
-    this.records.set(current.publicationId, next)
-    this.persist()
+
+    const tentativeRecords = new Map(this.records)
+    tentativeRecords.set(current.publicationId, next)
+    const tentativeCapabilities = new Set(this.capabilityIds)
+
+    this.applyAndPersist(tentativeRecords, tentativeCapabilities)
     return deepClone(next)
   }
 
@@ -347,8 +379,12 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
       input.acknowledgement
     )
     assertTm1TransportAcknowledgementTransition(current, next)
-    this.records.set(current.publicationId, next)
-    this.persist()
+
+    const tentativeRecords = new Map(this.records)
+    tentativeRecords.set(current.publicationId, next)
+    const tentativeCapabilities = new Set(this.capabilityIds)
+
+    this.applyAndPersist(tentativeRecords, tentativeCapabilities)
     return deepClone(next)
   }
 
@@ -358,8 +394,12 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
     const current = this.current(input)
     const next = parseTm1PublicationRecoveryRecord(input.nextRecord)
     assertTm1RecoveryTransition(current, next)
-    this.records.set(current.publicationId, next)
-    this.persist()
+
+    const tentativeRecords = new Map(this.records)
+    tentativeRecords.set(current.publicationId, next)
+    const tentativeCapabilities = new Set(this.capabilityIds)
+
+    this.applyAndPersist(tentativeRecords, tentativeCapabilities)
     return deepClone(next)
   }
 
@@ -379,18 +419,45 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
       ownerEpoch: input.nextOwnerEpoch
     })
     assertTm1OwnershipTransition(current, next)
-    this.records.set(current.publicationId, next)
-    this.persist()
+
+    const tentativeRecords = new Map(this.records)
+    tentativeRecords.set(current.publicationId, next)
+    const tentativeCapabilities = new Set(this.capabilityIds)
+
+    this.applyAndPersist(tentativeRecords, tentativeCapabilities)
     return deepClone(next)
   }
 
-  private insertInitial(recordValue: Tm1PublicationRecoveryRecord): void {
+  async remove(publicationId: string): Promise<boolean> {
+    if (!this.records.has(publicationId)) {
+      return false
+    }
+    const tentativeRecords = new Map(this.records)
+    tentativeRecords.delete(publicationId)
+    const remainingCapabilities = new Set(
+      [...tentativeRecords.values()].flatMap(consumedCapabilityIds)
+    )
+    this.applyAndPersist(tentativeRecords, remainingCapabilities)
+    return true
+  }
+
+  async clear(): Promise<void> {
+    const tentativeRecords = new Map<string, Tm1PublicationRecoveryRecord>()
+    const tentativeCapabilities = new Set<string>()
+    this.applyAndPersist(tentativeRecords, tentativeCapabilities)
+  }
+
+  private insertInitial(
+    recordValue: Tm1PublicationRecoveryRecord,
+    targetRecords: Map<string, Tm1PublicationRecoveryRecord>,
+    targetCapabilities: Set<string>
+  ): void {
     const record = parseTm1PublicationRecoveryRecord(recordValue)
-    if (this.records.has(record.publicationId)) {
+    if (targetRecords.has(record.publicationId)) {
       throw new Tm1PublicationRecoveryStoreError('DUPLICATE_PUBLICATION_ID')
     }
-    this.reserveCapabilities(consumedCapabilityIds(record))
-    this.records.set(record.publicationId, record)
+    this.reserveCapabilities(consumedCapabilityIds(record), targetCapabilities)
+    targetRecords.set(record.publicationId, record)
   }
 
   private current(input: {
@@ -411,14 +478,17 @@ export class Tm1WebStoragePublicationRecoveryStore implements Tm1PublicationReco
     return current
   }
 
-  private reserveCapabilities(capabilityIds: readonly string[]): void {
+  private reserveCapabilities(
+    capabilityIds: readonly string[],
+    targetSet: Set<string>
+  ): void {
     for (const capabilityId of capabilityIds) {
-      if (this.capabilityIds.has(capabilityId)) {
+      if (targetSet.has(capabilityId)) {
         throw new Tm1PublicationRecoveryStoreError('DUPLICATE_CAPABILITY_CONSUMPTION')
       }
     }
     for (const capabilityId of capabilityIds) {
-      this.capabilityIds.add(capabilityId)
+      targetSet.add(capabilityId)
     }
   }
 }

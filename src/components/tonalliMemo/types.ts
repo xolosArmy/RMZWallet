@@ -30,6 +30,7 @@ export const TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES = 80
  */
 export type Tm1PublishPhase =
   | 'idle'
+  | 'reconciling'
   | 'verifying_ownership'
   | 'requesting_authorization'
   | 'broadcasting'
@@ -98,4 +99,5 @@ export interface Tm1PublishState {
   readonly maxBytes: number
   readonly isOverLimit: boolean
   readonly isValid: boolean
+  readonly pendingRecord?: unknown | null
 }

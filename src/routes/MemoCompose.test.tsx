@@ -371,6 +371,105 @@ describe('MemoCompose Route', () => {
 
       createExecutorSpy.mockRestore()
     })
+
+    it('disables memo editor and enters reconciling state when recoveryStore has a pending record', async () => {
+      mockWallet.address = 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+      mockWallet.alias = 'satoshixolos.xec'
+
+      const hash = 'a'.repeat(64)
+      const pendingRecord = {
+        schema: 'tonalli.tm1-publication-recovery',
+        schemaVersion: 1,
+        publicationId: 'pending-pub-12345',
+        revision: 2,
+        ownerEpoch: 1,
+        phase: 'outcomeUnknown',
+        preDispatchStage: null,
+        prepared: {
+          preparedId: 'pending-pub-12345',
+          bindingHash: hash,
+          preparedDigest: hash
+        },
+        signed: {
+          signedId: 'signed:pending-pub-12345',
+          txid: hash,
+          signedArtifactHash: hash
+        },
+        signingAuthorization: {
+          operationId: 'op:sign:pending-pub-12345',
+          capabilityId: 'cap:sign:pending-pub-12345',
+          contentHash: `sha256:${hash}`,
+          expiresAt: Date.now() + 3600000,
+          consumedAt: Date.now(),
+          preparedId: 'pending-pub-12345',
+          bindingHash: hash
+        },
+        broadcastAuthorization: {
+          operationId: 'op:broadcast:pending-pub-12345',
+          capabilityId: 'cap:broadcast:pending-pub-12345',
+          contentHash: `sha256:${hash}`,
+          expiresAt: Date.now() + 3600000,
+          consumedAt: Date.now(),
+          signedId: 'signed:pending-pub-12345',
+          txid: hash,
+          signedArtifactHash: hash
+        },
+        dispatchIntent: {
+          submissionId: 'sub:pending-pub-12345',
+          txid: hash,
+          signedArtifactHash: hash,
+          broadcastCapabilityId: 'cap:broadcast:pending-pub-12345',
+          committedAt: Date.now()
+        },
+        transportAcknowledgement: null,
+        lastObservation: null,
+        terminal: null
+      }
+
+      const mockRecoveryStore = {
+        storeId: 'tm1-test-store',
+        createdAt: Date.now(),
+        load: vi.fn().mockResolvedValue(pendingRecord),
+        listRecoverable: vi.fn().mockResolvedValue([pendingRecord]),
+        create: vi.fn(),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn(),
+        commitTransportAcknowledgement: vi.fn(),
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn(),
+        remove: vi.fn(),
+        clear: vi.fn()
+      }
+
+      render(
+        <MemoryRouter initialEntries={['/memo/compose']}>
+          <Routes>
+            <Route
+              path="/memo/compose"
+              element={<MemoCompose recoveryStore={mockRecoveryStore as any} />}
+            />
+          </Routes>
+        </MemoryRouter>
+      )
+
+      // 1. Wait for reconciliation state to appear
+      const reconcilingCard = await screen.findByTestId('memo-reconciling-state')
+      expect(reconcilingCard).toBeDefined()
+      expect(screen.getByText(/Publicación pendiente en resolución/i)).toBeDefined()
+      expect(screen.getByText(/pending-pub-12345/i)).toBeDefined()
+
+      // 2. Verify editor is blocked/disabled
+      const textarea = (await screen.findByPlaceholderText(
+        /Escribe tu mensaje oficial Tonalli Memo aquí/i
+      )) as HTMLTextAreaElement
+      expect(textarea.disabled).toBe(true)
+
+      // 3. Verify publish button is disabled in reconciling state instead of allowing publication
+      const reconcilingButton = screen.getByTestId('publish-button-reconciling')
+      expect(reconcilingButton).toBeDefined()
+      expect((reconcilingButton as HTMLButtonElement).disabled).toBe(true)
+      expect(screen.queryByTestId('publish-button-idle')).toBeNull()
+    })
   })
 })
 
