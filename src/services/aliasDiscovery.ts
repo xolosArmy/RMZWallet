@@ -1,5 +1,59 @@
+import { decodeCashAddress, encodeCashAddress } from 'ecashaddrjs'
 import { getChronik } from './ChronikClient'
-import { xolosWalletService } from './XolosWalletService'
+
+/**
+ * Computes the 21-byte address payload hex (1 byte type + 20 bytes hash160 = 42 hex characters).
+ * P2PKH -> '00' + hash160
+ * P2SH  -> '08' + hash160
+ */
+export function getAddressPayloadHex(address: string): string | null {
+  if (typeof address !== 'string' || !address.trim()) return null
+  try {
+    const cleanAddr = address.trim()
+    const decoded = decodeCashAddress(cleanAddr)
+    const typeByte = decoded.type === 'p2pkh' ? '00' : (decoded.type === 'p2sh' ? '08' : null)
+    if (!typeByte || !decoded.hash || decoded.hash.length !== 40) return null
+    return `${typeByte}${decoded.hash.toLowerCase()}`
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Extracts and decodes the embedded owner address from an alias registration OP_RETURN script.
+ */
+export function extractOwnerAddressFromScript(
+  scriptHex: string,
+  prefix: 'ecash' | 'ecregtest' | 'ectest' = 'ecash'
+): string | null {
+  if (typeof scriptHex !== 'string') return null
+  const hex = scriptHex.toLowerCase()
+  const prefixHex = '6a042e78656300'
+  const idx = hex.indexOf(prefixHex)
+  if (idx === -1) return null
+
+  const remainder = hex.slice(idx + prefixHex.length)
+  if (remainder.length < 2) return null
+
+  const lenByte = parseInt(remainder.slice(0, 2), 16)
+  if (isNaN(lenByte) || lenByte < 1 || lenByte > 21) return null
+  if (remainder.length < 2 + lenByte * 2 + 44) return null
+
+  const postAlias = remainder.slice(2 + lenByte * 2)
+  if (!postAlias.startsWith('15')) return null
+
+  const payload = postAlias.slice(2, 44)
+  const typeByte = payload.slice(0, 2)
+  const hash = payload.slice(2, 42)
+  const type = typeByte === '00' ? 'p2pkh' : (typeByte === '08' ? 'p2sh' : null)
+  if (!type) return null
+
+  try {
+    return encodeCashAddress(prefix, type, hash)
+  } catch {
+    return null
+  }
+}
 
 /**
  * Extracts an eCash .xec alias from an OP_RETURN script hex if present.
@@ -11,8 +65,16 @@ import { xolosWalletService } from './XolosWalletService'
  * - 00: protocol version 0
  * - lenByte: length of alias in bytes (1 to 21)
  * - aliasHex: UTF-8 encoded alias name
+ * - 15: PUSHDATA(21)
+ * - addressPayload: 21 bytes (1 byte type + 20 bytes hash160)
+ *
+ * If expectedAddress is provided, verifies that the embedded 21-byte owner payload
+ * cryptographically matches the expectedAddress.
  */
-export function extractAliasFromOutputScript(scriptHex: string): string | null {
+export function extractAliasFromOutputScript(
+  scriptHex: string,
+  expectedAddress?: string
+): string | null {
   if (typeof scriptHex !== 'string') return null
   const hex = scriptHex.toLowerCase()
   const prefix = '6a042e78656300'
@@ -34,6 +96,22 @@ export function extractAliasFromOutputScript(scriptHex: string): string | null {
 
   const cleanName = name.trim().toLowerCase()
   if (!cleanName || !/^[a-z0-9]{1,21}$/.test(cleanName)) return null
+
+  // Finding 1 (Verify embedded owner - P2):
+  // When expectedAddress is specified, extract and validate the 21-byte owner payload.
+  // Only return the alias if the embedded owner cryptographically matches expectedAddress.
+  const postAlias = remainder.slice(2 + lenByte * 2)
+  if (expectedAddress) {
+    if (postAlias.length < 44 || !postAlias.startsWith('15')) {
+      return null
+    }
+    const embeddedPayload = postAlias.slice(2, 44)
+    const expectedPayload = getAddressPayloadHex(expectedAddress)
+    if (!expectedPayload || embeddedPayload !== expectedPayload) {
+      return null
+    }
+  }
+
   return `${cleanName}.xec`
 }
 
@@ -48,9 +126,9 @@ export async function discoverAliasForAddress(
 ): Promise<string | null> {
   if (!address || typeof address !== 'string') return null
 
-  // 1. Direct query on walletService / xolosWalletService if custom mocked/provided in test harness
+  // 1. Direct query on walletService if custom mocked/provided in test harness or context
   try {
-    const customService = walletService ?? (xolosWalletService as any)
+    const customService = walletService
     if (
       customService &&
       typeof customService.findAliasForAddress === 'function'
@@ -92,7 +170,7 @@ export async function discoverAliasForAddress(
             for (const out of outputs) {
               const script = out?.outputScript
               if (typeof script === 'string') {
-                const alias = extractAliasFromOutputScript(script)
+                const alias = extractAliasFromOutputScript(script, address)
                 if (alias) return alias
               }
             }

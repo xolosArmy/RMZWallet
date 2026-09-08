@@ -25,6 +25,7 @@ import {
   XEC_TONALLI_TREASURY_ADDRESS
 } from '../config/xecFees'
 import { getChronik } from './ChronikClient'
+import { extractAliasFromOutputScript } from './aliasDiscovery'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 import type { DecryptPasswordResult } from './crypto'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
@@ -1693,22 +1694,9 @@ export class XolosWalletService {
           for (const out of outputs) {
             const script = out?.outputScript
             if (typeof script === 'string') {
-              const prefix = '6a042e78656300'
-              const idx = script.toLowerCase().indexOf(prefix)
-              if (idx !== -1) {
-                const rem = script.toLowerCase().slice(idx + prefix.length)
-                if (rem.length >= 2) {
-                  const len = parseInt(rem.slice(0, 2), 16)
-                  if (!isNaN(len) && len >= 1 && len <= 21 && rem.length >= 2 + len * 2) {
-                    let name = ''
-                    for (let i = 2; i < 2 + len * 2; i += 2) {
-                      name += String.fromCharCode(parseInt(rem.slice(i, i + 2), 16))
-                    }
-                    if (name && /^[a-z0-9]{1,21}$/.test(name)) {
-                      return `${name}.xec`
-                    }
-                  }
-                }
+              const alias = extractAliasFromOutputScript(script, address)
+              if (alias) {
+                return alias
               }
             }
           }

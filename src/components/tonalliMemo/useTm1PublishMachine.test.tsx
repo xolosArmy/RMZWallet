@@ -393,13 +393,17 @@ describe('useTm1PublishMachine Hook', () => {
     })
 
     it('acknowledges and clears pending record only when Chronik confirms txid', async () => {
-      const mockAck = vi.fn().mockResolvedValue(true)
       const pendingRec = createOutcomeUnknownPendingRecord()
+      let pendingList = [pendingRec]
+      const mockAck = vi.fn().mockImplementation(async () => {
+        pendingList = []
+        return true
+      })
       const mockRecoveryStore = {
         storeId: 'test-store',
         createdAt: Date.now(),
         load: vi.fn(),
-        listRecoverable: vi.fn().mockResolvedValue([pendingRec]),
+        listRecoverable: vi.fn().mockImplementation(async () => pendingList),
         create: vi.fn(),
         commitExecutionEvidence: vi.fn(),
         commitDispatchIntent: vi.fn(),
@@ -436,6 +440,94 @@ describe('useTm1PublishMachine Hook', () => {
       })
 
       expect(mockAck).toHaveBeenCalled()
+      expect(result.current.state.phase).toBe('idle')
+      expect(result.current.state.pendingRecord).toBeNull()
+    })
+
+    it('Strict Rule 2: rechecks pending records after resolving one and stays in reconciling phase if another pending record remains', async () => {
+      const pendingRec1 = createOutcomeUnknownPendingRecord({
+        publicationId: 'pub-rec-1',
+        dispatchIntent: {
+          txid: 'txid-1111',
+          submissionId: 'sub-1',
+          committedAt: 1000,
+          signedArtifactHash: 'hash-1'
+        }
+      })
+      const pendingRec2 = createOutcomeUnknownPendingRecord({
+        publicationId: 'pub-rec-2',
+        dispatchIntent: {
+          txid: 'txid-2222',
+          submissionId: 'sub-2',
+          committedAt: 2000,
+          signedArtifactHash: 'hash-2'
+        }
+      })
+
+      let pendingList = [pendingRec1, pendingRec2]
+      const mockAck = vi.fn().mockImplementation(async (params: any) => {
+        pendingList = pendingList.filter((r) => r.publicationId !== params.publicationId)
+        return true
+      })
+
+      const mockRecoveryStore = {
+        storeId: 'test-store',
+        createdAt: Date.now(),
+        load: vi.fn(),
+        listRecoverable: vi.fn().mockImplementation(async () => pendingList),
+        create: vi.fn(),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn(),
+        commitTransportAcknowledgement: mockAck,
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn(),
+        remove: vi.fn(),
+        clear: vi.fn()
+      }
+
+      const mockChronik = {
+        tx: vi.fn().mockImplementation(async (txid: string) => {
+          return { txid }
+        })
+      }
+      const mockExecutor = createMockExecutor({
+        signer: { chronik: mockChronik }
+      } as any)
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          recoveryStore: mockRecoveryStore as any,
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+        })
+      )
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      // Initially in reconciling with pendingRec1
+      expect(result.current.state.phase).toBe('reconciling')
+      expect((result.current.state.pendingRecord as any)?.publicationId).toBe('pub-rec-1')
+
+      // Reconcile pending publication 1
+      await act(async () => {
+        await result.current.reconcilePending()
+      })
+
+      // Finding 2 (Strict Rule 2):
+      // Machine must NOT transition to idle. It must stay in reconciling with pendingRec2!
+      expect(mockAck).toHaveBeenCalledTimes(1)
+      expect(result.current.state.phase).toBe('reconciling')
+      expect((result.current.state.pendingRecord as any)?.publicationId).toBe('pub-rec-2')
+
+      // Reconcile pending publication 2
+      await act(async () => {
+        await result.current.reconcilePending()
+      })
+
+      // Both resolved, now machine transitions to idle
+      expect(mockAck).toHaveBeenCalledTimes(2)
       expect(result.current.state.phase).toBe('idle')
       expect(result.current.state.pendingRecord).toBeNull()
     })

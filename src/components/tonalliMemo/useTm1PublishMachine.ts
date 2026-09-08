@@ -205,8 +205,14 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
               } as any
             })
           }
-          setPendingRecord(null)
-          setPhase('idle')
+          // Finding 2 (Recheck all pending records - P1):
+          // After acknowledging one pending record, do not blindly transition to idle.
+          // Re-query the recovery store to check if any other pending records exist (e.g. from concurrent tabs).
+          const stillHasPending = await checkRecovery()
+          if (!stillHasPending) {
+            setPendingRecord(null)
+            setPhase('idle')
+          }
         }
       }
     } catch {
@@ -214,7 +220,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       // Chronik query failed, returned 404, or tx is not yet confirmed.
       // Absence of evidence is not evidence of absence. The record MUST remain fenced.
     }
-  }, [pendingRecord, recoveryStore])
+  }, [pendingRecord, recoveryStore, checkRecovery])
 
   /**
    * Dismiss or abandon an expired unresolvable pending publication.

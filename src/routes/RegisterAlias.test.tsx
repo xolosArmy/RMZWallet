@@ -122,4 +122,40 @@ describe('RegisterAlias Route - Finding 2: Persist registered alias', () => {
 
     expect(mockWallet.setAlias).not.toHaveBeenCalled()
   })
+
+  it('Finding 3: succeeds and does not fail registration if setAlias throws storage exception', async () => {
+    mockWallet.setAlias.mockImplementationOnce(() => {
+      throw new Error('QuotaExceededError: storage is full')
+    })
+
+    render(
+      <MemoryRouter initialEntries={['/register-alias']}>
+        <Routes>
+          <Route path="/register-alias" element={<RegisterAlias />} />
+        </Routes>
+      </MemoryRouter>
+    )
+
+    const input = screen.getByLabelText(/alias/i)
+    fireEvent.change(input, { target: { value: 'satoshixolos' } })
+
+    const submitBtn = screen.getByRole('button', { name: /registrar alias/i })
+    fireEvent.click(submitBtn)
+
+    await waitFor(() => {
+      expect(mockWallet.sendRMZ).toHaveBeenCalled()
+      expect(mockWallet.registerAliasOnChain).toHaveBeenCalled()
+    })
+
+    await waitFor(() => {
+      expect(mockWallet.setAlias).toHaveBeenCalledWith('satoshixolos.xec')
+    })
+
+    expect(screen.queryByText(/RMZ service fee paid, but alias registration failed/i)).toBeNull()
+
+    await waitFor(() => {
+      expect(screen.getByText(/Transacciones/i)).toBeDefined()
+      expect(screen.getAllByText(/alias-txid-67890/i).length).toBeGreaterThan(0)
+    })
+  })
 })
