@@ -14,8 +14,11 @@ import {
   ChronikNetworkTransport,
   WalletPublisherExecutor,
   WalletSigner,
-  createWalletPublisherExecutor
+  createWalletPublisherExecutor,
+  Tm1ProductionRecoveryStore,
+  Tm1WebStoragePublicationRecoveryStore
 } from './walletPublisherExecutor'
+import * as ChronikClientModule from '../../services/ChronikClient'
 
 const ecc = new Ecc()
 const testSk = fromHex('11'.repeat(32))
@@ -175,12 +178,28 @@ describe('walletPublisherExecutor components', () => {
       }
 
       // 1. Tip height is not known -> maturity cannot be proven, conservative rejection
+      const mockUnavailableChronik = {
+        blockchainInfo: vi.fn().mockRejectedValue(new Error('Network tip unavailable'))
+      }
       const signerWithoutTip = new WalletSigner({
         address: testAddress,
         signatory: testSignatory,
-        utxos: [immatureCoinbaseUtxo]
+        utxos: [immatureCoinbaseUtxo],
+        chronik: mockUnavailableChronik as never
       })
       await expect(signerWithoutTip.sign({ message: 'test' })).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+
+      // 1b. Mempool coinbase (blockHeight: -1) -> unproven maturity even if tip is known
+      const mempoolCoinbase: ScriptUtxo = {
+        ...immatureCoinbaseUtxo,
+        blockHeight: -1
+      }
+      const signerMempool = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: [mempoolCoinbase]
+      })
+      await expect(signerMempool.sign({ message: 'test' })).rejects.toThrow(/INSUFFICIENT_FUNDS/)
 
       // 2. Tip height confirms only 50 blocks
       const signerImmature = new WalletSigner({
@@ -217,6 +236,121 @@ describe('walletPublisherExecutor components', () => {
       const deserialized = Tx.deser(fromHex(result.rawTxBytes))
       expect(deserialized.inputs.length).toBe(1)
       expect(deserialized.outputs[1].sats).toBeGreaterThan(0n)
+    })
+
+    it('resolves chain tip height via global getChronik() fallback for mature coinbase UTXO when chronik is not explicitly passed to WalletSigner', async () => {
+      const matureCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '66'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 100_000n,
+        isFinal: true
+      }
+
+      // Mock the global Chronik client resolved by getChronik()
+      const mockGlobalChronik = {
+        blockchainInfo: vi.fn().mockResolvedValue({ tipHeight: 800_150 }) // 151 confirmations >= 100
+      }
+      const getChronikSpy = vi
+        .spyOn(ChronikClientModule, 'getChronik')
+        .mockReturnValue(mockGlobalChronik as never)
+
+      try {
+        // Construct WalletSigner WITHOUT options.chronik and WITHOUT options.tipHeight
+        const signer = new WalletSigner({
+          address: testAddress,
+          signatory: testSignatory,
+          utxos: [matureCoinbaseUtxo]
+        })
+
+        const result = await signer.sign({ message: 'mature coinbase via fallback chronik' })
+        expect(result.rawTxBytes).toBeDefined()
+        expect(mockGlobalChronik.blockchainInfo).toHaveBeenCalled()
+
+        const deserialized = Tx.deser(fromHex(result.rawTxBytes))
+        // Exactly 1 input from the mature coinbase
+        expect(deserialized.inputs.length).toBe(1)
+        expect(deserialized.outputs.length).toBe(2)
+        expect(deserialized.outputs[1].sats).toBeGreaterThan(0n)
+      } finally {
+        getChronikSpy.mockRestore()
+      }
+    })
+
+    it('rejects immature coinbase UTXO via global getChronik() fallback when chain tip proves immature confirmations (< 100)', async () => {
+      const immatureCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '77'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 100_000n,
+        isFinal: true
+      }
+
+      // Mock global Chronik returning tip confirming only 50 blocks
+      const mockGlobalChronik = {
+        blockchainInfo: vi.fn().mockResolvedValue({ tipHeight: 800_050 }) // 51 confirmations < 100
+      }
+      const getChronikSpy = vi
+        .spyOn(ChronikClientModule, 'getChronik')
+        .mockReturnValue(mockGlobalChronik as never)
+
+      try {
+        // Construct WalletSigner WITHOUT options.chronik and WITHOUT options.tipHeight
+        const signer = new WalletSigner({
+          address: testAddress,
+          signatory: testSignatory,
+          utxos: [immatureCoinbaseUtxo]
+        })
+
+        await expect(
+          signer.sign({ message: 'immature coinbase via fallback chronik' })
+        ).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+        expect(mockGlobalChronik.blockchainInfo).toHaveBeenCalled()
+      } finally {
+        getChronikSpy.mockRestore()
+      }
+    })
+
+    it('fails closed when global getChronik() blockchainInfo rejects during coinbase maturity check', async () => {
+      const candidateCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '88'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 100_000n,
+        isFinal: true
+      }
+
+      // Mock global Chronik where blockchainInfo fails/throws network error
+      const mockGlobalChronik = {
+        blockchainInfo: vi.fn().mockRejectedValue(new Error('Network offline'))
+      }
+      const getChronikSpy = vi
+        .spyOn(ChronikClientModule, 'getChronik')
+        .mockReturnValue(mockGlobalChronik as never)
+
+      try {
+        const signer = new WalletSigner({
+          address: testAddress,
+          signatory: testSignatory,
+          utxos: [candidateCoinbaseUtxo]
+        })
+
+        await expect(
+          signer.sign({ message: 'unproven coinbase when chronik rejects' })
+        ).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+        expect(mockGlobalChronik.blockchainInfo).toHaveBeenCalled()
+      } finally {
+        getChronikSpy.mockRestore()
+      }
     })
   })
 
@@ -742,5 +876,90 @@ describe('walletPublisherExecutor components', () => {
         /NO_UTXO_FOR_ACTIVE_ADDRESS/
       )
     })
+
+    it('always instantiates WalletPublisherExecutor with a valid non-null recoveryStore by default', () => {
+      const defaultExecutor = new WalletPublisherExecutor()
+      expect(defaultExecutor.recoveryStore).toBeDefined()
+      expect(defaultExecutor.recoveryStore).not.toBeNull()
+      expect(defaultExecutor.recoveryStore).toBeInstanceOf(Tm1ProductionRecoveryStore)
+      expect(defaultExecutor.recoveryStore).toBeInstanceOf(Tm1WebStoragePublicationRecoveryStore)
+      expect(typeof defaultExecutor.recoveryStore.commitDispatchIntent).toBe('function')
+      expect(typeof defaultExecutor.recoveryStore.create).toBe('function')
+      expect(typeof defaultExecutor.recoveryStore.load).toBe('function')
+
+      const factoryExecutor = createWalletPublisherExecutor()
+      expect(factoryExecutor.recoveryStore).toBeDefined()
+      expect(factoryExecutor.recoveryStore).not.toBeNull()
+      expect(factoryExecutor.recoveryStore).toBeInstanceOf(Tm1ProductionRecoveryStore)
+    })
+
+    it('persists recovery records across store instances via web storage backend', async () => {
+      const storageMap = new Map<string, string>()
+      const mockStorage: Storage = {
+        getItem: vi.fn((k: string) => storageMap.get(k) ?? null),
+        setItem: vi.fn((k: string, v: string) => {
+          storageMap.set(k, v)
+        }),
+        removeItem: vi.fn((k: string) => {
+          storageMap.delete(k)
+        }),
+        clear: vi.fn(() => {
+          storageMap.clear()
+        }),
+        key: vi.fn((i: number) => [...storageMap.keys()][i] ?? null),
+        length: 0
+      }
+
+      const storeA = new Tm1ProductionRecoveryStore({
+        address: testAddress,
+        storage: mockStorage
+      })
+
+      const mockChronik = {
+        broadcastTx: vi.fn().mockResolvedValue({})
+      }
+      const transport = new ChronikNetworkTransport({ chronik: mockChronik as never })
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: testUtxos
+      })
+
+      const executorA = new WalletPublisherExecutor({
+        transport,
+        signer,
+        recoveryStore: storeA
+      })
+
+      const prep = await executorA.prepareAndSign(
+        { authorized: true },
+        'memo with durable storage'
+      )
+
+      const finalizeResult = await executorA.broadcastAndFinalize(
+        prep.preparedReview,
+        prep.signedReview
+      )
+      expect(finalizeResult.txid).toBeDefined()
+
+      // Storage should have recorded mutations
+      expect(mockStorage.setItem).toHaveBeenCalled()
+
+      // Second store instance with same address and storage recovers the state
+      const storeB = new Tm1ProductionRecoveryStore({
+        address: testAddress,
+        storage: mockStorage
+      })
+
+      const recovered = (await storeB.load(
+        (prep.preparedReview as { preparedId: string }).preparedId
+      )) as { phase: string; publicationId: string } | null
+      expect(recovered).toBeDefined()
+      expect(recovered?.publicationId).toBe(
+        (prep.preparedReview as { preparedId: string }).preparedId
+      )
+      expect(recovered?.phase).toBe('submittedObserved')
+    })
   })
 })
+

@@ -296,4 +296,81 @@ describe('MemoCompose Route', () => {
       expect(freshTextarea.value).toBe('')
     })
   })
+
+  describe('Production executor construction and durable recoveryStore integration', () => {
+    it('constructs WalletPublisherExecutor with a valid non-null recoveryStore and active Chronik client', async () => {
+      const walletPublisherModule = await import('../components/tonalliMemo/walletPublisherExecutor')
+      const createExecutorSpy = vi.spyOn(walletPublisherModule, 'createWalletPublisherExecutor')
+
+      mockWallet.address = 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+      mockWallet.alias = 'satoshixolos.xec'
+
+      render(
+        <MemoryRouter initialEntries={['/memo/compose']}>
+          <Routes>
+            <Route path="/memo/compose" element={<MemoCompose />} />
+          </Routes>
+        </MemoryRouter>
+      )
+
+      expect(createExecutorSpy).toHaveBeenCalled()
+      const callOptions = createExecutorSpy.mock.calls[createExecutorSpy.mock.calls.length - 1][0]
+      expect(callOptions).toBeDefined()
+
+      // Assert that recoveryStore is valid and non-null
+      expect(callOptions?.recoveryStore).toBeDefined()
+      expect(callOptions?.recoveryStore).not.toBeNull()
+      expect(typeof callOptions?.recoveryStore?.create).toBe('function')
+      expect(typeof callOptions?.recoveryStore?.load).toBe('function')
+      expect(typeof callOptions?.recoveryStore?.commitDispatchIntent).toBe('function')
+      expect(typeof callOptions?.recoveryStore?.commitTransportAcknowledgement).toBe('function')
+      expect(typeof callOptions?.recoveryStore?.claimOwnership).toBe('function')
+
+      // Assert the constructed executor has the non-null recoveryStore instance
+      const executorInstance =
+        createExecutorSpy.mock.results[createExecutorSpy.mock.results.length - 1].value
+      expect(executorInstance).toBeInstanceOf(walletPublisherModule.WalletPublisherExecutor)
+      expect(executorInstance.recoveryStore).toBeDefined()
+      expect(executorInstance.recoveryStore).not.toBeNull()
+      expect(executorInstance.recoveryStore).toBe(callOptions?.recoveryStore)
+
+      // Assert active Chronik transport and signer are wired
+      expect(callOptions?.transport).toBeDefined()
+      expect(callOptions?.transport?.chronik).toBeDefined()
+      expect(callOptions?.signer).toBeDefined()
+
+      createExecutorSpy.mockRestore()
+    })
+
+    it('injects custom recoveryStore into production executor when passed via props', async () => {
+      const walletPublisherModule = await import('../components/tonalliMemo/walletPublisherExecutor')
+      const createExecutorSpy = vi.spyOn(walletPublisherModule, 'createWalletPublisherExecutor')
+      const customStore = new walletPublisherModule.Tm1ProductionRecoveryStore()
+
+      mockWallet.address = 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+      mockWallet.alias = 'satoshixolos.xec'
+
+      render(
+        <MemoryRouter initialEntries={['/memo/compose']}>
+          <Routes>
+            <Route
+              path="/memo/compose"
+              element={<MemoCompose recoveryStore={customStore} />}
+            />
+          </Routes>
+        </MemoryRouter>
+      )
+
+      expect(createExecutorSpy).toHaveBeenCalled()
+      const callOptions = createExecutorSpy.mock.calls[createExecutorSpy.mock.calls.length - 1][0]
+      expect(callOptions?.recoveryStore).toBe(customStore)
+
+      const executorInstance =
+        createExecutorSpy.mock.results[createExecutorSpy.mock.results.length - 1].value
+      expect(executorInstance.recoveryStore).toBe(customStore)
+
+      createExecutorSpy.mockRestore()
+    })
+  })
 })
+

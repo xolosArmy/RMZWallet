@@ -21,6 +21,19 @@ import {
   type Tm1AliasPublicationAuthorizer
 } from '../../integrations/tonalliMemo/tm1AliasPublicationAuthorization'
 import { encodeTm1Draft02Post } from '../../integrations/tonalliMemo/tm1Draft02'
+import {
+  Tm1ProductionRecoveryStore,
+  Tm1ProductionRecoveryStore as Tm1SqlitePublicationRecoveryStore,
+  Tm1WebStoragePublicationRecoveryStore,
+  createTm1ProductionRecoveryStore
+} from './walletPublisherRecoveryStore'
+
+export {
+  Tm1ProductionRecoveryStore,
+  Tm1SqlitePublicationRecoveryStore,
+  Tm1WebStoragePublicationRecoveryStore,
+  createTm1ProductionRecoveryStore
+}
 
 export const COINBASE_MATURITY_CONFIRMATIONS = 100
 
@@ -307,10 +320,14 @@ export class WalletSigner {
         } catch {
           tipHeight = undefined
         }
-      } else if (this.chronik && typeof this.chronik.blockchainInfo === 'function') {
+      } else {
         try {
-          const info = await this.chronik.blockchainInfo()
-          tipHeight = info.tipHeight
+          const chronikClient =
+            this.chronik ?? (typeof getChronik === 'function' ? getChronik() : undefined)
+          if (chronikClient && typeof chronikClient.blockchainInfo === 'function') {
+            const info = await chronikClient.blockchainInfo()
+            tipHeight = typeof info?.tipHeight === 'number' ? info.tipHeight : undefined
+          }
         } catch {
           tipHeight = undefined
         }
@@ -509,14 +526,15 @@ export interface WalletPublisherExecutorOptions {
 export class WalletPublisherExecutor implements Tm1PublisherExecutor {
   readonly transport: ChronikNetworkTransport
   readonly signer: WalletSigner
-  readonly recoveryStore?: Tm1PublicationRecoveryStore
+  readonly recoveryStore: Tm1PublicationRecoveryStore
   readonly verificationPort: Tm1OwnershipVerificationPortLike | Tm1AliasOwnershipVerificationPort
   readonly authorizer: Tm1PublicationAuthorizerLike | Tm1AliasPublicationAuthorizer
 
   constructor(options: WalletPublisherExecutorOptions = {}) {
-    this.transport = options.transport ?? new ChronikNetworkTransport()
-    this.signer = options.signer ?? new WalletSigner()
-    this.recoveryStore = options.recoveryStore
+    const defaultChronik = typeof getChronik === 'function' ? getChronik() : undefined
+    this.transport = options.transport ?? new ChronikNetworkTransport({ chronik: defaultChronik })
+    this.signer = options.signer ?? new WalletSigner({ chronik: defaultChronik })
+    this.recoveryStore = options.recoveryStore ?? new Tm1ProductionRecoveryStore()
     this.verificationPort = options.verificationPort ?? createTm1AliasOwnershipVerificationPort()
     this.authorizer = options.authorizer ?? createTm1AliasPublicationAuthorizer()
   }

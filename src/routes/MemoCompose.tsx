@@ -5,27 +5,37 @@ import { useWallet } from '../context/useWallet'
 import TonalliMemoComposer from '../components/tonalliMemo/TonalliMemoComposer'
 import {
   ChronikNetworkTransport,
-  WalletPublisherExecutor,
-  WalletSigner
+  WalletSigner,
+  createWalletPublisherExecutor,
+  Tm1ProductionRecoveryStore
 } from '../components/tonalliMemo/walletPublisherExecutor'
 import type { Tm1PublisherExecutor } from '../components/tonalliMemo/types'
+import type { Tm1PublicationRecoveryStore } from '../integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
+import { getChronik } from '../services/ChronikClient'
 
 export interface MemoComposeProps {
   executor?: Tm1PublisherExecutor
+  recoveryStore?: Tm1PublicationRecoveryStore
 }
 
-export function MemoCompose({ executor: customExecutor }: MemoComposeProps = {}) {
+export function MemoCompose({
+  executor: customExecutor,
+  recoveryStore: customRecoveryStore
+}: MemoComposeProps = {}) {
   const { address, alias } = useWallet()
 
   // Construct production publisher executor wired to real context dependencies
   const productionExecutor = useMemo(() => {
-    const transport = new ChronikNetworkTransport()
-    const signer = new WalletSigner({ address })
-    return new WalletPublisherExecutor({
+    const chronik = getChronik()
+    const transport = new ChronikNetworkTransport({ chronik })
+    const signer = new WalletSigner({ address, chronik })
+    const recoveryStore = customRecoveryStore ?? new Tm1ProductionRecoveryStore({ address })
+    return createWalletPublisherExecutor({
       transport,
-      signer
+      signer,
+      recoveryStore
     })
-  }, [address])
+  }, [address, customRecoveryStore])
 
   const executor = customExecutor ?? productionExecutor
 
