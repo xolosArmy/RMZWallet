@@ -116,6 +116,108 @@ describe('walletPublisherExecutor components', () => {
       expect(result.txid).toBe('custom-txid-123')
       expect(customSign).toHaveBeenCalledWith({ input: 'data' }, undefined)
     })
+
+    it('ignores giant immature coinbase UTXO and builds transaction using only mature standard UTXO', async () => {
+      const immatureCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '33'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 50_000_000_000n, // Giant 500,000 XEC coinbase UTXO
+        isFinal: true
+      }
+
+      const standardUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '44'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 799_950,
+        isCoinbase: false,
+        sats: 50_000n, // Small 500 XEC standard UTXO
+        isFinal: true
+      }
+
+      // Tip height 800_050 -> 800_050 - 800_000 + 1 = 51 confirmations < 100 maturity
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: [immatureCoinbaseUtxo, standardUtxo],
+        tipHeight: 800_050,
+        coinbaseMaturity: 100
+      })
+
+      const result = await signer.sign({ message: 'tonalli test memo' })
+      expect(result.rawTxBytes).toBeDefined()
+
+      const deserialized = Tx.deser(fromHex(result.rawTxBytes))
+      // Exactly 1 input selected (the small mature standard UTXO, NOT the giant coinbase UTXO)
+      expect(deserialized.inputs.length).toBe(1)
+      expect(deserialized.outputs.length).toBe(2)
+      // The change output must be less than 50,000 sats minus fees.
+      // If the giant coinbase UTXO was selected, change would exceed 49,000,000,000 sats!
+      expect(deserialized.outputs[1].sats).toBeLessThan(50_000n)
+      expect(deserialized.outputs[1].sats).toBeGreaterThan(0n)
+    })
+
+    it('rejects when only immature coinbase UTXOs are available (unproven or < 100 confirmations)', async () => {
+      const immatureCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '33'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 50_000_000_000n,
+        isFinal: true
+      }
+
+      // 1. Tip height is not known -> maturity cannot be proven, conservative rejection
+      const signerWithoutTip = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: [immatureCoinbaseUtxo]
+      })
+      await expect(signerWithoutTip.sign({ message: 'test' })).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+
+      // 2. Tip height confirms only 50 blocks
+      const signerImmature = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: [immatureCoinbaseUtxo],
+        tipHeight: 800_049
+      })
+      await expect(signerImmature.sign({ message: 'test' })).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+    })
+
+    it('permits coinbase UTXO once maturity (>= 100 confirmations) is proven', async () => {
+      const matureCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '55'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 100_000n,
+        isFinal: true
+      }
+
+      // Tip height 800_099 -> 800_099 - 800_000 + 1 = 100 confirmations >= 100
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: [matureCoinbaseUtxo],
+        tipHeight: 800_099
+      })
+
+      const result = await signer.sign({ message: 'test mature coinbase' })
+      expect(result.rawTxBytes).toBeDefined()
+      const deserialized = Tx.deser(fromHex(result.rawTxBytes))
+      expect(deserialized.inputs.length).toBe(1)
+      expect(deserialized.outputs[1].sats).toBeGreaterThan(0n)
+    })
   })
 
   describe('WalletPublisherExecutor workflow', () => {
@@ -211,11 +313,129 @@ describe('walletPublisherExecutor components', () => {
       // 4. Broadcast and finalize
       const dispatchResult = await executor.broadcastAndFinalize(preparedReview, signedReview)
       expect(dispatchResult.txid).toBe('tx-broadcasted-success')
-      expect(mockRecoveryStore.commitDispatchIntent).toHaveBeenCalled()
+      expect(mockRecoveryStore.create).toHaveBeenCalledWith({
+        record: expect.objectContaining({
+          schema: 'tonalli.tm1-publication-recovery',
+          schemaVersion: 1,
+          phase: 'preDispatch'
+        })
+      })
+      expect(mockRecoveryStore.commitDispatchIntent).toHaveBeenCalledWith({
+        publicationId: expect.any(String),
+        expectedRevision: 1,
+        expectedOwnerEpoch: 1,
+        nextRecord: expect.objectContaining({
+          schema: 'tonalli.tm1-publication-recovery',
+          schemaVersion: 1,
+          phase: 'outcomeUnknown',
+          dispatchIntent: expect.objectContaining({
+            committedAt: expect.any(Number)
+          })
+        })
+      })
       expect(mockRecoveryStore.commitTransportAcknowledgement).toHaveBeenCalled()
       expect(mockChronik.broadcastTx).toHaveBeenCalledWith(
         fromHex((signedReview as { rawTxBytes: string }).rawTxBytes)
       )
+    })
+
+    it('fails closed when commitDispatchIntent rejects and ensures transport.broadcast is never called', async () => {
+      let dispatchCount = 0
+      const mockChronik = {
+        broadcastTx: vi.fn().mockImplementation(async () => {
+          dispatchCount++
+          return { txid: 'unreachable-txid' }
+        })
+      }
+      const transport = new ChronikNetworkTransport({ chronik: mockChronik as never })
+      const broadcastSpy = vi.spyOn(transport, 'broadcast')
+
+      const persistenceError = new Error('DATABASE_DISK_FULL_PERSISTENCE_FAILED')
+      const mockRecoveryStore = {
+        load: vi.fn().mockResolvedValue(null),
+        listRecoverable: vi.fn(),
+        create: vi.fn().mockResolvedValue({}),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn().mockRejectedValue(persistenceError),
+        commitTransportAcknowledgement: vi.fn(),
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn()
+      }
+
+      const executor = new WalletPublisherExecutor({
+        transport,
+        recoveryStore: mockRecoveryStore as never
+      })
+
+      const preparedReview = {
+        protocol: 'TM1',
+        draft: '0.2',
+        preparedId: 'prep-fail-closed-test',
+        createdAt: Date.now()
+      }
+      const signedReview = {
+        preparedId: 'prep-fail-closed-test',
+        rawTxHex: '0100000000000000',
+        txid: '33'.repeat(32)
+      }
+
+      await expect(
+        executor.broadcastAndFinalize(preparedReview, signedReview)
+      ).rejects.toThrow('DATABASE_DISK_FULL_PERSISTENCE_FAILED')
+
+      // Strict assertions: persistence failed, transport.broadcast must NEVER be called
+      expect(dispatchCount).toBe(0)
+      expect(broadcastSpy).not.toHaveBeenCalled()
+      expect(mockChronik.broadcastTx).not.toHaveBeenCalled()
+      expect(mockRecoveryStore.commitDispatchIntent).toHaveBeenCalledTimes(1)
+      expect(mockRecoveryStore.commitTransportAcknowledgement).not.toHaveBeenCalled()
+    })
+
+    it('fails closed when recoveryStore.create rejects before broadcast', async () => {
+      let dispatchCount = 0
+      const mockChronik = {
+        broadcastTx: vi.fn().mockImplementation(async () => {
+          dispatchCount++
+          return { txid: 'unreachable-txid' }
+        })
+      }
+      const transport = new ChronikNetworkTransport({ chronik: mockChronik as never })
+      const broadcastSpy = vi.spyOn(transport, 'broadcast')
+
+      const createError = new Error('DUPLICATE_KEY_CANNOT_CREATE_RECORD')
+      const mockRecoveryStore = {
+        load: vi.fn().mockResolvedValue(null),
+        listRecoverable: vi.fn(),
+        create: vi.fn().mockRejectedValue(createError),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn().mockResolvedValue({}),
+        commitTransportAcknowledgement: vi.fn(),
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn()
+      }
+
+      const executor = new WalletPublisherExecutor({
+        transport,
+        recoveryStore: mockRecoveryStore as never
+      })
+
+      const preparedReview = {
+        preparedId: 'prep-create-fail-test'
+      }
+      const signedReview = {
+        preparedId: 'prep-create-fail-test',
+        rawTxHex: '0100000000000000',
+        txid: '44'.repeat(32)
+      }
+
+      await expect(
+        executor.broadcastAndFinalize(preparedReview, signedReview)
+      ).rejects.toThrow('DUPLICATE_KEY_CANNOT_CREATE_RECORD')
+
+      expect(dispatchCount).toBe(0)
+      expect(broadcastSpy).not.toHaveBeenCalled()
+      expect(mockChronik.broadcastTx).not.toHaveBeenCalled()
+      expect(mockRecoveryStore.commitDispatchIntent).not.toHaveBeenCalled()
     })
 
     it('generates unique evidence and nonces on successive retries to avoid ALIAS_PROOF_REPLAYED', async () => {

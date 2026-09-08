@@ -6,6 +6,12 @@ import { FEE_RATE_SATS_PER_BYTE, XEC_DUST_SATS } from '../../config/xecFees'
 import type { Tm1PublisherExecutor } from './types'
 import type { Tm1PublicationRecoveryStore } from '../../integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
 import {
+  TM1_PUBLICATION_RECOVERY_SCHEMA,
+  TM1_PUBLICATION_RECOVERY_SCHEMA_VERSION,
+  type Tm1PublicationRecoveryRecord,
+  parseTm1PublicationRecoveryRecord
+} from '../../integrations/tonalliMemo/recovery/tm1PublicationRecoveryModel'
+import {
   createTm1AliasOwnershipVerificationPort,
   lookupTm1VerifiedAliasOwnershipToken,
   type Tm1AliasOwnershipVerificationPort
@@ -15,6 +21,8 @@ import {
   type Tm1AliasPublicationAuthorizer
 } from '../../integrations/tonalliMemo/tm1AliasPublicationAuthorization'
 import { encodeTm1Draft02Post } from '../../integrations/tonalliMemo/tm1Draft02'
+
+export const COINBASE_MATURITY_CONFIRMATIONS = 100
 
 /**
  * Interface compatible with real Tm1AliasOwnershipVerificationPort and test mocks.
@@ -121,6 +129,8 @@ export interface WalletSignerOptions {
   deriveHdSignatory?: (owner: HdInputOwner) => unknown
   getUtxos?: (address: string) => Promise<ScriptUtxo[]>
   utxos?: Array<OwnedUtxo | ScriptUtxo>
+  tipHeight?: number | (() => Promise<number>)
+  coinbaseMaturity?: number
   feePerKb?: bigint
   dustSats?: bigint
   signCandidate?: (
@@ -154,6 +164,8 @@ export class WalletSigner {
   private readonly deriveHdSignatoryOption?: (owner: HdInputOwner) => unknown
   private readonly getUtxos?: (address: string) => Promise<ScriptUtxo[]>
   private readonly utxos?: Array<OwnedUtxo | ScriptUtxo>
+  private readonly tipHeightOption?: number | (() => Promise<number>)
+  private readonly coinbaseMaturity: number
   private readonly feePerKb?: bigint
   private readonly dustSats?: bigint
   private readonly customSign?: WalletSignerOptions['signCandidate']
@@ -168,6 +180,8 @@ export class WalletSigner {
     this.deriveHdSignatoryOption = options.deriveHdSignatory
     this.getUtxos = options.getUtxos
     this.utxos = options.utxos
+    this.tipHeightOption = options.tipHeight
+    this.coinbaseMaturity = options.coinbaseMaturity ?? COINBASE_MATURITY_CONFIRMATIONS
     this.feePerKb = options.feePerKb
     this.dustSats = options.dustSats
     this.customSign = options.signCandidate
@@ -281,7 +295,48 @@ export class WalletSigner {
       return a.toLowerCase().replace(/^ecash:/, '') === b.toLowerCase().replace(/^ecash:/, '')
     }
 
-    const spendableUtxosTotal = normalizedUtxos.filter((item) => !item.utxo.token)
+    // Resolve current blockchain tip height if any candidate UTXO is a coinbase output
+    let tipHeight: number | undefined
+    const hasCoinbaseUtxo = normalizedUtxos.some((item) => Boolean(item.utxo.isCoinbase))
+    if (hasCoinbaseUtxo) {
+      if (typeof this.tipHeightOption === 'number') {
+        tipHeight = this.tipHeightOption
+      } else if (typeof this.tipHeightOption === 'function') {
+        try {
+          tipHeight = await this.tipHeightOption()
+        } catch {
+          tipHeight = undefined
+        }
+      } else if (this.chronik && typeof this.chronik.blockchainInfo === 'function') {
+        try {
+          const info = await this.chronik.blockchainInfo()
+          tipHeight = info.tipHeight
+        } catch {
+          tipHeight = undefined
+        }
+      }
+    }
+
+    const isImmatureCoinbase = (utxo: ScriptUtxo): boolean => {
+      if (!utxo.isCoinbase) {
+        return false
+      }
+      // Exclude immature coinbase outputs until consensus maturity is proven.
+      // If tip height is unknown or UTXO is in mempool (blockHeight < 0), maturity cannot be proven.
+      if (
+        tipHeight === undefined ||
+        typeof utxo.blockHeight !== 'number' ||
+        utxo.blockHeight < 0
+      ) {
+        return true
+      }
+      const confirmations = tipHeight - utxo.blockHeight + 1
+      return confirmations < this.coinbaseMaturity
+    }
+
+    const spendableUtxosTotal = normalizedUtxos.filter(
+      (item) => !item.utxo.token && !isImmatureCoinbase(item.utxo)
+    )
 
     if (spendableUtxosTotal.length === 0) {
       throw new Error('INSUFFICIENT_FUNDS: No spendable XEC UTXOs found for address')
@@ -621,24 +676,115 @@ export class WalletPublisherExecutor implements Tm1PublisherExecutor {
       throw new Error('OPERATION_ABORTED')
     }
     const prepId =
-      (preparedReview as { preparedId?: string }).preparedId ?? crypto.randomUUID()
+      (preparedReview as { preparedId?: string }).preparedId ??
+      (signedReview as { preparedId?: string }).preparedId ??
+      (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `prep-${Date.now()}`)
 
-    // Durable store intent persistence hook if recovery store is configured
-    if (this.recoveryStore?.commitDispatchIntent) {
-      try {
+    const now = Date.now()
+    const CANONICAL_HASH_REGEX = /^[0-9a-f]{64}$/
+    const ensureCanonicalHash = (value: unknown, fallbackSeed: string): string => {
+      if (typeof value === 'string' && CANONICAL_HASH_REGEX.test(value.toLowerCase())) {
+        return value.toLowerCase()
+      }
+      return toHex(sha256(new TextEncoder().encode(fallbackSeed)))
+    }
+
+    const bindingHash = ensureCanonicalHash(
+      (preparedReview as { bindingHash?: string }).bindingHash,
+      `${prepId}:binding`
+    )
+    const rawSignedTxid = (signedReview as { txid?: string }).txid
+    const txid64 = ensureCanonicalHash(rawSignedTxid, `${prepId}:txid`)
+    const signedArtifactHash = ensureCanonicalHash(
+      (signedReview as { signedArtifactHash?: string }).signedArtifactHash,
+      `${prepId}:artifact:${txid64}`
+    )
+    const signedId =
+      (signedReview as { signedId?: string }).signedId ?? `signed:${prepId}`
+    const submissionId =
+      (signedReview as { submissionId?: string }).submissionId ?? `submission:${signedId}`
+
+    // Durable store intent persistence hook if recovery store is configured.
+    // Must fail closed: if recovery persistence fails, abort immediately without broadcast.
+    if (this.recoveryStore) {
+      const signingCapabilityId = `cap:sign:${prepId}`
+      const broadcastCapabilityId = `cap:broadcast:${prepId}`
+
+      const preDispatchRecord: Tm1PublicationRecoveryRecord = parseTm1PublicationRecoveryRecord({
+        schema: TM1_PUBLICATION_RECOVERY_SCHEMA,
+        schemaVersion: TM1_PUBLICATION_RECOVERY_SCHEMA_VERSION,
+        publicationId: prepId,
+        revision: 1,
+        ownerEpoch: 1,
+        phase: 'preDispatch',
+        preDispatchStage: 'broadcastAuthorizationConsumed',
+        prepared: {
+          preparedId: prepId,
+          bindingHash,
+          preparedDigest: bindingHash
+        },
+        signed: {
+          signedId,
+          txid: txid64,
+          signedArtifactHash
+        },
+        signingAuthorization: {
+          operationId: `op:sign:${prepId}`,
+          capabilityId: signingCapabilityId,
+          contentHash: `sha256:${bindingHash}`,
+          expiresAt: now + 3_600_000,
+          consumedAt: now,
+          preparedId: prepId,
+          bindingHash
+        },
+        broadcastAuthorization: {
+          operationId: `op:broadcast:${prepId}`,
+          capabilityId: broadcastCapabilityId,
+          contentHash: `sha256:${signedArtifactHash}`,
+          expiresAt: now + 3_600_000,
+          consumedAt: now,
+          signedId,
+          txid: txid64,
+          signedArtifactHash
+        },
+        dispatchIntent: null,
+        transportAcknowledgement: null,
+        lastObservation: null,
+        terminal: null
+      })
+
+      const outcomeUnknownRecord: Tm1PublicationRecoveryRecord = parseTm1PublicationRecoveryRecord({
+        ...preDispatchRecord,
+        revision: 2,
+        phase: 'outcomeUnknown',
+        preDispatchStage: null,
+        dispatchIntent: {
+          submissionId,
+          txid: txid64,
+          signedArtifactHash,
+          broadcastCapabilityId,
+          committedAt: now
+        }
+      })
+
+      if (typeof this.recoveryStore.load === 'function' && typeof this.recoveryStore.create === 'function') {
+        const existing = await this.recoveryStore.load(prepId)
+        if (!existing) {
+          await this.recoveryStore.create({ record: preDispatchRecord })
+        }
+      } else if (typeof this.recoveryStore.create === 'function') {
+        await this.recoveryStore.create({ record: preDispatchRecord })
+      }
+
+      if (typeof this.recoveryStore.commitDispatchIntent === 'function') {
         await this.recoveryStore.commitDispatchIntent({
           publicationId: prepId,
           expectedRevision: 1,
           expectedOwnerEpoch: 1,
-          nextRecord: {
-            publicationId: prepId,
-            revision: 2,
-            ownerEpoch: 1,
-            lifecycleState: 'dispatch_intent_committed'
-          } as never
+          nextRecord: outcomeUnknownRecord
         })
-      } catch {
-        // Tolerant to non-blocking intent record persistence in client context
       }
     }
 
@@ -660,8 +806,12 @@ export class WalletPublisherExecutor implements Tm1PublisherExecutor {
           expectedRevision: 2,
           expectedOwnerEpoch: 1,
           acknowledgement: {
-            acknowledgedAt: Date.now(),
-            txid
+            submissionId,
+            signedId,
+            txid: ensureCanonicalHash(txid, `${prepId}:txid`),
+            signedArtifactHash,
+            disposition: 'accepted',
+            acknowledgedAt: Date.now()
           } as never
         })
       } catch {
