@@ -69,11 +69,20 @@ export function TonalliMemoComposer({
             Publicación en curso o pendiente de verificación
           </h2>
           <p className="muted">
-            Se detectó una publicación previa en el almacén de recuperación duradero
-            {(state.pendingRecord as any)?.publicationId
-              ? ` (${(state.pendingRecord as any).publicationId})`
-              : ''} en fase <code>{(state.pendingRecord as any)?.phase ?? 'outcomeUnknown'}</code>.
-            El editor permanece bloqueado para evitar publicaciones duplicadas en la red eCash.
+            {state.error ? (
+              <span className="error-text" data-testid="reconciliation-error-text">
+                No se pudo consultar el almacén de recuperación: {state.error}.
+                El editor permanece bloqueado por seguridad hasta verificar la ausencia de transacciones pendientes.
+              </span>
+            ) : (
+              <>
+                Se detectó una publicación previa en el almacén de recuperación duradero
+                {(state.pendingRecord as any)?.publicationId
+                  ? ` (${(state.pendingRecord as any).publicationId})`
+                  : ''} en fase <code>{(state.pendingRecord as any)?.phase ?? 'outcomeUnknown'}</code>.
+                El editor permanece bloqueado para evitar publicaciones duplicadas en la red eCash.
+              </>
+            )}
           </p>
           <div
             className="reconciliation-actions"

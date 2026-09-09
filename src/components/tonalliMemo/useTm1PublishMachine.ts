@@ -50,6 +50,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
 
   const abortControllerRef = useRef<AbortController | null>(null)
   const activeExecutorRef = useRef<Tm1PublisherExecutor>(options.executor)
+  const onErrorRef = useRef(options.onError)
 
   // Update active executor if option changes
   useEffect(() => {
@@ -57,6 +58,10 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       activeExecutorRef.current = options.executor
     }
   }, [options.executor])
+
+  useEffect(() => {
+    onErrorRef.current = options.onError
+  }, [options.onError])
 
   const checkRecovery = useCallback(async (): Promise<boolean> => {
     if (!recoveryStore || typeof recoveryStore.listRecoverable !== 'function') {
@@ -75,16 +80,22 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       if (pending) {
         setPendingRecord(pending)
         setPhase('reconciling')
+        setError(null)
         return true
       } else {
         setPendingRecord(null)
         setPhase((prev) => (prev === 'reconciling' ? 'idle' : prev))
+        setError(null)
         return false
       }
-    } catch {
-      setPendingRecord(null)
-      setPhase((prev) => (prev === 'reconciling' ? 'idle' : prev))
-      return false
+    } catch (err) {
+      const errObj = err instanceof Error ? err : new Error(String(err))
+      // Fail closed: if listRecoverable() fails, keep machine fenced in reconciling phase
+      // and do NOT transition to idle, do NOT clear pendingRecord, and record error.
+      setPhase('reconciling')
+      setError(errObj.message)
+      onErrorRef.current?.(errObj)
+      return true
     }
   }, [ownerAddress, recoveryStore])
 
@@ -186,7 +197,11 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
    * MUST NOT delete or remove an outcomeUnknown record.
    */
   const reconcilePending = useCallback(async () => {
-    if (!pendingRecord || !recoveryStore) return
+    if (!recoveryStore) return
+    if (!pendingRecord) {
+      await checkRecovery()
+      return
+    }
     const txid = pendingRecord.dispatchIntent?.txid
     if (!txid) return
 

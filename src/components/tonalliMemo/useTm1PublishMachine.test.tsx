@@ -1,9 +1,10 @@
 /**
  * @vitest-environment jsdom
  */
-import { renderHook, act } from '@testing-library/react'
+import { renderHook, act, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { useTm1PublishMachine } from './useTm1PublishMachine'
+import TonalliMemoComposer from './TonalliMemoComposer'
 import type { Tm1PublisherExecutor } from './types'
 
 function createMockExecutor(overrides: Partial<Tm1PublisherExecutor> = {}): Tm1PublisherExecutor {
@@ -634,6 +635,85 @@ describe('useTm1PublishMachine Hook', () => {
       })
       expect(result.current.state.phase).toBe('idle')
       expect(result.current.state.isValid).toBe(true)
+    })
+
+    it('Finding 1: fails closed when listRecoverable throws, keeping publishing fenced in reconciling phase without transitioning to idle', async () => {
+      const storageError = new Error('DURABLE_STORAGE_READ_ERROR: Quota or permission failure')
+      const mockRecoveryStore = {
+        storeId: 'test-store',
+        createdAt: Date.now(),
+        listRecoverable: vi.fn().mockRejectedValue(storageError)
+      }
+      const mockExecutor = createMockExecutor()
+      const onErrorMock = vi.fn()
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          recoveryStore: mockRecoveryStore as any,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq',
+          initialMessage: 'Mensaje con fallo de lectura de recuperación',
+          onError: onErrorMock
+        })
+      )
+
+      // Wait for initial checkRecovery effect to settle
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      // 1. Strict assert: Phase must NOT transition to 'idle', it must remain 'reconciling'
+      expect(result.current.state.phase).not.toBe('idle')
+      expect(result.current.state.phase).toBe('reconciling')
+
+      // 2. Strict assert: Publishing must remain fenced (isValid = false)
+      expect(result.current.state.isValid).toBe(false)
+      expect(result.current.state.error).toBe('DURABLE_STORAGE_READ_ERROR: Quota or permission failure')
+      expect(onErrorMock).toHaveBeenCalledWith(storageError)
+
+      // 3. Strict assert: Calling publish() is rejected and does not proceed to network
+      await act(async () => {
+        await result.current.publish()
+      })
+      expect(mockExecutor.verifyOwnership).not.toHaveBeenCalled()
+      expect(mockExecutor.broadcastAndFinalize).not.toHaveBeenCalled()
+    })
+
+    it('Finding 1: UI button remains disabled and fenced in reconciling phase when recovery lookup fails', async () => {
+      const storageError = new Error('STORAGE_UNAVAILABLE')
+      const mockRecoveryStore = {
+        storeId: 'test-store',
+        createdAt: Date.now(),
+        listRecoverable: vi.fn().mockRejectedValue(storageError)
+      }
+      const mockExecutor = createMockExecutor()
+
+      render(
+        <TonalliMemoComposer
+          initialAlias="alice.xec"
+          initialOwnerAddress="ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq"
+          initialMessage="Mensaje de prueba UI"
+          executor={mockExecutor}
+          recoveryStore={mockRecoveryStore as any}
+        />
+      )
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      // 1. Strict assert: publish-button-idle must NOT be rendered
+      expect(screen.queryByTestId('publish-button-idle')).toBeNull()
+
+      // 2. Strict assert: publish-button-reconciling is rendered and strictly disabled
+      const reconcilingBtn = screen.getByTestId('publish-button-reconciling') as HTMLButtonElement
+      expect(reconcilingBtn).toBeDefined()
+      expect(reconcilingBtn.disabled).toBe(true)
+
+      // 3. Strict assert: reconciliation notice displays failure warning
+      expect(screen.getByTestId('memo-reconciling-state')).toBeDefined()
+      expect(screen.getByTestId('reconciliation-error-text').textContent).toContain('STORAGE_UNAVAILABLE')
     })
   })
 })
