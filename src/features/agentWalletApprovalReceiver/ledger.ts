@@ -1,41 +1,60 @@
 /**
  * @file ledger.ts
  *
- * In-memory Wallet-local approval ledger for atomic recording of HumanApprovalV1.
+ * Wallet Approval Ledger interface and in-memory test implementation.
  *
- * Architecture boundary:
- * Strictly isolated to approval receipts and bindings. No keys, no transaction construction,
- * no signer, and no broadcast.
+ * INVARIANTS:
+ * - Production REQUIRES explicit injection of a durable, transactional ledger.
+ * - Global default singleton fallback is REMOVED to prevent silent in-memory production deployment.
+ * - Enforces atomic uniqueness across requestId, approvalId, AND capabilityId.
  */
 
-import type {
-  WalletApprovalLedger,
-  WalletApprovalLedgerRecord
-} from './types'
 import { WalletApprovalReceiverError } from './types'
+import type { WalletApprovalLedger, WalletApprovalLedgerRecord } from './types'
 
+/**
+ * In-memory ledger implementation STRICTLY FOR TESTING and development.
+ *
+ * WARNING: This implementation does NOT provide persistence, durability across restarts,
+ * multi-process synchronization, or distributed consensus. It must NOT be used for real
+ * financial production.
+ */
 export class InMemoryWalletApprovalLedger implements WalletApprovalLedger {
   private readonly recordsByRequestId = new Map<string, WalletApprovalLedgerRecord>()
   private readonly recordsByApprovalId = new Map<string, WalletApprovalLedgerRecord>()
+  private readonly recordsByCapabilityId = new Map<string, WalletApprovalLedgerRecord>()
 
   async recordApprovalAtomic(record: WalletApprovalLedgerRecord): Promise<void> {
+    if (!record || typeof record !== 'object') {
+      throw new WalletApprovalReceiverError('ATOMIC_RECORDING_FAILED', 'Invalid record payload')
+    }
+
     if (this.recordsByRequestId.has(record.requestId)) {
       throw new WalletApprovalReceiverError(
         'DUPLICATE_APPROVAL_RECORD',
-        `Approval record already exists for requestId: ${record.requestId}`
+        `An approval record with requestId "${record.requestId}" already exists.`
       )
     }
 
     if (this.recordsByApprovalId.has(record.approvalId)) {
       throw new WalletApprovalReceiverError(
         'DUPLICATE_APPROVAL_RECORD',
-        `Approval record already exists for approvalId: ${record.approvalId}`
+        `An approval record with approvalId "${record.approvalId}" already exists.`
       )
     }
 
-    // Atomic stage: insert into both maps
-    this.recordsByRequestId.set(record.requestId, record)
-    this.recordsByApprovalId.set(record.approvalId, record)
+    if (this.recordsByCapabilityId.has(record.capabilityId)) {
+      throw new WalletApprovalReceiverError(
+        'DUPLICATE_APPROVAL_RECORD',
+        `An approval record with capabilityId "${record.capabilityId}" already exists.`
+      )
+    }
+
+    // Atomic commit into all indexes
+    const frozenRecord = Object.freeze({ ...record })
+    this.recordsByRequestId.set(record.requestId, frozenRecord)
+    this.recordsByApprovalId.set(record.approvalId, frozenRecord)
+    this.recordsByCapabilityId.set(record.capabilityId, frozenRecord)
   }
 
   async has(requestId: string): Promise<boolean> {
@@ -46,13 +65,10 @@ export class InMemoryWalletApprovalLedger implements WalletApprovalLedger {
     return this.recordsByRequestId.get(requestId)
   }
 
-  /**
-   * Test helper to clear records in isolated test suites.
-   */
+  // Helper for test cleanup
   clear(): void {
     this.recordsByRequestId.clear()
     this.recordsByApprovalId.clear()
+    this.recordsByCapabilityId.clear()
   }
 }
-
-export const defaultWalletApprovalLedger = new InMemoryWalletApprovalLedger()

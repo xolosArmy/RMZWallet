@@ -161,4 +161,14 @@ describe('agentWalletApprovalReceiver architecture boundaries', () => {
       }
     }
   })
+
+  test('index.ts does not export internal capability class, tokens, or internal bindings', async () => {
+    const indexExports = (await import('./index')) as Record<string, unknown>
+    expect(indexExports.INTERNAL_CAPABILITY_TOKEN).toBeUndefined()
+    expect(indexExports.ApprovalRecordCapability).toBeUndefined()
+    expect(indexExports.InternalApprovalBinding).toBeUndefined()
+    expect(indexExports.createApprovalCapabilityInternal).toBeUndefined()
+    expect(indexExports.WalletLocalApprovalBinding).toBeUndefined()
+  })
 })
+

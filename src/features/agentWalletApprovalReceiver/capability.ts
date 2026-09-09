@@ -1,94 +1,94 @@
 /**
  * @file capability.ts
  *
- * Wallet-local one-shot ApprovalRecordCapability.
+ * PACKAGE-INTERNAL Approval Record Capability.
  *
- * Security Properties:
- * - Wallet-local: Lives strictly in Wallet memory.
- * - Opaque & non-serializable: Throws on JSON serialization.
- * - Non-constructible by Agents: Guarded by package-internal token.
- * - One-shot: Transitions state fresh -> recording -> recorded. Fails closed on replay.
- * - Bound to contentHash: Cryptographically bound to H(E,C).
- * - Invalid after effectiveExpiresAt: Immediate failure and invalidation if expired.
+ * SECURITY INVARIANTS:
+ * - Strictly package-internal: NOT exported from index.ts.
+ * - Non-constructible outside this package (guarded by non-exported token).
+ * - Non-serializable: toJSON() throws unconditionally.
+ * - One-shot linear state machine: fresh -> recording -> recorded / invalidated.
+ * - Bound cryptographically to H(E,C) contentHash.
  */
 
-import type {
-  ApprovalCapabilityState,
-  WalletApprovalPresentation,
-  WalletLocalApprovalBinding
-} from './types'
 import { WalletApprovalReceiverError } from './types'
-import type { UniversalContentHash } from '../externalSign/contentHash'
+import type { InternalApprovalBinding } from './types'
 
-export const INTERNAL_CAPABILITY_TOKEN = Symbol('WalletApprovalReceiver.CapabilityToken')
+export type ApprovalCapabilityState = 'fresh' | 'recording' | 'recorded' | 'invalidated'
+
+export const INTERNAL_CAPABILITY_TOKEN = Symbol('INTERNAL_APPROVAL_CAPABILITY_TOKEN')
 
 export class ApprovalRecordCapability {
   readonly capabilityId: string
-  readonly requestId: string
-  readonly contentHash: UniversalContentHash
+  readonly binding: InternalApprovalBinding
+  readonly contentHash: string
   readonly effectiveExpiresAt: number
-  readonly binding: WalletLocalApprovalBinding
-  readonly presentation: WalletApprovalPresentation
-  private currentState: ApprovalCapabilityState = 'fresh'
+
+  private _state: ApprovalCapabilityState = 'fresh'
 
   constructor(
-    token: symbol,
+    internalToken: symbol,
     capabilityId: string,
-    binding: WalletLocalApprovalBinding,
-    presentation: WalletApprovalPresentation
+    binding: InternalApprovalBinding
   ) {
-    if (token !== INTERNAL_CAPABILITY_TOKEN) {
+    if (internalToken !== INTERNAL_CAPABILITY_TOKEN) {
       throw new WalletApprovalReceiverError(
-        'INVALID_CAPABILITY_SOURCE',
-        'ApprovalRecordCapability cannot be constructed externally. It is Wallet-local and requires fresh revalidation.'
+        'CAPABILITY_NOT_FRESH',
+        'Direct unauthorized instantiation of ApprovalRecordCapability is prohibited.'
       )
     }
-
     this.capabilityId = capabilityId
-    this.requestId = binding.requestId
+    this.binding = Object.freeze({ ...binding })
     this.contentHash = binding.contentHash
     this.effectiveExpiresAt = binding.effectiveExpiresAt
-    this.binding = Object.freeze({ ...binding })
-    this.presentation = Object.freeze({ ...presentation })
   }
 
   get state(): ApprovalCapabilityState {
-    return this.currentState
+    return this._state
   }
 
-  /**
-   * Guard preventing JSON serialization of the capability.
-   */
-  toJSON(): never {
+  transition(internalToken: symbol, nextState: ApprovalCapabilityState): void {
+    if (internalToken !== INTERNAL_CAPABILITY_TOKEN) {
+      throw new WalletApprovalReceiverError(
+        'CAPABILITY_NOT_FRESH',
+        'Unauthorized state transition attempt on ApprovalRecordCapability.'
+      )
+    }
+
+    if (this._state === 'recorded' || this._state === 'invalidated') {
+      throw new WalletApprovalReceiverError(
+        'CAPABILITY_NOT_FRESH',
+        `Terminal capability state cannot be transitioned: ${this._state} -> ${nextState}`
+      )
+    }
+
+    if (this._state === 'fresh' && (nextState === 'recording' || nextState === 'invalidated')) {
+      this._state = nextState
+      return
+    }
+
+    if (this._state === 'recording' && (nextState === 'recorded' || nextState === 'invalidated')) {
+      this._state = nextState
+      return
+    }
+
     throw new WalletApprovalReceiverError(
-      'INVALID_CAPABILITY_SOURCE',
-      'ApprovalRecordCapability is strictly Wallet-local and non-serializable.'
+      'CAPABILITY_NOT_FRESH',
+      `Illegal capability transition: ${this._state} -> ${nextState}`
     )
   }
 
-  /**
-   * Internal state transition helper, token-guarded.
-   */
-  transition(token: symbol, newState: ApprovalCapabilityState): void {
-    if (token !== INTERNAL_CAPABILITY_TOKEN) {
-      throw new WalletApprovalReceiverError(
-        'INVALID_CAPABILITY_SOURCE',
-        'Unauthorized attempt to mutate ApprovalRecordCapability state.'
-      )
-    }
-    this.currentState = newState
+  toJSON(): never {
+    throw new WalletApprovalReceiverError(
+      'CAPABILITY_NOT_FRESH',
+      'ApprovalRecordCapability is strictly Wallet-local and non-serializable.'
+    )
   }
 }
 
 export function createApprovalCapabilityInternal(
   capabilityId: string,
-  binding: WalletLocalApprovalBinding,
-  presentation: WalletApprovalPresentation
+  binding: InternalApprovalBinding
 ): ApprovalRecordCapability {
-  return new ApprovalRecordCapability(
-    INTERNAL_CAPABILITY_TOKEN,
-    capabilityId,
-    binding,
-    presentation
-  )
+  return new ApprovalRecordCapability(INTERNAL_CAPABILITY_TOKEN, capabilityId, binding)
 }
