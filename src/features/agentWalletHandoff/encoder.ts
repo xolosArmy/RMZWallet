@@ -56,7 +56,7 @@ export function encodeAgentWalletHandoffV1(value: unknown): Uint8Array {
   writer.writeLpAscii(request.policyDecision.reasonCode)
   writer.writeLpUtf8(request.policyDecision.reason)
   writer.writeLpAscii(request.policyDecision.policyTraceId)
-  writer.writeLpAscii(request.policyDecision.policyVersion)
+  writer.writeLpUtf8(request.policyDecision.policyVersion)
   writer.writeUint64(request.policyDecision.evaluatedAt)
   writer.writeUint64(request.policyDecision.expiresAt)
 

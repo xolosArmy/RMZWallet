@@ -55,7 +55,7 @@ export function decodeAgentWalletHandoffV1(content: Uint8Array): WalletApprovalR
   const reasonCode = reader.readLpAscii()
   const policyReason = reader.readLpUtf8()
   const policyTraceId = reader.readLpAscii()
-  const policyVersion = reader.readLpAscii()
+  const policyVersion = reader.readLpUtf8()
   const evaluatedAt = reader.readUint64()
   const policyExpiresAt = reader.readUint64()
 

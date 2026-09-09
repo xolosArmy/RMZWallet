@@ -94,6 +94,17 @@ const validMutations = Object.freeze([
         resourceHash: 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
       }
     }
+  }),
+  Object.freeze({
+    name: 'Unicode policyVersion',
+    base: AGENT_WALLET_HANDOFF_B0,
+    value: {
+      ...AGENT_WALLET_HANDOFF_B0,
+      policyDecision: {
+        ...AGENT_WALLET_HANDOFF_B0.policyDecision,
+        policyVersion: 'constitución-2026'
+      }
+    }
   })
 ])
 
