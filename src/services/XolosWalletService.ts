@@ -25,6 +25,7 @@ import {
   XEC_TONALLI_TREASURY_ADDRESS
 } from '../config/xecFees'
 import { getChronik } from './ChronikClient'
+import { extractAliasFromOutputScript } from './aliasDiscovery'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 import type { DecryptPasswordResult } from './crypto'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
@@ -75,6 +76,7 @@ import type {
   DerivationDiscovery,
   DiscoveredTokenAsset
 } from './dualDerivationDiscovery'
+export type { FirmaInputOwner, FirmaOwnedUtxo } from './firmaAlphaSend'
 
 // The package ships a UMD/CJS build without an ES default export; grab whatever
 // is available (named export, default from CJS transform, or browser global).
@@ -1681,6 +1683,51 @@ export class XolosWalletService {
     return this.registerAliasTransaction(registration, reservedUtxos, rmzTxid)
   }
 
+  async findAliasForAddress(address: string): Promise<string | null> {
+    try {
+      const chronik = getChronik()
+      if (chronik && typeof chronik.address === 'function') {
+        const pageSize = 20
+        let page = 0
+        let totalPages = 1
+        const MAX_PAGES = 50
+
+        while (page < totalPages && page < MAX_PAGES) {
+          const res = await chronik.address(address).history(page, pageSize)
+          if (typeof res?.numPages === 'number') {
+            totalPages = res.numPages
+          }
+          const txs = Array.isArray(res?.txs) ? res.txs : []
+          if (txs.length === 0) {
+            break
+          }
+
+          for (const tx of txs) {
+            const outputs = Array.isArray(tx?.outputs) ? tx.outputs : []
+            for (const out of outputs) {
+              const script = out?.outputScript
+              if (typeof script === 'string') {
+                const alias = extractAliasFromOutputScript(script, address)
+                if (alias) {
+                  return alias
+                }
+              }
+            }
+          }
+
+          if (typeof res?.numPages !== 'number' && txs.length < pageSize) {
+            break
+          }
+
+          page += 1
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return null
+  }
+
   getMnemonic(): string | null {
     return this.decryptedMnemonic
   }
@@ -1771,6 +1818,28 @@ export class XolosWalletService {
 
   signTxBuilder(builder: TxBuilder, options?: { feePerKb?: bigint; dustSats?: bigint }) {
     return builder.sign(options)
+  }
+
+  getHdSpendOwners(): FirmaInputOwner[] {
+    if (this.scanCache?.owners.length) {
+      return this.scanCache.owners
+    }
+    if (this.hdAddressCache.length === 0) {
+      this.ensureHdAddressCache(this.getEffectiveGapLimit())
+    }
+    return this.hdAddressCache
+  }
+
+  async getHdOwnedUtxos(): Promise<FirmaOwnedUtxo[]> {
+    const owners = this.getHdSpendOwners()
+    if (owners.length === 0) {
+      return []
+    }
+    return this.refreshFirmaOwnedUtxos(owners)
+  }
+
+  getHdSignatoryForOwner(owner: FirmaInputOwner): WalletSignatory {
+    return this.deriveHdSignatory(owner)
   }
 
 

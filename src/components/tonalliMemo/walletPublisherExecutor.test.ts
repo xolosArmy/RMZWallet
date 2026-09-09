@@ -1,0 +1,1034 @@
+import { describe, expect, it, vi } from 'vitest'
+import {
+  Address,
+  ALL_BIP143,
+  Ecc,
+  fromHex,
+  P2PKHSignatory,
+  shaRmd160,
+  toHex,
+  Tx
+} from 'ecash-lib'
+import type { ScriptUtxo } from 'chronik-client'
+import {
+  ChronikNetworkTransport,
+  WalletPublisherExecutor,
+  WalletSigner,
+  createWalletPublisherExecutor,
+  Tm1ProductionRecoveryStore,
+  Tm1WebStoragePublicationRecoveryStore
+} from './walletPublisherExecutor'
+import * as ChronikClientModule from '../../services/ChronikClient'
+
+const ecc = new Ecc()
+const testSk = fromHex('11'.repeat(32))
+const testPk = ecc.derivePubkey(testSk)
+const testAddress = Address.p2pkh(shaRmd160(testPk)).toString()
+const testSignatory = P2PKHSignatory(testSk, testPk, ALL_BIP143)
+const testUtxos: ScriptUtxo[] = [
+  {
+    outpoint: {
+      txid: '22'.repeat(32),
+      outIdx: 0
+    },
+    blockHeight: 800000,
+    sats: 100000n,
+    isCoinbase: false,
+    isFinal: true
+  }
+]
+
+describe('walletPublisherExecutor components', () => {
+  describe('ChronikNetworkTransport', () => {
+    it('broadcasts raw transaction to chronik and returns txid', async () => {
+      const mockChronik = {
+        broadcastTx: vi.fn().mockResolvedValue({ txid: 'mock-txid-12345' })
+      }
+      const transport = new ChronikNetworkTransport({ chronik: mockChronik as never })
+
+      const result = await transport.broadcast(new Uint8Array([0x01, 0x02, 0x03]))
+      expect(result.txid).toBe('mock-txid-12345')
+      expect(mockChronik.broadcastTx).toHaveBeenCalledWith(new Uint8Array([0x01, 0x02, 0x03]))
+    })
+
+    it('rejects when signal is already aborted', async () => {
+      const mockChronik = {
+        broadcastTx: vi.fn()
+      }
+      const transport = new ChronikNetworkTransport({ chronik: mockChronik as never })
+
+      const controller = new AbortController()
+      controller.abort()
+
+      await expect(transport.broadcast(new Uint8Array([0x01]), controller.signal)).rejects.toThrow(
+        'OPERATION_ABORTED'
+      )
+      expect(mockChronik.broadcastTx).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('WalletSigner', () => {
+    it('builds real eCash transaction with OP_RETURN payload and serializes rawTxBytes to hex', async () => {
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: testUtxos
+      })
+      expect(signer.address).toBe(testAddress)
+
+      const result = await signer.sign({ message: 'tonalli test memo' })
+      expect(typeof result.rawTxBytes).toBe('string')
+      expect(result.rawTxBytes).toMatch(/^[0-9a-fA-F]+$/)
+      expect(result.rawTxHex).toBe(result.rawTxBytes)
+      expect(result.signatureHex).toBe(result.rawTxBytes)
+
+      // Deserialize and verify structure using ecash-lib
+      const deserialized = Tx.deser(fromHex(result.rawTxBytes))
+      expect(deserialized.outputs.length).toBe(2)
+      expect(deserialized.outputs[0].sats).toBe(0n)
+      // Output 0 must be TM1 OP_RETURN (starts with 0x6a)
+      expect(deserialized.outputs[0].script.toHex()).toMatch(/^6a/)
+      // Output 1 is change to sender address with deducted fee
+      expect(deserialized.outputs[1].sats).toBeGreaterThan(0n)
+      expect(deserialized.outputs[1].sats).toBeLessThan(100000n)
+      expect(result.txid).toBe(deserialized.txid())
+    })
+
+    it('throws INSUFFICIENT_FUNDS when spendable UTXOs are empty', async () => {
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: []
+      })
+      await expect(signer.sign({ message: 'test' })).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+    })
+
+    it('uses custom signing delegate if provided', async () => {
+      const customSign = vi.fn().mockResolvedValue({
+        signedArtifact: { custom: true },
+        signatureHex: 'deadbeef',
+        rawTxBytes: 'deadbeef',
+        rawTxHex: 'deadbeef',
+        txid: 'custom-txid-123'
+      })
+      const signer = new WalletSigner({ signCandidate: customSign })
+
+      const result = await signer.sign({ input: 'data' })
+      expect(result.signatureHex).toBe('deadbeef')
+      expect(result.rawTxBytes).toBe('deadbeef')
+      expect(result.txid).toBe('custom-txid-123')
+      expect(customSign).toHaveBeenCalledWith({ input: 'data' }, undefined)
+    })
+
+    it('ignores giant immature coinbase UTXO and builds transaction using only mature standard UTXO', async () => {
+      const immatureCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '33'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 50_000_000_000n, // Giant 500,000 XEC coinbase UTXO
+        isFinal: true
+      }
+
+      const standardUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '44'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 799_950,
+        isCoinbase: false,
+        sats: 50_000n, // Small 500 XEC standard UTXO
+        isFinal: true
+      }
+
+      // Tip height 800_050 -> 800_050 - 800_000 + 1 = 51 confirmations < 100 maturity
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: [immatureCoinbaseUtxo, standardUtxo],
+        tipHeight: 800_050,
+        coinbaseMaturity: 100
+      })
+
+      const result = await signer.sign({ message: 'tonalli test memo' })
+      expect(result.rawTxBytes).toBeDefined()
+
+      const deserialized = Tx.deser(fromHex(result.rawTxBytes))
+      // Exactly 1 input selected (the small mature standard UTXO, NOT the giant coinbase UTXO)
+      expect(deserialized.inputs.length).toBe(1)
+      expect(deserialized.outputs.length).toBe(2)
+      // The change output must be less than 50,000 sats minus fees.
+      // If the giant coinbase UTXO was selected, change would exceed 49,000,000,000 sats!
+      expect(deserialized.outputs[1].sats).toBeLessThan(50_000n)
+      expect(deserialized.outputs[1].sats).toBeGreaterThan(0n)
+    })
+
+    it('rejects when only immature coinbase UTXOs are available (unproven or < 100 confirmations)', async () => {
+      const immatureCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '33'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 50_000_000_000n,
+        isFinal: true
+      }
+
+      // 1. Tip height is not known -> maturity cannot be proven, conservative rejection
+      const mockUnavailableChronik = {
+        blockchainInfo: vi.fn().mockRejectedValue(new Error('Network tip unavailable'))
+      }
+      const signerWithoutTip = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: [immatureCoinbaseUtxo],
+        chronik: mockUnavailableChronik as never
+      })
+      await expect(signerWithoutTip.sign({ message: 'test' })).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+
+      // 1b. Mempool coinbase (blockHeight: -1) -> unproven maturity even if tip is known
+      const mempoolCoinbase: ScriptUtxo = {
+        ...immatureCoinbaseUtxo,
+        blockHeight: -1
+      }
+      const signerMempool = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: [mempoolCoinbase],
+        tipHeight: 800_100
+      })
+      await expect(signerMempool.sign({ message: 'test' })).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+
+      // 2. Tip height confirms only 50 blocks
+      const signerImmature = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: [immatureCoinbaseUtxo],
+        tipHeight: 800_049
+      })
+      await expect(signerImmature.sign({ message: 'test' })).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+    })
+
+    it('permits coinbase UTXO once maturity (>= 100 confirmations) is proven', async () => {
+      const matureCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '55'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 100_000n,
+        isFinal: true
+      }
+
+      // Tip height 800_099 -> 800_099 - 800_000 + 1 = 100 confirmations >= 100
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: [matureCoinbaseUtxo],
+        tipHeight: 800_099
+      })
+
+      const result = await signer.sign({ message: 'test mature coinbase' })
+      expect(result.rawTxBytes).toBeDefined()
+      const deserialized = Tx.deser(fromHex(result.rawTxBytes))
+      expect(deserialized.inputs.length).toBe(1)
+      expect(deserialized.outputs[1].sats).toBeGreaterThan(0n)
+    })
+
+    it('resolves chain tip height via global getChronik() fallback for mature coinbase UTXO when chronik is not explicitly passed to WalletSigner', async () => {
+      const matureCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '66'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 100_000n,
+        isFinal: true
+      }
+
+      // Mock the global Chronik client resolved by getChronik()
+      const mockGlobalChronik = {
+        blockchainInfo: vi.fn().mockResolvedValue({ tipHeight: 800_150 }) // 151 confirmations >= 100
+      }
+      const getChronikSpy = vi
+        .spyOn(ChronikClientModule, 'getChronik')
+        .mockReturnValue(mockGlobalChronik as never)
+
+      try {
+        // Construct WalletSigner WITHOUT options.chronik and WITHOUT options.tipHeight
+        const signer = new WalletSigner({
+          address: testAddress,
+          signatory: testSignatory,
+          utxos: [matureCoinbaseUtxo]
+        })
+
+        const result = await signer.sign({ message: 'mature coinbase via fallback chronik' })
+        expect(result.rawTxBytes).toBeDefined()
+        expect(mockGlobalChronik.blockchainInfo).toHaveBeenCalled()
+
+        const deserialized = Tx.deser(fromHex(result.rawTxBytes))
+        // Exactly 1 input from the mature coinbase
+        expect(deserialized.inputs.length).toBe(1)
+        expect(deserialized.outputs.length).toBe(2)
+        expect(deserialized.outputs[1].sats).toBeGreaterThan(0n)
+      } finally {
+        getChronikSpy.mockRestore()
+      }
+    })
+
+    it('rejects immature coinbase UTXO via global getChronik() fallback when chain tip proves immature confirmations (< 100)', async () => {
+      const immatureCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '77'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 100_000n,
+        isFinal: true
+      }
+
+      // Mock global Chronik returning tip confirming only 50 blocks
+      const mockGlobalChronik = {
+        blockchainInfo: vi.fn().mockResolvedValue({ tipHeight: 800_050 }) // 51 confirmations < 100
+      }
+      const getChronikSpy = vi
+        .spyOn(ChronikClientModule, 'getChronik')
+        .mockReturnValue(mockGlobalChronik as never)
+
+      try {
+        // Construct WalletSigner WITHOUT options.chronik and WITHOUT options.tipHeight
+        const signer = new WalletSigner({
+          address: testAddress,
+          signatory: testSignatory,
+          utxos: [immatureCoinbaseUtxo]
+        })
+
+        await expect(
+          signer.sign({ message: 'immature coinbase via fallback chronik' })
+        ).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+        expect(mockGlobalChronik.blockchainInfo).toHaveBeenCalled()
+      } finally {
+        getChronikSpy.mockRestore()
+      }
+    })
+
+    it('fails closed when global getChronik() blockchainInfo rejects during coinbase maturity check', async () => {
+      const candidateCoinbaseUtxo: ScriptUtxo = {
+        outpoint: {
+          txid: '88'.repeat(32),
+          outIdx: 0
+        },
+        blockHeight: 800_000,
+        isCoinbase: true,
+        sats: 100_000n,
+        isFinal: true
+      }
+
+      // Mock global Chronik where blockchainInfo fails/throws network error
+      const mockGlobalChronik = {
+        blockchainInfo: vi.fn().mockRejectedValue(new Error('Network offline'))
+      }
+      const getChronikSpy = vi
+        .spyOn(ChronikClientModule, 'getChronik')
+        .mockReturnValue(mockGlobalChronik as never)
+
+      try {
+        const signer = new WalletSigner({
+          address: testAddress,
+          signatory: testSignatory,
+          utxos: [candidateCoinbaseUtxo]
+        })
+
+        await expect(
+          signer.sign({ message: 'unproven coinbase when chronik rejects' })
+        ).rejects.toThrow(/INSUFFICIENT_FUNDS/)
+        expect(mockGlobalChronik.blockchainInfo).toHaveBeenCalled()
+      } finally {
+        getChronikSpy.mockRestore()
+      }
+    })
+  })
+
+  describe('WalletPublisherExecutor workflow', () => {
+    it('executes full 4-phase publish pipeline with custom transport and signer', async () => {
+      const mockChronik = {
+        broadcastTx: vi.fn().mockResolvedValue({ txid: 'tx-broadcasted-success' })
+      }
+      const transport = new ChronikNetworkTransport({ chronik: mockChronik as never })
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: testUtxos
+      })
+
+      const mockVerificationPort = {
+        verifyAliasOwnership: vi.fn().mockResolvedValue({
+          verified: true,
+          evidenceToken: 'token-abc'
+        })
+      }
+      const mockAuthorizer = {
+        authorizePublication: vi.fn().mockResolvedValue({
+          authorized: true,
+          authToken: 'auth-123'
+        })
+      }
+      const mockRecoveryStore = {
+        load: vi.fn(),
+        listRecoverable: vi.fn(),
+        create: vi.fn(),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn().mockResolvedValue({}),
+        commitTransportAcknowledgement: vi.fn().mockResolvedValue({}),
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn()
+      }
+
+      const executor = new WalletPublisherExecutor({
+        transport,
+        signer,
+        verificationPort: mockVerificationPort,
+        authorizer: mockAuthorizer,
+        recoveryStore: mockRecoveryStore as never
+      })
+
+      // Also verify createWalletPublisherExecutor helper creates an instance
+      const factoryCreated = createWalletPublisherExecutor({ transport, signer })
+      expect(factoryCreated).toBeInstanceOf(WalletPublisherExecutor)
+
+      // 1. Verify ownership
+      const evidence = await executor.verifyOwnership(
+        'alice.xec',
+        testAddress
+      )
+      expect(evidence).toEqual(
+        expect.objectContaining({
+          verified: true,
+          evidenceToken: 'token-abc',
+          evidenceHash: expect.any(String),
+          nonce: expect.any(String)
+        })
+      )
+      expect(mockVerificationPort.verifyAliasOwnership).toHaveBeenCalledWith(
+        { alias: 'alice.xec', expectedOwnerAddress: testAddress },
+        undefined
+      )
+
+      // 2. Request authorization
+      const auth = await executor.requestAuthorization(evidence)
+      expect(auth).toEqual({ authorized: true, authToken: 'auth-123' })
+      expect(mockAuthorizer.authorizePublication).toHaveBeenCalledWith(
+        { verifiedAliasEvidenceToken: evidence },
+        undefined
+      )
+
+      // 3. Prepare and sign
+      const { preparedReview, signedReview } = await executor.prepareAndSign(auth, 'Test Memo')
+      expect(preparedReview).toHaveProperty('preparedId')
+      expect(signedReview).toHaveProperty('preparedId')
+      expect(signedReview).toHaveProperty('signature')
+      expect(signedReview).toHaveProperty('rawTxBytes')
+      expect(typeof (signedReview as { rawTxBytes: string }).rawTxBytes).toBe('string')
+      expect((signedReview as { rawTxBytes: string }).rawTxBytes).toMatch(/^[0-9a-fA-F]+$/)
+
+      // Verify that rawTxBytes deserializes to valid eCash transaction with OP_RETURN
+      const deserTx = Tx.deser(fromHex((signedReview as { rawTxBytes: string }).rawTxBytes))
+      expect(deserTx.outputs[0].sats).toBe(0n)
+      expect(deserTx.outputs[0].script.toHex()).toBe(
+        (preparedReview as { preview: { scriptHex: string } }).preview.scriptHex
+      )
+      expect((signedReview as { txid: string }).txid).toBe(deserTx.txid())
+
+      // 4. Broadcast and finalize
+      const dispatchResult = await executor.broadcastAndFinalize(preparedReview, signedReview)
+      expect(dispatchResult.txid).toBe('tx-broadcasted-success')
+      expect(mockRecoveryStore.create).toHaveBeenCalledWith({
+        record: expect.objectContaining({
+          schema: 'tonalli.tm1-publication-recovery',
+          schemaVersion: 1,
+          phase: 'preDispatch'
+        })
+      })
+      expect(mockRecoveryStore.commitDispatchIntent).toHaveBeenCalledWith({
+        publicationId: expect.any(String),
+        expectedRevision: 1,
+        expectedOwnerEpoch: 1,
+        nextRecord: expect.objectContaining({
+          schema: 'tonalli.tm1-publication-recovery',
+          schemaVersion: 1,
+          phase: 'outcomeUnknown',
+          dispatchIntent: expect.objectContaining({
+            committedAt: expect.any(Number)
+          })
+        })
+      })
+      expect(mockRecoveryStore.commitTransportAcknowledgement).toHaveBeenCalled()
+      expect(mockChronik.broadcastTx).toHaveBeenCalledWith(
+        fromHex((signedReview as { rawTxBytes: string }).rawTxBytes)
+      )
+    })
+
+    it('fails closed when commitDispatchIntent rejects and ensures transport.broadcast is never called', async () => {
+      let dispatchCount = 0
+      const mockChronik = {
+        broadcastTx: vi.fn().mockImplementation(async () => {
+          dispatchCount++
+          return { txid: 'unreachable-txid' }
+        })
+      }
+      const transport = new ChronikNetworkTransport({ chronik: mockChronik as never })
+      const broadcastSpy = vi.spyOn(transport, 'broadcast')
+
+      const persistenceError = new Error('DATABASE_DISK_FULL_PERSISTENCE_FAILED')
+      const mockRecoveryStore = {
+        load: vi.fn().mockResolvedValue(null),
+        listRecoverable: vi.fn(),
+        create: vi.fn().mockResolvedValue({}),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn().mockRejectedValue(persistenceError),
+        commitTransportAcknowledgement: vi.fn(),
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn()
+      }
+
+      const executor = new WalletPublisherExecutor({
+        transport,
+        recoveryStore: mockRecoveryStore as never
+      })
+
+      const preparedReview = {
+        protocol: 'TM1',
+        draft: '0.2',
+        preparedId: 'prep-fail-closed-test',
+        createdAt: Date.now()
+      }
+      const signedReview = {
+        preparedId: 'prep-fail-closed-test',
+        rawTxHex: '0100000000000000',
+        txid: '33'.repeat(32)
+      }
+
+      await expect(
+        executor.broadcastAndFinalize(preparedReview, signedReview)
+      ).rejects.toThrow('DATABASE_DISK_FULL_PERSISTENCE_FAILED')
+
+      // Strict assertions: persistence failed, transport.broadcast must NEVER be called
+      expect(dispatchCount).toBe(0)
+      expect(broadcastSpy).not.toHaveBeenCalled()
+      expect(mockChronik.broadcastTx).not.toHaveBeenCalled()
+      expect(mockRecoveryStore.commitDispatchIntent).toHaveBeenCalledTimes(1)
+      expect(mockRecoveryStore.commitTransportAcknowledgement).not.toHaveBeenCalled()
+    })
+
+    it('fails closed when recoveryStore.create rejects before broadcast', async () => {
+      let dispatchCount = 0
+      const mockChronik = {
+        broadcastTx: vi.fn().mockImplementation(async () => {
+          dispatchCount++
+          return { txid: 'unreachable-txid' }
+        })
+      }
+      const transport = new ChronikNetworkTransport({ chronik: mockChronik as never })
+      const broadcastSpy = vi.spyOn(transport, 'broadcast')
+
+      const createError = new Error('DUPLICATE_KEY_CANNOT_CREATE_RECORD')
+      const mockRecoveryStore = {
+        load: vi.fn().mockResolvedValue(null),
+        listRecoverable: vi.fn(),
+        create: vi.fn().mockRejectedValue(createError),
+        commitExecutionEvidence: vi.fn(),
+        commitDispatchIntent: vi.fn().mockResolvedValue({}),
+        commitTransportAcknowledgement: vi.fn(),
+        commitRecoveryTransition: vi.fn(),
+        claimOwnership: vi.fn()
+      }
+
+      const executor = new WalletPublisherExecutor({
+        transport,
+        recoveryStore: mockRecoveryStore as never
+      })
+
+      const preparedReview = {
+        preparedId: 'prep-create-fail-test'
+      }
+      const signedReview = {
+        preparedId: 'prep-create-fail-test',
+        rawTxHex: '0100000000000000',
+        txid: '44'.repeat(32)
+      }
+
+      await expect(
+        executor.broadcastAndFinalize(preparedReview, signedReview)
+      ).rejects.toThrow('DUPLICATE_KEY_CANNOT_CREATE_RECORD')
+
+      expect(dispatchCount).toBe(0)
+      expect(broadcastSpy).not.toHaveBeenCalled()
+      expect(mockChronik.broadcastTx).not.toHaveBeenCalled()
+      expect(mockRecoveryStore.commitDispatchIntent).not.toHaveBeenCalled()
+    })
+
+    it('generates unique evidence and nonces on successive retries to avoid ALIAS_PROOF_REPLAYED', async () => {
+      const consumedProofs = new Set<string>()
+      const mockAuthorizer = {
+        authorizePublication: vi.fn().mockImplementation(async ({ verifiedAliasEvidenceToken }) => {
+          const token = verifiedAliasEvidenceToken as { evidenceHash: string; nonce: string }
+          if (consumedProofs.has(token.evidenceHash)) {
+            throw new Error('ALIAS_PROOF_REPLAYED: Evidence proof was already consumed')
+          }
+          consumedProofs.add(token.evidenceHash)
+          return { authorized: true, authToken: `auth-${token.evidenceHash.slice(0, 8)}` }
+        })
+      }
+      const mockVerificationPort = {
+        verifyAliasOwnership: vi.fn().mockResolvedValue({
+          verified: true,
+          evidenceToken: 'base-chronik-tx-proof'
+        })
+      }
+      const executor = new WalletPublisherExecutor({
+        verificationPort: mockVerificationPort,
+        authorizer: mockAuthorizer
+      })
+
+      // Attempt 1
+      const evidence1 = await executor.verifyOwnership('alice.xec', testAddress)
+      const auth1 = await executor.requestAuthorization(evidence1)
+      expect(auth1).toHaveProperty('authorized', true)
+      expect(consumedProofs.size).toBe(1)
+
+      // Attempt 2 (e.g. user retries after a network or broadcast timeout)
+      const evidence2 = await executor.verifyOwnership('alice.xec', testAddress)
+      expect((evidence2 as { evidenceHash: string }).evidenceHash).not.toBe(
+        (evidence1 as { evidenceHash: string }).evidenceHash
+      )
+      expect((evidence2 as { nonce: string }).nonce).not.toBe(
+        (evidence1 as { nonce: string }).nonce
+      )
+
+      // Attempt 2 must pass authorizer without ALIAS_PROOF_REPLAYED
+      const auth2 = await executor.requestAuthorization(evidence2)
+      expect(auth2).toHaveProperty('authorized', true)
+      expect(consumedProofs.size).toBe(2)
+    })
+
+    it('passes wrapped evidence with fresh nonce and evidenceHash to authorizer.issue() on successive retries to avoid ALIAS_PROOF_REPLAYED', async () => {
+      const consumedProofs = new Set<string>()
+      const mockAuthorizer = {
+        issue: vi.fn().mockImplementation((request: any) => {
+          const evidence = request.evidence
+          if (!evidence || !evidence.evidenceHash || !evidence.nonce) {
+            throw new Error('EVIDENCE_NOT_WRAPPED: Missing fresh nonce or evidenceHash')
+          }
+          if (consumedProofs.has(evidence.evidenceHash)) {
+            throw new Error('ALIAS_PROOF_REPLAYED: Evidence proof was already consumed')
+          }
+          consumedProofs.add(evidence.evidenceHash)
+          return { authorized: true, authorizationId: `auth-${evidence.evidenceHash.slice(0, 8)}` }
+        })
+      }
+      const mockVerificationPort = {
+        verifyAliasOwnership: vi.fn().mockResolvedValue({
+          verified: true,
+          alias: 'alice.xec',
+          address: testAddress,
+          txid: '11'.repeat(32),
+          blockHeight: 800000,
+          status: 'confirmed',
+          expiresAt: Date.now() + 3600000
+        })
+      }
+      const executor = new WalletPublisherExecutor({
+        verificationPort: mockVerificationPort,
+        authorizer: mockAuthorizer
+      })
+
+      // Attempt 1
+      const evidence1 = await executor.verifyOwnership('alice.xec', testAddress)
+      const auth1 = await executor.requestAuthorization(evidence1)
+      expect(auth1).toHaveProperty('authorized', true)
+      expect(consumedProofs.size).toBe(1)
+      expect(mockAuthorizer.issue).toHaveBeenCalledWith(
+        expect.objectContaining({
+          alias: 'alice.xec',
+          ownerAddress: testAddress,
+          evidence: expect.objectContaining({
+            evidenceHash: (evidence1 as any).evidenceHash,
+            nonce: (evidence1 as any).nonce
+          })
+        })
+      )
+
+      // Attempt 2 (retry after failure/timeout)
+      const evidence2 = await executor.verifyOwnership('alice.xec', testAddress)
+      expect((evidence2 as any).evidenceHash).not.toBe((evidence1 as any).evidenceHash)
+      expect((evidence2 as any).nonce).not.toBe((evidence1 as any).nonce)
+
+      // Attempt 2 must pass authorizer.issue() with fresh wrapped evidence without ALIAS_PROOF_REPLAYED
+      const auth2 = await executor.requestAuthorization(evidence2)
+      expect(auth2).toHaveProperty('authorized', true)
+      expect(consumedProofs.size).toBe(2)
+      expect(mockAuthorizer.issue).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          alias: 'alice.xec',
+          ownerAddress: testAddress,
+          evidence: expect.objectContaining({
+            evidenceHash: (evidence2 as any).evidenceHash,
+            nonce: (evidence2 as any).nonce
+          })
+        })
+      )
+    })
+
+    it('handles HD wallet inputs from multiple derivation indices with their exact keys', async () => {
+      // Input 1: receive/0 (5,000 sats)
+      const sk1 = fromHex('33'.repeat(32))
+      const pk1 = ecc.derivePubkey(sk1)
+      const addr1 = Address.p2pkh(shaRmd160(pk1)).toString()
+      const sig1 = P2PKHSignatory(sk1, pk1, ALL_BIP143)
+
+      // Input 2: change/1 (15,000 sats)
+      const sk2 = fromHex('44'.repeat(32))
+      const pk2 = ecc.derivePubkey(sk2)
+      const addr2 = Address.p2pkh(shaRmd160(pk2)).toString()
+      const sig2 = P2PKHSignatory(sk2, pk2, ALL_BIP143)
+
+      // Input 3: receive/3 (40,000 sats)
+      const sk3 = fromHex('55'.repeat(32))
+      const pk3 = ecc.derivePubkey(sk3)
+      const addr3 = Address.p2pkh(shaRmd160(pk3)).toString()
+      const sig3 = P2PKHSignatory(sk3, pk3, ALL_BIP143)
+
+      const multiIndexUtxos = [
+        {
+          utxo: {
+            outpoint: { txid: '10'.repeat(32), outIdx: 0 },
+            blockHeight: 800000,
+            sats: 5000n,
+            isCoinbase: false,
+            isFinal: true
+          },
+          owner: {
+            address: addr1,
+            hdPath: "m/44'/899'/0'/0/0",
+            branch: 'receive' as const,
+            index: 0,
+            signatory: sig1
+          }
+        },
+        {
+          utxo: {
+            outpoint: { txid: '20'.repeat(32), outIdx: 1 },
+            blockHeight: 800000,
+            sats: 15000n,
+            isCoinbase: false,
+            isFinal: true
+          },
+          owner: {
+            address: addr2,
+            hdPath: "m/44'/899'/0'/1/1",
+            branch: 'change' as const,
+            index: 1,
+            signatory: sig2
+          }
+        },
+        {
+          utxo: {
+            outpoint: { txid: '30'.repeat(32), outIdx: 2 },
+            blockHeight: 800000,
+            sats: 40000n,
+            isCoinbase: false,
+            isFinal: true
+          },
+          owner: {
+            address: addr3,
+            hdPath: "m/44'/899'/0'/0/3",
+            branch: 'receive' as const,
+            index: 3,
+            signatory: sig3
+          }
+        }
+      ]
+
+      const hdSigner = new WalletSigner({
+        address: addr1,
+        hdUtxos: multiIndexUtxos
+      })
+
+      const signed = await hdSigner.sign({ message: 'multi-index test memo' })
+      expect(typeof signed.rawTxBytes).toBe('string')
+      expect(signed.txid).toBeDefined()
+
+      // Deserializing verifies that all inputs were properly mapped and signed
+      const tx = Tx.deser(fromHex(signed.rawTxBytes))
+      expect(tx.inputs.length).toBeGreaterThanOrEqual(1)
+      expect(tx.outputs.length).toBe(2) // OP_RETURN + change to addr1
+      expect(tx.outputs[0].sats).toBe(0n)
+      expect(tx.outputs[1].sats).toBeGreaterThan(0n)
+      expect(signed.txid).toBe(tx.txid())
+    })
+
+    it('resolves HD signatories via walletService.getHdSignatoryForOwner for multi-path UTXOs', async () => {
+      const skActive = fromHex('55'.repeat(32))
+      const pkActive = ecc.derivePubkey(skActive)
+      const sigActive = P2PKHSignatory(skActive, pkActive, ALL_BIP143)
+
+      const skChange = fromHex('66'.repeat(32))
+      const pkChange = ecc.derivePubkey(skChange)
+      const addrChange = Address.p2pkh(shaRmd160(pkChange)).toString()
+      const sigChange = P2PKHSignatory(skChange, pkChange, ALL_BIP143)
+
+      const mockWalletService = {
+        getHdOwnedUtxos: vi.fn().mockResolvedValue([
+          {
+            utxo: {
+              outpoint: { txid: '88'.repeat(32), outIdx: 0 },
+              blockHeight: 800000,
+              sats: 100n,
+              isCoinbase: false,
+              isFinal: true
+            },
+            owner: {
+              address: testAddress,
+              hdPath: "m/44'/899'/0'/0/0",
+              branch: 'receive' as const,
+              index: 0,
+              signatory: sigActive
+            }
+          },
+          {
+            utxo: {
+              outpoint: { txid: '77'.repeat(32), outIdx: 0 },
+              blockHeight: 800000,
+              sats: 25000n,
+              isCoinbase: false,
+              isFinal: true
+            },
+            owner: {
+              address: addrChange,
+              hdPath: "m/44'/899'/0'/1/2",
+              branch: 'change' as const,
+              index: 2
+            }
+          }
+        ]),
+        getHdSignatoryForOwner: vi.fn().mockReturnValue(sigChange),
+        getAddress: vi.fn().mockReturnValue(testAddress)
+      }
+
+      const signer = new WalletSigner({
+        address: testAddress,
+        walletService: mockWalletService
+      })
+
+      const signed = await signer.sign({ message: 'delegated hd test' })
+      expect(mockWalletService.getHdOwnedUtxos).toHaveBeenCalled()
+      expect(mockWalletService.getHdSignatoryForOwner).toHaveBeenCalledWith(
+        expect.objectContaining({ hdPath: "m/44'/899'/0'/1/2" })
+      )
+      expect(signed.rawTxBytes).toBeDefined()
+    })
+
+    it('places activeAddress UTXO at input zero even when a change address has a giant UTXO', async () => {
+      const skActive = fromHex('11'.repeat(32))
+      const pkActive = ecc.derivePubkey(skActive)
+      const sigActive = P2PKHSignatory(skActive, pkActive, ALL_BIP143)
+
+      const skChange = fromHex('22'.repeat(32))
+      const pkChange = ecc.derivePubkey(skChange)
+      const addrChange = Address.p2pkh(shaRmd160(pkChange)).toString()
+      const sigChange = P2PKHSignatory(skChange, pkChange, ALL_BIP143)
+
+      const smallActiveUtxo = {
+        outpoint: { txid: 'aa'.repeat(32), outIdx: 0 },
+        blockHeight: 800000,
+        sats: 100n, // small UTXO: less than network fee, forcing multi-input selection
+        isCoinbase: false,
+        isFinal: true
+      }
+
+      const giantChangeUtxo = {
+        outpoint: { txid: 'bb'.repeat(32), outIdx: 1 },
+        blockHeight: 800000,
+        sats: 10_000_000n, // giant UTXO on change address
+        isCoinbase: false,
+        isFinal: true
+      }
+
+      // Pass giant UTXO first in the array to guarantee it isn't an array-ordering coincidence
+      const hdUtxos = [
+        {
+          utxo: giantChangeUtxo,
+          owner: {
+            address: addrChange,
+            hdPath: "m/44'/899'/0'/1/0",
+            branch: 'change' as const,
+            index: 0,
+            signatory: sigChange
+          }
+        },
+        {
+          utxo: smallActiveUtxo,
+          owner: {
+            address: testAddress,
+            hdPath: "m/44'/899'/0'/0/0",
+            branch: 'receive' as const,
+            index: 0,
+            signatory: sigActive
+          }
+        }
+      ]
+
+      const signer = new WalletSigner({
+        address: testAddress,
+        hdUtxos
+      })
+
+      const signed = await signer.sign({ message: 'input-zero-guarantee' })
+      expect(typeof signed.rawTxBytes).toBe('string')
+
+      const tx = Tx.deser(fromHex(signed.rawTxBytes))
+      expect(tx.inputs.length).toBe(2)
+      // Input 0 MUST strictly be the activeAddress small UTXO
+      const input0Txid =
+        typeof tx.inputs[0].prevOut.txid === 'string'
+          ? tx.inputs[0].prevOut.txid
+          : toHex(tx.inputs[0].prevOut.txid)
+      expect(input0Txid).toBe('aa'.repeat(32))
+      expect(tx.inputs[0].prevOut.outIdx).toBe(0)
+
+      // Input 1 is the giant change UTXO added afterwards to cover the transaction
+      const input1Txid =
+        typeof tx.inputs[1].prevOut.txid === 'string'
+          ? tx.inputs[1].prevOut.txid
+          : toHex(tx.inputs[1].prevOut.txid)
+      expect(input1Txid).toBe('bb'.repeat(32))
+      expect(tx.inputs[1].prevOut.outIdx).toBe(1)
+    })
+
+    it('aborts with NO_UTXO_FOR_ACTIVE_ADDRESS when activeAddress has 0 UTXOs even if other HD addresses have funds', async () => {
+      const skChange = fromHex('22'.repeat(32))
+      const pkChange = ecc.derivePubkey(skChange)
+      const addrChange = Address.p2pkh(shaRmd160(pkChange)).toString()
+      const sigChange = P2PKHSignatory(skChange, pkChange, ALL_BIP143)
+
+      const hdUtxosOnlyChange = [
+        {
+          utxo: {
+            outpoint: { txid: 'cc'.repeat(32), outIdx: 0 },
+            blockHeight: 800000,
+            sats: 5_000_000n,
+            isCoinbase: false,
+            isFinal: true
+          },
+          owner: {
+            address: addrChange,
+            hdPath: "m/44'/899'/0'/1/0",
+            branch: 'change' as const,
+            index: 0,
+            signatory: sigChange
+          }
+        }
+      ]
+
+      const signer = new WalletSigner({
+        address: testAddress,
+        hdUtxos: hdUtxosOnlyChange
+      })
+
+      await expect(signer.sign({ message: 'fail-no-active-utxo' })).rejects.toThrow(
+        /NO_UTXO_FOR_ACTIVE_ADDRESS/
+      )
+    })
+
+    it('always instantiates WalletPublisherExecutor with a valid non-null recoveryStore by default', () => {
+      const defaultExecutor = new WalletPublisherExecutor()
+      expect(defaultExecutor.recoveryStore).toBeDefined()
+      expect(defaultExecutor.recoveryStore).not.toBeNull()
+      expect(defaultExecutor.recoveryStore).toBeInstanceOf(Tm1ProductionRecoveryStore)
+      expect(defaultExecutor.recoveryStore).toBeInstanceOf(Tm1WebStoragePublicationRecoveryStore)
+      expect(typeof defaultExecutor.recoveryStore.commitDispatchIntent).toBe('function')
+      expect(typeof defaultExecutor.recoveryStore.create).toBe('function')
+      expect(typeof defaultExecutor.recoveryStore.load).toBe('function')
+
+      const factoryExecutor = createWalletPublisherExecutor()
+      expect(factoryExecutor.recoveryStore).toBeDefined()
+      expect(factoryExecutor.recoveryStore).not.toBeNull()
+      expect(factoryExecutor.recoveryStore).toBeInstanceOf(Tm1ProductionRecoveryStore)
+    })
+
+    it('persists recovery records across store instances via web storage backend', async () => {
+      const storageMap = new Map<string, string>()
+      const mockStorage: Storage = {
+        getItem: vi.fn((k: string) => storageMap.get(k) ?? null),
+        setItem: vi.fn((k: string, v: string) => {
+          storageMap.set(k, v)
+        }),
+        removeItem: vi.fn((k: string) => {
+          storageMap.delete(k)
+        }),
+        clear: vi.fn(() => {
+          storageMap.clear()
+        }),
+        key: vi.fn((i: number) => [...storageMap.keys()][i] ?? null),
+        length: 0
+      }
+
+      const storeA = new Tm1ProductionRecoveryStore({
+        address: testAddress,
+        storage: mockStorage
+      })
+
+      const mockChronik = {
+        broadcastTx: vi.fn().mockResolvedValue({})
+      }
+      const transport = new ChronikNetworkTransport({ chronik: mockChronik as never })
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: testUtxos
+      })
+
+      const executorA = new WalletPublisherExecutor({
+        transport,
+        signer,
+        recoveryStore: storeA
+      })
+
+      const prep = await executorA.prepareAndSign(
+        { authorized: true },
+        'memo with durable storage'
+      )
+
+      const finalizeResult = await executorA.broadcastAndFinalize(
+        prep.preparedReview,
+        prep.signedReview
+      )
+      expect(finalizeResult.txid).toBeDefined()
+
+      // Storage should have recorded mutations
+      expect(mockStorage.setItem).toHaveBeenCalled()
+
+      // Second store instance with same address and storage recovers the state
+      const storeB = new Tm1ProductionRecoveryStore({
+        address: testAddress,
+        storage: mockStorage
+      })
+
+      const recovered = (await storeB.load(
+        (prep.preparedReview as { preparedId: string }).preparedId
+      )) as { phase: string; publicationId: string } | null
+      expect(recovered).toBeDefined()
+      expect(recovered?.publicationId).toBe(
+        (prep.preparedReview as { preparedId: string }).preparedId
+      )
+      expect(recovered?.phase).toBe('submittedObserved')
+    })
+  })
+})
+

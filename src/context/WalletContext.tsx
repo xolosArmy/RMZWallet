@@ -11,6 +11,7 @@ import type { FirmaSendPreview } from '../services/firmaAlphaSend'
 import type { DerivationProfileId } from '../services/derivationProfiles'
 import { WalletContext } from './walletContext'
 import { WALLET_REFRESH_EVENT, type WalletRefreshDetail } from '../utils/walletRefresh'
+import { discoverAliasForAddress } from '../services/aliasDiscovery'
 
 const BACKUP_KEY = 'xoloswallet_backup_verified'
 
@@ -144,7 +145,13 @@ const buildXecPlan = (amountSats: number, utxos: SpendableUtxo[], opReturnOutput
 }
 
 export function WalletProvider({ children }: { children: ReactNode }) {
-  const [address, setAddress] = useState<string | null>(null)
+  const [address, setAddress] = useState<string | null>(() => {
+    try {
+      return xolosWalletService.getAddress() ?? null
+    } catch {
+      return null
+    }
+  })
   const [balance, setBalance] = useState<WalletBalance | null>(null)
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
@@ -153,6 +160,82 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     if (typeof window === 'undefined') return false
     return localStorage.getItem(BACKUP_KEY) === 'true'
   })
+  const getAliasStorageKey = useCallback((addr: string | null) => {
+    return addr ? `rmzwallet_alias_${addr}` : 'rmzwallet_alias'
+  }, [])
+
+  const [alias, setAliasState] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null
+    try {
+      const initialAddr = xolosWalletService.getAddress()
+      if (initialAddr) {
+        return localStorage.getItem(`rmzwallet_alias_${initialAddr}`) || null
+      }
+    } catch {
+      // ignore
+    }
+    return null
+  })
+
+  // Synchronize alias whenever the active wallet address changes (e.g. account switch)
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!address) {
+      setAliasState(null)
+      return
+    }
+    const key = `rmzwallet_alias_${address}`
+    const stored = localStorage.getItem(key)
+    setAliasState(stored || null)
+  }, [address])
+
+  const updateAlias = useCallback(
+    (newAlias: string | null) => {
+      setAliasState(newAlias)
+      if (typeof window === 'undefined') return
+      const key = getAliasStorageKey(address)
+      if (newAlias) {
+        localStorage.setItem(key, newAlias)
+      } else {
+        localStorage.removeItem(key)
+      }
+    },
+    [address, getAliasStorageKey]
+  )
+
+  // Hydrate alias from blockchain/alias service for existing wallets
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const activeAddr = address
+    if (!activeAddr) return
+
+    let cancelled = false
+    async function hydrateOnChainAlias(targetAddress: string) {
+      try {
+        const discovered = await discoverAliasForAddress(targetAddress, getChronik(), xolosWalletService)
+        if (!cancelled && discovered) {
+          const canonical = discovered.endsWith('.xec') ? discovered : `${discovered}.xec`
+          const key = getAliasStorageKey(targetAddress)
+          const stored = localStorage.getItem(key)
+          if (stored !== canonical) {
+            try {
+              updateAlias(canonical)
+            } catch (storageErr) {
+              console.error('Failed to persist hydrated alias locally:', storageErr)
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Could not hydrate alias for address:', targetAddress, err)
+      }
+    }
+
+    void hydrateOnChainAlias(activeAddr)
+
+    return () => {
+      cancelled = true
+    }
+  }, [address, getAliasStorageKey, updateAlias])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -490,7 +573,21 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setError(null)
       try {
         const txid = await xolosWalletService.registerAliasOnChain(registration, reservedUtxos, rmzFeeTxid)
-        await syncAddressAndBalance()
+        try {
+          await syncAddressAndBalance()
+        } catch (syncErr) {
+          console.warn('Error syncing balance after alias registration:', syncErr)
+        }
+        if (registration?.alias) {
+          try {
+            const canonicalAlias = registration.alias.endsWith('.xec')
+              ? registration.alias
+              : `${registration.alias}.xec`
+            updateAlias(canonicalAlias)
+          } catch (storageErr) {
+            console.error('Failed to persist registered alias locally:', storageErr)
+          }
+        }
         return txid
       } catch (err) {
         const message = (err as Error).message || 'No se pudo registrar el alias.'
@@ -500,7 +597,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setLoading(false)
       }
     },
-    [backupVerified, initialized, syncAddressAndBalance]
+    [backupVerified, initialized, syncAddressAndBalance, updateAlias]
   )
 
   const getMnemonic = useCallback(() => xolosWalletService.getMnemonic(), [])
@@ -508,6 +605,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const value = useMemo(
     () => ({
       address,
+      alias,
       balance,
       loading,
       error,
@@ -530,10 +628,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       estimateXecSend,
       getMnemonic,
       unlockEncryptedWallet,
-      setBackupVerified: setBackupVerifiedState
+      setBackupVerified: setBackupVerifiedState,
+      setAlias: updateAlias
     }),
     [
       address,
+      alias,
       balance,
       loading,
       error,
@@ -555,7 +655,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       registerAliasOnChain,
       estimateXecSend,
       getMnemonic,
-      unlockEncryptedWallet
+      unlockEncryptedWallet,
+      updateAlias
     ]
   )
 

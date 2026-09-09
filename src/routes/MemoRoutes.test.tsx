@@ -35,6 +35,7 @@ vi.mock('../context/useWallet', () => ({
   useWallet: () => ({
     initialized: true,
     address: 'ecash:qptestaddress',
+    alias: 'satoshixec.xec',
     balance: { rmzFormatted: '1', xecFormatted: '2', xec: 2n },
     refreshBalances: vi.fn(),
     rescanWallet: vi.fn(),
@@ -171,6 +172,30 @@ describe('Tonalli Memo routes', () => {
     ))
 
     expect(await screen.findByText('Feed oficial verificado')).toBeTruthy()
+  })
+
+  test('route navigation mounts MemoCompose through App', async () => {
+    renderAt('/memo/compose', (
+      <Routes>
+        <Route path="*" element={<App />} />
+      </Routes>
+    ) as ReactNode)
+
+    expect(await screen.findByText('Componer y Publicar Memo TM1')).toBeTruthy()
+    expect(screen.getByTestId('memo-composer')).toBeTruthy()
+  })
+
+  test('feed has link to compose memo', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ items: [] }))
+
+    renderAt('/memo', (
+      <Routes>
+        <Route path="*" element={<App />} />
+      </Routes>
+    ) as ReactNode)
+
+    const composeLink = await screen.findByRole('link', { name: 'Publicar memo' })
+    expect(composeLink.getAttribute('href')).toBe('/memo/compose')
   })
 
   test('Memo bottom navigation active state', () => {

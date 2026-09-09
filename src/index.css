@@ -850,3 +850,241 @@ code {
   .topbar { flex-wrap: wrap; }
   .status-pill { width: 100%; justify-content: center; }
 }
+
+/* Tonalli Memo Compose & State Machine Styles */
+.memo-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.memo-editor__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.byte-counter {
+  font-family: 'JetBrains Mono', 'SFMono-Regular', monospace;
+  font-size: 0.85rem;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(249, 248, 246, 0.05);
+  border: 1px solid rgba(249, 248, 246, 0.1);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.byte-counter--warning {
+  border-color: rgba(255, 179, 71, 0.5);
+  color: #ffb347;
+  background: rgba(255, 179, 71, 0.08);
+}
+
+.byte-counter--error {
+  border-color: rgba(255, 75, 75, 0.6);
+  color: #ff6b6b;
+  background: rgba(255, 75, 75, 0.1);
+}
+
+.byte-counter__badge {
+  font-size: 0.75rem;
+  opacity: 0.85;
+}
+
+.memo-editor__input-wrapper {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.memo-editor__textarea {
+  min-height: 90px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.memo-editor__progress-bar {
+  height: 3px;
+  background: var(--color-primary);
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  transition: width 0.2s ease, background-color 0.2s ease;
+}
+
+.memo-editor__progress-bar[data-status="warning"] {
+  background: #ffb347;
+}
+
+.memo-editor__progress-bar[data-status="error"] {
+  background: #ff6b6b;
+}
+
+.memo-editor__overhead {
+  margin-top: 12px;
+  padding: 12px;
+}
+
+.memo-overhead-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin: 8px 0;
+}
+
+.memo-overhead-grid div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.85rem;
+}
+
+.identity-context__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.identity-context__alias-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.identity-context__alias {
+  margin: 0;
+  font-family: 'Space Grotesk', 'Inter', sans-serif;
+  font-size: 1.3rem;
+  color: var(--text);
+}
+
+.identity-context__details {
+  margin-top: 12px;
+}
+
+.identity-context__address {
+  margin: 4px 0 0;
+  font-size: 0.85rem;
+}
+
+.canonical-preview__hex-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.hex-block__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.code-box {
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(249, 248, 246, 0.12);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  font-size: 0.82rem;
+  color: #a5f3fc;
+  overflow-x: auto;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.publish-state-machine {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.state-stepper {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+}
+
+.state-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--muted);
+  opacity: 0.6;
+}
+
+.state-step--active {
+  color: var(--color-primary);
+  opacity: 1;
+  font-weight: 700;
+}
+
+.state-step--completed {
+  color: #34d399;
+  opacity: 0.9;
+}
+
+.state-step__num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(249, 248, 246, 0.08);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.state-step--active .state-step__num {
+  background: var(--color-primary);
+  color: var(--color-primary-text);
+}
+
+.state-step--completed .state-step__num {
+  background: #34d399;
+  color: #042f2e;
+}
+
+.success-card {
+  border-color: rgba(52, 211, 153, 0.35);
+  background: rgba(52, 211, 153, 0.04);
+}
+
+.success-txid-box {
+  margin: 14px 0;
+}
+
+.explorer-link-row {
+  margin-top: 10px;
+}
+
+.error-card {
+  border-color: rgba(255, 75, 75, 0.4);
+  background: rgba(255, 75, 75, 0.04);
+}
+
+.error-actions, .success-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.memo-no-alias-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 40px 24px;
+  gap: 16px;
+}
+

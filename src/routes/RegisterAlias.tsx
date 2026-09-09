@@ -41,7 +41,8 @@ function RegisterAlias() {
     estimateAliasRegistration,
     reserveAliasRegistrationUtxos,
     buildAliasRegistrationRawTx,
-    registerAliasOnChain
+    registerAliasOnChain,
+    setAlias
   } = useWallet()
   const [aliasInput, setAliasInput] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
@@ -226,6 +227,17 @@ function RegisterAlias() {
         debug: aliasBroadcast.debug
       }
       setResult(txResult)
+      // Finding 3 (Isolate route-level alias persistence write - P1):
+      // Wrap duplicate setAlias write in an isolated try/catch so client storage exceptions
+      // (e.g. QuotaExceededError) never drown out the successful on-chain transaction.
+      try {
+        const canonicalAlias = registration.alias.endsWith('.xec')
+          ? registration.alias
+          : `${registration.alias}.xec`
+        setAlias?.(canonicalAlias)
+      } catch (storageErr) {
+        console.error('Failed to set alias in route after successful registration:', storageErr)
+      }
       setStep('done')
     } catch (err) {
       const aliasError = getErrorMessage(err)

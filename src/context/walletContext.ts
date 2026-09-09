@@ -15,11 +15,13 @@ import type { FirmaSendPreview } from '../services/firmaAlphaSend'
 
 export interface WalletContextValue {
   address: string | null
+  alias?: string | null
   balance: WalletBalance | null
   loading: boolean
   error: string | null
   initialized: boolean
   backupVerified: boolean
+  setAlias?: (alias: string | null) => void
   createNewWallet: () => Promise<string>
   restoreWallet: (
     mnemonic: string,
