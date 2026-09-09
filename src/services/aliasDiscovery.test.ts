@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
+import * as ChronikClientModule from './ChronikClient'
+import { xolosWalletService } from './XolosWalletService'
 import {
   discoverAliasForAddress,
   extractAliasFromOutputScript,
@@ -171,6 +173,81 @@ describe('aliasDiscovery service', () => {
       expect(alias).toBe('lookup.xec')
     })
 
+    it('Finding 2: paginates Chronik address history beyond page 0 to discover older alias registrations', async () => {
+      const aliasHex = Buffer.from('veteran', 'utf8').toString('hex')
+      const addrPayload = getAddressPayloadHex(testAddress)
+      const scriptHex = `6a042e7865630007${aliasHex}15${addrPayload}`
+
+      // Page 0: 20 recent unrelated transactions
+      const page0Txs = Array.from({ length: 20 }, (_, i) => ({
+        txid: `recent-tx-${i}`,
+        outputs: [{ outputScript: '76a914751e76e8199196d454941c45d1b3a323f1433bd688ac' }]
+      }))
+
+      // Page 1: older transaction containing the alias registration
+      const page1Txs = [
+        {
+          txid: 'old-alias-tx',
+          outputs: [{ outputScript: scriptHex }]
+        }
+      ]
+
+      const historyMock = vi.fn().mockImplementation((page: number, _pageSize: number) => {
+        if (page === 0) {
+          return Promise.resolve({ txs: page0Txs, numPages: 2 })
+        }
+        if (page === 1) {
+          return Promise.resolve({ txs: page1Txs, numPages: 2 })
+        }
+        return Promise.resolve({ txs: [], numPages: 2 })
+      })
+
+      const mockChronik = {
+        address: vi.fn().mockReturnValue({
+          history: historyMock
+        })
+      }
+
+      const alias = await discoverAliasForAddress(testAddress, mockChronik, {})
+      expect(alias).toBe('veteran.xec')
+      expect(historyMock).toHaveBeenCalledWith(0, 20)
+      expect(historyMock).toHaveBeenCalledWith(1, 20)
+    })
+
+    it('Finding 2: terminates pagination cleanly when history is exhausted without discovering alias', async () => {
+      const historyMock = vi.fn().mockImplementation((page: number) => {
+        if (page === 0) {
+          return Promise.resolve({
+            txs: Array.from({ length: 20 }, (_, i) => ({
+              txid: `tx-p0-${i}`,
+              outputs: []
+            })),
+            numPages: 2
+          })
+        }
+        if (page === 1) {
+          return Promise.resolve({
+            txs: Array.from({ length: 5 }, (_, i) => ({
+              txid: `tx-p1-${i}`,
+              outputs: []
+            })),
+            numPages: 2
+          })
+        }
+        return Promise.resolve({ txs: [], numPages: 2 })
+      })
+
+      const mockChronik = {
+        address: vi.fn().mockReturnValue({
+          history: historyMock
+        })
+      }
+
+      const alias = await discoverAliasForAddress(testAddress, mockChronik, {})
+      expect(alias).toBeNull()
+      expect(historyMock).toHaveBeenCalledTimes(2)
+    })
+
     it('returns null if neither chronik nor services find any alias', async () => {
       const mockChronik = {
         address: vi.fn().mockReturnValue({
@@ -179,6 +256,45 @@ describe('aliasDiscovery service', () => {
       }
       const alias = await discoverAliasForAddress(testAddress, mockChronik, {})
       expect(alias).toBeNull()
+    })
+
+    it('Finding 2: XolosWalletService.findAliasForAddress paginates Chronik address history beyond page 0', async () => {
+      const aliasHex = Buffer.from('satoshiold', 'utf8').toString('hex')
+      const addrPayload = getAddressPayloadHex(testAddress)
+      const scriptHex = `6a042e786563000a${aliasHex}15${addrPayload}`
+
+      const page0Txs = Array.from({ length: 20 }, (_, i) => ({
+        txid: `p0-tx-${i}`,
+        outputs: [{ outputScript: '76a914751e76e8199196d454941c45d1b3a323f1433bd688ac' }]
+      }))
+      const page1Txs = [
+        {
+          txid: 'p1-alias-tx',
+          outputs: [{ outputScript: scriptHex }]
+        }
+      ]
+
+      const historyMock = vi.fn().mockImplementation((page: number) => {
+        if (page === 0) return Promise.resolve({ txs: page0Txs, numPages: 2 })
+        if (page === 1) return Promise.resolve({ txs: page1Txs, numPages: 2 })
+        return Promise.resolve({ txs: [], numPages: 2 })
+      })
+
+      const mockChronik = {
+        address: vi.fn().mockReturnValue({
+          history: historyMock
+        })
+      }
+
+      const spy = vi.spyOn(ChronikClientModule, 'getChronik').mockReturnValue(mockChronik as any)
+      try {
+        const alias = await xolosWalletService.findAliasForAddress(testAddress)
+        expect(alias).toBe('satoshiold.xec')
+        expect(historyMock).toHaveBeenCalledWith(0, 20)
+        expect(historyMock).toHaveBeenCalledWith(1, 20)
+      } finally {
+        spy.mockRestore()
+      }
     })
   })
 })

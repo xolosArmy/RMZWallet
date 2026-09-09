@@ -1687,19 +1687,39 @@ export class XolosWalletService {
     try {
       const chronik = getChronik()
       if (chronik && typeof chronik.address === 'function') {
-        const res = await chronik.address(address).history(0, 20)
-        const txs = Array.isArray(res?.txs) ? res.txs : []
-        for (const tx of txs) {
-          const outputs = Array.isArray(tx?.outputs) ? tx.outputs : []
-          for (const out of outputs) {
-            const script = out?.outputScript
-            if (typeof script === 'string') {
-              const alias = extractAliasFromOutputScript(script, address)
-              if (alias) {
-                return alias
+        const pageSize = 20
+        let page = 0
+        let totalPages = 1
+        const MAX_PAGES = 50
+
+        while (page < totalPages && page < MAX_PAGES) {
+          const res = await chronik.address(address).history(page, pageSize)
+          if (typeof res?.numPages === 'number') {
+            totalPages = res.numPages
+          }
+          const txs = Array.isArray(res?.txs) ? res.txs : []
+          if (txs.length === 0) {
+            break
+          }
+
+          for (const tx of txs) {
+            const outputs = Array.isArray(tx?.outputs) ? tx.outputs : []
+            for (const out of outputs) {
+              const script = out?.outputScript
+              if (typeof script === 'string') {
+                const alias = extractAliasFromOutputScript(script, address)
+                if (alias) {
+                  return alias
+                }
               }
             }
           }
+
+          if (typeof res?.numPages !== 'number' && txs.length < pageSize) {
+            break
+          }
+
+          page += 1
         }
       }
     } catch {

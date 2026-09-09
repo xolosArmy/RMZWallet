@@ -33,7 +33,14 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
   const [message, setMessage] = useState(options.initialMessage ?? '')
   const [alias, setAlias] = useState(options.initialAlias ?? '')
   const [ownerAddress, setOwnerAddress] = useState(options.initialOwnerAddress ?? '')
-  const [phase, setPhase] = useState<Tm1PublishPhase>('idle')
+
+  const recoveryStore =
+    options.recoveryStore ?? (options.executor as any)?.recoveryStore
+  // Initialize in 'reconciling' if a recovery store is present so publishing
+  // is immediately fenced while the initial checkRecovery() lookup executes.
+  const [phase, setPhase] = useState<Tm1PublishPhase>(
+    recoveryStore ? 'reconciling' : 'idle'
+  )
   const [pendingRecord, setPendingRecord] = useState<any | null>(null)
   const [verificationStatus, setVerificationStatus] =
     useState<Tm1VerificationStatus>('unverified')
@@ -43,8 +50,6 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
 
   const abortControllerRef = useRef<AbortController | null>(null)
   const activeExecutorRef = useRef<Tm1PublisherExecutor>(options.executor)
-  const recoveryStore =
-    options.recoveryStore ?? (options.executor as any)?.recoveryStore
 
   // Update active executor if option changes
   useEffect(() => {
@@ -55,6 +60,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
 
   const checkRecovery = useCallback(async (): Promise<boolean> => {
     if (!recoveryStore || typeof recoveryStore.listRecoverable !== 'function') {
+      setPhase((prev) => (prev === 'reconciling' ? 'idle' : prev))
       return false
     }
     try {
@@ -76,6 +82,8 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
         return false
       }
     } catch {
+      setPendingRecord(null)
+      setPhase((prev) => (prev === 'reconciling' ? 'idle' : prev))
       return false
     }
   }, [ownerAddress, recoveryStore])
@@ -84,6 +92,9 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
   // If an unfinalized record (such as outcomeUnknown) is present in the durable store,
   // enter 'reconciling' phase to block the editor and prevent duplicate publishes.
   useEffect(() => {
+    if (recoveryStore) {
+      setPhase((prev) => (prev === 'idle' ? 'reconciling' : prev))
+    }
     let active = true
     void (async () => {
       if (active) {
@@ -93,7 +104,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     return () => {
       active = false
     }
-  }, [checkRecovery])
+  }, [checkRecovery, recoveryStore])
 
   // Real-time byte length calculation via TextEncoder (handles UTF-8 multi-byte characters)
   const byteLength = useMemo(() => {

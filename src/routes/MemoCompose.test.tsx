@@ -147,7 +147,7 @@ describe('MemoCompose Route', () => {
   })
 
   describe('Finding 3: Canonical preview error keeps publish button disabled', () => {
-    it('disables the publish button when canonical encoding throws an error (>80 bytes)', () => {
+    it('disables the publish button when canonical encoding throws an error (>80 bytes)', async () => {
       mockWallet.alias = 'satoshixolos.xec'
       const mockExecutor = createMockExecutor()
 
@@ -165,7 +165,7 @@ describe('MemoCompose Route', () => {
       const textarea = screen.getByRole('textbox', {
         name: /mensaje de tonalli memo/i
       })
-      const publishBtn = screen.getByTestId('publish-button-idle') as HTMLButtonElement
+      const publishBtn = (await screen.findByTestId('publish-button-idle')) as HTMLButtonElement
 
       // Initially empty -> disabled
       expect(publishBtn.disabled).toBe(true)
@@ -186,7 +186,7 @@ describe('MemoCompose Route', () => {
   })
 
   describe('P1 Finding: Refresh composer identity after wallet switch', () => {
-    it('remounts composer with fresh state and updated identity when wallet switches account and alias', () => {
+    it('remounts composer with fresh state and updated identity when wallet switches account and alias', async () => {
       mockWallet.address = 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
       mockWallet.alias = 'alice.xec'
       const mockExecutor = createMockExecutor()
@@ -213,7 +213,7 @@ describe('MemoCompose Route', () => {
       fireEvent.change(textarea, { target: { value: 'Borrador confidencial de Alice' } })
       expect(textarea.value).toBe('Borrador confidencial de Alice')
 
-      const publishBtn = screen.getByTestId('publish-button-idle') as HTMLButtonElement
+      const publishBtn = (await screen.findByTestId('publish-button-idle')) as HTMLButtonElement
       expect(publishBtn.disabled).toBe(false)
 
       // Switch wallet context to Bob
@@ -243,7 +243,7 @@ describe('MemoCompose Route', () => {
       }) as HTMLTextAreaElement
       expect(freshTextarea.value).toBe('')
 
-      const freshPublishBtn = screen.getByTestId('publish-button-idle') as HTMLButtonElement
+      const freshPublishBtn = (await screen.findByTestId('publish-button-idle')) as HTMLButtonElement
       expect(freshPublishBtn.disabled).toBe(true)
     })
 

@@ -593,5 +593,47 @@ describe('useTm1PublishMachine Hook', () => {
       expect(result.current.state.pendingRecord).toEqual(pendingRec)
       expect(result.current.state.isValid).toBe(false)
     })
+
+    it('Finding 1: fences publishing immediately in reconciling phase when recoveryStore is present until check completes', async () => {
+      let resolveRecoverable: (val: any) => void = () => {}
+      const pendingPromise = new Promise((resolve) => {
+        resolveRecoverable = resolve
+      })
+      const mockRecoveryStore = {
+        storeId: 'test-store',
+        createdAt: Date.now(),
+        listRecoverable: vi.fn().mockReturnValue(pendingPromise)
+      }
+      const mockExecutor = createMockExecutor()
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          recoveryStore: mockRecoveryStore as any,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq',
+          initialMessage: 'Mensaje inmediato'
+        })
+      )
+
+      // 1. Immediately on mount, before listRecoverable resolves:
+      // Machine must be in 'reconciling' and isValid must be false
+      expect(result.current.state.phase).toBe('reconciling')
+      expect(result.current.state.isValid).toBe(false)
+
+      // 2. An attempt to publish while lookup is in-flight must be completely ignored/fenced
+      await act(async () => {
+        await result.current.publish()
+      })
+      expect(mockExecutor.verifyOwnership).not.toHaveBeenCalled()
+      expect(mockExecutor.broadcastAndFinalize).not.toHaveBeenCalled()
+
+      // 3. Once listRecoverable resolves with no pending records, transitions to idle
+      await act(async () => {
+        resolveRecoverable([])
+      })
+      expect(result.current.state.phase).toBe('idle')
+      expect(result.current.state.isValid).toBe(true)
+    })
   })
 })
