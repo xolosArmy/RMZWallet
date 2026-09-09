@@ -1,13 +1,11 @@
-export {
-  validateAndPresentApprovalRequest,
-  recordWalletHumanDecision,
-  type ValidateOptions,
-  type RecordOptions
-} from './receiver'
+/**
+ * @file index.ts
+ *
+ * Public API for the hardened Wallet-owned approval receiver (Gate 2B).
+ */
 
-export {
-  WalletApprovalReceiverError,
-  type WalletApprovalReceiverErrorCode,
-  type HumanDecisionInput,
-  type WalletApprovalPresentation
-} from './types'
+export * from './types'
+export * from './capability'
+export * from './format'
+export * from './ledger'
+export * from './receiver'

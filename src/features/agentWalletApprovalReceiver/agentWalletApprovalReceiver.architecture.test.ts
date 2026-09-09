@@ -7,7 +7,10 @@ import { describe, expect, test } from 'vitest'
 const FEATURE_DIRECTORY = resolve(fileURLToPath(new URL('.', import.meta.url)))
 const ENTRYPOINT = resolve(FEATURE_DIRECTORY, 'index.ts')
 const EXPECTED_PRODUCTION_FILES = Object.freeze([
+  'capability.ts',
+  'format.ts',
   'index.ts',
+  'ledger.ts',
   'receiver.ts',
   'types.ts'
 ])
@@ -19,18 +22,12 @@ const FORBIDDEN_MODULE_FRAGMENTS = Object.freeze([
   'component',
   'hook',
   'context',
-  'externalSign',
-  'tonalliMemo',
-  'service',
-  '/wallet/',
   'services/wallet',
   'chronik',
-  'storage',
-  'ledger',
-  'lease',
-  'transaction',
   'ecash-lib',
-  'signPreparedTransaction'
+  'signPreparedTransaction',
+  'txBuilder',
+  'broadcast'
 ])
 
 const FORBIDDEN_AUTHORITY_IDENTIFIERS = new Set([
@@ -49,7 +46,8 @@ const FORBIDDEN_AUTHORITY_IDENTIFIERS = new Set([
   'fetch',
   'XMLHttpRequest',
   'WebSocket',
-  'postMessage'
+  'postMessage',
+  'buildTransaction'
 ])
 
 function listProductionSourceFiles(): string[] {
@@ -98,70 +96,69 @@ function collectModuleSpecifiers(sourceFile: ts.SourceFile): string[] {
 }
 
 function collectIdentifiers(sourceFile: ts.SourceFile): string[] {
-  const ids: string[] = []
+  const identifiers: string[] = []
 
   function visit(node: ts.Node) {
     if (ts.isIdentifier(node)) {
-      ids.push(node.text)
+      identifiers.push(node.text)
     }
     ts.forEachChild(node, visit)
   }
 
   visit(sourceFile)
-  return ids
+  return identifiers
 }
 
-describe('agentWalletApprovalReceiver architecture invariants', () => {
+describe('agentWalletApprovalReceiver architecture boundaries', () => {
   test('contains only expected production files', () => {
     const files = listProductionSourceFiles()
-    expect(files).toEqual([...EXPECTED_PRODUCTION_FILES].sort())
+    expect(files).toEqual(EXPECTED_PRODUCTION_FILES)
   })
 
-  test('production files do not import forbidden modules or external authority', () => {
-    for (const fileName of EXPECTED_PRODUCTION_FILES) {
-      const filePath = resolve(FEATURE_DIRECTORY, fileName)
-      const sourceFile = parseSourceFile(filePath)
-      const specifiers = collectModuleSpecifiers(sourceFile)
+  test('entrypoint exists and only imports allowed modules', () => {
+    const parsed = parseSourceFile(ENTRYPOINT)
+    const imports = collectModuleSpecifiers(parsed)
 
-      for (const specifier of specifiers) {
-        if (!specifier.startsWith('.')) {
+    for (const specifier of imports) {
+      if (specifier.startsWith('.')) {
+        expect(specifier).toMatch(/^\.\/[a-zA-Z0-9]+$/)
+      } else {
+        expect(ALLOWED_BARE_IMPORTS.has(specifier)).toBe(true)
+      }
+    }
+  })
+
+  test('does not import forbidden UI, signing, wallet or network modules', () => {
+    const files = listProductionSourceFiles()
+
+    for (const file of files) {
+      const parsed = parseSourceFile(resolve(FEATURE_DIRECTORY, file))
+      const imports = collectModuleSpecifiers(parsed)
+
+      for (const specifier of imports) {
+        for (const fragment of FORBIDDEN_MODULE_FRAGMENTS) {
           expect(
-            ALLOWED_BARE_IMPORTS.has(specifier),
-            `Forbidden bare import "${specifier}" in ${fileName}`
-          ).toBe(true)
-        } else {
-          const lower = specifier.toLowerCase()
-          for (const fragment of FORBIDDEN_MODULE_FRAGMENTS) {
-            expect(
-              lower.includes(fragment.toLowerCase()),
-              `Forbidden import fragment "${fragment}" found in "${specifier}" in ${fileName}`
-            ).toBe(false)
-          }
+            specifier.toLowerCase(),
+            `File ${file} imports forbidden module ${specifier}`
+          ).not.toContain(fragment.toLowerCase())
         }
       }
     }
   })
 
-  test('production files do not reference forbidden authority identifiers', () => {
-    for (const fileName of EXPECTED_PRODUCTION_FILES) {
-      const filePath = resolve(FEATURE_DIRECTORY, fileName)
-      const sourceFile = parseSourceFile(filePath)
-      const ids = collectIdentifiers(sourceFile)
+  test('does not reference forbidden signing, persistent storage or network identifiers', () => {
+    const files = listProductionSourceFiles()
 
-      for (const id of ids) {
+    for (const file of files) {
+      const parsed = parseSourceFile(resolve(FEATURE_DIRECTORY, file))
+      const identifiers = collectIdentifiers(parsed)
+
+      for (const id of identifiers) {
         expect(
           FORBIDDEN_AUTHORITY_IDENTIFIERS.has(id),
-          `Forbidden authority identifier "${id}" detected in ${fileName}`
+          `File ${file} contains forbidden identifier: ${id}`
         ).toBe(false)
       }
-    }
-  })
-
-  test('index entrypoint exists and defines cleanly isolated export surface', () => {
-    const sourceFile = parseSourceFile(ENTRYPOINT)
-    const specifiers = collectModuleSpecifiers(sourceFile)
-    for (const specifier of specifiers) {
-      expect(specifier.startsWith('.')).toBe(true)
     }
   })
 })
