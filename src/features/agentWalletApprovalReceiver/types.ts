@@ -1,7 +1,13 @@
 /**
  * @file types.ts
  *
- * Public and internal type definitions for the hardened Wallet Approval Receiver (Gate 2B).
+ * Public type definitions for the hardened Wallet Approval Receiver (Gate 2B).
+ *
+ * Architecture:
+ * - Built once via trusted Wallet bootstrap: createAgentWalletApprovalReceiver(deps).
+ * - UI only interacts with opaque handles and immutable presentations.
+ * - Human session verification is internal and Wallet-owned (enforcing activeAddress === fromAddress).
+ * - Atomic ledger records both approvals and rejections with 3-way uniqueness.
  *
  * Mandatory Lifecycle:
  * idle -> receiving -> validating -> preparing -> reviewReady -> approvalRequested ->
@@ -9,7 +15,6 @@
  */
 
 import type { HumanApprovalV1 } from '@xolosarmy/tonalli-core'
-import type { UniversalAuthorizationEnvelopeV1 } from '../externalSign/contract'
 import type { UniversalContentHash } from '../externalSign/contentHash'
 
 export type ApprovalReceiverLifecycleState =
@@ -25,33 +30,36 @@ export type ApprovalReceiverLifecycleState =
   | 'STOP'
 
 /**
- * Immutable projection formatted specifically for Wallet human review UI.
+ * Immutable presentation snapshot formatted specifically for Wallet human review UI.
+ * Covers the entire request and policy domain to prevent TOCTOU substitution.
  */
 export interface WalletApprovalPresentation {
   readonly requestId: string
   readonly intentId: string
   readonly decisionId: string
-  readonly agentId: string
-  readonly agentRole: string
   readonly amountSats: string
   readonly amountXEC: string
   readonly fromAddress: string
   readonly destination: string
+  readonly network: 'xec:mainnet' | 'xec:regtest'
+  readonly agentId: string
+  readonly agentRole: string
   readonly reason: string
   readonly memo?: string
-  readonly network: 'xec:mainnet'
   readonly policyTraceId: string
   readonly policyReasonCode: string
   readonly policyVersion: string
+  readonly policyReason: string
+  readonly requestedAt: number
   readonly requestedAtIso: string
-  readonly effectiveExpiresAtIso: string
   readonly effectiveExpiresAt: number
+  readonly effectiveExpiresAtIso: string
+  readonly presentationHash: string
 }
 
 /**
- * Public result returned to Wallet UI after successful preparation.
- * Note: Only an opaque handle and the immutable presentation are exposed.
- * Internal bytes, envelopes, bindings and capabilities are strictly guarded.
+ * Public review state returned to Wallet UI after successful preparation.
+ * Exposes strictly an opaque handle and the immutable presentation snapshot.
  */
 export interface WalletApprovalReviewState {
   readonly handle: string
@@ -59,74 +67,80 @@ export interface WalletApprovalReviewState {
 }
 
 /**
- * Result of verifying an authentic, Wallet-owned human session.
+ * Result of resolving the active authenticated custodian session in RMZWallet.
  */
 export interface WalletHumanSessionVerificationResult {
   readonly authenticated: boolean
-  readonly activeAddress: string
-  readonly authenticatedAlias?: string
-  readonly sessionToken: string
+  readonly activeAddress?: string
+  readonly approverId?: string
+  readonly error?: string
 }
 
 /**
  * Interface for verifying Wallet-owned authenticated human sessions.
- * Caller cannot pass arbitrary strings; session must be verified against
- * authentic Wallet runtime state.
+ * Implemented by Wallet bootstrap and injected once into the receiver factory.
+ * Resolves active session from internal wallet state; caller cannot supply arbitrary tokens.
  */
 export interface WalletHumanSessionVerifier {
-  verifySession(sessionToken: string): Promise<WalletHumanSessionVerificationResult>
+  verifyActiveSession(): Promise<WalletHumanSessionVerificationResult>
 }
 
 /**
- * Human action submitted from Wallet UI referencing an opaque review handle.
- */
-export interface WalletHumanAction {
-  readonly decision: 'approved' | 'rejected'
-  readonly sessionToken: string
-  readonly reason?: string
-}
-
-/**
- * Internal binding maintained exclusively inside the receiver module.
- * Never returned to callers, agents, or public UI.
- */
-export interface InternalApprovalBinding {
-  readonly operationId: string
-  readonly requestId: string
-  readonly intentId: string
-  readonly decisionId: string
-  readonly contentHash: UniversalContentHash
-  readonly envelope: UniversalAuthorizationEnvelopeV1
-  readonly canonicalBytes: Uint8Array
-  readonly network: 'xec:mainnet'
-  readonly amountSats: string
-  readonly destination: string
-  readonly effectiveExpiresAt: number
-  readonly presentationSnapshot: WalletApprovalPresentation
-}
-
-/**
- * Immutable atomic record for Wallet local approval ledger.
+ * Immutable atomic record for the Wallet-local approval ledger.
+ * Preserves operation, request, intent, decision IDs, content hash, capability ID,
+ * effective expiry, network, amount, destination, presentation hash, and HumanApprovalV1.
  */
 export interface WalletApprovalLedgerRecord {
   readonly operationId: string
   readonly requestId: string
   readonly approvalId: string
+  readonly intentId: string
+  readonly decisionId: string
+  readonly contentHash: UniversalContentHash
   readonly capabilityId: string
+  readonly effectiveExpiresAt: number
+  readonly network: string
+  readonly amountSats: string
+  readonly fromAddress: string
+  readonly destination: string
+  readonly presentationHash: string
   readonly humanApproval: HumanApprovalV1
-  readonly contentHash: string
   readonly recordedAt: number
-  readonly status: 'approvalRecorded'
+  readonly status: 'approved' | 'rejected'
 }
 
 /**
  * Interface for the Wallet-local approval ledger.
  * Production environments MUST inject a durable, transactional implementation.
+ * In-memory implementation is strictly permitted in unit/integration tests.
  */
 export interface WalletApprovalLedger {
   recordApprovalAtomic(record: WalletApprovalLedgerRecord): Promise<void>
   has(requestId: string): Promise<boolean>
   get(requestId: string): Promise<WalletApprovalLedgerRecord | undefined>
+}
+
+/**
+ * Dependencies injected once during trusted Wallet bootstrap.
+ */
+export interface AgentWalletApprovalReceiverDependencies {
+  readonly ledger: WalletApprovalLedger
+  readonly sessionVerifier: WalletHumanSessionVerifier
+  readonly clock?: () => number
+  readonly idGenerator?: () => string
+  readonly declaredOrigin?: string
+}
+
+/**
+ * Hardened Wallet-owned receiver instance used by UI and transport adapters.
+ */
+export interface AgentWalletApprovalReceiver {
+  prepareHandoff(rawHandoffBytes: Uint8Array): Promise<WalletApprovalReviewState>
+  prepareRequest(requestInput: unknown): Promise<WalletApprovalReviewState>
+  approveHandle(handle: string, options?: { reason?: string }): Promise<HumanApprovalV1>
+  rejectHandle(handle: string, options?: { reason?: string }): Promise<HumanApprovalV1>
+  getPresentation(handle: string): WalletApprovalPresentation | undefined
+  dismissHandle(handle: string): void
 }
 
 export type WalletApprovalReceiverErrorCode =
@@ -145,6 +159,7 @@ export type WalletApprovalReceiverErrorCode =
   | 'UNKNOWN_REVIEW_HANDLE'
   | 'INVALID_LIFECYCLE_STATE'
   | 'INVALID_HUMAN_SESSION'
+  | 'SESSION_ADDRESS_MISMATCH'
   | 'MISSING_HUMAN_APPROVER'
   | 'TOCTOU_VALIDATION_FAILED'
   | 'CAPABILITY_NOT_FRESH'
@@ -155,6 +170,9 @@ export type WalletApprovalReceiverErrorCode =
   | 'ATOMIC_RECORDING_FAILED'
   | 'OPERATION_ABORTED'
   | 'INVALID_HUMAN_ACTION'
+  | 'INVALID_INPUT'
+  | 'INVALID_DECLARED_ORIGIN'
+  | 'INVALID_HUMAN_APPROVAL_SCHEMA'
 
 export class WalletApprovalReceiverError extends Error {
   readonly code: WalletApprovalReceiverErrorCode
@@ -170,17 +188,4 @@ export class WalletApprovalReceiverError extends Error {
     this.code = code
     this.details = details
   }
-}
-
-export interface PrepareApprovalReviewOptions {
-  readonly nowEpochSeconds?: () => number
-  readonly signal?: AbortSignal
-}
-
-export interface RecordHumanDecisionOptions {
-  readonly ledger: WalletApprovalLedger
-  readonly sessionVerifier: WalletHumanSessionVerifier
-  readonly nowEpochSeconds?: () => number
-  readonly idGenerator?: () => string
-  readonly signal?: AbortSignal
 }

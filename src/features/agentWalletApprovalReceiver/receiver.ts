@@ -1,25 +1,37 @@
 /**
  * @file receiver.ts
  *
- * Canonical Hardened Wallet Approval Receiver (Gate 2B).
+ * CANONICAL WALLET-OWNED APPROVAL RECEIVER FACTORY (Gate 2B)
  *
- * Mandatory Lifecycle:
- * idle -> receiving -> validating -> preparing -> reviewReady -> approvalRequested ->
- * revalidating -> approvalRecording -> approvalRecorded -> STOP
- *
- * SECURITY INVARIANTS:
- * - ApprovalRecordCapability is STRICTLY internal and one-shot.
- * - Preparation returns ONLY an opaque handle and an immutable presentation.
- * - Anti-TOCTOU: Full reconstruction and equality check of E, C, H(E,C), and projection before recording.
- * - Human session verification via Wallet-owned WalletHumanSessionVerifier (no arbitrary caller identity).
- * - Universal Authorization Envelope E is strictly validated via parseUniversalAuthorizationEnvelope.
- * - Content hash H(E,C) computed via calculateUniversalContentHash over canonical wire bytes C.
- * - Atomic ledger recording with rollback on failure; fail closed if ledger is omitted.
- * - Return value is strictly HumanApprovalV1 as a read-only audit receipt, never an execution capability.
+ * Architecture & Invariants:
+ * 1. Factory built once from trusted Wallet bootstrap:
+ *    createAgentWalletApprovalReceiver({ ledger, sessionVerifier, clock, idGenerator, declaredOrigin })
+ * 2. Complete closure encapsulation:
+ *    - ApprovalRecordCapability class, internal tokens, and bindings are strictly module-private.
+ *    - Zero exports of capability, internal tokens, or in-memory ledgers.
+ * 3. Defensive copies of incoming bytes:
+ *    - Caller Uint8Array references are never retained or aliased.
+ * 4. Anti-TOCTOU presentation protection:
+ *    - Full snapshot comparison across all fields: amount, destination, fromAddress, agent, reason,
+ *      memo, policy reason/code/version/trace, requestedAt, expiry, and presentation hash.
+ * 5. Authentic human session verification:
+ *    - sessionVerifier resolves RMZWallet custodian session internally.
+ *    - Enforces verified.activeAddress === request.intent.fromAddress.
+ * 6. Runtime validation:
+ *    - Every constructed HumanApprovalV1 is validated against humanApprovalV1Schema before commit.
+ *    - Runtime type/regex/length validation of approver and reason.
+ * 7. Fail-closed session cleanup:
+ *    - On ANY error during revalidation or recording, session lifecycle transitions to STOP,
+ *      handle is destroyed, and no sessions are left dangling in revalidating.
+ * 8. Atomic ledger recording for BOTH approved and rejected:
+ *    - Both decisions transition approvalRecording -> approvalRecorded -> STOP and commit
+ *      identities, content hashes, capability IDs, and HumanApprovalV1 receipts to the ledger.
  */
 
+import { createHash } from 'node:crypto'
 import {
   AGENTIC_CONTRACT_VERSION,
+  humanApprovalV1Schema,
   parseWalletApprovalRequestV1,
   type HumanApprovalV1,
   type WalletApprovalRequestV1
@@ -38,592 +50,718 @@ import {
   UNIVERSAL_AUTHORIZATION_VERSION,
   type UniversalAuthorizationEnvelopeV1
 } from '../externalSign/contract'
-import {
-  createApprovalCapabilityInternal,
-  INTERNAL_CAPABILITY_TOKEN
-} from './capability'
 import { formatSatsToExactXEC } from './format'
 import {
-  WalletApprovalReceiverError,
+  type AgentWalletApprovalReceiver,
+  type AgentWalletApprovalReceiverDependencies,
   type ApprovalReceiverLifecycleState,
-  type InternalApprovalBinding,
-  type PrepareApprovalReviewOptions,
-  type RecordHumanDecisionOptions,
   type WalletApprovalLedgerRecord,
   type WalletApprovalPresentation,
   type WalletApprovalReviewState,
-  type WalletHumanAction
+  WalletApprovalReceiverError
 } from './types'
 
-/**
- * Valid Wallet-owned origin for Universal Authorization Envelope.
- * Complies with normalizedDeclaredOrigin (https: protocol).
- */
-export const WALLET_DECLARED_ORIGIN = 'https://wallet.tonalli.app'
-export const WALLET_DISPLAY_NAME = 'RMZWallet Agent Approval Receiver'
-export const WALLET_PROFILE_ID = 'profile/agent-approval-v1'
+// ============================================================================
+// MODULE-PRIVATE CAPABILITY ENCAPSULATION (Zero External Visibility)
+// ============================================================================
 
-interface ActiveReviewSession {
-  handle: string
-  state: ApprovalReceiverLifecycleState
-  request: WalletApprovalRequestV1
-  canonicalBytes: Uint8Array
-  envelope: UniversalAuthorizationEnvelopeV1
-  contentHash: UniversalContentHash
-  presentation: WalletApprovalPresentation
-  effectiveExpiresAt: number
-  nowEpochSeconds: () => number
+const INTERNAL_CAPABILITY_TOKEN: unique symbol = Symbol('agent_wallet_approval_capability_token')
+
+type CapabilityState = 'active' | 'recording' | 'recorded' | 'invalidated'
+
+interface InternalApprovalBinding {
+  readonly operationId: string
+  readonly requestId: string
+  readonly intentId: string
+  readonly decisionId: string
+  readonly contentHash: UniversalContentHash
+  readonly envelope: UniversalAuthorizationEnvelopeV1
+  readonly canonicalBytes: Uint8Array
+  readonly network: 'xec:mainnet'
+  readonly amountSats: string
+  readonly fromAddress: string
+  readonly destination: string
+  readonly effectiveExpiresAt: number
+  readonly presentationSnapshot: WalletApprovalPresentation
 }
 
-// Module-local active sessions. Not exported.
-const activeReviewSessions = new Map<string, ActiveReviewSession>()
+class ApprovalRecordCapability {
+  readonly capabilityId: string
+  readonly binding: InternalApprovalBinding
+  private _state: CapabilityState = 'active'
 
-function defaultIdGenerator(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
-  }
-  throw new WalletApprovalReceiverError(
-    'INVALID_HUMAN_ACTION',
-    'Crypto randomUUID is unavailable; a cryptographically secure idGenerator must be provided.'
-  )
-}
-
-/**
- * Formats an immutable presentation snapshot for Wallet UI display.
- */
-function createPresentationSnapshot(
-  request: WalletApprovalRequestV1,
-  effectiveExpiresAt: number
-): WalletApprovalPresentation {
-  return Object.freeze({
-    requestId: request.requestId,
-    intentId: request.intent.intentId,
-    decisionId: request.policyDecision.decisionId,
-    agentId: request.intent.agentId,
-    agentRole: request.intent.agentRole,
-    amountSats: request.intent.amountSats,
-    amountXEC: formatSatsToExactXEC(request.intent.amountSats),
-    fromAddress: request.intent.fromAddress,
-    destination: request.intent.toAddress,
-    reason: request.intent.reason,
-    memo: request.intent.memo,
-    network: request.intent.network,
-    policyTraceId: request.policyDecision.policyTraceId,
-    policyReasonCode: request.policyDecision.reasonCode,
-    policyVersion: request.policyDecision.policyVersion,
-    requestedAtIso: new Date(request.requestedAt * 1000).toISOString(),
-    effectiveExpiresAtIso: new Date(effectiveExpiresAt * 1000).toISOString(),
-    effectiveExpiresAt
-  })
-}
-
-/**
- * Builds and validates a Universal Authorization Envelope E for externalSign compatibility.
- * Timestamps in externalSign are converted from epoch-seconds to milliseconds.
- */
-function buildCanonicalEnvelope(
-  operationId: string,
-  requestedAtEpochSec: number,
-  effectiveExpiresAtEpochSec: number,
-  nowEpochSec: number
-): UniversalAuthorizationEnvelopeV1 {
-  const issuedAtMs = requestedAtEpochSec * 1000
-  const expiresAtMs = effectiveExpiresAtEpochSec * 1000
-  const nowMs = nowEpochSec * 1000
-
-  const rawEnvelope = {
-    schema: UNIVERSAL_AUTHORIZATION_SCHEMA,
-    version: UNIVERSAL_AUTHORIZATION_VERSION,
-    operationId,
-    profileId: WALLET_PROFILE_ID,
-    issuedAt: issuedAtMs,
-    expiresAt: expiresAtMs,
-    requester: {
-      declaredOrigin: WALLET_DECLARED_ORIGIN,
-      displayName: WALLET_DISPLAY_NAME
-    }
-  }
-
-  try {
-    return parseUniversalAuthorizationEnvelope(rawEnvelope, nowMs)
-  } catch (err: unknown) {
-    throw new WalletApprovalReceiverError(
-      'INVALID_ENVELOPE',
-      'Failed to construct valid Universal Authorization Envelope E',
-      err
-    )
-  }
-}
-
-/**
- * Validates request schema and core security boundaries.
- */
-function validateRequestBoundaries(
-  request: WalletApprovalRequestV1,
-  now: number
-): number {
-  if (request.contractVersion !== AGENTIC_CONTRACT_VERSION) {
-    throw new WalletApprovalReceiverError(
-      'INVALID_CONTRACT_VERSION',
-      `Unsupported contract version: "${request.contractVersion}"`
-    )
-  }
-  if (request.kind !== 'wallet_approval_request') {
-    throw new WalletApprovalReceiverError('INVALID_KIND', `Invalid kind: "${request.kind}"`)
-  }
-  if (request.purpose !== 'xec_payment') {
-    throw new WalletApprovalReceiverError('INVALID_PURPOSE', `Unsupported purpose: "${request.purpose}"`)
-  }
-  if (request.policyDecision.decision !== 'needs_human_approval') {
-    throw new WalletApprovalReceiverError(
-      'POLICY_NOT_NEEDS_HUMAN_APPROVAL',
-      `Policy decision must be needs_human_approval, got "${request.policyDecision.decision}"`
-    )
-  }
-  if (request.policyDecision.intentId !== request.intent.intentId) {
-    throw new WalletApprovalReceiverError(
-      'INTENT_ID_MISMATCH',
-      'Policy decision intentId does not match request intentId'
-    )
-  }
-  if (!request.policyDecision.policyTraceId || request.policyDecision.policyTraceId.trim() === '') {
-    throw new WalletApprovalReceiverError('EMPTY_POLICY_TRACE', 'Policy trace ID cannot be empty')
-  }
-  if (request.intent.network !== 'xec:mainnet') {
-    throw new WalletApprovalReceiverError(
-      'UNSUPPORTED_NETWORK',
-      `Only xec:mainnet is supported in v1.0, got "${request.intent.network}"`
-    )
-  }
-
-  // Calculate effective expiration across all bounded components
-  const expirationCandidates = [
-    request.expiresAt,
-    request.intent.expiresAt,
-    request.policyDecision.expiresAt
-  ]
-  if (request.x402) {
-    expirationCandidates.push(request.x402.expiresAt)
-  }
-  const effectiveExpiresAt = Math.min(...expirationCandidates)
-
-  if (effectiveExpiresAt <= now) {
-    throw new WalletApprovalReceiverError(
-      'EXPIRED_REQUEST',
-      `Request is expired (effectiveExpiresAt: ${effectiveExpiresAt}, now: ${now})`
-    )
-  }
-
-  if (request.requestedAt > now + 300) {
-    throw new WalletApprovalReceiverError(
-      'REQUEST_NOT_YET_VALID',
-      `Request timestamp is too far in future (requestedAt: ${request.requestedAt}, now: ${now})`
-    )
-  }
-
-  return effectiveExpiresAt
-}
-
-/**
- * Prepares an incoming agent approval request for human review in Wallet UI.
- *
- * Mandatory Lifecycle Phase:
- * idle -> receiving -> validating -> preparing -> reviewReady
- *
- * Returns ONLY an opaque review handle and an immutable presentation.
- * All internal bytes, envelopes, bindings, and capabilities remain strictly encapsulated.
- */
-export async function prepareApprovalReview(
-  input: Uint8Array | WalletApprovalRequestV1,
-  options?: PrepareApprovalReviewOptions
-): Promise<WalletApprovalReviewState> {
-  const signal = options?.signal ?? new AbortController().signal
-  if (signal.aborted) {
-    throw new WalletApprovalReceiverError('OPERATION_ABORTED', 'Operation was aborted')
-  }
-
-  // 1. Lifecycle: idle -> receiving
-  let canonicalBytes: Uint8Array
-  let rawRequest: unknown
-
-  if (input instanceof Uint8Array) {
-    canonicalBytes = input
-    try {
-      rawRequest = decodeAgentWalletHandoffV1(canonicalBytes)
-    } catch (err: unknown) {
+  constructor(
+    token: unknown,
+    capabilityId: string,
+    binding: InternalApprovalBinding
+  ) {
+    if (token !== INTERNAL_CAPABILITY_TOKEN) {
       throw new WalletApprovalReceiverError(
-        'INVALID_REQUEST_SCHEMA',
-        'Failed to decode canonical agent wallet handoff bytes',
-        err
+        'INVALID_INPUT',
+        'Direct instantiation of ApprovalRecordCapability is strictly prohibited.'
       )
     }
-  } else {
-    rawRequest = input
-    try {
-      canonicalBytes = encodeAgentWalletHandoffV1(rawRequest as WalletApprovalRequestV1)
-    } catch (err: unknown) {
+    this.capabilityId = capabilityId
+    this.binding = Object.freeze({ ...binding })
+  }
+
+  get state(): CapabilityState {
+    return this._state
+  }
+
+  transition(token: unknown, nextState: CapabilityState): void {
+    if (token !== INTERNAL_CAPABILITY_TOKEN) {
+      throw new WalletApprovalReceiverError('INVALID_INPUT', 'Unauthorized capability transition.')
+    }
+    if (this._state === 'recorded' || this._state === 'invalidated') {
       throw new WalletApprovalReceiverError(
-        'INVALID_REQUEST_SCHEMA',
-        'Failed to encode request into canonical handoff bytes',
-        err
+        'CAPABILITY_NOT_FRESH',
+        `Terminal capability state cannot be transitioned: ${this._state} -> ${nextState}`
       )
     }
-  }
-
-  // 2. Lifecycle: receiving -> validating
-  let request: WalletApprovalRequestV1
-  try {
-    request = parseWalletApprovalRequestV1(rawRequest)
-  } catch (err: unknown) {
-    throw new WalletApprovalReceiverError(
-      'INVALID_REQUEST_SCHEMA',
-      'Wallet approval request schema validation failed',
-      err
-    )
-  }
-
-  const now = options?.nowEpochSeconds ? options.nowEpochSeconds() : Math.floor(Date.now() / 1000)
-  const effectiveExpiresAt = validateRequestBoundaries(request, now)
-
-  // 3. Lifecycle: validating -> preparing
-  const presentation = createPresentationSnapshot(request, effectiveExpiresAt)
-  const envelope = buildCanonicalEnvelope(request.requestId, request.requestedAt, effectiveExpiresAt, now)
-
-  let contentHash: UniversalContentHash
-  try {
-    contentHash = await calculateUniversalContentHash(envelope, canonicalBytes, signal)
-  } catch (err: unknown) {
-    throw new WalletApprovalReceiverError(
-      'INVALID_CONTENT_HASH',
-      'Failed to compute normative H(E,C) content hash',
-      err
-    )
-  }
-
-  // Generate opaque review handle
-  const handle = defaultIdGenerator()
-
-  // 4. Lifecycle: preparing -> reviewReady
-  const session: ActiveReviewSession = {
-    handle,
-    state: 'reviewReady',
-    request,
-    canonicalBytes,
-    envelope,
-    contentHash,
-    presentation,
-    effectiveExpiresAt,
-    nowEpochSeconds: options?.nowEpochSeconds ?? (() => Math.floor(Date.now() / 1000))
-  }
-
-  activeReviewSessions.set(handle, session)
-
-  return Object.freeze({
-    handle,
-    presentation
-  })
-}
-
-/**
- * Records a human decision (approved or rejected) initiated from the Wallet UI.
- *
- * Mandatory Lifecycle Phase:
- * reviewReady -> approvalRequested -> revalidating -> approvalRecording -> approvalRecorded -> STOP
- *
- * Enforces:
- * 1. Wallet-owned authentic human session verification (no spoofed identities).
- * 2. Complete anti-TOCTOU reconstruction & byte-exact equality (E' = E, C' = C, H' = H, projection' = projection).
- * 3. Minting of internal one-shot capability only during atomic recording.
- * 4. Atomic ledger recording with rollback on failure.
- * 5. Returns exclusively a read-only HumanApprovalV1 audit receipt.
- */
-export async function recordWalletHumanDecision(
-  handle: string,
-  action: WalletHumanAction,
-  options: RecordHumanDecisionOptions
-): Promise<HumanApprovalV1> {
-  const signal = options.signal ?? new AbortController().signal
-  if (signal.aborted) {
-    throw new WalletApprovalReceiverError('OPERATION_ABORTED', 'Operation was aborted')
-  }
-
-  if (!options.ledger) {
-    throw new WalletApprovalReceiverError(
-      'MISSING_LEDGER_DEPENDENCY',
-      'Explicit WalletApprovalLedger injection is required. Global fallback is prohibited.'
-    )
-  }
-
-  if (!options.sessionVerifier) {
-    throw new WalletApprovalReceiverError(
-      'MISSING_SESSION_VERIFIER',
-      'Explicit WalletHumanSessionVerifier injection is required.'
-    )
-  }
-
-  const session = activeReviewSessions.get(handle)
-  if (!session) {
-    throw new WalletApprovalReceiverError(
-      'UNKNOWN_REVIEW_HANDLE',
-      `Review session handle "${handle}" is unknown or expired.`
-    )
-  }
-
-  if (session.state !== 'reviewReady') {
+    if (this._state === 'active' && nextState === 'recording') {
+      this._state = 'recording'
+      return
+    }
+    if (this._state === 'recording' && nextState === 'recorded') {
+      this._state = 'recorded'
+      return
+    }
+    if (nextState === 'invalidated') {
+      this._state = 'invalidated'
+      return
+    }
     throw new WalletApprovalReceiverError(
       'INVALID_LIFECYCLE_STATE',
-      `Cannot record decision from state "${session.state}". Must be "reviewReady".`
+      `Illegal capability transition: ${this._state} -> ${nextState}`
     )
   }
+}
 
-  // 1. Lifecycle: reviewReady -> approvalRequested
-  session.state = 'approvalRequested'
+// ============================================================================
+// ORIGIN & ADDRESS VALIDATION
+// ============================================================================
 
-  // 2. Lifecycle: approvalRequested -> revalidating
-  session.state = 'revalidating'
+const ALLOWED_PRODUCTION_ORIGINS = new Set([
+  'https://app.tonalli.cash',
+  'https://wallet.tonalli.app'
+])
 
-  if (!action || typeof action !== 'object') {
-    throw new WalletApprovalReceiverError('INVALID_HUMAN_ACTION', 'Action must be an object')
-  }
-
-  if (action.decision !== 'approved' && action.decision !== 'rejected') {
-    throw new WalletApprovalReceiverError(
-      'INVALID_HUMAN_ACTION',
-      `Invalid decision: "${String((action as { decision?: unknown }).decision)}". Must be "approved" or "rejected".`
-    )
-  }
-
-  if (!action.sessionToken || typeof action.sessionToken !== 'string' || action.sessionToken.trim() === '') {
-    throw new WalletApprovalReceiverError(
-      'INVALID_HUMAN_SESSION',
-      'A valid, non-empty sessionToken is required.'
-    )
-  }
-
-  // Verify authentic Wallet-owned human session
-  let sessionVerification
+function validateDeclaredOrigin(origin: string): string {
   try {
-    sessionVerification = await options.sessionVerifier.verifySession(action.sessionToken)
-  } catch (err: unknown) {
+    const parsed = new URL(origin)
+    if (ALLOWED_PRODUCTION_ORIGINS.has(origin)) {
+      return origin
+    }
+    // Allow localhost/127.0.0.1 strictly in test environments
+    if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') {
+      return origin
+    }
+    throw new Error(`Origin "${origin}" is not an authorized Wallet production or test origin.`)
+  } catch (err) {
     throw new WalletApprovalReceiverError(
-      'INVALID_HUMAN_SESSION',
-      'Failed during session verification execution',
-      err
+      'INVALID_DECLARED_ORIGIN',
+      `Declared origin is invalid or unauthorized: ${err instanceof Error ? err.message : String(err)}`
     )
   }
+}
 
-  if (!sessionVerification.authenticated || !sessionVerification.activeAddress) {
-    throw new WalletApprovalReceiverError(
-      'INVALID_HUMAN_SESSION',
-      'Human session verification failed or activeAddress is missing.'
-    )
-  }
+const CASHADDR_MAINNET_REGEX = /^ecash:[qp][a-z0-9]{41,}$/
 
-  const approver = sessionVerification.authenticatedAlias ?? sessionVerification.activeAddress
-  if (!approver || approver.trim() === '') {
+function validateApproverAddress(address: unknown): string {
+  if (typeof address !== 'string' || !CASHADDR_MAINNET_REGEX.test(address)) {
     throw new WalletApprovalReceiverError(
       'MISSING_HUMAN_APPROVER',
-      'Unable to resolve authenticated approver identity from session.'
+      'Approver must be a valid lowercase CashAddr mainnet address.'
     )
   }
+  return address
+}
 
-  const now = options.nowEpochSeconds ? options.nowEpochSeconds() : session.nowEpochSeconds()
-
-  // Fresh temporal validity check
-  if (now >= session.effectiveExpiresAt) {
-    session.state = 'STOP'
-    activeReviewSessions.delete(handle)
+function validateActionReason(reason: unknown): string | undefined {
+  if (reason === undefined || reason === null) return undefined
+  if (typeof reason !== 'string') {
+    throw new WalletApprovalReceiverError('INVALID_INPUT', 'Reason must be a string if provided.')
+  }
+  const trimmed = reason.trim()
+  if (trimmed.length === 0) return undefined
+  if (trimmed.length > 500) {
     throw new WalletApprovalReceiverError(
-      'EXPIRED_REQUEST',
-      `Approval request expired before recording (effectiveExpiresAt: ${session.effectiveExpiresAt}, now: ${now})`
+      'INVALID_INPUT',
+      'Reason exceeds maximum permitted length of 500 characters.'
     )
   }
+  return trimmed
+}
 
-  // 3. Anti-TOCTOU Deep Revalidation:
-  // Reconstruct E', C', H' and projection from the stored canonical bytes and request
-  let reconstructedRequest: WalletApprovalRequestV1
-  try {
-    const rawReconstructed = decodeAgentWalletHandoffV1(session.canonicalBytes)
-    reconstructedRequest = parseWalletApprovalRequestV1(rawReconstructed)
-  } catch (err: unknown) {
+// ============================================================================
+// PRESENTATION HASH COMPUTATION
+// ============================================================================
+
+function computePresentationHash(presentation: Omit<WalletApprovalPresentation, 'presentationHash'>): string {
+  const canonicalPresentationJson = JSON.stringify({
+    requestId: presentation.requestId,
+    intentId: presentation.intentId,
+    decisionId: presentation.decisionId,
+    amountSats: presentation.amountSats,
+    amountXEC: presentation.amountXEC,
+    fromAddress: presentation.fromAddress,
+    destination: presentation.destination,
+    network: presentation.network,
+    agentId: presentation.agentId,
+    agentRole: presentation.agentRole,
+    reason: presentation.reason,
+    memo: presentation.memo ?? null,
+    policyTraceId: presentation.policyTraceId,
+    policyReasonCode: presentation.policyReasonCode,
+    policyVersion: presentation.policyVersion,
+    policyReason: presentation.policyReason,
+    requestedAt: presentation.requestedAt,
+    effectiveExpiresAt: presentation.effectiveExpiresAt
+  })
+  return createHash('sha256').update(canonicalPresentationJson, 'utf8').digest('hex')
+}
+
+// ============================================================================
+// INTERNAL REVIEW SESSION STATE
+// ============================================================================
+
+interface ActiveReviewSession {
+  readonly handle: string
+  readonly operationId: string
+  readonly request: WalletApprovalRequestV1
+  readonly canonicalBytes: Uint8Array
+  readonly envelope: UniversalAuthorizationEnvelopeV1
+  readonly contentHash: UniversalContentHash
+  readonly presentation: WalletApprovalPresentation
+  readonly effectiveExpiresAt: number
+  lifecycle: ApprovalReceiverLifecycleState
+}
+
+// ============================================================================
+// RECEIVER FACTORY
+// ============================================================================
+
+/**
+ * Creates a Wallet-owned approval receiver instance bound to trusted Wallet dependencies.
+ */
+export function createAgentWalletApprovalReceiver(
+  deps: AgentWalletApprovalReceiverDependencies
+): AgentWalletApprovalReceiver {
+  if (!deps || typeof deps !== 'object') {
+    throw new WalletApprovalReceiverError('INVALID_INPUT', 'Receiver dependencies must be provided.')
+  }
+  if (!deps.ledger || typeof deps.ledger.recordApprovalAtomic !== 'function') {
     throw new WalletApprovalReceiverError(
-      'TOCTOU_VALIDATION_FAILED',
-      'Anti-TOCTOU failure: unable to re-decode canonical bytes',
-      err
+      'MISSING_LEDGER_DEPENDENCY',
+      'Trusted WalletApprovalLedger must be injected at bootstrap.'
     )
   }
-
-  // Check C' = C
-  const reencodedBytes = encodeAgentWalletHandoffV1(reconstructedRequest)
-  if (
-    reencodedBytes.length !== session.canonicalBytes.length ||
-    !reencodedBytes.every((byte, idx) => byte === session.canonicalBytes[idx])
-  ) {
+  if (!deps.sessionVerifier || typeof deps.sessionVerifier.verifyActiveSession !== 'function') {
     throw new WalletApprovalReceiverError(
-      'TOCTOU_VALIDATION_FAILED',
-      'Anti-TOCTOU failure: canonical byte stream mutated during review'
+      'MISSING_SESSION_VERIFIER',
+      'Trusted WalletHumanSessionVerifier must be injected at bootstrap.'
     )
   }
 
-  // Check Projection identity
-  const reconstructedEffectiveExpiresAt = validateRequestBoundaries(reconstructedRequest, now)
-  const reconstructedPresentation = createPresentationSnapshot(
-    reconstructedRequest,
-    reconstructedEffectiveExpiresAt
-  )
+  const ledger = deps.ledger
+  const sessionVerifier = deps.sessionVerifier
+  const clock = deps.clock ?? (() => Math.floor(Date.now() / 1000))
+  const idGenerator = deps.idGenerator ?? (() => {
+    // Standard secure UUID generator
+    return typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `uuid_${Math.random().toString(36).slice(2)}_${Date.now()}`
+  })
+  const declaredOrigin = validateDeclaredOrigin(deps.declaredOrigin ?? 'https://app.tonalli.cash')
 
-  if (
-    reconstructedPresentation.amountSats !== session.presentation.amountSats ||
-    reconstructedPresentation.destination !== session.presentation.destination ||
-    reconstructedPresentation.network !== session.presentation.network ||
-    reconstructedPresentation.policyTraceId !== session.presentation.policyTraceId ||
-    reconstructedPresentation.intentId !== session.presentation.intentId ||
-    reconstructedPresentation.requestId !== session.presentation.requestId
-  ) {
-    throw new WalletApprovalReceiverError(
-      'TOCTOU_VALIDATION_FAILED',
-      'Anti-TOCTOU failure: presentation projection parameters mutated during review'
+  // Wallet-owned private active session store
+  const activeSessions = new Map<string, ActiveReviewSession>()
+
+  // --------------------------------------------------------------------------
+  // PREPARATION PIPELINE
+  // --------------------------------------------------------------------------
+
+  async function prepareHandoff(rawHandoffBytes: Uint8Array): Promise<WalletApprovalReviewState> {
+    if (!(rawHandoffBytes instanceof Uint8Array) || rawHandoffBytes.byteLength === 0) {
+      throw new WalletApprovalReceiverError(
+        'INVALID_REQUEST_SCHEMA',
+        'Incoming handoff payload must be a non-empty Uint8Array.'
+      )
+    }
+
+    // Defensive copy: NEVER retain caller buffer reference
+    const safeBytes = new Uint8Array(rawHandoffBytes.slice())
+
+    // 1. Decode canonical binary handoff
+    let decodedRequest: WalletApprovalRequestV1
+    try {
+      decodedRequest = decodeAgentWalletHandoffV1(safeBytes)
+    } catch (err) {
+      throw new WalletApprovalReceiverError(
+        'INVALID_REQUEST_SCHEMA',
+        `Failed to decode binary handoff: ${err instanceof Error ? err.message : String(err)}`,
+        err
+      )
+    }
+
+    // 2. Validate against Core v1.0 canonical schema
+    let parsedRequest: WalletApprovalRequestV1
+    try {
+      parsedRequest = parseWalletApprovalRequestV1(decodedRequest)
+    } catch (err) {
+      throw new WalletApprovalReceiverError(
+        'INVALID_REQUEST_SCHEMA',
+        `Request does not satisfy canonical WalletApprovalRequestV1 schema: ${err instanceof Error ? err.message : String(err)}`,
+        err
+      )
+    }
+
+    // 3. Strict semantic validation
+    if (parsedRequest.contractVersion !== AGENTIC_CONTRACT_VERSION) {
+      throw new WalletApprovalReceiverError(
+        'INVALID_CONTRACT_VERSION',
+        `Expected contractVersion ${AGENTIC_CONTRACT_VERSION}, got ${parsedRequest.contractVersion}`
+      )
+    }
+    if (parsedRequest.kind !== 'wallet_approval_request') {
+      throw new WalletApprovalReceiverError('INVALID_KIND', `Invalid kind: ${parsedRequest.kind}`)
+    }
+    if (parsedRequest.purpose !== 'xec_payment') {
+      throw new WalletApprovalReceiverError('INVALID_PURPOSE', `Invalid purpose: ${parsedRequest.purpose}`)
+    }
+    if (parsedRequest.intent.network !== 'xec:mainnet') {
+      throw new WalletApprovalReceiverError(
+        'UNSUPPORTED_NETWORK',
+        `Network ${parsedRequest.intent.network} is unsupported; only xec:mainnet is admitted in Gate 2B.`
+      )
+    }
+    if (parsedRequest.policyDecision.decision !== 'needs_human_approval') {
+      throw new WalletApprovalReceiverError(
+        'POLICY_NOT_NEEDS_HUMAN_APPROVAL',
+        `Expected needs_human_approval, got ${parsedRequest.policyDecision.decision}`
+      )
+    }
+    if (parsedRequest.policyDecision.intentId !== parsedRequest.intent.intentId) {
+      throw new WalletApprovalReceiverError(
+        'INTENT_ID_MISMATCH',
+        `Policy decision intentId does not match intentId`
+      )
+    }
+    if (!parsedRequest.policyDecision.policyTraceId || parsedRequest.policyDecision.policyTraceId.trim() === '') {
+      throw new WalletApprovalReceiverError('EMPTY_POLICY_TRACE', 'Policy decision policyTraceId cannot be empty.')
+    }
+
+    // 4. Temporal bounds check
+    const now = clock()
+    const effectiveExpiresAt = Math.min(
+      parsedRequest.expiresAt,
+      parsedRequest.intent.expiresAt,
+      parsedRequest.policyDecision.expiresAt
     )
-  }
+    if (parsedRequest.requestedAt > now + 60) {
+      throw new WalletApprovalReceiverError(
+        'REQUEST_NOT_YET_VALID',
+        `Request requestedAt (${parsedRequest.requestedAt}) is in future compared to (${now}).`
+      )
+    }
+    if (effectiveExpiresAt <= now) {
+      throw new WalletApprovalReceiverError(
+        'EXPIRED_REQUEST',
+        `Request expired at ${effectiveExpiresAt}, current time is ${now}.`
+      )
+    }
 
-  // Check E' = E
-  const reconstructedEnvelope = buildCanonicalEnvelope(
-    reconstructedRequest.requestId,
-    reconstructedRequest.requestedAt,
-    reconstructedEffectiveExpiresAt,
-    now
-  )
+    // 5. Re-encode canonical binary bytes to guarantee byte parity
+    const canonicalBytes = encodeAgentWalletHandoffV1(parsedRequest)
+    if (Buffer.compare(Buffer.from(canonicalBytes), Buffer.from(safeBytes)) !== 0) {
+      throw new WalletApprovalReceiverError(
+        'INVALID_REQUEST_SCHEMA',
+        'Incoming handoff bytes do not match canonical binary encoding.'
+      )
+    }
 
-  if (
-    reconstructedEnvelope.operationId !== session.envelope.operationId ||
-    reconstructedEnvelope.expiresAt !== session.envelope.expiresAt ||
-    reconstructedEnvelope.issuedAt !== session.envelope.issuedAt ||
-    reconstructedEnvelope.requester.declaredOrigin !== session.envelope.requester.declaredOrigin ||
-    reconstructedEnvelope.requester.displayName !== session.envelope.requester.displayName
-  ) {
-    throw new WalletApprovalReceiverError(
-      'TOCTOU_VALIDATION_FAILED',
-      'Anti-TOCTOU failure: Universal Authorization Envelope E mutated during review'
-    )
-  }
+    // 6. Build UniversalAuthorizationEnvelopeV1
+    const operationId = `op_rev_${idGenerator()}`
+    const issuedAtMs = Math.min(parsedRequest.requestedAt, now) * 1000
+    const expiresAtMs = effectiveExpiresAt * 1000
+    const nowMs = now * 1000
 
-  // Check H' = H
-  const reconstructedHash = await calculateUniversalContentHash(
-    reconstructedEnvelope,
-    session.canonicalBytes,
-    signal
-  )
+    const rawEnvelope = {
+      schema: UNIVERSAL_AUTHORIZATION_SCHEMA,
+      version: UNIVERSAL_AUTHORIZATION_VERSION,
+      operationId,
+      profileId: 'profile/agent-approval-v1',
+      issuedAt: issuedAtMs,
+      expiresAt: expiresAtMs,
+      requester: {
+        declaredOrigin,
+        displayName: 'RMZWallet Agent Approval Receiver'
+      }
+    }
+    let envelope: UniversalAuthorizationEnvelopeV1
+    try {
+      envelope = parseUniversalAuthorizationEnvelope(rawEnvelope, nowMs)
+    } catch (err) {
+      throw new WalletApprovalReceiverError(
+        'INVALID_ENVELOPE',
+        `Failed to construct valid Universal Authorization Envelope: ${err instanceof Error ? err.message : String(err)}`,
+        err
+      )
+    }
 
-  if (reconstructedHash !== session.contentHash) {
-    throw new WalletApprovalReceiverError(
-      'TOCTOU_VALIDATION_FAILED',
-      `Anti-TOCTOU failure: H(E,C) hash mismatch. Expected ${session.contentHash}, computed ${reconstructedHash}`
-    )
-  }
+    // 7. Compute Universal Content Hash H(E, C)
+    let contentHash: UniversalContentHash
+    try {
+      contentHash = await calculateUniversalContentHash(envelope, canonicalBytes, new AbortController().signal)
+    } catch (err) {
+      throw new WalletApprovalReceiverError(
+        'INVALID_CONTENT_HASH',
+        `Failed to compute universal content hash: ${err instanceof Error ? err.message : String(err)}`,
+        err
+      )
+    }
 
-  const idGenerator = options.idGenerator ?? defaultIdGenerator
+    // 8. Construct comprehensive presentation snapshot
+    const amountXEC = formatSatsToExactXEC(parsedRequest.intent.amountSats)
+    const partialPresentation = {
+      requestId: parsedRequest.requestId,
+      intentId: parsedRequest.intent.intentId,
+      decisionId: parsedRequest.policyDecision.decisionId,
+      amountSats: parsedRequest.intent.amountSats,
+      amountXEC,
+      fromAddress: parsedRequest.intent.fromAddress,
+      destination: parsedRequest.intent.toAddress,
+      network: parsedRequest.intent.network,
+      agentId: parsedRequest.intent.agentId,
+      agentRole: parsedRequest.intent.agentRole,
+      reason: parsedRequest.intent.reason,
+      memo: parsedRequest.intent.memo,
+      policyTraceId: parsedRequest.policyDecision.policyTraceId,
+      policyReasonCode: parsedRequest.policyDecision.reasonCode,
+      policyVersion: parsedRequest.policyDecision.policyVersion,
+      policyReason: parsedRequest.policyDecision.reason,
+      requestedAt: parsedRequest.requestedAt,
+      requestedAtIso: new Date(parsedRequest.requestedAt * 1000).toISOString(),
+      effectiveExpiresAt,
+      effectiveExpiresAtIso: new Date(effectiveExpiresAt * 1000).toISOString()
+    }
+    const presentationHash = computePresentationHash(partialPresentation)
+    const presentation: WalletApprovalPresentation = Object.freeze({
+      ...partialPresentation,
+      presentationHash
+    })
 
-  // Handle REJECTED decision
-  if (action.decision === 'rejected') {
-    session.state = 'STOP'
-    activeReviewSessions.delete(handle)
-    const rejectionApprovalId = idGenerator()
+    // 9. Allocate opaque handle and persist active session
+    const handle = `hnd_${idGenerator()}`
+    const session: ActiveReviewSession = {
+      handle,
+      operationId,
+      request: parsedRequest,
+      canonicalBytes,
+      envelope,
+      contentHash,
+      presentation,
+      effectiveExpiresAt,
+      lifecycle: 'reviewReady'
+    }
+    activeSessions.set(handle, session)
 
     return Object.freeze({
-      contractVersion: AGENTIC_CONTRACT_VERSION,
-      kind: 'human_approval',
-      approvalId: rejectionApprovalId,
-      requestId: session.request.requestId,
-      intentId: session.request.intent.intentId,
-      decisionId: session.request.policyDecision.decisionId,
-      approver,
-      status: 'rejected',
-      reason: action.reason ?? 'Rejected by human custodian in Wallet UI',
-      recordedAt: now
+      handle,
+      presentation
     })
   }
 
-  // 4. Lifecycle: revalidating -> approvalRecording
-  session.state = 'approvalRecording'
-
-  const internalBinding: InternalApprovalBinding = {
-    operationId: session.request.requestId,
-    requestId: session.request.requestId,
-    intentId: session.request.intent.intentId,
-    decisionId: session.request.policyDecision.decisionId,
-    contentHash: session.contentHash,
-    envelope: session.envelope,
-    canonicalBytes: session.canonicalBytes,
-    network: session.request.intent.network,
-    amountSats: session.request.intent.amountSats,
-    destination: session.request.intent.toAddress,
-    effectiveExpiresAt: session.effectiveExpiresAt,
-    presentationSnapshot: session.presentation
+  async function prepareRequest(requestInput: unknown): Promise<WalletApprovalReviewState> {
+    const parsed = parseWalletApprovalRequestV1(requestInput)
+    const encoded = encodeAgentWalletHandoffV1(parsed)
+    return prepareHandoff(encoded)
   }
 
-  const capabilityId = idGenerator()
-  const capability = createApprovalCapabilityInternal(capabilityId, internalBinding)
+  // --------------------------------------------------------------------------
+  // DECISION RECORDING PIPELINE (Approvals & Rejections)
+  // --------------------------------------------------------------------------
 
-  // Transition capability to recording
-  capability.transition(INTERNAL_CAPABILITY_TOKEN, 'recording')
+  async function recordDecision(
+    handle: string,
+    decision: 'approved' | 'rejected',
+    options?: { reason?: string }
+  ): Promise<HumanApprovalV1> {
+    const session = activeSessions.get(handle)
+    if (!session) {
+      throw new WalletApprovalReceiverError(
+        'UNKNOWN_REVIEW_HANDLE',
+        `No active review session found for handle "${handle}".`
+      )
+    }
 
-  const approvalId = idGenerator()
-  const humanApproval: HumanApprovalV1 = Object.freeze({
-    contractVersion: AGENTIC_CONTRACT_VERSION,
-    kind: 'human_approval',
-    approvalId,
-    requestId: session.request.requestId,
-    intentId: session.request.intent.intentId,
-    decisionId: session.request.policyDecision.decisionId,
-    approver,
-    status: 'approved',
-    reason: action.reason,
-    recordedAt: now
-  })
+    if (session.lifecycle !== 'reviewReady') {
+      throw new WalletApprovalReceiverError(
+        'INVALID_LIFECYCLE_STATE',
+        `Cannot record decision in lifecycle state "${session.lifecycle}". Expected "reviewReady".`
+      )
+    }
 
-  const ledgerRecord: WalletApprovalLedgerRecord = Object.freeze({
-    operationId: session.request.requestId,
-    requestId: session.request.requestId,
-    approvalId,
-    capabilityId,
-    humanApproval,
-    contentHash: session.contentHash,
-    recordedAt: now,
-    status: 'approvalRecorded'
-  })
+    session.lifecycle = 'approvalRequested'
 
-  // 5. Atomic ledger insertion with rollback on failure
-  try {
-    await options.ledger.recordApprovalAtomic(ledgerRecord)
-  } catch (err: unknown) {
-    // Rollback: invalidate capability and stop session
-    capability.transition(INTERNAL_CAPABILITY_TOKEN, 'invalidated')
-    session.state = 'STOP'
-    activeReviewSessions.delete(handle)
+    let capability: ApprovalRecordCapability | undefined
+    try {
+      session.lifecycle = 'revalidating'
 
-    if (err instanceof WalletApprovalReceiverError) {
+      // 1. Resolve authentic custodian session from trusted verifier
+      const sessionResult = await sessionVerifier.verifyActiveSession()
+      if (!sessionResult || !sessionResult.authenticated || !sessionResult.activeAddress) {
+        throw new WalletApprovalReceiverError(
+          'INVALID_HUMAN_SESSION',
+          `Human custodian session verification failed: ${sessionResult?.error ?? 'Session not authenticated'}`
+        )
+      }
+
+      // 2. Enforce activeAddress matches intent.fromAddress
+      const approverAddress = validateApproverAddress(sessionResult.activeAddress)
+      if (approverAddress !== session.request.intent.fromAddress) {
+        throw new WalletApprovalReceiverError(
+          'SESSION_ADDRESS_MISMATCH',
+          `Active custodian address "${approverAddress}" does not match intent fromAddress "${session.request.intent.fromAddress}".`
+        )
+      }
+
+      // 3. Validate optional action reason
+      const sanitizedReason = validateActionReason(options?.reason)
+
+      // 4. Temporal revalidation
+      const now = clock()
+      if (now >= session.effectiveExpiresAt) {
+        throw new WalletApprovalReceiverError(
+          'EXPIRED_REQUEST',
+          `Session expired at ${session.effectiveExpiresAt}, current time is ${now}.`
+        )
+      }
+
+      // 5. Anti-TOCTOU Full Presentation Revalidation
+      const recomputedBytes = encodeAgentWalletHandoffV1(session.request)
+      if (Buffer.compare(Buffer.from(recomputedBytes), Buffer.from(session.canonicalBytes)) !== 0) {
+        throw new WalletApprovalReceiverError(
+          'TOCTOU_VALIDATION_FAILED',
+          'Canonical bytes mutated between presentation and revalidation.'
+        )
+      }
+
+      const recomputedEnvelopeCandidate = {
+        schema: UNIVERSAL_AUTHORIZATION_SCHEMA,
+        version: UNIVERSAL_AUTHORIZATION_VERSION,
+        operationId: session.operationId,
+        profileId: 'profile/agent-approval-v1',
+        issuedAt: session.envelope.issuedAt,
+        expiresAt: session.envelope.expiresAt,
+        requester: {
+          declaredOrigin: session.envelope.requester.declaredOrigin,
+          displayName: session.envelope.requester.displayName
+        }
+      }
+      const recomputedEnvelope = parseUniversalAuthorizationEnvelope(
+        recomputedEnvelopeCandidate,
+        now * 1000
+      )
+      const recomputedHash = await calculateUniversalContentHash(
+        recomputedEnvelope,
+        recomputedBytes,
+        new AbortController().signal
+      )
+      if (recomputedHash !== session.contentHash) {
+        throw new WalletApprovalReceiverError(
+          'TOCTOU_VALIDATION_FAILED',
+          'Content hash mismatch between presentation and revalidation.'
+        )
+      }
+
+      // Re-project full presentation and compare every single field
+      const recomputedAmountXEC = formatSatsToExactXEC(session.request.intent.amountSats)
+      const recomputedPresentation = {
+        requestId: session.request.requestId,
+        intentId: session.request.intent.intentId,
+        decisionId: session.request.policyDecision.decisionId,
+        amountSats: session.request.intent.amountSats,
+        amountXEC: recomputedAmountXEC,
+        fromAddress: session.request.intent.fromAddress,
+        destination: session.request.intent.toAddress,
+        network: session.request.intent.network,
+        agentId: session.request.intent.agentId,
+        agentRole: session.request.intent.agentRole,
+        reason: session.request.intent.reason,
+        memo: session.request.intent.memo,
+        policyTraceId: session.request.policyDecision.policyTraceId,
+        policyReasonCode: session.request.policyDecision.reasonCode,
+        policyVersion: session.request.policyDecision.policyVersion,
+        policyReason: session.request.policyDecision.reason,
+        requestedAt: session.request.requestedAt,
+        requestedAtIso: new Date(session.request.requestedAt * 1000).toISOString(),
+        effectiveExpiresAt: session.effectiveExpiresAt,
+        effectiveExpiresAtIso: new Date(session.effectiveExpiresAt * 1000).toISOString()
+      }
+      const recomputedPresentationHash = computePresentationHash(recomputedPresentation)
+
+      const stored = session.presentation
+      if (
+        stored.requestId !== recomputedPresentation.requestId ||
+        stored.intentId !== recomputedPresentation.intentId ||
+        stored.decisionId !== recomputedPresentation.decisionId ||
+        stored.amountSats !== recomputedPresentation.amountSats ||
+        stored.amountXEC !== recomputedPresentation.amountXEC ||
+        stored.fromAddress !== recomputedPresentation.fromAddress ||
+        stored.destination !== recomputedPresentation.destination ||
+        stored.network !== recomputedPresentation.network ||
+        stored.agentId !== recomputedPresentation.agentId ||
+        stored.agentRole !== recomputedPresentation.agentRole ||
+        stored.reason !== recomputedPresentation.reason ||
+        stored.memo !== recomputedPresentation.memo ||
+        stored.policyTraceId !== recomputedPresentation.policyTraceId ||
+        stored.policyReasonCode !== recomputedPresentation.policyReasonCode ||
+        stored.policyVersion !== recomputedPresentation.policyVersion ||
+        stored.policyReason !== recomputedPresentation.policyReason ||
+        stored.requestedAt !== recomputedPresentation.requestedAt ||
+        stored.requestedAtIso !== recomputedPresentation.requestedAtIso ||
+        stored.effectiveExpiresAt !== recomputedPresentation.effectiveExpiresAt ||
+        stored.effectiveExpiresAtIso !== recomputedPresentation.effectiveExpiresAtIso ||
+        stored.presentationHash !== recomputedPresentationHash
+      ) {
+        throw new WalletApprovalReceiverError(
+          'TOCTOU_VALIDATION_FAILED',
+          'Full presentation snapshot mismatch: intent or policy was mutated after presentation.'
+        )
+      }
+
+      // 6. Transition to recording
+      session.lifecycle = 'approvalRecording'
+
+      // 7. Construct candidate HumanApprovalV1
+      const approvalId = `appr_${idGenerator()}`
+      const candidateApproval = {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: 'human_approval' as const,
+        approvalId,
+        requestId: session.request.requestId,
+        intentId: session.request.intent.intentId,
+        decisionId: session.request.policyDecision.decisionId,
+        status: decision,
+        recordedAt: now,
+        approver: approverAddress,
+        reason: sanitizedReason
+      }
+
+      // 8. Schema validation on constructed artifact before persisting or returning
+      let verifiedHumanApproval: HumanApprovalV1
+      try {
+        verifiedHumanApproval = humanApprovalV1Schema.parse(candidateApproval) as HumanApprovalV1
+      } catch (err) {
+        throw new WalletApprovalReceiverError(
+          'INVALID_HUMAN_APPROVAL_SCHEMA',
+          `Constructed HumanApprovalV1 failed canonical schema validation: ${err instanceof Error ? err.message : String(err)}`,
+          err
+        )
+      }
+
+      // 9. Mint one-shot capability internally
+      const capabilityId = `cap_${idGenerator()}`
+      const internalBinding: InternalApprovalBinding = {
+        operationId: session.operationId,
+        requestId: session.request.requestId,
+        intentId: session.request.intent.intentId,
+        decisionId: session.request.policyDecision.decisionId,
+        contentHash: session.contentHash,
+        envelope: session.envelope,
+        canonicalBytes: session.canonicalBytes,
+        network: session.request.intent.network,
+        amountSats: session.request.intent.amountSats,
+        fromAddress: session.request.intent.fromAddress,
+        destination: session.request.intent.toAddress,
+        effectiveExpiresAt: session.effectiveExpiresAt,
+        presentationSnapshot: session.presentation
+      }
+      capability = new ApprovalRecordCapability(INTERNAL_CAPABILITY_TOKEN, capabilityId, internalBinding)
+      capability.transition(INTERNAL_CAPABILITY_TOKEN, 'recording')
+
+      // 10. Atomic commit to Wallet Approval Ledger (BOTH approved AND rejected)
+      const ledgerRecord: WalletApprovalLedgerRecord = {
+        operationId: session.operationId,
+        requestId: session.request.requestId,
+        approvalId,
+        intentId: session.request.intent.intentId,
+        decisionId: session.request.policyDecision.decisionId,
+        contentHash: session.contentHash,
+        capabilityId,
+        effectiveExpiresAt: session.effectiveExpiresAt,
+        network: session.request.intent.network,
+        amountSats: session.request.intent.amountSats,
+        fromAddress: session.request.intent.fromAddress,
+        destination: session.request.intent.toAddress,
+        presentationHash: stored.presentationHash,
+        humanApproval: verifiedHumanApproval,
+        recordedAt: now,
+        status: decision
+      }
+
+      try {
+        await ledger.recordApprovalAtomic(ledgerRecord)
+      } catch (err) {
+        capability.transition(INTERNAL_CAPABILITY_TOKEN, 'invalidated')
+        throw new WalletApprovalReceiverError(
+          'ATOMIC_RECORDING_FAILED',
+          `Failed to persist approval record in ledger: ${err instanceof Error ? err.message : String(err)}`,
+          err
+        )
+      }
+
+      capability.transition(INTERNAL_CAPABILITY_TOKEN, 'recorded')
+      session.lifecycle = 'approvalRecorded'
+      session.lifecycle = 'STOP'
+
+      // Clean up handle
+      activeSessions.delete(handle)
+
+      return Object.freeze(verifiedHumanApproval)
+    } catch (err) {
+      // Fail closed: immediately transition session to STOP and clean up handle
+      session.lifecycle = 'STOP'
+      activeSessions.delete(handle)
+      if (capability && capability.state === 'recording') {
+        try {
+          capability.transition(INTERNAL_CAPABILITY_TOKEN, 'invalidated')
+        } catch {
+          // ignore error during cleanup
+        }
+      }
       throw err
     }
-    throw new WalletApprovalReceiverError(
-      'ATOMIC_RECORDING_FAILED',
-      'Failed during atomic ledger insertion; approval rolled back.',
-      err
-    )
   }
 
-  // 6. Lifecycle: approvalRecording -> approvalRecorded -> STOP
-  capability.transition(INTERNAL_CAPABILITY_TOKEN, 'recorded')
-  session.state = 'approvalRecorded'
-  session.state = 'STOP'
-  activeReviewSessions.delete(handle)
+  function approveHandle(handle: string, options?: { reason?: string }): Promise<HumanApprovalV1> {
+    return recordDecision(handle, 'approved', options)
+  }
 
-  // Return strictly read-only audit receipt
-  return humanApproval
-}
+  function rejectHandle(handle: string, options?: { reason?: string }): Promise<HumanApprovalV1> {
+    return recordDecision(handle, 'rejected', options)
+  }
 
-/**
- * Clear all in-flight review sessions. Strictly for testing environments.
- */
-export function _clearActiveReviewSessionsForTesting(): void {
-  activeReviewSessions.clear()
+  function getPresentation(handle: string): WalletApprovalPresentation | undefined {
+    return activeSessions.get(handle)?.presentation
+  }
+
+  function dismissHandle(handle: string): void {
+    const session = activeSessions.get(handle)
+    if (session) {
+      session.lifecycle = 'STOP'
+      activeSessions.delete(handle)
+    }
+  }
+
+  return {
+    prepareHandoff,
+    prepareRequest,
+    approveHandle,
+    rejectHandle,
+    getPresentation,
+    dismissHandle
+  }
 }

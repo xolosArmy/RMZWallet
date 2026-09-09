@@ -1,39 +1,31 @@
 /**
  * @file index.ts
  *
- * Public surface of the hardened Wallet Approval Receiver feature.
- * Strictly approval-only receiver/recording core for Gate 2B.
+ * CANONICAL WALLET APPROVAL RECEIVER PUBLIC API (Gate 2B)
  *
- * INVARIANTS:
- * - Explicit exports only. No `export *`.
- * - ApprovalRecordCapability and InternalApprovalBinding are strictly internal.
- * - Presentation and opaque handle are the only review artifacts exposed to Wallet UI.
+ * Invariants & Boundaries:
+ * - Built once via trusted bootstrap: createAgentWalletApprovalReceiver(deps).
+ * - UI only interacts with opaque handles and immutable presentations.
+ * - Capabilities, tokens, and bindings are strictly module-private closures.
+ * - Test-only in-memory ledgers are NOT exported from this production entrypoint.
+ * - Zero access to private keys, transaction signing, Chronik, or broadcast.
  */
 
-export {
-  prepareApprovalReview,
-  recordWalletHumanDecision,
-  WALLET_DECLARED_ORIGIN,
-  WALLET_DISPLAY_NAME,
-  WALLET_PROFILE_ID,
-  _clearActiveReviewSessionsForTesting
-} from './receiver'
-
-export { formatSatsToExactXEC } from './format'
+export { createAgentWalletApprovalReceiver } from './receiver'
 
 export {
   WalletApprovalReceiverError,
+  type WalletApprovalReceiverErrorCode,
   type ApprovalReceiverLifecycleState,
   type WalletApprovalPresentation,
   type WalletApprovalReviewState,
-  type WalletHumanSessionVerificationResult,
   type WalletHumanSessionVerifier,
-  type WalletHumanAction,
+  type WalletHumanSessionVerificationResult,
   type WalletApprovalLedger,
   type WalletApprovalLedgerRecord,
-  type WalletApprovalReceiverErrorCode,
-  type PrepareApprovalReviewOptions,
-  type RecordHumanDecisionOptions
+  type AgentWalletApprovalReceiverDependencies,
+  type AgentWalletApprovalReceiver
 } from './types'
 
-export { InMemoryWalletApprovalLedger } from './ledger'
+export { formatSatsToExactXEC } from './format'
+

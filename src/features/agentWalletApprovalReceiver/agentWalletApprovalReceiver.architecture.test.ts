@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
@@ -7,7 +7,6 @@ import { describe, expect, test } from 'vitest'
 const FEATURE_DIRECTORY = resolve(fileURLToPath(new URL('.', import.meta.url)))
 const ENTRYPOINT = resolve(FEATURE_DIRECTORY, 'index.ts')
 const EXPECTED_PRODUCTION_FILES = Object.freeze([
-  'capability.ts',
   'format.ts',
   'index.ts',
   'ledger.ts',
@@ -53,7 +52,7 @@ const FORBIDDEN_AUTHORITY_IDENTIFIERS = new Set([
 function listProductionSourceFiles(): string[] {
   return readdirSync(FEATURE_DIRECTORY)
     .filter((file) => extname(file) === '.ts')
-    .filter((file) => !file.endsWith('.test.ts'))
+    .filter((file) => !file.endsWith('.test.ts') && !file.includes('testUtils'))
     .sort()
 }
 
@@ -110,6 +109,10 @@ function collectIdentifiers(sourceFile: ts.SourceFile): string[] {
 }
 
 describe('agentWalletApprovalReceiver architecture boundaries', () => {
+  test('capability.ts is completely deleted to prevent deep imports', () => {
+    expect(existsSync(resolve(FEATURE_DIRECTORY, 'capability.ts'))).toBe(false)
+  })
+
   test('contains only expected production files', () => {
     const files = listProductionSourceFiles()
     expect(files).toEqual(EXPECTED_PRODUCTION_FILES)
@@ -170,5 +173,13 @@ describe('agentWalletApprovalReceiver architecture boundaries', () => {
     expect(indexExports.createApprovalCapabilityInternal).toBeUndefined()
     expect(indexExports.WalletLocalApprovalBinding).toBeUndefined()
   })
-})
 
+  test('index.ts does not export in-memory test ledgers or per-call procedural functions', async () => {
+    const indexExports = (await import('./index')) as Record<string, unknown>
+    expect(indexExports.InMemoryWalletApprovalLedger).toBeUndefined()
+    expect(indexExports._clearActiveReviewSessionsForTesting).toBeUndefined()
+    expect(indexExports.prepareApprovalReview).toBeUndefined()
+    expect(indexExports.recordWalletHumanDecision).toBeUndefined()
+    expect(indexExports.createAgentWalletApprovalReceiver).toBeTypeOf('function')
+  })
+})
