@@ -185,6 +185,7 @@ export type WalletApprovalReceiverErrorCode =
   | 'INVALID_INPUT'
   | 'INVALID_DECLARED_ORIGIN'
   | 'INVALID_HUMAN_APPROVAL_SCHEMA'
+  | 'CONCURRENT_REVIEW_ACTIVE'
 
 export class WalletApprovalReceiverError extends Error {
   readonly code: WalletApprovalReceiverErrorCode
