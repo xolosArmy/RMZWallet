@@ -6,6 +6,7 @@ import './index.css'
 import App from './App'
 import { WalletProvider } from './context/WalletContext'
 import { TonalliX402ApprovalProvider } from './context/TonalliX402ApprovalContext'
+import { AgentWalletApprovalProvider } from './components/agentApproval/AgentWalletApprovalProvider'
 
 const normalizeExternalSignHashRoute = () => {
   const hash = window.location.hash
@@ -29,7 +30,9 @@ createRoot(document.getElementById('root')!).render(
     <BrowserRouter>
       <WalletProvider>
         <TonalliX402ApprovalProvider>
-          <App />
+          <AgentWalletApprovalProvider>
+            <App />
+          </AgentWalletApprovalProvider>
         </TonalliX402ApprovalProvider>
       </WalletProvider>
     </BrowserRouter>

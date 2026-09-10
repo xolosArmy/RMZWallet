@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'vitest'
 import { encodeAgentWalletHandoffV1 } from '../agentWalletHandoff'
-import { createAgentWalletApprovalReceiver } from './receiver'
+import {
+  createAgentWalletApprovalReceiver,
+  createAgentWalletApprovalReceiverForTest
+} from './receiver'
 import {
   InMemoryWalletApprovalLedger,
   createMockSessionVerifier
@@ -102,7 +105,7 @@ describe('agentWalletApprovalReceiver (Gate 2B Hardening)', () => {
   test('happy path: rejection records atomically in ledger and returns rejected receipt', async () => {
     const ledger = new InMemoryWalletApprovalLedger()
     const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
-    const receiver = createAgentWalletApprovalReceiver({
+    const receiver = createAgentWalletApprovalReceiverForTest({
       ledger,
       sessionVerifier,
       clock: () => 1770000010,
@@ -140,7 +143,7 @@ describe('agentWalletApprovalReceiver (Gate 2B Hardening)', () => {
     const sessionVerifier = createMockSessionVerifier(
       'ecash:qp3wjpa3tjlj042z2wv7hah0ldgwhwy0rq9sywjpy5'
     )
-    const receiver = createAgentWalletApprovalReceiver({
+    const receiver = createAgentWalletApprovalReceiverForTest({
       ledger,
       sessionVerifier,
       clock: () => 1770000010,
@@ -169,7 +172,7 @@ describe('agentWalletApprovalReceiver (Gate 2B Hardening)', () => {
       BASE_VALID_REQUEST.intent.fromAddress,
       false // Not authenticated
     )
-    const receiver = createAgentWalletApprovalReceiver({
+    const receiver = createAgentWalletApprovalReceiverForTest({
       ledger,
       sessionVerifier,
       clock: () => 1770000010,
@@ -184,7 +187,7 @@ describe('agentWalletApprovalReceiver (Gate 2B Hardening)', () => {
   test('negative: expired request fails closed at prepare and revalidate', async () => {
     const ledger = new InMemoryWalletApprovalLedger()
     const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
-    const receiver = createAgentWalletApprovalReceiver({
+    const receiver = createAgentWalletApprovalReceiverForTest({
       ledger,
       sessionVerifier,
       clock: () => 1770000400, // Past expiresAt 1770000300
@@ -229,7 +232,7 @@ describe('agentWalletApprovalReceiver (Gate 2B Hardening)', () => {
   test('negative: duplicate capability or requestId in ledger throws DUPLICATE_APPROVAL_RECORD', async () => {
     const ledger = new InMemoryWalletApprovalLedger()
     const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
-    const receiver = createAgentWalletApprovalReceiver({
+    const receiver = createAgentWalletApprovalReceiverForTest({
       ledger,
       sessionVerifier,
       clock: () => 1770000010,
@@ -276,7 +279,7 @@ describe('agentWalletApprovalReceiver (Gate 2B Hardening)', () => {
   test('negative: reason length exceeding 500 characters fails closed', async () => {
     const ledger = new InMemoryWalletApprovalLedger()
     const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
-    const receiver = createAgentWalletApprovalReceiver({
+    const receiver = createAgentWalletApprovalReceiverForTest({
       ledger,
       sessionVerifier,
       clock: () => 1770000010,
@@ -289,5 +292,70 @@ describe('agentWalletApprovalReceiver (Gate 2B Hardening)', () => {
     await expect(
       receiver.rejectHandle(reviewState.handle, { reason: tooLongReason })
     ).rejects.toThrow('INVALID_INPUT')
+  })
+
+  test('canonical invariant: operationId is strictly equal to requestId in ledger record', async () => {
+    const ledger = new InMemoryWalletApprovalLedger()
+    const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
+    const receiver = createAgentWalletApprovalReceiver({
+      ledger,
+      sessionVerifier,
+      clock: () => 1770000010,
+      declaredOrigin: 'https://app.tonalli.cash'
+    })
+
+    const rawBytes = encodeAgentWalletHandoffV1(BASE_VALID_REQUEST)
+    const reviewState = await receiver.prepareHandoff(rawBytes)
+    await receiver.approveHandle(reviewState.handle)
+
+    const record = await ledger.get(BASE_VALID_REQUEST.requestId)
+    expect(record).toBeDefined()
+    expect(record?.operationId).toBe(BASE_VALID_REQUEST.requestId)
+    expect(record?.operationId).not.toContain('op_rev_')
+  })
+
+  test('negative: fails closed with MISSING_ID_GENERATOR if crypto.randomUUID is unavailable and no idGenerator is provided', async () => {
+    const originalRandomUUID = globalThis.crypto.randomUUID
+    try {
+      Object.defineProperty(globalThis.crypto, 'randomUUID', {
+        value: undefined,
+        configurable: true
+      })
+
+      const ledger = new InMemoryWalletApprovalLedger()
+      const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
+      const receiver = createAgentWalletApprovalReceiver({
+        ledger,
+        sessionVerifier,
+        clock: () => 1770000010,
+        declaredOrigin: 'https://app.tonalli.cash'
+      })
+
+      const rawBytes = encodeAgentWalletHandoffV1(BASE_VALID_REQUEST)
+      await expect(receiver.prepareHandoff(rawBytes)).rejects.toThrow('MISSING_ID_GENERATOR')
+    } finally {
+      Object.defineProperty(globalThis.crypto, 'randomUUID', {
+        value: originalRandomUUID,
+        configurable: true
+      })
+    }
+  })
+
+  test('negative: rejects non-canonical bytes fail-closed with INVALID_REQUEST_SCHEMA', async () => {
+    const ledger = new InMemoryWalletApprovalLedger()
+    const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
+    const receiver = createAgentWalletApprovalReceiver({
+      ledger,
+      sessionVerifier,
+      clock: () => 1770000010,
+      declaredOrigin: 'https://app.tonalli.cash'
+    })
+
+    // Random non-canonical corrupted payload
+    const corruptBytes = new Uint8Array([0x54, 0x4f, 0x4e, 0x01, 0xff, 0xff])
+    await expect(receiver.prepareHandoff(corruptBytes)).rejects.toThrow('INVALID_REQUEST_SCHEMA')
+
+    // Empty payload
+    await expect(receiver.prepareHandoff(new Uint8Array(0))).rejects.toThrow('INVALID_REQUEST_SCHEMA')
   })
 })

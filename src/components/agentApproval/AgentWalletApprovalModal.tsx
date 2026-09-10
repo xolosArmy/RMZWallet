@@ -194,7 +194,34 @@ export function AgentApprovalModal({
             fontWeight: 500
           }}
         >
-          <strong>⚠️ Aviso de Seguridad:</strong> Aprobación únicamente; no firma ni transmite una transacción.
+          <div><strong>⚠️ Aviso de Seguridad:</strong> Aprobación únicamente; no firma ni transmite una transacción.</div>
+          <div style={{ display: 'flex', gap: 16, marginTop: 6, fontSize: 11 }}>
+            <span data-testid="signing-status-badge" style={{ color: '#fca5a5' }}>
+              Signing: <strong>not authorized</strong>
+            </span>
+            <span data-testid="broadcast-status-badge" style={{ color: '#fca5a5' }}>
+              Broadcast: <strong>not attempted</strong>
+            </span>
+          </div>
+        </div>
+
+        {/* Network Warning Banner */}
+        <div
+          data-testid="network-warning-banner"
+          style={{
+            padding: '10px 14px',
+            borderRadius: 8,
+            backgroundColor: presentation.network === 'xec:mainnet' ? 'rgba(220, 38, 38, 0.2)' : 'rgba(59, 130, 246, 0.2)',
+            border: presentation.network === 'xec:mainnet' ? '2px solid #ef4444' : '1px solid #3b82f6',
+            color: presentation.network === 'xec:mainnet' ? '#fecaca' : '#bfdbfe',
+            fontSize: 13,
+            fontWeight: 700,
+            textAlign: 'center'
+          }}
+        >
+          {presentation.network === 'xec:mainnet'
+            ? '🚨 ADVERTENCIA DE RED: xec:mainnet — OPERACIÓN CON FONDOS REALES EN LA RED PRINCIPAL'
+            : '🧪 ADVERTENCIA DE RED: xec:regtest — ENTORNO DE PRUEBAS (NO PERMITIDO EN GATE 2B)'}
         </div>
 
         {/* Error Display */}
@@ -247,6 +274,11 @@ export function AgentApprovalModal({
             border: '1px solid rgba(148, 163, 184, 0.1)'
           }}
         >
+          <DetailRow label="ID de Solicitud (RequestId)" value={presentation.requestId} />
+          <DetailRow label="Propósito (Purpose)" value={presentation.purpose} />
+          <DetailRow label="Decisión CAE" value={presentation.decision} />
+          <DetailRow label="Firma" value={`Signing: ${presentation.signingStatus}`} />
+          <DetailRow label="Transmisión" value={`Broadcast: ${presentation.broadcastStatus}`} />
           <DetailRow label="Destino" value={presentation.destination} />
           <DetailRow label="Dirección Origen (Custodio)" value={presentation.fromAddress} />
           <DetailRow label="Red" value={presentation.network} />

@@ -53,6 +53,7 @@ import {
 import { formatSatsToExactXEC } from './format'
 import {
   type AgentWalletApprovalReceiver,
+  type AgentWalletApprovalReceiverForTest,
   type AgentWalletApprovalReceiverDependencies,
   type ApprovalReceiverLifecycleState,
   type WalletApprovalLedgerRecord,
@@ -201,6 +202,10 @@ function validateActionReason(reason: unknown): string | undefined {
 function computePresentationHash(presentation: Omit<WalletApprovalPresentation, 'presentationHash'>): string {
   const canonicalPresentationJson = JSON.stringify({
     requestId: presentation.requestId,
+    purpose: presentation.purpose,
+    decision: presentation.decision,
+    signingStatus: presentation.signingStatus,
+    broadcastStatus: presentation.broadcastStatus,
     intentId: presentation.intentId,
     decisionId: presentation.decisionId,
     amountSats: presentation.amountSats,
@@ -243,11 +248,11 @@ interface ActiveReviewSession {
 // ============================================================================
 
 /**
- * Creates a Wallet-owned approval receiver instance bound to trusted Wallet dependencies.
+ * Creates internal instance of receiver.
  */
-export function createAgentWalletApprovalReceiver(
+function createAgentWalletApprovalReceiverInternal(
   deps: AgentWalletApprovalReceiverDependencies
-): AgentWalletApprovalReceiver {
+): AgentWalletApprovalReceiverForTest {
   if (!deps || typeof deps !== 'object') {
     throw new WalletApprovalReceiverError('INVALID_INPUT', 'Receiver dependencies must be provided.')
   }
@@ -268,10 +273,13 @@ export function createAgentWalletApprovalReceiver(
   const sessionVerifier = deps.sessionVerifier
   const clock = deps.clock ?? (() => Math.floor(Date.now() / 1000))
   const idGenerator = deps.idGenerator ?? (() => {
-    // Standard secure UUID generator
-    return typeof crypto !== 'undefined' && crypto.randomUUID
-      ? crypto.randomUUID()
-      : `uuid_${Math.random().toString(36).slice(2)}_${Date.now()}`
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID()
+    }
+    throw new WalletApprovalReceiverError(
+      'MISSING_ID_GENERATOR',
+      'crypto.randomUUID is not available and no secure idGenerator was injected.'
+    )
   })
   const declaredOrigin = validateDeclaredOrigin(deps.declaredOrigin ?? 'https://app.tonalli.cash')
 
@@ -359,7 +367,7 @@ export function createAgentWalletApprovalReceiver(
       parsedRequest.intent.expiresAt,
       parsedRequest.policyDecision.expiresAt
     )
-    if (parsedRequest.requestedAt > now + 60) {
+    if (parsedRequest.requestedAt > now) {
       throw new WalletApprovalReceiverError(
         'REQUEST_NOT_YET_VALID',
         `Request requestedAt (${parsedRequest.requestedAt}) is in future compared to (${now}).`
@@ -382,8 +390,9 @@ export function createAgentWalletApprovalReceiver(
     }
 
     // 6. Build UniversalAuthorizationEnvelopeV1
-    const operationId = `op_rev_${idGenerator()}`
-    const issuedAtMs = Math.min(parsedRequest.requestedAt, now) * 1000
+    // OperationId MUST be strictly equal to requestId per Gate 2B canonical specification
+    const operationId = parsedRequest.requestId
+    const issuedAtMs = parsedRequest.requestedAt * 1000
     const expiresAtMs = effectiveExpiresAt * 1000
     const nowMs = now * 1000
 
@@ -425,7 +434,11 @@ export function createAgentWalletApprovalReceiver(
     // 8. Construct comprehensive presentation snapshot
     const amountXEC = formatSatsToExactXEC(parsedRequest.intent.amountSats)
     const partialPresentation = {
+      purpose: parsedRequest.purpose,
       requestId: parsedRequest.requestId,
+      decision: parsedRequest.policyDecision.decision as 'needs_human_approval',
+      signingStatus: 'not authorized' as const,
+      broadcastStatus: 'not attempted' as const,
       intentId: parsedRequest.intent.intentId,
       decisionId: parsedRequest.policyDecision.decisionId,
       amountSats: parsedRequest.intent.amountSats,
@@ -579,7 +592,11 @@ export function createAgentWalletApprovalReceiver(
       // Re-project full presentation and compare every single field
       const recomputedAmountXEC = formatSatsToExactXEC(session.request.intent.amountSats)
       const recomputedPresentation = {
+        purpose: session.request.purpose,
         requestId: session.request.requestId,
+        decision: session.request.policyDecision.decision as 'needs_human_approval',
+        signingStatus: 'not authorized' as const,
+        broadcastStatus: 'not attempted' as const,
         intentId: session.request.intent.intentId,
         decisionId: session.request.policyDecision.decisionId,
         amountSats: session.request.intent.amountSats,
@@ -604,7 +621,11 @@ export function createAgentWalletApprovalReceiver(
 
       const stored = session.presentation
       if (
+        stored.purpose !== recomputedPresentation.purpose ||
         stored.requestId !== recomputedPresentation.requestId ||
+        stored.decision !== recomputedPresentation.decision ||
+        stored.signingStatus !== recomputedPresentation.signingStatus ||
+        stored.broadcastStatus !== recomputedPresentation.broadcastStatus ||
         stored.intentId !== recomputedPresentation.intentId ||
         stored.decisionId !== recomputedPresentation.decisionId ||
         stored.amountSats !== recomputedPresentation.amountSats ||
@@ -764,4 +785,31 @@ export function createAgentWalletApprovalReceiver(
     getPresentation,
     dismissHandle
   }
+}
+
+/**
+ * Canonical production receiver factory.
+ * Only accepts canonical binary handoff (Uint8Array) via prepareHandoff.
+ * prepareRequest is NOT part of the production surface.
+ */
+export function createAgentWalletApprovalReceiver(
+  deps: AgentWalletApprovalReceiverDependencies
+): AgentWalletApprovalReceiver {
+  const internal = createAgentWalletApprovalReceiverInternal(deps)
+  return {
+    prepareHandoff: internal.prepareHandoff,
+    approveHandle: internal.approveHandle,
+    rejectHandle: internal.rejectHandle,
+    getPresentation: internal.getPresentation,
+    dismissHandle: internal.dismissHandle
+  }
+}
+
+/**
+ * Test receiver factory exposing helper prepareRequest.
+ */
+export function createAgentWalletApprovalReceiverForTest(
+  deps: AgentWalletApprovalReceiverDependencies
+): AgentWalletApprovalReceiverForTest {
+  return createAgentWalletApprovalReceiverInternal(deps)
 }

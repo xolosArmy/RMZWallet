@@ -5,7 +5,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentApprovalModal } from './AgentWalletApprovalModal'
-import { createAgentWalletApprovalReceiver } from '../../features/agentWalletApprovalReceiver/receiver'
+import { createAgentWalletApprovalReceiverForTest } from '../../features/agentWalletApprovalReceiver/receiver'
 import { InMemoryWalletApprovalLedger, createMockSessionVerifier } from '../../features/agentWalletApprovalReceiver/testUtils'
 import type { WalletApprovalPresentation } from '../../features/agentWalletApprovalReceiver/types'
 
@@ -15,6 +15,10 @@ afterEach(() => {
 
 const VALID_PRESENTATION: WalletApprovalPresentation = {
   requestId: 'wallet-req-test-001',
+  purpose: 'xec_payment',
+  decision: 'needs_human_approval',
+  signingStatus: 'not authorized',
+  broadcastStatus: 'not attempted',
   intentId: 'intent-test-001',
   decisionId: 'cae-test-001',
   amountSats: '1500000',
@@ -41,7 +45,7 @@ describe('AgentApprovalModal Component (Gate 2B)', () => {
   it('renders all presentation fields and prominent security warning', () => {
     const ledger = new InMemoryWalletApprovalLedger()
     const sessionVerifier = createMockSessionVerifier(VALID_PRESENTATION.fromAddress)
-    const receiver = createAgentWalletApprovalReceiver({
+    const receiver = createAgentWalletApprovalReceiverForTest({
       ledger,
       sessionVerifier,
       declaredOrigin: 'https://app.tonalli.cash'
@@ -81,12 +85,20 @@ describe('AgentApprovalModal Component (Gate 2B)', () => {
     expect(screen.getByText('POLICY_MANUAL_REVIEW (vcae-v1.0.0)')).toBeTruthy()
     expect(screen.getByText('Amount exceeds autonomous threshold')).toBeTruthy()
     expect(screen.getByText('trace-cae-test-999')).toBeTruthy()
+
+    // Verify mandatory Gate 2B fields & badges
+    expect(screen.getByTestId('signing-status-badge').textContent).toContain('Signing: not authorized')
+    expect(screen.getByTestId('broadcast-status-badge').textContent).toContain('Broadcast: not attempted')
+    expect(screen.getByTestId('network-warning-banner').textContent).toContain('OPERACIÓN CON FONDOS REALES EN LA RED PRINCIPAL')
+    expect(screen.getByText('wallet-req-test-001')).toBeTruthy()
+    expect(screen.getByText('xec_payment')).toBeTruthy()
+    expect(screen.getByText('needs_human_approval')).toBeTruthy()
   })
 
   it('approves handle through receiver and fires onApprovalSuccess', async () => {
     const ledger = new InMemoryWalletApprovalLedger()
     const sessionVerifier = createMockSessionVerifier(VALID_PRESENTATION.fromAddress)
-    const receiver = createAgentWalletApprovalReceiver({
+    const receiver = createAgentWalletApprovalReceiverForTest({
       ledger,
       sessionVerifier,
       clock: () => 1770000010,
@@ -171,7 +183,7 @@ describe('AgentApprovalModal Component (Gate 2B)', () => {
   it('rejects handle through receiver with reason and fires onRejectionSuccess', async () => {
     const ledger = new InMemoryWalletApprovalLedger()
     const sessionVerifier = createMockSessionVerifier(VALID_PRESENTATION.fromAddress)
-    const receiver = createAgentWalletApprovalReceiver({
+    const receiver = createAgentWalletApprovalReceiverForTest({
       ledger,
       sessionVerifier,
       clock: () => 1770000010,
@@ -263,7 +275,7 @@ describe('AgentApprovalModal Component (Gate 2B)', () => {
     const sessionVerifier = createMockSessionVerifier(
       'ecash:qp3wjpa3tjlj042z2wv7hah0ldgwhwy0rq9sywjpy5'
     )
-    const receiver = createAgentWalletApprovalReceiver({
+    const receiver = createAgentWalletApprovalReceiverForTest({
       ledger,
       sessionVerifier,
       clock: () => 1770000010,

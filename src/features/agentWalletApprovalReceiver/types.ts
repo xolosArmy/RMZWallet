@@ -35,6 +35,10 @@ export type ApprovalReceiverLifecycleState =
  */
 export interface WalletApprovalPresentation {
   readonly requestId: string
+  readonly purpose: string
+  readonly decision: 'needs_human_approval'
+  readonly signingStatus: 'not authorized'
+  readonly broadcastStatus: 'not attempted'
   readonly intentId: string
   readonly decisionId: string
   readonly amountSats: string
@@ -133,14 +137,21 @@ export interface AgentWalletApprovalReceiverDependencies {
 
 /**
  * Hardened Wallet-owned receiver instance used by UI and transport adapters.
+ * Note: prepareRequest is NOT on this production interface; handoffs arrive as binary.
  */
 export interface AgentWalletApprovalReceiver {
   prepareHandoff(rawHandoffBytes: Uint8Array): Promise<WalletApprovalReviewState>
-  prepareRequest(requestInput: unknown): Promise<WalletApprovalReviewState>
   approveHandle(handle: string, options?: { reason?: string }): Promise<HumanApprovalV1>
   rejectHandle(handle: string, options?: { reason?: string }): Promise<HumanApprovalV1>
   getPresentation(handle: string): WalletApprovalPresentation | undefined
   dismissHandle(handle: string): void
+}
+
+/**
+ * Extended interface for testing purposes that exposes prepareRequest.
+ */
+export interface AgentWalletApprovalReceiverForTest extends AgentWalletApprovalReceiver {
+  prepareRequest(requestInput: unknown): Promise<WalletApprovalReviewState>
 }
 
 export type WalletApprovalReceiverErrorCode =
@@ -166,6 +177,7 @@ export type WalletApprovalReceiverErrorCode =
   | 'CAPABILITY_EXPIRED'
   | 'MISSING_LEDGER_DEPENDENCY'
   | 'MISSING_SESSION_VERIFIER'
+  | 'MISSING_ID_GENERATOR'
   | 'DUPLICATE_APPROVAL_RECORD'
   | 'ATOMIC_RECORDING_FAILED'
   | 'OPERATION_ABORTED'
