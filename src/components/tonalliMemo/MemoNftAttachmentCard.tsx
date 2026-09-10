@@ -4,6 +4,8 @@ import { fetchNftDetails, type NftDetails } from '../../services/nftService'
 
 export interface MemoNftAttachmentCardProps {
   attachment: TonalliMemoAttachment
+  mode?: 'read_model' | 'selection'
+  selectedAsset?: { name?: string; imageUrl?: string }
   onRemove?: () => void
   className?: string
 }
@@ -15,54 +17,69 @@ function abbreviateTokenId(id: string): string {
 
 export function MemoNftAttachmentCard({
   attachment,
+  mode = 'read_model',
+  selectedAsset,
   onRemove,
   className = ''
 }: MemoNftAttachmentCardProps) {
   const { tokenId, ownership } = attachment
+  const isSelection = mode === 'selection'
   const isVerified = ownership === 'VERIFIED_AT_INDEXING'
 
-  const [loading, setLoading] = useState<boolean>(isVerified)
-  const [details, setDetails] = useState<NftDetails | null>(null)
-  const [hasError, setHasError] = useState<boolean>(false)
+  const needsFetch =
+    Boolean(tokenId) &&
+    ((!isSelection && isVerified) ||
+      (isSelection && (!selectedAsset?.name || !selectedAsset?.imageUrl)))
+
+  const [fetchStatus, setFetchStatus] = useState<{
+    tokenId: string
+    details?: NftDetails | null
+    hasError?: boolean
+  }>({
+    tokenId,
+    details: null,
+    hasError: false
+  })
+  const [imageErrorToken, setImageErrorToken] = useState<string | null>(null)
+
+  const details = fetchStatus.tokenId === tokenId ? fetchStatus.details ?? null : null
+  const hasError = fetchStatus.tokenId === tokenId ? Boolean(fetchStatus.hasError) : false
+  const hasImageError = (imageErrorToken === tokenId) || hasError
+
+  const loading = !isSelection && isVerified && details === null && !hasError
 
   useEffect(() => {
-    // For UNVERIFIED references, do not fetch or display full NFT asset as verified
-    if (!isVerified || !tokenId) {
-      setLoading(false)
-      setDetails(null)
+    if (!needsFetch || !tokenId || (!isSelection && !isVerified)) {
       return
     }
 
     let active = true
-    setLoading(true)
-    setHasError(false)
 
     fetchNftDetails(tokenId)
       .then((data) => {
         if (active) {
-          setDetails(data)
-          setLoading(false)
+          setFetchStatus({ tokenId, details: data })
         }
       })
       .catch(() => {
         if (active) {
-          setHasError(true)
-          setLoading(false)
+          setFetchStatus({ tokenId, hasError: true })
         }
       })
 
     return () => {
       active = false
     }
-  }, [tokenId, isVerified])
+  }, [tokenId, isVerified, isSelection, needsFetch])
 
   const name =
+    selectedAsset?.name ||
     (typeof details?.metadata?.name === 'string' && details.metadata.name) ||
     details?.genesisInfo?.tokenTicker ||
     'NFT'
-  const imageUrl = details?.imageUrl
+  const imageUrl = selectedAsset?.imageUrl || details?.imageUrl
 
-  if (!isVerified) {
+  if (!isSelection && !isVerified) {
     return (
       <div
         className={`memo-nft-attachment memo-nft-attachment--unverified card subtle ${className}`.trim()}
@@ -117,8 +134,8 @@ export function MemoNftAttachmentCard({
 
   return (
     <div
-      className={`memo-nft-attachment memo-nft-attachment--verified card ${className}`.trim()}
-      data-testid="memo-nft-verified"
+      className={`memo-nft-attachment ${isSelection ? 'memo-nft-attachment--selection' : 'memo-nft-attachment--verified'} card ${className}`.trim()}
+      data-testid={isSelection ? 'memo-nft-selection' : 'memo-nft-verified'}
       style={{
         display: 'flex',
         alignItems: 'center',
@@ -150,12 +167,12 @@ export function MemoNftAttachmentCard({
         </div>
       ) : (
         <>
-          {imageUrl && !hasError ? (
+          {imageUrl && !hasImageError ? (
             <img
               src={imageUrl}
               alt={name}
               data-testid="memo-nft-image"
-              onError={() => setHasError(true)}
+              onError={() => setImageErrorToken(tokenId)}
               style={{
                 width: '40px',
                 height: '40px',
@@ -194,19 +211,37 @@ export function MemoNftAttachmentCard({
               >
                 {name}
               </span>
-              <span
-                className="badge badge--success"
-                style={{
-                  padding: '1px 5px',
-                  borderRadius: '3px',
-                  background: 'rgba(40, 167, 69, 0.2)',
-                  color: '#28a745',
-                  fontWeight: 600,
-                  fontSize: '0.7rem'
-                }}
-              >
-                NFT Verificado
-              </span>
+              {isSelection ? (
+                <span
+                  className="badge badge--info"
+                  data-testid="memo-nft-selection-badge"
+                  style={{
+                    padding: '1px 5px',
+                    borderRadius: '3px',
+                    background: 'rgba(59, 130, 246, 0.15)',
+                    color: '#3b82f6',
+                    fontWeight: 600,
+                    fontSize: '0.7rem'
+                  }}
+                >
+                  NFT seleccionado
+                </span>
+              ) : (
+                <span
+                  className="badge badge--success"
+                  data-testid="memo-nft-verified-badge"
+                  style={{
+                    padding: '1px 5px',
+                    borderRadius: '3px',
+                    background: 'rgba(40, 167, 69, 0.2)',
+                    color: '#28a745',
+                    fontWeight: 600,
+                    fontSize: '0.7rem'
+                  }}
+                >
+                  NFT Verificado
+                </span>
+              )}
             </div>
             <code
               title={tokenId}

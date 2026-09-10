@@ -213,6 +213,56 @@ describe('Tonalli Memo routes', () => {
     expect(screen.getAllByTestId('memo-nft-unverified').length).toBeGreaterThan(0)
   })
 
+  test('feed NFT-only does not contain "@nft1:" and card remains visible', async () => {
+    const attachedTokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    const nftOnlyItem = {
+      ...item,
+      payload: `@nft1:${attachedTokenId}\n`,
+      displayPayload: '',
+      attachment: {
+        type: 'NFT',
+        tokenId: attachedTokenId,
+        ownership: 'VERIFIED_AT_INDEXING'
+      }
+    }
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ items: [{ transaction: nftOnlyItem, verification: nftOnlyItem }] })
+    )
+
+    renderAt('/memo', <MemoFeed />)
+
+    expect(await screen.findByTestId('memo-nft-verified')).toBeTruthy()
+    expect(document.body.textContent).not.toContain('@nft1:')
+  })
+
+  test('tx detail NFT-only does not contain "@nft1:" and card remains visible', async () => {
+    const attachedTokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    const nftOnlyItem = {
+      ...item,
+      payload: `@nft1:${attachedTokenId}\n`,
+      displayPayload: '',
+      attachment: {
+        type: 'NFT',
+        tokenId: attachedTokenId,
+        ownership: 'VERIFIED_AT_INDEXING'
+      }
+    }
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ transaction: nftOnlyItem, verification: nftOnlyItem })
+    )
+
+    renderAt(`/memo/tx/${TXID}`, (
+      <Routes>
+        <Route path="/memo/tx/:txid" element={<MemoTx />} />
+      </Routes>
+    ))
+
+    expect((await screen.findAllByTestId('memo-nft-verified')).length).toBeGreaterThan(0)
+    expect(document.body.textContent).not.toContain('@nft1:')
+  })
+
   test('route navigation mounts Memo routes through App', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ items: [] }))
 

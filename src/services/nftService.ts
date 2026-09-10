@@ -139,6 +139,7 @@ const hashJsonToSha256Hex = async (json: string): Promise<string> => {
 export const isNftChildUtxo = (utxo: ScriptUtxo) => {
   if (!utxo.token) return false
   if (utxo.token.tokenType.protocol !== 'SLP') return false
+  if (utxo.token.tokenType.type !== 'SLP_TOKEN_TYPE_NFT1_CHILD') return false
   if (utxo.token.tokenType.number !== SLP_NFT1_CHILD) return false
   if (utxo.token.isMintBaton) return false
   try {

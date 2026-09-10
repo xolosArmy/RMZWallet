@@ -239,6 +239,10 @@ describe('TonalliMemoComposer Integration', () => {
     // Modal closed, selected preview visible
     expect(screen.queryByTestId('nft-selector-modal')).toBeNull()
     expect(screen.getByTestId('memo-selected-nft-preview')).toBeTruthy()
+    expect(screen.getByTestId('memo-nft-selection')).toBeTruthy()
+    expect(screen.getByTestId('memo-nft-selection-badge').textContent).toBe('NFT seleccionado')
+    expect(screen.queryByText('NFT Verificado')).toBeNull()
+    expect(screen.queryByTestId('memo-nft-verified')).toBeNull()
 
     // Wire payload encoded in preview: @nft1:8539...ff8\nAcompañado de mi Xolo
     // 71 bytes directive + 22 bytes text = 93 bytes payload
@@ -253,6 +257,27 @@ describe('TonalliMemoComposer Integration', () => {
 
     expect(screen.queryByTestId('memo-selected-nft-preview')).toBeNull()
     expect(screen.getByTestId('memo-attach-nft-btn')).toBeTruthy()
+  })
+
+  it('does NOT render "NFT Verificado" when an NFT is attached in the composer', async () => {
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    const mockExecutor = createMockExecutor()
+
+    render(
+      <TonalliMemoComposer
+        executor={mockExecutor}
+        initialAlias="satoshi.xec"
+        initialOwnerAddress="ecash:qqtest123"
+        initialMessage="Hola"
+        initialAttachedNft={{ tokenId, name: 'Mi Xolo' }}
+      />
+    )
+
+    expect(screen.getByTestId('memo-selected-nft-preview')).toBeTruthy()
+    expect(screen.getByTestId('memo-nft-selection-badge').textContent).toBe('NFT seleccionado')
+    expect(screen.queryByText('NFT Verificado')).toBeNull()
+    expect(screen.queryByTestId('memo-nft-verified')).toBeNull()
+    expect(screen.queryByText('No verificado')).toBeNull()
   })
 
   it('allows an NFT-only memo without message text', async () => {

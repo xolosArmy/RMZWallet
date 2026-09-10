@@ -101,13 +101,15 @@ describe('useTm1PublishMachine Hook', () => {
 
     it('marks isValid false if isOverLimit is true, even when canonical preview is non-null', () => {
       const mockExecutor = createMockExecutor()
-      // Message has 30 bytes, which is valid for TM1 (<=80 bytes), but exceeds custom maxBytes of 20
+      const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+      // 30 bytes message, but maxBytes is 20 (wire is 71 + 30 = 101 <= 212)
       const message = '123456789012345678901234567890'
 
       const { result } = renderHook(() =>
         useTm1PublishMachine({
           executor: mockExecutor,
           initialMessage: message,
+          initialAttachedNft: { tokenId, name: 'Xolo #1' },
           maxBytes: 20
         })
       )
@@ -889,6 +891,105 @@ describe('useTm1PublishMachine Hook', () => {
       expect(mockExecutor.prepareAndSign).not.toHaveBeenCalled()
       expect(result.current.state.phase).toBe('error')
       expect(result.current.state.error).toContain('CHRONIK_OFFLINE')
+    })
+
+    it('supports custom maxBytes=100 with 90 B plain message as valid', () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'a'.repeat(90),
+          maxBytes: 100
+        })
+      )
+
+      expect(result.current.state.isOverLimit).toBe(false)
+      expect(result.current.state.isValid).toBe(true)
+      expect(result.current.state.preview).not.toBeNull()
+      expect(result.current.state.previewError).toBeNull()
+    })
+
+    it('rejects maxBytes=50 with 51 B message as invalid', () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'a'.repeat(51),
+          maxBytes: 50
+        })
+      )
+
+      expect(result.current.state.isOverLimit).toBe(true)
+      expect(result.current.state.isValid).toBe(false)
+      expect(result.current.state.previewError).toBeTruthy()
+    })
+
+    it('custom maxBytes > 212 never permits wire > 212', () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'a'.repeat(213),
+          maxBytes: 300
+        })
+      )
+
+      expect(result.current.state.isOverLimit).toBe(true)
+      expect(result.current.state.isValid).toBe(false)
+      expect(result.current.state.preview).toBeNull()
+      expect(result.current.state.wirePayloadByteLength).toBe(213)
+    })
+
+    it('handles abort lifecycle cleanly during pending JIT check', async () => {
+      let resolveJit!: (val: boolean) => void
+      const jitPromise = new Promise<boolean>((resolve) => {
+        resolveJit = resolve
+      })
+      vi.spyOn(nftServiceModule, 'ownsNftChildToken').mockReturnValue(jitPromise)
+
+      const mockExecutor = createMockExecutor()
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'Publicando con abort',
+          initialAttachedNft: { tokenId, name: 'Xolo #1' }
+        })
+      )
+
+      // Start publish - this will enter JIT check and pause
+      let publishPromise!: Promise<void>
+      act(() => {
+        publishPromise = result.current.publish()
+      })
+
+      // Verify phase is verifying_ownership
+      expect(result.current.state.phase).toBe('verifying_ownership')
+
+      // Call abort while JIT is pending
+      act(() => {
+        result.current.abort()
+      })
+
+      // Resolve JIT check
+      await act(async () => {
+        resolveJit(true)
+        await publishPromise
+      })
+
+      // Phase must end in idle
+      expect(result.current.state.phase).toBe('idle')
+      // prepareAndSign and broadcastAndFinalize must NOT be called
+      expect(mockExecutor.prepareAndSign).not.toHaveBeenCalled()
+      expect(mockExecutor.broadcastAndFinalize).not.toHaveBeenCalled()
     })
   })
 })

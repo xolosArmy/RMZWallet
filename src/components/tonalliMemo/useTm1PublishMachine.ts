@@ -188,12 +188,14 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       return { preview: null, previewError: undefined }
     }
     try {
+      const maxEventDataBytes = attachedNft
+        ? TM1_PROTOCOL_MAX_EVENT_DATA_BYTES
+        : Math.min(maxBytes, TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
+
       const encoded = encodeTm1Draft02Post({
         eventData: wirePayload,
         authorInputIndex: 0,
-        maxEventDataBytes: attachedNft
-          ? TM1_PROTOCOL_MAX_EVENT_DATA_BYTES
-          : TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES
+        maxEventDataBytes
       })
       return { preview: encoded, previewError: undefined }
     } catch (err) {
@@ -208,7 +210,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
         previewError: msg
       }
     }
-  }, [wirePayload])
+  }, [wirePayload, attachedNft, maxBytes])
 
   const isValidAttachedToken = !attachedNft || /^[0-9a-f]{64}$/.test(attachedNft.tokenId.toLowerCase())
 
@@ -381,12 +383,19 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
         ownerAddress,
         signal
       )
+      if (signal.aborted) {
+        setPhase('idle')
+        return
+      }
       setVerificationStatus('verified')
 
       // JIT check: verify active wallet still owns the selected NFT before requesting auth and signing (Adjustment 1)
       if (attachedNft) {
         const stillOwned = await ownsNftChildToken(ownerAddress, attachedNft.tokenId)
-        if (signal.aborted) return
+        if (signal.aborted) {
+          setPhase('idle')
+          return
+        }
         if (!stillOwned) {
           const errorMsg = 'El NFT seleccionado ya no se encuentra en la billetera activa o no es un SLP NFT1 Child válido.'
           const err = new Error(errorMsg)
@@ -468,6 +477,11 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     setError(null)
   }, [])
 
+  const abort = useCallback(() => {
+    abortControllerRef.current?.abort()
+    setPhase('idle')
+  }, [])
+
   const state: Tm1PublishState = {
     phase,
     message,
@@ -502,6 +516,6 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     dismissPending,
     publish,
     reset,
-    abort: () => abortControllerRef.current?.abort()
+    abort
   }
 }

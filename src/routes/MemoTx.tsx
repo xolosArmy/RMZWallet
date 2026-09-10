@@ -55,7 +55,11 @@ function VerificationFields({ verification }: { verification: TonalliMemoVerific
           <p>{formatTonalliMemoTimestamp(verification.timestamp)}</p>
         </div>
       </div>
-      <p className="tx-message memo-payload">{verification.displayPayload || verification.payload || '(sin payload)'}</p>
+      {verification.displayPayload ? (
+        <p className="tx-message memo-payload">{verification.displayPayload}</p>
+      ) : !verification.attachment ? (
+        <p className="tx-message memo-payload">(sin payload)</p>
+      ) : null}
       {verification.attachment && (
         <MemoNftAttachmentCard attachment={verification.attachment} />
       )}
@@ -179,7 +183,11 @@ function MemoTx() {
                 <p>{formatTonalliMemoTimestamp(state.detail.transaction.timestamp)}</p>
               </div>
             </div>
-            <p className="tx-message memo-payload">{state.detail.transaction.displayPayload || state.detail.transaction.payload || '(sin payload)'}</p>
+            {state.detail.transaction.displayPayload ? (
+              <p className="tx-message memo-payload">{state.detail.transaction.displayPayload}</p>
+            ) : !state.detail.transaction.attachment ? (
+              <p className="tx-message memo-payload">(sin payload)</p>
+            ) : null}
             {state.detail.transaction.attachment && (
               <MemoNftAttachmentCard attachment={state.detail.transaction.attachment} />
             )}

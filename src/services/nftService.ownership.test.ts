@@ -18,7 +18,7 @@ describe('ownsNftChildToken & isNftChildUtxo (lightweight JIT check)', () => {
       value: 546n,
       token: {
         tokenId,
-        tokenType: { protocol: 'SLP', number: 65 },
+        tokenType: { protocol: 'SLP', type: 'SLP_TOKEN_TYPE_NFT1_CHILD', number: 65 },
         isMintBaton: false,
         atoms: 1n
       }
@@ -26,10 +26,16 @@ describe('ownsNftChildToken & isNftChildUtxo (lightweight JIT check)', () => {
 
     expect(isNftChildUtxo(validUtxo)).toBe(true)
 
+    // protocol SLP + number 65 pero type distinto => false
+    expect(isNftChildUtxo({
+      ...validUtxo,
+      token: { ...validUtxo.token!, tokenType: { protocol: 'SLP', type: 'SLP_TOKEN_TYPE_UNKNOWN', number: 65 } }
+    } as unknown as ScriptUtxo)).toBe(false)
+
     // Not NFT1 Child (wrong number)
     expect(isNftChildUtxo({
       ...validUtxo,
-      token: { ...validUtxo.token!, tokenType: { protocol: 'SLP', number: 1 } }
+      token: { ...validUtxo.token!, tokenType: { protocol: 'SLP', type: 'SLP_TOKEN_TYPE_NFT1_CHILD', number: 1 } }
     } as unknown as ScriptUtxo)).toBe(false)
 
     // Mint baton
@@ -56,7 +62,7 @@ describe('ownsNftChildToken & isNftChildUtxo (lightweight JIT check)', () => {
             {
               token: {
                 tokenId: tokenId.toUpperCase(), // case insensitive check
-                tokenType: { protocol: 'SLP', number: 65 },
+                tokenType: { protocol: 'SLP', type: 'SLP_TOKEN_TYPE_NFT1_CHILD', number: 65 },
                 isMintBaton: false,
                 atoms: 1n
               }

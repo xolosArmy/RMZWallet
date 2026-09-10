@@ -115,7 +115,11 @@ function MemoFeed() {
                   <p>{formatTonalliMemoTimestamp(item.timestamp)}</p>
                 </div>
               </div>
-              <p className="tx-message memo-payload">{item.displayPayload || item.payload || '(sin payload)'}</p>
+              {item.displayPayload ? (
+                <p className="tx-message memo-payload">{item.displayPayload}</p>
+              ) : !item.attachment ? (
+                <p className="tx-message memo-payload">(sin payload)</p>
+              ) : null}
               {item.attachment && (
                 <MemoNftAttachmentCard attachment={item.attachment} />
               )}

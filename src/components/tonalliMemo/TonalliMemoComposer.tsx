@@ -166,10 +166,15 @@ export function TonalliMemoComposer({
           {state.attachedNft ? (
             <div data-testid="memo-selected-nft-preview">
               <MemoNftAttachmentCard
+                mode="selection"
                 attachment={{
                   type: 'NFT',
                   tokenId: state.attachedNft.tokenId,
-                  ownership: 'VERIFIED_AT_INDEXING'
+                  ownership: 'UNVERIFIED'
+                }}
+                selectedAsset={{
+                  name: state.attachedNft.name,
+                  imageUrl: state.attachedNft.imageUrl
                 }}
                 onRemove={isFormDisabled || state.phase === 'success' ? undefined : () => setAttachedNft(null)}
               />

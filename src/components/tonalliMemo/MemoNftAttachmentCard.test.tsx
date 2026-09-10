@@ -115,4 +115,36 @@ describe('MemoNftAttachmentCard Component', () => {
     fireEvent.click(removeBtn)
     expect(handleRemove).toHaveBeenCalledTimes(1)
   })
+
+  it('renders selection mode with "NFT seleccionado" badge and NEVER renders "NFT Verificado"', () => {
+    const handleRemove = vi.fn()
+
+    render(
+      <MemoNftAttachmentCard
+        mode="selection"
+        attachment={{
+          type: 'NFT',
+          tokenId,
+          ownership: 'UNVERIFIED'
+        }}
+        selectedAsset={{
+          name: 'Xoloitzcuintle Guardián',
+          imageUrl: 'https://ipfs.io/ipfs/QmHash/guardian.png'
+        }}
+        onRemove={handleRemove}
+      />
+    )
+
+    expect(screen.getByTestId('memo-nft-selection')).toBeTruthy()
+    expect(screen.getByTestId('memo-nft-selection-badge').textContent).toBe('NFT seleccionado')
+    expect(screen.queryByText('NFT Verificado')).toBeNull()
+    expect(screen.queryByTestId('memo-nft-verified')).toBeNull()
+    expect(screen.queryByText('No verificado')).toBeNull()
+    expect(screen.getByText('Xoloitzcuintle Guardián')).toBeTruthy()
+    expect(screen.getByText('8539b6...955ff8')).toBeTruthy()
+
+    const removeBtn = screen.getByTestId('memo-nft-remove-btn')
+    fireEvent.click(removeBtn)
+    expect(handleRemove).toHaveBeenCalledTimes(1)
+  })
 })
