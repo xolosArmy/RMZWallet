@@ -65,7 +65,7 @@ describe('ownsNftChildToken & isNftChildUtxo (lightweight JIT check)', () => {
         })
       })
     }
-    vi.spyOn(chronikClientModule, 'getChronik').mockReturnValue(mockChronik as any)
+    vi.spyOn(chronikClientModule, 'getChronik').mockReturnValue(mockChronik as unknown as ReturnType<typeof chronikClientModule.getChronik>)
 
     const result = await ownsNftChildToken(address, tokenId)
     expect(result).toBe(true)
@@ -89,7 +89,7 @@ describe('ownsNftChildToken & isNftChildUtxo (lightweight JIT check)', () => {
         })
       })
     }
-    vi.spyOn(chronikClientModule, 'getChronik').mockReturnValue(mockChronik as any)
+    vi.spyOn(chronikClientModule, 'getChronik').mockReturnValue(mockChronik as unknown as ReturnType<typeof chronikClientModule.getChronik>)
 
     const result = await ownsNftChildToken(address, tokenId)
     expect(result).toBe(false)
@@ -101,7 +101,7 @@ describe('ownsNftChildToken & isNftChildUtxo (lightweight JIT check)', () => {
         utxos: vi.fn().mockRejectedValue(new Error('Chronik offline'))
       })
     }
-    vi.spyOn(chronikClientModule, 'getChronik').mockReturnValue(mockChronik as any)
+    vi.spyOn(chronikClientModule, 'getChronik').mockReturnValue(mockChronik as unknown as ReturnType<typeof chronikClientModule.getChronik>)
 
     const result = await ownsNftChildToken(address, tokenId)
     expect(result).toBe(false)
