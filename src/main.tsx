@@ -24,6 +24,20 @@ const normalizeExternalSignHashRoute = () => {
 
 normalizeExternalSignHashRoute()
 
+// H3WC is a dormant candidate.  Keep the implementation out of the module
+// graph at runtime unless the explicit hard flag is enabled; no legacy
+// WalletConnect environment variable is consulted here.
+if (String(import.meta.env.VITE_X402_H3WC_ENABLED).trim().toLowerCase() === 'true') {
+  void import('./lib/h3wc/bootstrap').then(({ initializeH3wc }) => initializeH3wc({
+    enabled: true,
+    projectId: import.meta.env.VITE_X402_H3WC_PROJECT_ID,
+    mode: import.meta.env.MODE,
+    requesterOrigin: import.meta.env.VITE_X402_H3WC_REQUESTER_ORIGIN
+  })).catch(error => {
+    console.error('[H3WC] initialization failed closed', error)
+  })
+}
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <BrowserRouter>
