@@ -17,6 +17,10 @@ const VERIFICATION_STATUSES = new Set<TonalliMemoVerificationStatus>([
 
 type RecordValue = Record<string, unknown>
 
+type ConsensusFields = Pick<TonalliMemoFeedItem, 'chainStatus' | 'blockHeight' | 'timestamp'>
+
+type ProtocolFields = Pick<TonalliMemoFeedItem, 'profileAlias' | 'profileCode' | 'eventType' | 'payload'>
+
 export function isValidTonalliMemoTxid(value: string) {
   return TXID_RE.test(value)
 }
@@ -29,6 +33,14 @@ function stringField(record: RecordValue, keys: string[], fallback = '') {
   for (const key of keys) {
     const value = record[key]
     if (typeof value === 'string') return value
+  }
+  return fallback
+}
+
+function nullableStringField(record: RecordValue, keys: string[], fallback: string | null = '') {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string' || value === null) return value
   }
   return fallback
 }
@@ -50,41 +62,63 @@ function profileFields(record: RecordValue) {
   const profile = isRecord(record.profile) ? record.profile : {}
   return {
     profileAlias: stringField(record, ['profileAlias', 'alias'], stringField(profile, ['alias', 'profileAlias'])),
-    profileCode: stringField(record, ['profileCode', 'code'], stringField(profile, ['code', 'profileCode']))
+    profileCode: nullableStringField(
+      record,
+      ['profileCode', 'code'],
+      nullableStringField(profile, ['code', 'profileCode'])
+    )
   }
 }
 
-function parseFeedFields(value: unknown): Omit<TonalliMemoFeedItem, 'status' | 'txid'> | null {
+function parseConsensusFields(value: unknown): ConsensusFields | null {
   if (!isRecord(value)) return null
 
   const blockHeight = nullableHeight(value.blockHeight ?? value.height)
-  const timestamp = nullableTimestamp(value.timestamp ?? value.createdAt ?? value.time)
+  const timestamp = nullableTimestamp(value.blockTimestamp ?? value.timestamp ?? value.createdAt ?? value.time)
   if (blockHeight === undefined || timestamp === undefined) return null
 
-  const { profileAlias, profileCode } = profileFields(value)
   return {
-    profileAlias,
-    profileCode,
-    eventType: stringField(value, ['eventType', 'type']),
-    payload: stringField(value, ['payload', 'memo', 'message']),
     chainStatus: stringField(value, ['chainStatus', 'chain_status']),
     blockHeight,
     timestamp
   }
 }
 
-function parseDetailTransaction(value: unknown): TonalliMemoFeedItem | null {
+function parseProtocolFields(value: unknown): ProtocolFields | null {
   if (!isRecord(value)) return null
-  const txid = stringField(value, ['txid'])
-  if (!isValidTonalliMemoTxid(txid)) return null
-  if (value.status !== 'VERIFIED') return null
-
-  const fields = parseFeedFields(value)
-  if (!fields) return null
+  const { profileAlias, profileCode } = profileFields(value)
   return {
-    txid,
-    status: 'VERIFIED',
-    ...fields
+    profileAlias,
+    profileCode,
+    eventType: stringField(value, ['eventType', 'type']),
+    payload: stringField(value, ['payload', 'memo', 'message'])
+  }
+}
+
+function parseVerification(
+  value: unknown,
+  txid: string,
+  consensus: ConsensusFields | null
+): TonalliMemoVerification | null | undefined {
+  if (value === null) return null
+  if (!isRecord(value)) return undefined
+
+  const verificationTxid = stringField(value, ['txid'])
+  if (verificationTxid !== txid || !isValidTonalliMemoTxid(verificationTxid)) return undefined
+  if (!VERIFICATION_STATUSES.has(value.status as TonalliMemoVerificationStatus)) return undefined
+
+  const protocol = parseProtocolFields(value)
+  if (!protocol) return undefined
+
+  const verificationConsensus = parseConsensusFields(value)
+  const effectiveConsensus = consensus ?? verificationConsensus
+  if (!effectiveConsensus) return undefined
+
+  return {
+    txid: verificationTxid,
+    status: value.status as TonalliMemoVerificationStatus,
+    ...protocol,
+    ...effectiveConsensus
   }
 }
 
@@ -97,41 +131,20 @@ function parseFeedItem(value: unknown): TonalliMemoFeedItem | null {
   const txid = stringField(rawTransaction, ['txid'], stringField(value, ['txid']))
   if (!isValidTonalliMemoTxid(txid)) return null
 
-  const verification = parseVerification(value.verification, txid)
-  if (!verification || verification.status !== 'VERIFIED') return null
+  const consensus = parseConsensusFields(rawTransaction) ?? parseConsensusFields(value)
+  if (!consensus) return null
 
-  const fields = parseFeedFields(rawTransaction) ?? parseFeedFields(value)
-  if (!fields) return null
+  const verification = parseVerification(value.verification, txid, consensus)
+  if (!verification || verification.status !== 'VERIFIED') return null
 
   return {
     txid,
     status: 'VERIFIED',
-    ...fields
-  }
-}
-
-function parseVerification(value: unknown, txid: string): TonalliMemoVerification | null | undefined {
-  if (value === null) return null
-  if (!isRecord(value)) return undefined
-  const verificationTxid = stringField(value, ['txid'])
-  if (verificationTxid !== txid || !isValidTonalliMemoTxid(verificationTxid)) return undefined
-  if (!VERIFICATION_STATUSES.has(value.status as TonalliMemoVerificationStatus)) return undefined
-
-  const blockHeight = nullableHeight(value.blockHeight ?? value.height)
-  const timestamp = nullableTimestamp(value.timestamp ?? value.createdAt ?? value.time)
-  if (blockHeight === undefined || timestamp === undefined) return undefined
-
-  const { profileAlias, profileCode } = profileFields(value)
-  return {
-    txid: verificationTxid,
-    status: value.status as TonalliMemoVerificationStatus,
-    profileAlias,
-    profileCode,
-    eventType: stringField(value, ['eventType', 'type']),
-    payload: stringField(value, ['payload', 'memo', 'message']),
-    chainStatus: stringField(value, ['chainStatus', 'chain_status']),
-    blockHeight,
-    timestamp
+    profileAlias: verification.profileAlias,
+    profileCode: verification.profileCode,
+    eventType: verification.eventType,
+    payload: verification.payload,
+    ...consensus
   }
 }
 
@@ -155,19 +168,39 @@ export function parseTonalliMemoFeed(value: unknown): TonalliMemoFeed | null {
 
 export function parseTonalliMemoTxDetail(value: unknown, txid: string): TonalliMemoTxDetail | null {
   if (!isRecord(value)) return null
+
   const rawTransaction = value.transaction ?? value.tx ?? value
-  const transaction = parseDetailTransaction(rawTransaction)
-  if (!transaction || transaction.txid !== txid) return null
+  if (!isRecord(rawTransaction)) return null
+
+  const transactionTxid = stringField(rawTransaction, ['txid'])
+  if (transactionTxid !== txid || !isValidTonalliMemoTxid(transactionTxid)) return null
+
+  const consensus = parseConsensusFields(rawTransaction) ?? parseConsensusFields(value)
+  if (!consensus) return null
 
   const verificationValue = Object.prototype.hasOwnProperty.call(value, 'verification')
     ? value.verification
     : rawTransaction
-  const verification = parseVerification(verificationValue, txid)
+  const verification = parseVerification(verificationValue, txid, consensus)
   if (verification === undefined) return null
+
+  const protocol = verification === null
+    ? parseProtocolFields(rawTransaction) ?? { profileAlias: '', profileCode: '', eventType: '', payload: '' }
+    : {
+        profileAlias: verification.profileAlias,
+        profileCode: verification.profileCode,
+        eventType: verification.eventType,
+        payload: verification.payload
+      }
 
   return {
     txid,
-    transaction,
+    transaction: {
+      txid,
+      status: 'VERIFIED',
+      ...protocol,
+      ...consensus
+    },
     verification
   }
 }
