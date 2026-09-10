@@ -3,7 +3,7 @@ import { getChronik } from '../../services/ChronikClient'
 import { fromHex, toHex, Script, Tx, TxBuilder, sha256 } from 'ecash-lib'
 import { xolosWalletService, type FirmaInputOwner } from '../../services/XolosWalletService'
 import { FEE_RATE_SATS_PER_BYTE, XEC_DUST_SATS } from '../../config/xecFees'
-import type { Tm1PublisherExecutor } from './types'
+import { TM1_PROTOCOL_MAX_EVENT_DATA_BYTES, type Tm1PublisherExecutor } from './types'
 import type { Tm1PublicationRecoveryStore } from '../../integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
 import {
   TM1_PUBLICATION_RECOVERY_SCHEMA,
@@ -246,7 +246,8 @@ export class WalletSigner {
       } else if (typeof candidateObj.message === 'string') {
         const encoded = encodeTm1Draft02Post({
           eventData: candidateObj.message,
-          authorInputIndex: 0
+          authorInputIndex: 0,
+          maxEventDataBytes: TM1_PROTOCOL_MAX_EVENT_DATA_BYTES
         })
         scriptHex = encoded.scriptHex
       }
@@ -645,7 +646,8 @@ export class WalletPublisherExecutor implements Tm1PublisherExecutor {
     }
     const preview = encodeTm1Draft02Post({
       eventData: message,
-      authorInputIndex: 0
+      authorInputIndex: 0,
+      maxEventDataBytes: TM1_PROTOCOL_MAX_EVENT_DATA_BYTES
     })
 
     const preparedId = crypto.randomUUID()

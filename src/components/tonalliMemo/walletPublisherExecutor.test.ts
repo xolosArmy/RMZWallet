@@ -18,6 +18,8 @@ import {
   Tm1ProductionRecoveryStore,
   Tm1WebStoragePublicationRecoveryStore
 } from './walletPublisherExecutor'
+import { TM1_PROTOCOL_MAX_EVENT_DATA_BYTES } from './types'
+import { Tm1Draft02EncodingError } from '../../integrations/tonalliMemo/tm1Draft02'
 import * as ChronikClientModule from '../../services/ChronikClient'
 
 const ecc = new Ecc()
@@ -92,6 +94,21 @@ describe('walletPublisherExecutor components', () => {
       expect(deserialized.outputs[1].sats).toBeGreaterThan(0n)
       expect(deserialized.outputs[1].sats).toBeLessThan(100000n)
       expect(result.txid).toBe(deserialized.txid())
+    })
+
+    it('accepts candidate message > 80 bytes up to 212 bytes in fallback encoding', async () => {
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: testUtxos
+      })
+      const longMessage = 'e'.repeat(150)
+      const result = await signer.sign({ message: longMessage })
+      expect(result.rawTxBytes).toBeTruthy()
+
+      const deser = Tx.deser(fromHex(result.rawTxBytes))
+      expect(deser.outputs[0].sats).toBe(0n)
+      expect(deser.outputs[0].script.toHex()).toMatch(/^6a/)
     })
 
     it('throws INSUFFICIENT_FUNDS when spendable UTXOs are empty', async () => {
@@ -620,7 +637,7 @@ describe('walletPublisherExecutor components', () => {
     it('passes wrapped evidence with fresh nonce and evidenceHash to authorizer.issue() on successive retries to avoid ALIAS_PROOF_REPLAYED', async () => {
       const consumedProofs = new Set<string>()
       const mockAuthorizer = {
-        issue: vi.fn().mockImplementation((request: any) => {
+        issue: vi.fn().mockImplementation((request: { evidence?: { evidenceHash?: string; nonce?: string } }) => {
           const evidence = request.evidence
           if (!evidence || !evidence.evidenceHash || !evidence.nonce) {
             throw new Error('EVIDENCE_NOT_WRAPPED: Missing fresh nonce or evidenceHash')
@@ -650,6 +667,7 @@ describe('walletPublisherExecutor components', () => {
 
       // Attempt 1
       const evidence1 = await executor.verifyOwnership('alice.xec', testAddress)
+      const ev1 = evidence1 as { evidenceHash: string; nonce: string }
       const auth1 = await executor.requestAuthorization(evidence1)
       expect(auth1).toHaveProperty('authorized', true)
       expect(consumedProofs.size).toBe(1)
@@ -658,16 +676,17 @@ describe('walletPublisherExecutor components', () => {
           alias: 'alice.xec',
           ownerAddress: testAddress,
           evidence: expect.objectContaining({
-            evidenceHash: (evidence1 as any).evidenceHash,
-            nonce: (evidence1 as any).nonce
+            evidenceHash: ev1.evidenceHash,
+            nonce: ev1.nonce
           })
         })
       )
 
       // Attempt 2 (retry after failure/timeout)
       const evidence2 = await executor.verifyOwnership('alice.xec', testAddress)
-      expect((evidence2 as any).evidenceHash).not.toBe((evidence1 as any).evidenceHash)
-      expect((evidence2 as any).nonce).not.toBe((evidence1 as any).nonce)
+      const ev2 = evidence2 as { evidenceHash: string; nonce: string }
+      expect(ev2.evidenceHash).not.toBe(ev1.evidenceHash)
+      expect(ev2.nonce).not.toBe(ev1.nonce)
 
       // Attempt 2 must pass authorizer.issue() with fresh wrapped evidence without ALIAS_PROOF_REPLAYED
       const auth2 = await executor.requestAuthorization(evidence2)
@@ -678,8 +697,8 @@ describe('walletPublisherExecutor components', () => {
           alias: 'alice.xec',
           ownerAddress: testAddress,
           evidence: expect.objectContaining({
-            evidenceHash: (evidence2 as any).evidenceHash,
-            nonce: (evidence2 as any).nonce
+            evidenceHash: ev2.evidenceHash,
+            nonce: ev2.nonce
           })
         })
       )
@@ -1028,6 +1047,104 @@ describe('walletPublisherExecutor components', () => {
         (prep.preparedReview as { preparedId: string }).preparedId
       )
       expect(recovered?.phase).toBe('submittedObserved')
+    })
+
+    it('accepts 129-byte NFT wire payload without EVENT_DATA_TOO_LARGE and produces valid transaction', async () => {
+      const transport = new ChronikNetworkTransport({ chronik: { broadcastTx: vi.fn() } as never })
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: testUtxos
+      })
+      const executor = new WalletPublisherExecutor({ transport, signer })
+
+      const nftTokenId = 'a'.repeat(64)
+      const userText = 'b'.repeat(58)
+      const wirePayload = `@nft1:${nftTokenId}\n${userText}`
+      // Verify wirePayload length is exactly 129 bytes UTF-8 (71 directive + 58 text)
+      expect(new TextEncoder().encode(wirePayload).length).toBe(129)
+
+      const auth = { authorized: true }
+      const { preparedReview, signedReview } = await executor.prepareAndSign(auth, wirePayload)
+
+      expect(preparedReview).toBeDefined()
+      const prep = preparedReview as {
+        preview: {
+          eventData: string
+          eventDataByteLength: number
+          scriptHex: string
+        }
+      }
+      expect(prep.preview.eventData).toBe(wirePayload)
+      expect(prep.preview.eventDataByteLength).toBe(129)
+      expect(prep.preview.scriptHex).toBeTruthy()
+
+      // Validate signed review and serialized transaction
+      const signed = signedReview as { rawTxBytes: string; txid: string }
+      expect(signed.rawTxBytes).toBeTruthy()
+      const deserTx = Tx.deser(fromHex(signed.rawTxBytes))
+      expect(deserTx.outputs[0].sats).toBe(0n)
+      expect(deserTx.outputs[0].script.toHex()).toBe(prep.preview.scriptHex)
+      expect(signed.txid).toBe(deserTx.txid())
+    })
+
+    it('accepts exact 212-byte payload and rejects 213-byte payload with EVENT_DATA_TOO_LARGE', async () => {
+      const transport = new ChronikNetworkTransport({ chronik: { broadcastTx: vi.fn() } as never })
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: testUtxos
+      })
+      const executor = new WalletPublisherExecutor({ transport, signer })
+
+      // Exact 212 bytes: 71 B directive + 141 B text = 212 B
+      const nftTokenId = 'c'.repeat(64)
+      const userText141 = 'd'.repeat(141)
+      const payload212 = `@nft1:${nftTokenId}\n${userText141}`
+      expect(new TextEncoder().encode(payload212).length).toBe(212)
+      expect(new TextEncoder().encode(payload212).length).toBe(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
+
+      const result212 = await executor.prepareAndSign({ authorized: true }, payload212)
+      const prep212 = result212.preparedReview as { preview: { eventDataByteLength: number } }
+      expect(prep212.preview.eventDataByteLength).toBe(212)
+
+      // 213 bytes: 71 B directive + 142 B text = 213 B
+      const userText142 = 'd'.repeat(142)
+      const payload213 = `@nft1:${nftTokenId}\n${userText142}`
+      expect(new TextEncoder().encode(payload213).length).toBe(213)
+
+      await expect(
+        executor.prepareAndSign({ authorized: true }, payload213)
+      ).rejects.toThrowError(Tm1Draft02EncodingError)
+
+      try {
+        await executor.prepareAndSign({ authorized: true }, payload213)
+        expect.unreachable('Should have thrown')
+      } catch (err) {
+        expect(err).toBeInstanceOf(Tm1Draft02EncodingError)
+        expect((err as Tm1Draft02EncodingError).code).toBe('EVENT_DATA_TOO_LARGE')
+      }
+    })
+
+    it('accepts plain text message > 80 bytes but <= 212 bytes (protocol limit, not UI limit)', async () => {
+      const transport = new ChronikNetworkTransport({ chronik: { broadcastTx: vi.fn() } as never })
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: testUtxos
+      })
+      const executor = new WalletPublisherExecutor({ transport, signer })
+
+      // Plain text of 120 bytes (> 80 wallet text limit, but <= 212 wire protocol limit)
+      const plain120 = 'x'.repeat(120)
+      expect(new TextEncoder().encode(plain120).length).toBe(120)
+
+      const { preparedReview, signedReview } = await executor.prepareAndSign({ authorized: true }, plain120)
+      const prep = preparedReview as { preview: { eventDataByteLength: number; eventData: string } }
+      expect(prep.preview.eventDataByteLength).toBe(120)
+      expect(prep.preview.eventData).toBe(plain120)
+      const signed = signedReview as { rawTxBytes: string }
+      expect(signed.rawTxBytes).toBeTruthy()
     })
   })
 })
