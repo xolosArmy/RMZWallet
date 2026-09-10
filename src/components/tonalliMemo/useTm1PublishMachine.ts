@@ -7,16 +7,21 @@ import type { Tm1PublicationRecoveryStore } from '../../integrations/tonalliMemo
 import { getChronik } from '../../services/ChronikClient'
 import {
   TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES,
+  TM1_PROTOCOL_MAX_EVENT_DATA_BYTES,
+  buildTm1WirePayload,
+  type Tm1AttachedNft,
   type Tm1PublisherExecutor,
   type Tm1PublishPhase,
   type Tm1PublishState,
   type Tm1VerificationStatus
 } from './types'
+import { ownsNftChildToken } from '../../services/nftService'
 
 export interface UseTm1PublishMachineOptions {
   initialMessage?: string
   initialAlias?: string
   initialOwnerAddress?: string
+  initialAttachedNft?: Tm1AttachedNft | null
   maxBytes?: number
   executor: Tm1PublisherExecutor
   recoveryStore?: Tm1PublicationRecoveryStore
@@ -31,8 +36,11 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
 
   const maxBytes = options.maxBytes ?? TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES
   const [message, setMessage] = useState(options.initialMessage ?? '')
+  const [attachedNft, setAttachedNftState] = useState<Tm1AttachedNft | null>(
+    options.initialAttachedNft ?? null
+  )
   const [alias, setAlias] = useState(options.initialAlias ?? '')
-  const [ownerAddress, setOwnerAddress] = useState(options.initialOwnerAddress ?? '')
+  const [ownerAddress, setOwnerAddressState] = useState(options.initialOwnerAddress ?? '')
 
   const recoveryStore =
     options.recoveryStore ?? (options.executor as any)?.recoveryStore
@@ -117,25 +125,75 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     }
   }, [checkRecovery, recoveryStore])
 
-  // Real-time byte length calculation via TextEncoder (handles UTF-8 multi-byte characters)
-  const byteLength = useMemo(() => {
+  // Address change effect: clear attached NFT if active address changes (Section F)
+  const prevOwnerAddressRef = useRef(ownerAddress)
+  useEffect(() => {
+    if (prevOwnerAddressRef.current !== ownerAddress) {
+      prevOwnerAddressRef.current = ownerAddress
+      setAttachedNftState(null)
+    }
+  }, [ownerAddress])
+
+  // Prevent modifying attached NFT during locked phases
+  const isLocked =
+    phase === 'reconciling' ||
+    phase === 'verifying_ownership' ||
+    phase === 'requesting_authorization' ||
+    phase === 'broadcasting' ||
+    phase === 'success'
+
+  const setAttachedNft = useCallback(
+    (nft: Tm1AttachedNft | null) => {
+      if (isLocked) return
+      setAttachedNftState(nft)
+    },
+    [isLocked]
+  )
+
+  const setOwnerAddress = useCallback((addr: string) => {
+    setOwnerAddressState(addr)
+    setVerificationStatus('unverified')
+    setAttachedNftState(null)
+  }, [])
+
+  // Build the on-chain wire payload (Section A, C, D)
+  const wirePayload = useMemo(() => {
+    return buildTm1WirePayload(message, attachedNft?.tokenId)
+  }, [message, attachedNft])
+
+  // Real-time byte length calculations via TextEncoder (handles UTF-8 multi-byte characters)
+  const userMessageByteLength = useMemo(() => {
     return new TextEncoder().encode(message).length
   }, [message])
 
-  const isOverLimit = byteLength > maxBytes
+  const wirePayloadByteLength = useMemo(() => {
+    return new TextEncoder().encode(wirePayload).length
+  }, [wirePayload])
 
-  // Canonical payload preview calculation in real time using the canonical encoder as sole authority
+  // Byte limit checks: user message must be <= maxBytes (Section B, Adjustment 2)
+  // Total wire payload must be <= 212 bytes (TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
+  const isUserMessageOverLimit = userMessageByteLength > maxBytes
+  const isWirePayloadOverLimit = wirePayloadByteLength > TM1_PROTOCOL_MAX_EVENT_DATA_BYTES
+  const isOverLimit = isUserMessageOverLimit || isWirePayloadOverLimit
+  const byteLength = userMessageByteLength
+
+  // Canonical payload preview calculation in real time using the canonical encoder as sole authority.
+  // Encodes wirePayload (Section A, C). When an NFT is attached with empty text, wirePayload is '@nft1:...\n'
+  // which is non-empty and valid according to TM1 protocol canonical rules.
   const { preview, previewError } = useMemo<{
     preview: ReturnType<typeof encodeTm1Draft02Post> | null
     previewError: string | undefined
   }>(() => {
-    if (!message || message.length === 0) {
+    if (!wirePayload || wirePayload.length === 0) {
       return { preview: null, previewError: undefined }
     }
     try {
       const encoded = encodeTm1Draft02Post({
-        eventData: message,
-        authorInputIndex: 0
+        eventData: wirePayload,
+        authorInputIndex: 0,
+        maxEventDataBytes: attachedNft
+          ? TM1_PROTOCOL_MAX_EVENT_DATA_BYTES
+          : TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES
       })
       return { preview: encoded, previewError: undefined }
     } catch (err) {
@@ -150,13 +208,16 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
         previewError: msg
       }
     }
-  }, [message])
+  }, [wirePayload])
 
-  // Finding 3: The memo is valid ONLY if canonical preview succeeded, it honors component byte limits, and not reconciling:
+  const isValidAttachedToken = !attachedNft || /^[0-9a-f]{64}$/.test(attachedNft.tokenId.toLowerCase())
+
+  // The memo is valid ONLY if canonical preview succeeded, byte limits are honored, attached token is valid, and not reconciling
   const isValid =
     preview !== null &&
     previewError === undefined &&
     !isOverLimit &&
+    isValidAttachedToken &&
     phase !== 'reconciling'
 
   // Cleanup abort controller on unmount
@@ -322,6 +383,20 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       )
       setVerificationStatus('verified')
 
+      // JIT check: verify active wallet still owns the selected NFT before requesting auth and signing (Adjustment 1)
+      if (attachedNft) {
+        const stillOwned = await ownsNftChildToken(ownerAddress, attachedNft.tokenId)
+        if (signal.aborted) return
+        if (!stillOwned) {
+          const errorMsg = 'El NFT seleccionado ya no se encuentra en la billetera activa o no es un SLP NFT1 Child válido.'
+          const err = new Error(errorMsg)
+          setError(errorMsg)
+          setPhase('error')
+          options.onError?.(err)
+          return
+        }
+      }
+
       // 2. Requesting Authorization
       setPhase('requesting_authorization')
       const auth = await activeExecutorRef.current.requestAuthorization(
@@ -329,7 +404,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
         signal
       )
       const { preparedReview, signedReview } =
-        await activeExecutorRef.current.prepareAndSign(auth, message, signal)
+        await activeExecutorRef.current.prepareAndSign(auth, wirePayload, signal)
 
       // 3. Broadcasting
       setPhase('broadcasting')
@@ -379,13 +454,15 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       setError(errObj.message)
       options.onError?.(errObj)
     }
-  }, [isValid, phase, alias, ownerAddress, message, options, checkRecovery, recoveryStore])
+  }, [isValid, phase, alias, ownerAddress, message, attachedNft, wirePayload, options, checkRecovery, recoveryStore])
 
   /**
    * Reset machine back to idle state.
    */
   const reset = useCallback(() => {
     abortControllerRef.current?.abort()
+    setMessage('')
+    setAttachedNftState(null)
     setPhase('idle')
     setTxid(null)
     setError(null)
@@ -394,6 +471,10 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
   const state: Tm1PublishState = {
     phase,
     message,
+    attachedNft,
+    wirePayload,
+    userMessageByteLength,
+    wirePayloadByteLength,
     alias,
     ownerAddress,
     verificationStatus,
@@ -413,6 +494,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
   return {
     state,
     setMessage,
+    setAttachedNft,
     setAlias,
     setOwnerAddress,
     verifyOwnership,

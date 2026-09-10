@@ -52,6 +52,7 @@ export type Tm1Draft02PostPreview = {
 export type EncodeTm1Draft02PostOptions = {
   readonly eventData: string
   readonly authorInputIndex?: number
+  readonly maxEventDataBytes?: number
 }
 
 function mapCanonicalProtocolError(error: unknown): Tm1Draft02EncodingError {
@@ -95,10 +96,11 @@ export function encodeTm1Draft02Post(options: EncodeTm1Draft02PostOptions): Tm1D
   if (eventDataLength === 0) {
     throw new Tm1Draft02EncodingError('EMPTY_EVENT_DATA', 'El mensaje TM1 no puede estar vacío.')
   }
-  if (eventDataLength > TM1_DRAFT_02_WALLET_MAX_EVENT_DATA_BYTES) {
+  const maxAllowedBytes = options.maxEventDataBytes ?? TM1_DRAFT_02_WALLET_MAX_EVENT_DATA_BYTES
+  if (eventDataLength > maxAllowedBytes) {
     throw new Tm1Draft02EncodingError(
       'EVENT_DATA_TOO_LARGE',
-      `El mensaje TM1 usa ${eventDataLength} bytes UTF-8; la vista previa de Tonalli Wallet permite hasta ${TM1_DRAFT_02_WALLET_MAX_EVENT_DATA_BYTES}.`
+      `El mensaje TM1 usa ${eventDataLength} bytes UTF-8; la vista previa de Tonalli Wallet permite hasta ${maxAllowedBytes}.`
     )
   }
 

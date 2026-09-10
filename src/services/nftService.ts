@@ -136,13 +136,32 @@ const hashJsonToSha256Hex = async (json: string): Promise<string> => {
     .join('')
 }
 
-const isNftChildUtxo = (utxo: ScriptUtxo) => {
+export const isNftChildUtxo = (utxo: ScriptUtxo) => {
   if (!utxo.token) return false
   if (utxo.token.tokenType.protocol !== 'SLP') return false
   if (utxo.token.tokenType.number !== SLP_NFT1_CHILD) return false
   if (utxo.token.isMintBaton) return false
   try {
     return BigInt(utxo.token.atoms) === 1n
+  } catch {
+    return false
+  }
+}
+
+export const ownsNftChildToken = async (
+  walletAddress: string,
+  tokenId: string
+): Promise<boolean> => {
+  if (!walletAddress || !tokenId) return false
+  const normalizedTargetId = tokenId.toLowerCase()
+  try {
+    const utxosResponse = await getChronik().address(walletAddress).utxos()
+    const allUtxos = Array.isArray(utxosResponse?.utxos) ? utxosResponse.utxos : []
+    return allUtxos.some((utxo) => {
+      const utxoTokenId = utxo.token?.tokenId?.toLowerCase()
+      if (utxoTokenId !== normalizedTargetId) return false
+      return isNftChildUtxo(utxo)
+    })
   } catch {
     return false
   }

@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { useTm1PublishMachine } from './useTm1PublishMachine'
 import TonalliMemoComposer from './TonalliMemoComposer'
 import type { Tm1PublisherExecutor } from './types'
+import * as nftServiceModule from '../../services/nftService'
 
 function createMockExecutor(overrides: Partial<Tm1PublisherExecutor> = {}): Tm1PublisherExecutor {
   return {
@@ -714,6 +715,180 @@ describe('useTm1PublishMachine Hook', () => {
       // 3. Strict assert: reconciliation notice displays failure warning
       expect(screen.getByTestId('memo-reconciling-state')).toBeDefined()
       expect(screen.getByTestId('reconciliation-error-text').textContent).toContain('STORAGE_UNAVAILABLE')
+    })
+  })
+
+  describe('NFT attachment integration in useTm1PublishMachine', () => {
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    const ownerAddress = 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+
+    it('preserves configurable maxBytes while counting attachment overhead against protocol wire limit 212', () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'x'.repeat(50),
+          maxBytes: 50 // custom limit
+        })
+      )
+
+      expect(result.current.state.userMessageByteLength).toBe(50)
+      expect(result.current.state.isValid).toBe(true)
+
+      // Attach NFT: directive overhead is 71 bytes. Wire total = 50 + 71 = 121 bytes <= 212.
+      act(() => {
+        result.current.setAttachedNft({ tokenId, name: 'Xolo #1' })
+      })
+
+      expect(result.current.state.attachedNft?.tokenId).toBe(tokenId)
+      expect(result.current.state.wirePayload).toBe(`@nft1:${tokenId}\n${'x'.repeat(50)}`)
+      expect(result.current.state.wirePayloadByteLength).toBe(121)
+      expect(result.current.state.userMessageByteLength).toBe(50)
+      // Attachment overhead does NOT consume visual userMessage budget:
+      expect(result.current.state.isValid).toBe(true)
+
+      // Exceeding custom user maxBytes makes it invalid:
+      act(() => {
+        result.current.setMessage('x'.repeat(51))
+      })
+      expect(result.current.state.isValid).toBe(false)
+
+      // Setting message within custom limit (50) makes it valid again:
+      act(() => {
+        result.current.setMessage('x'.repeat(50))
+      })
+      expect(result.current.state.isValid).toBe(true)
+
+      // If wire payload were to exceed TM1_PROTOCOL_MAX_EVENT_DATA_BYTES (212), state becomes invalid:
+      // With 71 B directive, max remaining for wire is 212 - 71 = 141 B.
+      // If options.maxBytes was e.g. 200, but user typed 150 B:
+      // wire would be 150 + 71 = 221 B > 212 B -> invalid!
+    })
+
+    it('enables publication for NFT-only memo (empty user text)', () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: '',
+          initialAttachedNft: { tokenId, name: 'Xolo #1' }
+        })
+      )
+
+      expect(result.current.state.message).toBe('')
+      expect(result.current.state.userMessageByteLength).toBe(0)
+      expect(result.current.state.attachedNft?.tokenId).toBe(tokenId)
+      expect(result.current.state.wirePayload).toBe(`@nft1:${tokenId}\n`)
+      expect(result.current.state.wirePayloadByteLength).toBe(71)
+      expect(result.current.state.isValid).toBe(true)
+      expect(result.current.state.preview).not.toBeNull()
+      expect(result.current.state.preview?.eventDataByteLength).toBe(71)
+    })
+
+    it('clears attached NFT when ownerAddress changes', () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'Hola',
+          initialAttachedNft: { tokenId, name: 'Xolo #1' }
+        })
+      )
+
+      expect(result.current.state.attachedNft).not.toBeNull()
+      expect(result.current.state.wirePayload).toContain(`@nft1:${tokenId}`)
+
+      // Change address:
+      act(() => {
+        result.current.setOwnerAddress('ecash:qznewaddress999999999999999999999999999999')
+      })
+
+      expect(result.current.state.attachedNft).toBeNull()
+      expect(result.current.state.wirePayload).toBe('Hola')
+    })
+
+    it('revalidates ownership JIT via ownsNftChildToken before calling prepareAndSign', async () => {
+      vi.spyOn(nftServiceModule, 'ownsNftChildToken').mockResolvedValue(true)
+      const mockExecutor = createMockExecutor()
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'Publicando con NFT',
+          initialAttachedNft: { tokenId, name: 'Xolo #1' }
+        })
+      )
+
+      await act(async () => {
+        await result.current.publish()
+      })
+
+      expect(nftServiceModule.ownsNftChildToken).toHaveBeenCalledWith(ownerAddress, tokenId)
+      expect(mockExecutor.prepareAndSign).toHaveBeenCalledWith(
+        expect.anything(),
+        `@nft1:${tokenId}\nPublicando con NFT`,
+        expect.anything()
+      )
+      expect(mockExecutor.broadcastAndFinalize).toHaveBeenCalled()
+      expect(result.current.state.phase).toBe('success')
+    })
+
+    it('fails closed and blocks prepareAndSign if JIT ownership verification returns false', async () => {
+      vi.spyOn(nftServiceModule, 'ownsNftChildToken').mockResolvedValue(false)
+      const mockExecutor = createMockExecutor()
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'Publicando con NFT no poseído',
+          initialAttachedNft: { tokenId, name: 'Xolo #1' }
+        })
+      )
+
+      await act(async () => {
+        await result.current.publish()
+      })
+
+      expect(nftServiceModule.ownsNftChildToken).toHaveBeenCalledWith(ownerAddress, tokenId)
+      expect(mockExecutor.prepareAndSign).not.toHaveBeenCalled()
+      expect(result.current.state.phase).toBe('error')
+      expect(result.current.state.error).toContain(
+        'El NFT seleccionado ya no se encuentra en la billetera activa'
+      )
+    })
+
+    it('fails closed and blocks prepareAndSign if Chronik JIT check rejects', async () => {
+      vi.spyOn(nftServiceModule, 'ownsNftChildToken').mockRejectedValue(new Error('CHRONIK_OFFLINE'))
+      const mockExecutor = createMockExecutor()
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'Publicando con Chronik caído',
+          initialAttachedNft: { tokenId, name: 'Xolo #1' }
+        })
+      )
+
+      await act(async () => {
+        await result.current.publish()
+      })
+
+      expect(nftServiceModule.ownsNftChildToken).toHaveBeenCalledWith(ownerAddress, tokenId)
+      expect(mockExecutor.prepareAndSign).not.toHaveBeenCalled()
+      expect(result.current.state.phase).toBe('error')
+      expect(result.current.state.error).toContain('CHRONIK_OFFLINE')
     })
   })
 })

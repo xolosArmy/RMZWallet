@@ -26,6 +26,26 @@ export const TM1_PROTOCOL_MAX_EVENT_DATA_BYTES = 212
 export const TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES = 80
 
 /**
+ * NFT attachment directive constants.
+ * Format on-chain within eventData: @nft1:<64-char lowercase hex tokenId>\n<optional user text>
+ * Total overhead of directive: "@nft1:" (6) + tokenId (64) + "\n" (1) = 71 bytes UTF-8.
+ */
+export const TM1_NFT_DIRECTIVE_PREFIX = '@nft1:'
+export const TM1_NFT_DIRECTIVE_BYTES = 71
+
+export function buildTm1WirePayload(userMessage: string, attachedTokenId?: string | null): string {
+  if (!attachedTokenId) return userMessage
+  return `${TM1_NFT_DIRECTIVE_PREFIX}${attachedTokenId.toLowerCase()}\n${userMessage}`
+}
+
+export interface Tm1AttachedNft {
+  tokenId: string
+  name?: string
+  imageUrl?: string
+  collectionName?: string
+}
+
+/**
  * State machine phases for the Tonalli Memo publication flow.
  */
 export type Tm1PublishPhase =
@@ -86,6 +106,10 @@ export interface Tm1PublisherExecutor {
 export interface Tm1PublishState {
   readonly phase: Tm1PublishPhase
   readonly message: string
+  readonly attachedNft: Tm1AttachedNft | null
+  readonly wirePayload: string
+  readonly userMessageByteLength: number
+  readonly wirePayloadByteLength: number
   readonly alias: string
   readonly ownerAddress: string
   readonly verificationStatus: Tm1VerificationStatus

@@ -123,4 +123,42 @@ describe('MemoEditor Component', () => {
     const textarea = screen.getByRole('textbox', { name: /mensaje de tonalli memo/i }) as HTMLTextAreaElement
     expect(textarea.disabled).toBe(true)
   })
+
+  it('renders NFT attachment overhead badge and wire calculation when attachedNftTokenId is provided', () => {
+    const handleChange = vi.fn()
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    render(
+      <MemoEditor
+        value="Hola mundo"
+        onChange={handleChange}
+        attachedNftTokenId={tokenId}
+        showOverheadDetails={true}
+      />
+    )
+
+    // "Hola mundo" = 10 bytes, +71 B = 81 B wire
+    const badge = screen.getByTestId('memo-attachment-overhead')
+    expect(badge.textContent).toContain('+71 B NFT (81/212 B wire)')
+
+    const breakdown = screen.getByTestId('memo-overhead-breakdown')
+    expect(breakdown.textContent).toContain('+71 bytes')
+    expect(breakdown.textContent).toContain('81/212 bytes')
+  })
+
+  it('alerts when total wire payload exceeds protocol limit', () => {
+    const handleChange = vi.fn()
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    // User message 150 bytes, maxBytes 160 (under user maxBytes), but 150 + 71 = 221 > 212 protocolMaxBytes
+    render(
+      <MemoEditor
+        value={'a'.repeat(150)}
+        onChange={handleChange}
+        maxBytes={160}
+        attachedNftTokenId={tokenId}
+      />
+    )
+
+    const alert = screen.getByRole('alert')
+    expect(alert.textContent).toContain('La carga wire total con el NFT adjunto excede el límite del protocolo (221/212 bytes)')
+  })
 })

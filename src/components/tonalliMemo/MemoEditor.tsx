@@ -2,6 +2,7 @@ import { useId, useMemo } from 'react'
 import {
   MAX_TM1_SCRIPT_BYTES,
   TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES,
+  TM1_NFT_DIRECTIVE_BYTES,
   TM1_PROTOCOL_MAX_EVENT_DATA_BYTES,
   TM1_PROTOCOL_OVERHEAD_BYTES
 } from './types'
@@ -15,6 +16,8 @@ export interface MemoEditorProps {
   protocolMaxBytes?: number
   id?: string
   showOverheadDetails?: boolean
+  attachedNftTokenId?: string | null
+  wirePayloadBytes?: number
 }
 
 export function MemoEditor({
@@ -25,21 +28,28 @@ export function MemoEditor({
   maxBytes = TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES,
   protocolMaxBytes = TM1_PROTOCOL_MAX_EVENT_DATA_BYTES,
   id: customId,
-  showOverheadDetails = true
+  showOverheadDetails = true,
+  attachedNftTokenId,
+  wirePayloadBytes
 }: MemoEditorProps) {
   const generatedId = useId()
   const textareaId = customId || `memo-editor-${generatedId}`
   const counterId = `memo-counter-${textareaId}`
   const overheadId = `memo-overhead-${textareaId}`
 
-  // Real-time byte calculation via TextEncoder
+  // Real-time byte calculation via TextEncoder for the user-entered text
   const currentBytes = useMemo(() => {
     return new TextEncoder().encode(value).length
   }, [value])
 
+  const hasAttachment = Boolean(attachedNftTokenId)
+  const effectiveWireBytes = wirePayloadBytes ?? (hasAttachment ? currentBytes + TM1_NFT_DIRECTIVE_BYTES : currentBytes)
+
   const remainingBytes = maxBytes - currentBytes
-  const isOverLimit = currentBytes > maxBytes
-  const isNearLimit = currentBytes >= maxBytes * 0.85 && !isOverLimit
+  const isUserTextOverLimit = currentBytes > maxBytes
+  const isWireOverLimit = effectiveWireBytes > protocolMaxBytes
+  const isOverLimit = isUserTextOverLimit || isWireOverLimit
+  const isNearLimit = (currentBytes >= maxBytes * 0.85 || effectiveWireBytes >= protocolMaxBytes * 0.85) && !isOverLimit
 
   const percentUsed = Math.min(100, Math.round((currentBytes / maxBytes) * 100))
 
@@ -61,10 +71,19 @@ export function MemoEditor({
           <span className="byte-counter__divider">/</span>
           <span className="byte-counter__max">{maxBytes} bytes UTF-8</span>
           <span className="byte-counter__badge">
-            {isOverLimit
+            {isUserTextOverLimit
               ? `Excedido por ${currentBytes - maxBytes} B`
               : `${remainingBytes} B restantes`}
           </span>
+          {hasAttachment && (
+            <span
+              className={`byte-counter__attachment-badge ${isWireOverLimit ? 'error-text' : 'muted'}`}
+              data-testid="memo-attachment-overhead"
+              style={{ marginLeft: '0.5rem', fontSize: '0.85em' }}
+            >
+              +{TM1_NFT_DIRECTIVE_BYTES} B NFT ({effectiveWireBytes}/{protocolMaxBytes} B wire)
+            </span>
+          )}
         </div>
       </div>
 
@@ -91,9 +110,15 @@ export function MemoEditor({
         />
       </div>
 
-      {isOverLimit && (
+      {isUserTextOverLimit && (
         <p className="tx-meta error-text" role="alert">
           El mensaje excede el límite del borrador ({currentBytes}/{maxBytes} bytes). Por favor reduce el texto.
+        </p>
+      )}
+
+      {isWireOverLimit && !isUserTextOverLimit && (
+        <p className="tx-meta error-text" role="alert">
+          La carga wire total con el NFT adjunto excede el límite del protocolo ({effectiveWireBytes}/{protocolMaxBytes} bytes). Por favor reduce el texto.
         </p>
       )}
 
@@ -114,13 +139,26 @@ export function MemoEditor({
               <strong>{protocolMaxBytes} bytes</strong>
             </div>
             <div>
-              <span className="muted">Borrador de billetera:</span>
+              <span className="muted">Borrador de texto:</span>
               <strong>{maxBytes} bytes</strong>
             </div>
+            {hasAttachment && (
+              <>
+                <div>
+                  <span className="muted">Directiva NFT on-chain:</span>
+                  <strong>+{TM1_NFT_DIRECTIVE_BYTES} bytes</strong>
+                </div>
+                <div>
+                  <span className="muted">Wire total / protocolo:</span>
+                  <strong>{effectiveWireBytes}/{protocolMaxBytes} bytes</strong>
+                </div>
+              </>
+            )}
           </div>
           <p className="tx-meta muted">
             Descontando el marcador OP_RETURN (0x6a), identificador LOKAD &apos;TMM\0&apos; (5B),
             prefijo OP_PUSHDATA1 (2B), y cabecera de versión, evento e índice de autor (3B).
+            {hasAttachment && ' El NFT adjunto incluye la referencia on-chain @nft1:<tokenId>\\n (71 B).'}
           </p>
         </div>
       )}

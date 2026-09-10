@@ -81,6 +81,8 @@ describe('Tonalli Memo client', () => {
           profileCode: 'TONALLI',
           eventType: 'ANNOUNCEMENT',
           payload: 'Mensaje oficial',
+          displayPayload: 'Mensaje oficial',
+          attachment: null,
           chainStatus: 'CONFIRMED',
           blockHeight: 900001,
           timestamp: '2026-07-28T12:00:00.000Z'

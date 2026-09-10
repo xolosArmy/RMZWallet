@@ -5,6 +5,7 @@ import { fetchTonalliMemoTx } from '../integrations/tonalliMemo/client'
 import { formatTonalliMemoTimestamp } from '../integrations/tonalliMemo/format'
 import { isValidTonalliMemoTxid } from '../integrations/tonalliMemo/guards'
 import type { TonalliMemoTxDetail, TonalliMemoVerification } from '../integrations/tonalliMemo/types'
+import { MemoNftAttachmentCard } from '../components/tonalliMemo/MemoNftAttachmentCard'
 
 type DetailState =
   | { status: 'loading'; detail: TonalliMemoTxDetail | null }
@@ -54,7 +55,10 @@ function VerificationFields({ verification }: { verification: TonalliMemoVerific
           <p>{formatTonalliMemoTimestamp(verification.timestamp)}</p>
         </div>
       </div>
-      <p className="tx-message memo-payload">{verification.payload || '(sin payload)'}</p>
+      <p className="tx-message memo-payload">{verification.displayPayload || verification.payload || '(sin payload)'}</p>
+      {verification.attachment && (
+        <MemoNftAttachmentCard attachment={verification.attachment} />
+      )}
     </div>
   )
 }
@@ -175,7 +179,10 @@ function MemoTx() {
                 <p>{formatTonalliMemoTimestamp(state.detail.transaction.timestamp)}</p>
               </div>
             </div>
-            <p className="tx-message memo-payload">{state.detail.transaction.payload || '(sin payload)'}</p>
+            <p className="tx-message memo-payload">{state.detail.transaction.displayPayload || state.detail.transaction.payload || '(sin payload)'}</p>
+            {state.detail.transaction.attachment && (
+              <MemoNftAttachmentCard attachment={state.detail.transaction.attachment} />
+            )}
           </div>
           <VerificationFields verification={state.detail.verification} />
         </>
