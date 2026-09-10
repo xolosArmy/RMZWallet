@@ -203,4 +203,230 @@ describe('AgentWalletApprovalProvider (Gate 2B)', () => {
     const ledgerRecord = await ledger.get(VALID_REQUEST.requestId)
     expect(ledgerRecord?.status).toBe('rejected')
   })
+
+  it('single-flight guard: second concurrent handoff fails closed without corrupting the first or leaking handles', async () => {
+    const ledger = new InMemoryWalletApprovalLedger()
+    const sessionVerifier = {
+      async verifyActiveSession() {
+        return {
+          authenticated: true,
+          activeAddress: VALID_REQUEST.intent.fromAddress
+        }
+      }
+    }
+
+    let capturedHandler: ((bytes: Uint8Array) => Promise<HumanApprovalV1>) | null = null
+
+    render(
+      <AgentWalletApprovalProvider
+        enabled={true}
+        ledger={ledger}
+        sessionVerifier={sessionVerifier}
+        declaredOrigin="https://app.tonalli.cash"
+        clock={() => 1770000010}
+        idGenerator={() => 'id_single_flight'}
+      >
+        <TestConsumer onCapture={(fn) => { capturedHandler = fn }} />
+      </AgentWalletApprovalProvider>
+    )
+
+    const rawBytes = encodeAgentWalletHandoffV1(VALID_REQUEST)
+    const firstPromise = capturedHandler!(rawBytes)
+
+    await waitFor(() => {
+      expect(screen.getByTestId('agent-approval-modal')).toBeTruthy()
+    })
+
+    // Second concurrent handoff must fail closed immediately
+    const secondRequest: WalletApprovalRequestV1 = {
+      ...VALID_REQUEST,
+      requestId: 'wallet-req-provider-test-02',
+      intent: {
+        ...VALID_REQUEST.intent,
+        intentId: 'intent-provider-02',
+        nonce: 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0Ng'
+      },
+      policyDecision: {
+        ...VALID_REQUEST.policyDecision,
+        decisionId: 'cae-dec-02',
+        intentId: 'intent-provider-02'
+      }
+    }
+    const secondRawBytes = encodeAgentWalletHandoffV1(secondRequest)
+
+    await expect(capturedHandler!(secondRawBytes)).rejects.toThrow('CONCURRENT_HANDOFF_BLOCKED')
+
+    // First handoff is still intact and can be approved
+    const approveBtn = screen.getByTestId('approve-button')
+    fireEvent.click(approveBtn)
+
+    const receipt = await firstPromise
+    expect(receipt.status).toBe('approved')
+    expect(receipt.requestId).toBe(VALID_REQUEST.requestId)
+  })
+
+  it('double click: multiple clicks on approve button do not duplicate submission or trigger race errors', async () => {
+    const ledger = new InMemoryWalletApprovalLedger()
+    const sessionVerifier = {
+      async verifyActiveSession() {
+        return {
+          authenticated: true,
+          activeAddress: VALID_REQUEST.intent.fromAddress
+        }
+      }
+    }
+
+    let capturedHandler: ((bytes: Uint8Array) => Promise<HumanApprovalV1>) | null = null
+
+    render(
+      <AgentWalletApprovalProvider
+        enabled={true}
+        ledger={ledger}
+        sessionVerifier={sessionVerifier}
+        declaredOrigin="https://app.tonalli.cash"
+        clock={() => 1770000010}
+        idGenerator={() => 'id_double_click'}
+      >
+        <TestConsumer onCapture={(fn) => { capturedHandler = fn }} />
+      </AgentWalletApprovalProvider>
+    )
+
+    const rawBytes = encodeAgentWalletHandoffV1(VALID_REQUEST)
+    const approvalPromise = capturedHandler!(rawBytes)
+
+    await waitFor(() => {
+      expect(screen.getByTestId('agent-approval-modal')).toBeTruthy()
+    })
+
+    const approveBtn = screen.getByTestId('approve-button')
+    // Click twice rapidly
+    fireEvent.click(approveBtn)
+    fireEvent.click(approveBtn)
+
+    const receipt = await approvalPromise
+    expect(receipt.status).toBe('approved')
+
+    // Modal closes cleanly
+    await waitFor(() => {
+      expect(screen.queryByTestId('agent-approval-modal')).toBeNull()
+    })
+
+    // Ledger has exactly one record
+    expect(await ledger.has(VALID_REQUEST.requestId)).toBe(true)
+  })
+
+  it('dismiss during processing is ignored and does not execute dismiss/reject route after success', async () => {
+    const ledger = new InMemoryWalletApprovalLedger()
+    let resolveSessionVerifier!: (value: any) => void
+    const sessionVerifier = {
+      async verifyActiveSession() {
+        return new Promise<any>((resolve) => {
+          resolveSessionVerifier = resolve
+        })
+      }
+    }
+
+    let capturedHandler: ((bytes: Uint8Array) => Promise<HumanApprovalV1>) | null = null
+
+    render(
+      <AgentWalletApprovalProvider
+        enabled={true}
+        ledger={ledger}
+        sessionVerifier={sessionVerifier}
+        declaredOrigin="https://app.tonalli.cash"
+        clock={() => 1770000010}
+        idGenerator={() => 'id_dismiss_processing'}
+      >
+        <TestConsumer onCapture={(fn) => { capturedHandler = fn }} />
+      </AgentWalletApprovalProvider>
+    )
+
+    const rawBytes = encodeAgentWalletHandoffV1(VALID_REQUEST)
+    const approvalPromise = capturedHandler!(rawBytes)
+
+    await waitFor(() => {
+      expect(screen.getByTestId('agent-approval-modal')).toBeTruthy()
+    })
+
+    const approveBtn = screen.getByTestId('approve-button')
+    fireEvent.click(approveBtn)
+
+    // Button is now submitting
+    expect(approveBtn.textContent).toContain('Aprobando...')
+
+    // Attempt dismiss via backdrop during submission
+    const backdrop = screen.getByTestId('agent-approval-backdrop')
+    fireEvent.mouseDown(backdrop)
+
+    // Attempt dismiss via Escape key during submission
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    // Finish session verification
+    resolveSessionVerifier({
+      authenticated: true,
+      activeAddress: VALID_REQUEST.intent.fromAddress
+    })
+
+    const receipt = await approvalPromise
+    expect(receipt.status).toBe('approved')
+
+    // Ensure dismiss route was NOT triggered
+    await waitFor(() => {
+      expect(screen.queryByTestId('agent-approval-modal')).toBeNull()
+    })
+  })
+
+  it('exact handle cleanup: manual dismiss cleans up handle and rejects with USER_DISMISSED', async () => {
+    const ledger = new InMemoryWalletApprovalLedger()
+    const sessionVerifier = {
+      async verifyActiveSession() {
+        return {
+          authenticated: true,
+          activeAddress: VALID_REQUEST.intent.fromAddress
+        }
+      }
+    }
+
+    let capturedHandler: ((bytes: Uint8Array) => Promise<HumanApprovalV1>) | null = null
+
+    render(
+      <AgentWalletApprovalProvider
+        enabled={true}
+        ledger={ledger}
+        sessionVerifier={sessionVerifier}
+        declaredOrigin="https://app.tonalli.cash"
+        clock={() => 1770000010}
+        idGenerator={() => 'id_handle_cleanup'}
+      >
+        <TestConsumer onCapture={(fn) => { capturedHandler = fn }} />
+      </AgentWalletApprovalProvider>
+    )
+
+    const rawBytes = encodeAgentWalletHandoffV1(VALID_REQUEST)
+    const dismissPromise = capturedHandler!(rawBytes)
+
+    await waitFor(() => {
+      expect(screen.getByTestId('agent-approval-modal')).toBeTruthy()
+    })
+
+    // Dismiss via close button
+    const closeBtn = screen.getByRole('button', { name: /cerrar/i })
+    fireEvent.click(closeBtn)
+
+    await expect(dismissPromise).rejects.toThrow('USER_DISMISSED')
+
+    // Modal is removed
+    await waitFor(() => {
+      expect(screen.queryByTestId('agent-approval-modal')).toBeNull()
+    })
+
+    // Now a subsequent request can be submitted cleanly because handle and flight lock were cleaned up
+    const secondPromise = capturedHandler!(rawBytes)
+    await waitFor(() => {
+      expect(screen.getByTestId('agent-approval-modal')).toBeTruthy()
+    })
+    fireEvent.click(screen.getByTestId('approve-button'))
+    const receipt = await secondPromise
+    expect(receipt.status).toBe('approved')
+  })
 })

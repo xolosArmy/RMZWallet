@@ -358,4 +358,46 @@ describe('agentWalletApprovalReceiver (Gate 2B Hardening)', () => {
     // Empty payload
     await expect(receiver.prepareHandoff(new Uint8Array(0))).rejects.toThrow('INVALID_REQUEST_SCHEMA')
   })
+
+  test('single-flight guard: concurrent prepareHandoff call rejected with CONCURRENT_REVIEW_ACTIVE', async () => {
+    const ledger = new InMemoryWalletApprovalLedger()
+    const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
+    let idCounter = 1
+    const receiver = createAgentWalletApprovalReceiver({
+      ledger,
+      sessionVerifier,
+      clock: () => 1770000010,
+      idGenerator: () => `id_${idCounter++}`,
+      declaredOrigin: 'https://app.tonalli.cash'
+    })
+
+    const rawBytes = encodeAgentWalletHandoffV1(BASE_VALID_REQUEST)
+    const reviewState = await receiver.prepareHandoff(rawBytes)
+    expect(reviewState.handle).toBe('hnd_id_1')
+
+    // Second prepareHandoff while first is active must fail closed
+    const secondRawBytes = encodeAgentWalletHandoffV1({
+      ...BASE_VALID_REQUEST,
+      requestId: 'req-unit-test-002',
+      intent: {
+        ...BASE_VALID_REQUEST.intent,
+        intentId: 'intent-unit-test-002',
+        nonce: 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0Ng'
+      },
+      policyDecision: {
+        ...BASE_VALID_REQUEST.policyDecision,
+        decisionId: 'cae-unit-test-002',
+        intentId: 'intent-unit-test-002'
+      }
+    })
+
+    await expect(receiver.prepareHandoff(secondRawBytes)).rejects.toThrow('CONCURRENT_REVIEW_ACTIVE')
+
+    // Resolving first handle releases slot
+    await receiver.approveHandle(reviewState.handle)
+
+    // Now another handoff can be prepared cleanly
+    const secondReviewState = await receiver.prepareHandoff(secondRawBytes)
+    expect(secondReviewState.presentation.intentId).toBe('intent-unit-test-002')
+  })
 })

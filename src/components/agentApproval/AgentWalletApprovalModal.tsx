@@ -12,7 +12,7 @@
  *   or access Chronik/x402 settlement.
  */
 
-import { useState, useEffect, type ReactElement } from 'react'
+import { useState, useEffect, useCallback, type ReactElement } from 'react'
 import type { HumanApprovalV1 } from '@xolosarmy/tonalli-core'
 import type {
   AgentWalletApprovalReceiver,
@@ -56,28 +56,34 @@ export function AgentApprovalModal({
   const [showRejectInput, setShowRejectInput] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
+  const handleDismiss = useCallback(() => {
+    if (!isSubmitting) {
+      receiver.dismissHandle(handle)
+      onClose()
+    }
+  }, [isSubmitting, receiver, handle, onClose])
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !isSubmitting) {
-        receiver.dismissHandle(handle)
-        onClose()
+      if (event.key === 'Escape') {
+        handleDismiss()
       }
     }
     if (isOpen) {
       window.addEventListener('keydown', handleKeyDown)
     }
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [isOpen, isSubmitting, handle, receiver, onClose])
+  }, [isOpen, handleDismiss])
 
   if (!isOpen) return null
 
   const handleApprove = async () => {
+    if (isSubmitting) return
     setIsSubmitting(true)
     setErrorMessage(null)
     try {
       const receipt = await receiver.approveHandle(handle)
       onApprovalSuccess?.(receipt)
-      onClose()
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err))
       setErrorMessage(error.message)
@@ -88,6 +94,7 @@ export function AgentApprovalModal({
   }
 
   const handleReject = async () => {
+    if (isSubmitting) return
     setIsSubmitting(true)
     setErrorMessage(null)
     try {
@@ -95,20 +102,12 @@ export function AgentApprovalModal({
         reason: rejectReason.trim() ? rejectReason.trim() : undefined
       })
       onRejectionSuccess?.(receipt)
-      onClose()
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err))
       setErrorMessage(error.message)
       onError?.(error)
     } finally {
       setIsSubmitting(false)
-    }
-  }
-
-  const handleDismiss = () => {
-    if (!isSubmitting) {
-      receiver.dismissHandle(handle)
-      onClose()
     }
   }
 

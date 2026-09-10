@@ -325,6 +325,19 @@ function createAgentWalletApprovalReceiverInternal(
       )
     }
 
+    // 2b. Single-flight guard: prevent concurrent review sessions
+    for (const [existingHandle, existingSession] of activeSessions.entries()) {
+      if (existingSession.effectiveExpiresAt <= clock() || existingSession.lifecycle === 'STOP') {
+        activeSessions.delete(existingHandle)
+      }
+    }
+    if (activeSessions.size > 0) {
+      throw new WalletApprovalReceiverError(
+        'CONCURRENT_REVIEW_ACTIVE',
+        'Another review session is currently active. Concurrent handoffs are rejected to avoid overwriting state.'
+      )
+    }
+
     // 3. Strict semantic validation
     if (parsedRequest.contractVersion !== AGENTIC_CONTRACT_VERSION) {
       throw new WalletApprovalReceiverError(

@@ -15,7 +15,9 @@
 
 import {
   useCallback,
+  useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
   type ReactElement
@@ -26,6 +28,7 @@ import {
   type AgentWalletApprovalReceiver,
   type WalletApprovalLedger,
   type WalletApprovalPresentation,
+  type WalletApprovalReviewState,
   type WalletHumanSessionVerifier
 } from '../../features/agentWalletApprovalReceiver'
 import { AgentApprovalModal } from './AgentWalletApprovalModal'
@@ -49,8 +52,13 @@ export interface AgentWalletApprovalProviderProps {
 interface PendingApprovalState {
   readonly handle: string
   readonly presentation: WalletApprovalPresentation
-  readonly resolve: (receipt: HumanApprovalV1) => void
-  readonly reject: (error: Error) => void
+}
+
+interface ActiveFlightState {
+  handle: string
+  isSettled: boolean
+  resolve: (receipt: HumanApprovalV1) => void
+  reject: (error: Error) => void
 }
 
 export function AgentWalletApprovalProvider({
@@ -63,6 +71,7 @@ export function AgentWalletApprovalProvider({
   idGenerator
 }: AgentWalletApprovalProviderProps): ReactElement {
   const [pending, setPending] = useState<PendingApprovalState | null>(null)
+  const activeFlightRef = useRef<ActiveFlightState | null>(null)
 
   // Wallet-owned session verifier enforcing active authenticated wallet address
   const defaultSessionVerifier = useMemo<WalletHumanSessionVerifier>(() => ({
@@ -104,34 +113,95 @@ export function AgentWalletApprovalProvider({
       }
       if (!ledger) {
         throw new Error(
-          'MISSING_LEDGER_DEPENDENCY: Trusted WalletApprovalLedger must be provided to AgentWalletApprovalProvider.'
+          'MISSING_LEDGER_DEPENDENCY: Trusted WalletApprovalLedger must be provided to AgentWalletApprovalProvider. In-memory fallback in production is strictly forbidden.'
         )
       }
       if (!receiver) {
         throw new Error('RECEIVER_NOT_INITIALIZED: Approval receiver could not be initialized.')
       }
 
-      const reviewState = await receiver.prepareHandoff(rawHandoffBytes)
+      // Single-flight guard: prevent concurrent handoffs
+      if (activeFlightRef.current !== null) {
+        throw new Error(
+          'CONCURRENT_HANDOFF_BLOCKED: Another agent approval review is already in progress. Single-flight policy strictly enforced.'
+        )
+      }
 
-      return new Promise<HumanApprovalV1>((resolve, reject) => {
-        setPending({
-          handle: reviewState.handle,
-          presentation: reviewState.presentation,
-          resolve,
-          reject
-        })
+      let flightResolve!: (receipt: HumanApprovalV1) => void
+      let flightReject!: (error: Error) => void
+      const flightPromise = new Promise<HumanApprovalV1>((res, rej) => {
+        flightResolve = res
+        flightReject = rej
       })
+
+      const flightState: ActiveFlightState = {
+        handle: '',
+        isSettled: false,
+        resolve: (receipt: HumanApprovalV1) => {
+          if (flightState.isSettled) return
+          flightState.isSettled = true
+          activeFlightRef.current = null
+          setPending(null)
+          flightResolve(receipt)
+        },
+        reject: (error: Error) => {
+          if (flightState.isSettled) return
+          flightState.isSettled = true
+          activeFlightRef.current = null
+          setPending(null)
+          flightReject(error)
+        }
+      }
+      activeFlightRef.current = flightState
+
+      let reviewState: WalletApprovalReviewState
+      try {
+        reviewState = await receiver.prepareHandoff(rawHandoffBytes)
+      } catch (err) {
+        activeFlightRef.current = null
+        throw err
+      }
+
+      flightState.handle = reviewState.handle
+      setPending({
+        handle: reviewState.handle,
+        presentation: reviewState.presentation
+      })
+
+      return flightPromise
     },
     [enabled, ledger, receiver]
   )
 
   const handleClose = useCallback(() => {
-    if (pending && receiver) {
-      receiver.dismissHandle(pending.handle)
-      pending.reject(new Error('USER_DISMISSED'))
-      setPending(null)
+    const flight = activeFlightRef.current
+    if (flight && !flight.isSettled && receiver) {
+      if (flight.handle) {
+        try {
+          receiver.dismissHandle(flight.handle)
+        } catch {
+          // Ignore handle dismiss errors during cleanup
+        }
+      }
+      flight.reject(new Error('USER_DISMISSED'))
     }
-  }, [pending, receiver])
+  }, [receiver])
+
+  useEffect(() => {
+    return () => {
+      const flight = activeFlightRef.current
+      if (flight && !flight.isSettled && receiver) {
+        if (flight.handle) {
+          try {
+            receiver.dismissHandle(flight.handle)
+          } catch {
+            // Ignore handle dismiss errors during unmount cleanup
+          }
+        }
+        flight.reject(new Error('PROVIDER_UNMOUNTED'))
+      }
+    }
+  }, [receiver])
 
   const contextValue = useMemo<AgentWalletApprovalContextValue>(
     () => ({
@@ -150,16 +220,13 @@ export function AgentWalletApprovalProvider({
           presentation={pending.presentation}
           receiver={receiver}
           onApprovalSuccess={(receipt) => {
-            pending.resolve(receipt)
-            setPending(null)
+            activeFlightRef.current?.resolve(receipt)
           }}
           onRejectionSuccess={(receipt) => {
-            pending.resolve(receipt)
-            setPending(null)
+            activeFlightRef.current?.resolve(receipt)
           }}
           onError={(err) => {
-            pending.reject(err)
-            setPending(null)
+            activeFlightRef.current?.reject(err)
           }}
           onClose={handleClose}
         />

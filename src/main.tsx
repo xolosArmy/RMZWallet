@@ -30,6 +30,13 @@ createRoot(document.getElementById('root')!).render(
     <BrowserRouter>
       <WalletProvider>
         <TonalliX402ApprovalProvider>
+          {/*
+            CANONICAL WALLET-OWNED AGENT APPROVAL PROVIDER (Gate 2B)
+            Explicit Security Boundary:
+            AgentWalletApprovalProvider remains strictly non-operational (fails closed
+            with MISSING_LEDGER_DEPENDENCY) while it does not receive a trusted, durable ledger.
+            Zero in-memory fallback ledger in production.
+          */}
           <AgentWalletApprovalProvider>
             <App />
           </AgentWalletApprovalProvider>
