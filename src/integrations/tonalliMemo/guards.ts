@@ -1,4 +1,5 @@
 import type {
+  TonalliMemoAttachment,
   TonalliMemoFeed,
   TonalliMemoFeedItem,
   TonalliMemoTxDetail,
@@ -7,6 +8,7 @@ import type {
 } from './types'
 
 const TXID_RE = /^[0-9a-f]{64}$/
+const TOKEN_ID_RE = /^[0-9a-f]{64}$/
 const VERIFICATION_STATUSES = new Set<TonalliMemoVerificationStatus>([
   'VERIFIED',
   'UNAUTHORIZED',
@@ -19,7 +21,10 @@ type RecordValue = Record<string, unknown>
 
 type ConsensusFields = Pick<TonalliMemoFeedItem, 'chainStatus' | 'blockHeight' | 'timestamp'>
 
-type ProtocolFields = Pick<TonalliMemoFeedItem, 'profileAlias' | 'profileCode' | 'eventType' | 'payload'>
+type ProtocolFields = Pick<
+  TonalliMemoFeedItem,
+  'profileAlias' | 'profileCode' | 'eventType' | 'payload' | 'displayPayload' | 'attachment'
+>
 
 export function isValidTonalliMemoTxid(value: string) {
   return TXID_RE.test(value)
@@ -84,14 +89,57 @@ function parseConsensusFields(value: unknown): ConsensusFields | null {
   }
 }
 
+function parseAttachment(value: unknown): TonalliMemoAttachment | null | undefined {
+  if (value === null || value === undefined) {
+    return null
+  }
+  if (!isRecord(value)) {
+    return undefined
+  }
+  if (value.type !== 'NFT') {
+    return undefined
+  }
+  if (typeof value.tokenId !== 'string' || !TOKEN_ID_RE.test(value.tokenId)) {
+    return undefined
+  }
+  if (value.ownership !== 'VERIFIED_AT_INDEXING' && value.ownership !== 'UNVERIFIED') {
+    return undefined
+  }
+  return {
+    type: 'NFT',
+    tokenId: value.tokenId,
+    ownership: value.ownership
+  }
+}
+
+function parseDisplayPayload(record: RecordValue, fallbackPayload: string): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(record, 'displayPayload') || record.displayPayload === undefined) {
+    return fallbackPayload
+  }
+  if (typeof record.displayPayload === 'string') {
+    return record.displayPayload
+  }
+  return undefined
+}
+
 function parseProtocolFields(value: unknown): ProtocolFields | null {
   if (!isRecord(value)) return null
   const { profileAlias, profileCode } = profileFields(value)
+  const eventType = stringField(value, ['eventType', 'type'])
+  const payload = stringField(value, ['payload', 'memo', 'message'])
+  const displayPayload = parseDisplayPayload(value, payload)
+  if (displayPayload === undefined) return null
+
+  const attachment = parseAttachment(value.attachment)
+  if (attachment === undefined) return null
+
   return {
     profileAlias,
     profileCode,
-    eventType: stringField(value, ['eventType', 'type']),
-    payload: stringField(value, ['payload', 'memo', 'message'])
+    eventType,
+    payload,
+    displayPayload,
+    attachment
   }
 }
 
@@ -144,6 +192,8 @@ function parseFeedItem(value: unknown): TonalliMemoFeedItem | null {
     profileCode: verification.profileCode,
     eventType: verification.eventType,
     payload: verification.payload,
+    displayPayload: verification.displayPayload,
+    attachment: verification.attachment,
     ...consensus
   }
 }
@@ -184,13 +234,22 @@ export function parseTonalliMemoTxDetail(value: unknown, txid: string): TonalliM
   const verification = parseVerification(verificationValue, txid, consensus)
   if (verification === undefined) return null
 
-  const protocol = verification === null
-    ? parseProtocolFields(rawTransaction) ?? { profileAlias: '', profileCode: '', eventType: '', payload: '' }
+  const protocol: ProtocolFields = verification === null
+    ? parseProtocolFields(rawTransaction) ?? {
+        profileAlias: '',
+        profileCode: '',
+        eventType: '',
+        payload: '',
+        displayPayload: '',
+        attachment: null
+      }
     : {
         profileAlias: verification.profileAlias,
         profileCode: verification.profileCode,
         eventType: verification.eventType,
-        payload: verification.payload
+        payload: verification.payload,
+        displayPayload: verification.displayPayload,
+        attachment: verification.attachment
       }
 
   return {

@@ -4,6 +4,7 @@ import TopBar from '../components/TopBar'
 import { fetchTonalliMemoFeed } from '../integrations/tonalliMemo/client'
 import { abbreviateTxid, formatTonalliMemoTimestamp } from '../integrations/tonalliMemo/format'
 import type { TonalliMemoFeedItem } from '../integrations/tonalliMemo/types'
+import { MemoNftAttachmentCard } from '../components/tonalliMemo/MemoNftAttachmentCard'
 
 type FeedState =
   | { status: 'loading'; items: TonalliMemoFeedItem[] }
@@ -114,7 +115,14 @@ function MemoFeed() {
                   <p>{formatTonalliMemoTimestamp(item.timestamp)}</p>
                 </div>
               </div>
-              <p className="tx-message memo-payload">{item.payload || '(sin payload)'}</p>
+              {item.displayPayload ? (
+                <p className="tx-message memo-payload">{item.displayPayload}</p>
+              ) : !item.attachment ? (
+                <p className="tx-message memo-payload">(sin payload)</p>
+              ) : null}
+              {item.attachment && (
+                <MemoNftAttachmentCard attachment={item.attachment} />
+              )}
               <Link className="tx-address memo-tx-link" to={`/memo/tx/${item.txid}`} title={item.txid}>
                 {abbreviateTxid(item.txid)}
               </Link>

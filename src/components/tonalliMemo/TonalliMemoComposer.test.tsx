@@ -5,9 +5,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { TonalliMemoComposer } from './TonalliMemoComposer'
 import type { Tm1PublisherExecutor } from './types'
+import * as nftServiceModule from '../../services/nftService'
 
 afterEach(() => {
   cleanup()
+  vi.restoreAllMocks()
 })
 
 function createMockExecutor(overrides: Partial<Tm1PublisherExecutor> = {}): Tm1PublisherExecutor {
@@ -191,6 +193,184 @@ describe('TonalliMemoComposer Integration', () => {
       expect(mockExecutor.broadcastAndFinalize).toHaveBeenCalledTimes(2)
       // On second try it succeeds (mock resolved)
       expect(screen.getByTestId('publish-success-card')).toBeTruthy()
+    })
+  })
+
+  it('opens NFT selector modal, selects an NFT, and renders wire payload in canonical preview', async () => {
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    vi.spyOn(nftServiceModule, 'fetchOwnedNfts').mockResolvedValue([
+      {
+        tokenId,
+        name: 'Xolo Guía Espiritual',
+        imageUrl: 'https://ipfs.io/ipfs/QmXolo/image.png'
+      }
+    ])
+    vi.spyOn(nftServiceModule, 'fetchNftDetails').mockResolvedValue({
+      tokenId,
+      imageUrl: 'https://ipfs.io/ipfs/QmXolo/image.png',
+      metadata: { name: 'Xolo Guía Espiritual' }
+    })
+
+    const mockExecutor = createMockExecutor()
+    render(
+      <TonalliMemoComposer
+        executor={mockExecutor}
+        initialAlias="satoshi.xec"
+        initialOwnerAddress="ecash:qqtest123"
+        initialMessage="Acompañado de mi Xolo"
+      />
+    )
+
+    // Open modal
+    const attachBtn = screen.getByTestId('memo-attach-nft-btn')
+    fireEvent.click(attachBtn)
+
+    expect(screen.getByTestId('nft-selector-modal')).toBeTruthy()
+
+    // Wait for NFT item to appear
+    await waitFor(() => {
+      expect(screen.getByTestId(`nft-select-item-${tokenId}`)).toBeTruthy()
+      expect(screen.getByText('Xolo Guía Espiritual')).toBeTruthy()
+    })
+
+    // Click to select
+    fireEvent.click(screen.getByTestId(`nft-select-item-${tokenId}`))
+
+    // Modal closed, selected preview visible
+    expect(screen.queryByTestId('nft-selector-modal')).toBeNull()
+    expect(screen.getByTestId('memo-selected-nft-preview')).toBeTruthy()
+    expect(screen.getByTestId('memo-nft-selection')).toBeTruthy()
+    expect(screen.getByTestId('memo-nft-selection-badge').textContent).toBe('NFT seleccionado')
+    expect(screen.queryByText('NFT Verificado')).toBeNull()
+    expect(screen.queryByTestId('memo-nft-verified')).toBeNull()
+
+    // Wire payload encoded in preview: @nft1:8539...ff8\nAcompañado de mi Xolo
+    // 71 bytes directive + 22 bytes text = 93 bytes payload
+    const previewContent = screen.getByTestId('preview-active-content')
+    expect(previewContent.textContent).toContain('Payload: 93B')
+    const expectedHexDirective = Buffer.from(`@nft1:${tokenId}\n`).toString('hex')
+    expect(screen.getByTestId('envelope-hex').textContent).toContain(expectedHexDirective)
+
+    // Removing the NFT once details loaded
+    const removeBtn = await screen.findByTestId('memo-nft-remove-btn')
+    fireEvent.click(removeBtn)
+
+    expect(screen.queryByTestId('memo-selected-nft-preview')).toBeNull()
+    expect(screen.getByTestId('memo-attach-nft-btn')).toBeTruthy()
+  })
+
+  it('does NOT render "NFT Verificado" when an NFT is attached in the composer', async () => {
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    const mockExecutor = createMockExecutor()
+
+    render(
+      <TonalliMemoComposer
+        executor={mockExecutor}
+        initialAlias="satoshi.xec"
+        initialOwnerAddress="ecash:qqtest123"
+        initialMessage="Hola"
+        initialAttachedNft={{ tokenId, name: 'Mi Xolo' }}
+      />
+    )
+
+    expect(screen.getByTestId('memo-selected-nft-preview')).toBeTruthy()
+    expect(screen.getByTestId('memo-nft-selection-badge').textContent).toBe('NFT seleccionado')
+    expect(screen.queryByText('NFT Verificado')).toBeNull()
+    expect(screen.queryByTestId('memo-nft-verified')).toBeNull()
+    expect(screen.queryByText('No verificado')).toBeNull()
+  })
+
+  it('allows an NFT-only memo without message text', async () => {
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    vi.spyOn(nftServiceModule, 'fetchNftDetails').mockResolvedValue({
+      tokenId,
+      metadata: { name: 'Xolo #1' }
+    })
+
+    const mockExecutor = createMockExecutor()
+    render(
+      <TonalliMemoComposer
+        executor={mockExecutor}
+        initialAlias="satoshi.xec"
+        initialOwnerAddress="ecash:qqtest123"
+        initialMessage=""
+        initialAttachedNft={{ tokenId, name: 'Xolo #1' }}
+      />
+    )
+
+    // Even with empty text, the wire payload is "@nft1:...\n", which is valid TM1!
+    expect(screen.queryByTestId('preview-empty-state')).toBeNull()
+    const btn = screen.getByTestId('publish-button-idle') as HTMLButtonElement
+    expect(btn.disabled).toBe(false)
+  })
+
+  it('verifies JIT ownership and sends canonical wire payload to prepareAndSign during publish', async () => {
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    vi.spyOn(nftServiceModule, 'ownsNftChildToken').mockResolvedValue(true)
+    vi.spyOn(nftServiceModule, 'fetchNftDetails').mockResolvedValue({
+      tokenId,
+      metadata: { name: 'Xolo #1' }
+    })
+
+    const mockExecutor = createMockExecutor()
+    render(
+      <TonalliMemoComposer
+        executor={mockExecutor}
+        initialAlias="satoshi.xec"
+        initialOwnerAddress="ecash:qqtest123"
+        initialMessage="Publicación con NFT"
+        initialAttachedNft={{ tokenId, name: 'Xolo #1' }}
+      />
+    )
+
+    const publishBtn = screen.getByTestId('publish-button-idle')
+    fireEvent.click(publishBtn)
+
+    await waitFor(() => {
+      expect(mockExecutor.verifyOwnership).toHaveBeenCalled()
+      expect(nftServiceModule.ownsNftChildToken).toHaveBeenCalledWith('ecash:qqtest123', tokenId)
+      // prepareAndSign MUST receive canonical wire payload!
+      expect(mockExecutor.prepareAndSign).toHaveBeenCalledWith(
+        expect.anything(),
+        `@nft1:${tokenId}\nPublicación con NFT`,
+        expect.anything()
+      )
+      expect(mockExecutor.broadcastAndFinalize).toHaveBeenCalled()
+      expect(screen.getByTestId('publish-success-card')).toBeTruthy()
+    })
+  })
+
+  it('fails closed and blocks prepareAndSign if JIT ownership check returns false', async () => {
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    vi.spyOn(nftServiceModule, 'ownsNftChildToken').mockResolvedValue(false)
+    vi.spyOn(nftServiceModule, 'fetchNftDetails').mockResolvedValue({
+      tokenId,
+      metadata: { name: 'Xolo #1' }
+    })
+
+    const mockExecutor = createMockExecutor()
+    render(
+      <TonalliMemoComposer
+        executor={mockExecutor}
+        initialAlias="satoshi.xec"
+        initialOwnerAddress="ecash:qqtest123"
+        initialMessage="Publicación con NFT transferido"
+        initialAttachedNft={{ tokenId, name: 'Xolo #1' }}
+      />
+    )
+
+    const publishBtn = screen.getByTestId('publish-button-idle')
+    fireEvent.click(publishBtn)
+
+    await waitFor(() => {
+      expect(mockExecutor.verifyOwnership).toHaveBeenCalled()
+      expect(nftServiceModule.ownsNftChildToken).toHaveBeenCalledWith('ecash:qqtest123', tokenId)
+      // MUST NOT call prepareAndSign when JIT ownership fails!
+      expect(mockExecutor.prepareAndSign).not.toHaveBeenCalled()
+      expect(screen.getByTestId('publish-error-card')).toBeTruthy()
+      expect(screen.getByTestId('publish-error-message').textContent).toContain(
+        'El NFT seleccionado ya no se encuentra en la billetera activa'
+      )
     })
   })
 })

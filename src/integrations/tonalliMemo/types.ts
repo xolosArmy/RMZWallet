@@ -5,6 +5,12 @@ export type TonalliMemoVerificationStatus =
   | 'INVALID_MEMO'
   | 'MULTIPLE_MEMOS'
 
+export type TonalliMemoAttachment = {
+  type: 'NFT'
+  tokenId: string
+  ownership: 'VERIFIED_AT_INDEXING' | 'UNVERIFIED'
+}
+
 export type TonalliMemoFeedItem = {
   txid: string
   status: 'VERIFIED'
@@ -12,6 +18,8 @@ export type TonalliMemoFeedItem = {
   profileCode: string | null
   eventType: string
   payload: string
+  displayPayload: string
+  attachment: TonalliMemoAttachment | null
   chainStatus: string
   blockHeight: number | null
   timestamp: string | number | null
@@ -28,6 +36,8 @@ export type TonalliMemoVerification = {
   profileCode: string | null
   eventType: string
   payload: string
+  displayPayload: string
+  attachment: TonalliMemoAttachment | null
   chainStatus: string
   blockHeight: number | null
   timestamp: string | number | null
