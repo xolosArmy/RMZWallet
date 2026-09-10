@@ -9,7 +9,7 @@ export type TonalliMemoFeedItem = {
   txid: string
   status: 'VERIFIED'
   profileAlias: string
-  profileCode: string
+  profileCode: string | null
   eventType: string
   payload: string
   chainStatus: string
@@ -25,7 +25,7 @@ export type TonalliMemoVerification = {
   txid: string
   status: TonalliMemoVerificationStatus
   profileAlias: string
-  profileCode: string
+  profileCode: string | null
   eventType: string
   payload: string
   chainStatus: string
