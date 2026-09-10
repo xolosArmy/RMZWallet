@@ -14,7 +14,7 @@ import {
   type CollectionId
 } from '../domain/nftCollections'
 import { xolosWalletService } from './XolosWalletService'
-import { ipfsToCid, ipfsToGatewayUrl } from '../utils/ipfs'
+import { fetchIpfsJson, ipfsToCid, ipfsToGatewayUrl } from '../utils/ipfs'
 
 const NFT_CACHE_KEY = 'tonalli_nft_cache_v1'
 const SLP_NFT1_CHILD = 65
@@ -108,7 +108,8 @@ const cacheParent = (tokenId: string, parentId: string) => {
   })
 }
 
-const getCachedMetadata = (tokenId: string) => readCache().metadataByTokenId[tokenId]
+export const getCachedMetadata = (tokenId: string) => readCache().metadataByTokenId[tokenId]
+export const getCachedParent = (tokenId: string) => readCache().parentByTokenId[tokenId]
 
 const stableStringifyJson = (value: unknown): string => {
   if (value === null || typeof value !== 'object') {
@@ -239,7 +240,7 @@ export const mintXolosarmyNftChild = async (params: {
 
 export const fetchNftDetails = async (
   tokenId: string,
-  options: { refreshMetadata?: boolean } = {}
+  options: { refreshMetadata?: boolean; signal?: AbortSignal } = {}
 ): Promise<NftDetails> => {
   const cached = getCachedMetadata(tokenId)
   let metadata = options.refreshMetadata ? undefined : cached?.metadata
@@ -266,23 +267,12 @@ export const fetchNftDetails = async (
   }
 
   if (!metadata && tokenInfo?.genesisInfo?.url) {
-    const url = tokenInfo.genesisInfo.url
-    const httpUrl =
-      url.startsWith('http://') || url.startsWith('https://') ? url : ipfsToGatewayUrl(url) || ''
-    if (httpUrl) {
-      try {
-        const response = await fetch(httpUrl)
-        if (response.ok) {
-          metadata = (await response.json()) as Record<string, unknown>
-          cacheMetadata(tokenId, metadata, metadataCid)
-        } else if (shouldLogNftDebug()) {
-          console.warn('[NFT] Metadata fetch error', tokenId, response.status)
-        }
-      } catch (err) {
-        if (shouldLogNftDebug()) {
-          console.warn('[NFT] Metadata fetch error', tokenId, err)
-        }
-      }
+    const result = await fetchIpfsJson(tokenInfo.genesisInfo.url, {
+      signal: options.signal
+    })
+    if (result?.data) {
+      metadata = result.data as Record<string, unknown>
+      cacheMetadata(tokenId, metadata, metadataCid)
     }
   }
 
@@ -290,23 +280,35 @@ export const fetchNftDetails = async (
     metadata = cached.metadata
   }
 
-  const rawImage = metadata?.image ? String(metadata.image) : ''
+  const groupTokenId =
+    tokenInfo?.groupTokenId ||
+    getCachedParent(tokenId) ||
+    (typeof metadata?.parent === 'string' && /^[0-9a-fA-F]{64}$/.test(metadata.parent)
+      ? metadata.parent
+      : undefined)
+  if (groupTokenId) {
+    cacheParent(tokenId, groupTokenId)
+  }
+
+  const rawImage = metadata?.image ? String(metadata.image).trim() : ''
   const imageCid = rawImage ? ipfsToCid(rawImage) || undefined : undefined
-  const image =
-    rawImage && (rawImage.startsWith('http://') || rawImage.startsWith('https://'))
-      ? rawImage
-      : rawImage
-      ? ipfsToGatewayUrl(rawImage) || ''
-      : ''
+  let imageUrl = ''
+  if (rawImage) {
+    if (rawImage.startsWith('http://') || rawImage.startsWith('https://')) {
+      imageUrl = rawImage
+    } else {
+      imageUrl = ipfsToGatewayUrl(rawImage) || ''
+    }
+  }
 
   return {
     tokenId,
     metadata,
     metadataCid,
     imageCid,
-    imageUrl: image,
+    imageUrl,
     genesisInfo: tokenInfo?.genesisInfo,
-    groupTokenId: tokenInfo?.groupTokenId
+    groupTokenId
   }
 }
 
