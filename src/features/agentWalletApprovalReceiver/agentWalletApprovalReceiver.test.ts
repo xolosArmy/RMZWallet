@@ -4,6 +4,7 @@ import {
   createAgentWalletApprovalReceiver,
   createAgentWalletApprovalReceiverForTest
 } from './receiver'
+import { WalletApprovalReceiverError, type WalletApprovalReviewState } from './types'
 import {
   InMemoryWalletApprovalLedger,
   createMockSessionVerifier
@@ -399,5 +400,117 @@ describe('agentWalletApprovalReceiver (Gate 2B Hardening)', () => {
     // Now another handoff can be prepared cleanly
     const secondReviewState = await receiver.prepareHandoff(secondRawBytes)
     expect(secondReviewState.presentation.intentId).toBe('intent-unit-test-002')
+  })
+
+  test('single-flight guard: truly concurrent un-awaited prepareHandoff calls reject exactly one with CONCURRENT_REVIEW_ACTIVE', async () => {
+    const ledger = new InMemoryWalletApprovalLedger()
+    const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
+    let idCounter = 1
+    const receiver = createAgentWalletApprovalReceiver({
+      ledger,
+      sessionVerifier,
+      clock: () => 1770000010,
+      idGenerator: () => `id_${idCounter++}`,
+      declaredOrigin: 'https://app.tonalli.cash'
+    })
+
+    const firstRawBytes = encodeAgentWalletHandoffV1(BASE_VALID_REQUEST)
+    const secondRawBytes = encodeAgentWalletHandoffV1({
+      ...BASE_VALID_REQUEST,
+      requestId: 'req-unit-test-002',
+      intent: {
+        ...BASE_VALID_REQUEST.intent,
+        intentId: 'intent-unit-test-002',
+        nonce: 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0Ng'
+      },
+      policyDecision: {
+        ...BASE_VALID_REQUEST.policyDecision,
+        decisionId: 'cae-unit-test-002',
+        intentId: 'intent-unit-test-002'
+      }
+    })
+
+    // Dispatch both calls directly without awaiting the first
+    const firstPromise = receiver.prepareHandoff(firstRawBytes)
+    const secondPromise = receiver.prepareHandoff(secondRawBytes)
+
+    const results = await Promise.allSettled([firstPromise, secondPromise])
+
+    // Exactly one fulfilled, exactly one rejected
+    const fulfilled = results.filter((r) => r.status === 'fulfilled')
+    const rejected = results.filter((r) => r.status === 'rejected')
+
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+
+    // First one got the synchronous reservation and succeeded
+    expect(results[0].status).toBe('fulfilled')
+    // Second one was rejected with CONCURRENT_REVIEW_ACTIVE
+    expect(results[1].status).toBe('rejected')
+    if (results[1].status === 'rejected') {
+      expect(results[1].reason).toBeInstanceOf(WalletApprovalReceiverError)
+      expect((results[1].reason as WalletApprovalReceiverError).code).toBe('CONCURRENT_REVIEW_ACTIVE')
+    }
+
+    // Clean up active session
+    if (results[0].status === 'fulfilled') {
+      receiver.dismissHandle((results[0] as PromiseFulfilledResult<WalletApprovalReviewState>).value.handle)
+    }
+  })
+
+  test('single-flight slot is released when preparation fails validation', async () => {
+    const ledger = new InMemoryWalletApprovalLedger()
+    const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
+    let idCounter = 1
+    const receiver = createAgentWalletApprovalReceiver({
+      ledger,
+      sessionVerifier,
+      clock: () => 1770000010,
+      idGenerator: () => `id_${idCounter++}`,
+      declaredOrigin: 'https://app.tonalli.cash'
+    })
+
+    // An invalid handoff (e.g. unsupported network or future requestedAt)
+    const invalidFutureRequest = {
+      ...BASE_VALID_REQUEST,
+      requestedAt: 1770000020 // in future relative to clock 1770000010
+    }
+    const invalidBytes = encodeAgentWalletHandoffV1(invalidFutureRequest)
+
+    // Preparation fails with REQUEST_NOT_YET_VALID after reservation
+    await expect(receiver.prepareHandoff(invalidBytes)).rejects.toThrow('REQUEST_NOT_YET_VALID')
+
+    // Since reservation was released in finally block, a subsequent valid handoff must succeed
+    const validBytes = encodeAgentWalletHandoffV1(BASE_VALID_REQUEST)
+    const reviewState = await receiver.prepareHandoff(validBytes)
+    expect(reviewState.handle).toBe('hnd_id_1')
+    expect(reviewState.presentation.requestId).toBe(BASE_VALID_REQUEST.requestId)
+  })
+
+  test('single-flight slot is released after dismissHandle terminal cleanup', async () => {
+    const ledger = new InMemoryWalletApprovalLedger()
+    const sessionVerifier = createMockSessionVerifier(BASE_VALID_REQUEST.intent.fromAddress)
+    let idCounter = 1
+    const receiver = createAgentWalletApprovalReceiver({
+      ledger,
+      sessionVerifier,
+      clock: () => 1770000010,
+      idGenerator: () => `id_${idCounter++}`,
+      declaredOrigin: 'https://app.tonalli.cash'
+    })
+
+    const rawBytes = encodeAgentWalletHandoffV1(BASE_VALID_REQUEST)
+    const reviewState = await receiver.prepareHandoff(rawBytes)
+    expect(reviewState.handle).toBe('hnd_id_1')
+
+    // Second call rejected while first is active
+    await expect(receiver.prepareHandoff(rawBytes)).rejects.toThrow('CONCURRENT_REVIEW_ACTIVE')
+
+    // Dismiss the active handle
+    receiver.dismissHandle(reviewState.handle)
+
+    // After dismiss terminal cleanup, a new session can be prepared cleanly
+    const secondReviewState = await receiver.prepareHandoff(rawBytes)
+    expect(secondReviewState.handle).toBe('hnd_id_2')
   })
 })

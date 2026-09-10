@@ -8,6 +8,7 @@ import { useEffect } from 'react'
 import { AgentWalletApprovalProvider } from './AgentWalletApprovalProvider'
 import { useAgentWalletApproval } from './AgentWalletApprovalContext'
 import { InMemoryWalletApprovalLedger } from '../../features/agentWalletApprovalReceiver/testUtils'
+import type { WalletHumanSessionVerificationResult } from '../../features/agentWalletApprovalReceiver'
 import { encodeAgentWalletHandoffV1 } from '../../features/agentWalletHandoff'
 import type { HumanApprovalV1, WalletApprovalRequestV1 } from '@xolosarmy/tonalli-core'
 
@@ -317,10 +318,10 @@ describe('AgentWalletApprovalProvider (Gate 2B)', () => {
 
   it('dismiss during processing is ignored and does not execute dismiss/reject route after success', async () => {
     const ledger = new InMemoryWalletApprovalLedger()
-    let resolveSessionVerifier!: (value: any) => void
+    let resolveSessionVerifier!: (value: WalletHumanSessionVerificationResult) => void
     const sessionVerifier = {
       async verifyActiveSession() {
-        return new Promise<any>((resolve) => {
+        return new Promise<WalletHumanSessionVerificationResult>((resolve) => {
           resolveSessionVerifier = resolve
         })
       }

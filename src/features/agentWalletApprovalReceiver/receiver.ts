@@ -285,6 +285,7 @@ function createAgentWalletApprovalReceiverInternal(
 
   // Wallet-owned private active session store
   const activeSessions = new Map<string, ActiveReviewSession>()
+  let isPreparing = false
 
   // --------------------------------------------------------------------------
   // PREPARATION PIPELINE
@@ -331,14 +332,18 @@ function createAgentWalletApprovalReceiverInternal(
         activeSessions.delete(existingHandle)
       }
     }
-    if (activeSessions.size > 0) {
+    if (isPreparing || activeSessions.size > 0) {
       throw new WalletApprovalReceiverError(
         'CONCURRENT_REVIEW_ACTIVE',
         'Another review session is currently active. Concurrent handoffs are rejected to avoid overwriting state.'
       )
     }
 
-    // 3. Strict semantic validation
+    // Synchronously reserve preparation slot before first await
+    isPreparing = true
+
+    try {
+      // 3. Strict semantic validation
     if (parsedRequest.contractVersion !== AGENTIC_CONTRACT_VERSION) {
       throw new WalletApprovalReceiverError(
         'INVALID_CONTRACT_VERSION',
@@ -497,7 +502,10 @@ function createAgentWalletApprovalReceiverInternal(
       handle,
       presentation
     })
+  } finally {
+    isPreparing = false
   }
+}
 
   async function prepareRequest(requestInput: unknown): Promise<WalletApprovalReviewState> {
     const parsed = parseWalletApprovalRequestV1(requestInput)

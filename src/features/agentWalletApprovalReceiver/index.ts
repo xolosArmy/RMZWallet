@@ -28,4 +28,3 @@ export {
 } from './types'
 
 export { formatSatsToExactXEC } from './format'
-
