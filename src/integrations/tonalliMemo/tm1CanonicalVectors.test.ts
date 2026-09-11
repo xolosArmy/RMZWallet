@@ -70,7 +70,7 @@ describe('TM1 canonical wire protocol test vectors (Anti-Drift Gate)', () => {
         expect(validated.eventData).toBe(vector.eventDataUtf8)
         expect(validated.authorInputIndex).toBe(vector.authorInputIndex)
 
-        // If within wallet limit (<= 80 bytes), RMZWallet's encodeTm1Draft02Post produces identical scriptHex
+        // If within wallet/protocol eventData limit, RMZWallet's encodeTm1Draft02Post produces identical scriptHex
         if (vector.eventDataByteLength <= TM1_DRAFT_02_WALLET_MAX_EVENT_DATA_BYTES) {
           const walletPreview = encodeTm1Draft02Post({
             eventData: vector.eventDataUtf8,

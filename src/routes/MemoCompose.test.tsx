@@ -147,7 +147,7 @@ describe('MemoCompose Route', () => {
   })
 
   describe('Finding 3: Canonical preview error keeps publish button disabled', () => {
-    it('disables the publish button when canonical encoding throws an error (>80 bytes)', async () => {
+    it('disables the publish button when canonical encoding throws an error (>212 bytes)', async () => {
       mockWallet.alias = 'satoshixolos.xec'
       const mockExecutor = createMockExecutor()
 
@@ -175,13 +175,13 @@ describe('MemoCompose Route', () => {
       expect(publishBtn.disabled).toBe(false)
       expect(screen.getByTestId('preview-active-content')).toBeTruthy()
 
-      // Exceed canonical 80 bytes (e.g. 85 bytes) -> preview error and disabled
-      const tooLongMessage = 'X'.repeat(85)
+      // Exceed canonical 212-byte protocol ceiling -> preview error and disabled
+      const tooLongMessage = 'X'.repeat(213)
       fireEvent.change(textarea, { target: { value: tooLongMessage } })
 
       expect(publishBtn.disabled).toBe(true)
       expect(screen.getByTestId('preview-error-state')).toBeTruthy()
-      expect(screen.getByTestId('preview-error-state').textContent).toContain('85 bytes UTF-8')
+      expect(screen.getByTestId('preview-error-state').textContent).toContain('213 bytes UTF-8')
     })
   })
 

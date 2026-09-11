@@ -44,13 +44,20 @@ describe('CanonicalPayloadPreview Component', () => {
     expect(scriptHex?.startsWith('6a04544d4d00')).toBe(true)
   })
 
-  it('displays error state when message is too long', () => {
-    const tooLong = 'x'.repeat(81) // exceeds wallet max of 80 bytes
-    render(<CanonicalPayloadPreview message={tooLong} />)
+  it('encodes a full 212-byte protocol payload and rejects 213 bytes', () => {
+    const exact212 = 'x'.repeat(212)
+    const { rerender } = render(<CanonicalPayloadPreview message={exact212} />)
+
+    expect(screen.getByTestId('preview-active-content')).toBeTruthy()
+    expect(screen.getByTestId('preview-active-content').textContent).toContain('Payload: 212B')
+    expect(screen.queryByTestId('preview-error-state')).toBeNull()
+
+    rerender(<CanonicalPayloadPreview message={'x'.repeat(213)} />)
 
     const errorBox = screen.getByTestId('preview-error-state')
     expect(errorBox).toBeTruthy()
     expect(errorBox.textContent).toContain('Error de codificación canónica')
+    expect(errorBox.textContent).toContain('213 bytes UTF-8')
     expect(screen.queryByTestId('preview-active-content')).toBeNull()
   })
 

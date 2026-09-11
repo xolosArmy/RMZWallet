@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import {
   encodeTm1Draft02Post,
+  TM1_DRAFT_02_PROTOCOL_MAX_EVENT_DATA_BYTES,
   type Tm1Draft02PostPreview
 } from '../../integrations/tonalliMemo/tm1Draft02'
 
@@ -31,7 +32,8 @@ export function CanonicalPayloadPreview({
     try {
       const p = encodeTm1Draft02Post({
         eventData: message,
-        authorInputIndex
+        authorInputIndex,
+        maxEventDataBytes: TM1_DRAFT_02_PROTOCOL_MAX_EVENT_DATA_BYTES
       })
       return { preview: p, error: null }
     } catch (err) {
