@@ -321,4 +321,77 @@ describe('Tonalli Memo routes', () => {
 
     expect(vi.mocked(globalThis.fetch).mock.calls.map(([url]) => String(url)).join('\\n')).not.toContain('/api/v1/admin/index')
   })
+
+  test('feed renders clickable safe hyperlinks for URLs in displayPayload', async () => {
+    const itemWithUrl = {
+      ...item,
+      payload: 'Visita https://xolosarmy.xyz para ver el protocolo.',
+      displayPayload: 'Visita https://xolosarmy.xyz para ver el protocolo.'
+    }
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ items: [{ transaction: itemWithUrl, verification: itemWithUrl }] })
+    )
+
+    renderAt('/memo', <MemoFeed />)
+
+    const link = await screen.findByRole('link', { name: 'https://xolosarmy.xyz' })
+    expect(link).toBeTruthy()
+    expect(link.getAttribute('href')).toBe('https://xolosarmy.xyz/')
+    expect(link.getAttribute('target')).toBe('_blank')
+    expect(link.getAttribute('rel')).toBe('noopener noreferrer nofollow ugc')
+    expect(screen.getByText(/Visita/)).toBeTruthy()
+    expect(screen.getByText(/para ver el protocolo\./)).toBeTruthy()
+  })
+
+  test('detail route renders clickable safe hyperlinks in transaction and verification displayPayload', async () => {
+    const itemWithUrl = {
+      ...item,
+      payload: 'Ver docs en https://e.cash/build ahora!',
+      displayPayload: 'Ver docs en https://e.cash/build ahora!'
+    }
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ transaction: itemWithUrl, verification: itemWithUrl })
+    )
+
+    renderAt(`/memo/tx/${TXID}`, (
+      <Routes>
+        <Route path="/memo/tx/:txid" element={<MemoTx />} />
+      </Routes>
+    ))
+
+    const links = await screen.findAllByRole('link', { name: 'https://e.cash/build' })
+    expect(links.length).toBeGreaterThanOrEqual(2) // Once in transaction, once in verification
+    for (const link of links) {
+      expect(link.getAttribute('href')).toBe('https://e.cash/build')
+      expect(link.getAttribute('target')).toBe('_blank')
+      expect(link.getAttribute('rel')).toBe('noopener noreferrer nofollow ugc')
+    }
+  })
+
+  test('feed handles coexistence of clickable URL and verified NFT attachment', async () => {
+    const attachedTokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    const itemWithUrlAndNft = {
+      ...item,
+      payload: `@nft1:${attachedTokenId}\nExplora https://xolosarmy.xyz con tu NFT`,
+      displayPayload: 'Explora https://xolosarmy.xyz con tu NFT',
+      attachment: {
+        type: 'NFT',
+        tokenId: attachedTokenId,
+        ownership: 'VERIFIED_AT_INDEXING'
+      }
+    }
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ items: [{ transaction: itemWithUrlAndNft, verification: itemWithUrlAndNft }] })
+    )
+
+    renderAt('/memo', <MemoFeed />)
+
+    const link = await screen.findByRole('link', { name: 'https://xolosarmy.xyz' })
+    expect(link).toBeTruthy()
+    expect(link.getAttribute('href')).toBe('https://xolosarmy.xyz/')
+    expect(screen.getByTestId('memo-nft-verified')).toBeTruthy()
+  })
 })
