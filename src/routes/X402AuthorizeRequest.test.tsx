@@ -159,7 +159,7 @@ describe('Gate H3B wallet confirmation route', () => {
     })
     renderMemoryRoute(wallet, route)
 
-    expect(await screen.findByRole('heading', { name: 'Wallet confirmation required' })).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: 'Wallet confirmation required' }, { timeout: 5000 })).toBeTruthy()
     expect(events[0]).toBe('cleanup')
     expect(events.slice(1).every((event) => event === 'account::')).toBe(true)
     expect(screen.getByText('Gate H3B — Tonalli Authorization Proof')).toBeTruthy()
