@@ -6,9 +6,10 @@ import {
 import type { Tm1PublicationRecoveryStore } from '../../integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
 import { getChronik } from '../../services/ChronikClient'
 import {
-  TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES,
+  TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES,
   TM1_PROTOCOL_MAX_EVENT_DATA_BYTES,
   buildTm1WirePayload,
+  tm1EffectiveUserMessageMaxBytes,
   type Tm1AttachedNft,
   type Tm1PublisherExecutor,
   type Tm1PublishPhase,
@@ -34,7 +35,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     throw new Error('EXECUTOR_REQUIRED: useTm1PublishMachine requires an explicit Tm1PublisherExecutor')
   }
 
-  const maxBytes = options.maxBytes ?? TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES
+  const maxBytes = options.maxBytes ?? TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES
   const [message, setMessage] = useState(options.initialMessage ?? '')
   const [attachedNft, setAttachedNftState] = useState<Tm1AttachedNft | null>(
     options.initialAttachedNft ?? null
@@ -170,9 +171,17 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     return new TextEncoder().encode(wirePayload).length
   }, [wirePayload])
 
-  // Byte limit checks: user message must be <= maxBytes (Section B, Adjustment 2)
-  // Total wire payload must be <= 212 bytes (TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
-  const isUserMessageOverLimit = userMessageByteLength > maxBytes
+  // Policy ceiling (`options.maxBytes`) is reserved independently of NFT overhead.
+  // The effective user-text budget shrinks by the NFT directive when attached.
+  const effectiveUserMessageMaxBytes = tm1EffectiveUserMessageMaxBytes(
+    maxBytes,
+    Boolean(attachedNft)
+  )
+
+  // Byte limit checks: user message must be <= effectiveUserMessageMaxBytes.
+  // Total wire payload must be <= 212 bytes (TM1_PROTOCOL_MAX_EVENT_DATA_BYTES).
+  // Both validations remain independent; publish is impossible if either fails.
+  const isUserMessageOverLimit = userMessageByteLength > effectiveUserMessageMaxBytes
   const isWirePayloadOverLimit = wirePayloadByteLength > TM1_PROTOCOL_MAX_EVENT_DATA_BYTES
   const isOverLimit = isUserMessageOverLimit || isWirePayloadOverLimit
   const byteLength = userMessageByteLength
@@ -180,6 +189,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
   // Canonical payload preview calculation in real time using the canonical encoder as sole authority.
   // Encodes wirePayload (Section A, C). When an NFT is attached with empty text, wirePayload is '@nft1:...\n'
   // which is non-empty and valid according to TM1 protocol canonical rules.
+  // The encoder always validates the protocol wire ceiling (212 B), never the wallet text policy.
   const { preview, previewError } = useMemo<{
     preview: ReturnType<typeof encodeTm1Draft02Post> | null
     previewError: string | undefined
@@ -188,14 +198,10 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       return { preview: null, previewError: undefined }
     }
     try {
-      const maxEventDataBytes = attachedNft
-        ? TM1_PROTOCOL_MAX_EVENT_DATA_BYTES
-        : Math.min(maxBytes, TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
-
       const encoded = encodeTm1Draft02Post({
         eventData: wirePayload,
         authorInputIndex: 0,
-        maxEventDataBytes
+        maxEventDataBytes: TM1_PROTOCOL_MAX_EVENT_DATA_BYTES
       })
       return { preview: encoded, previewError: undefined }
     } catch (err) {
@@ -210,7 +216,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
         previewError: msg
       }
     }
-  }, [wirePayload, attachedNft, maxBytes])
+  }, [wirePayload])
 
   const isValidAttachedToken = !attachedNft || /^[0-9a-f]{64}$/.test(attachedNft.tokenId.toLowerCase())
 
@@ -500,6 +506,9 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     previewError: previewError ?? null,
     byteLength,
     maxBytes,
+    effectiveUserMessageMaxBytes,
+    isUserMessageOverLimit,
+    isWirePayloadOverLimit,
     isOverLimit,
     isValid,
     pendingRecord

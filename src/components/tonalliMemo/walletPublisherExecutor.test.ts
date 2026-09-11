@@ -1126,6 +1126,28 @@ describe('walletPublisherExecutor components', () => {
       }
     })
 
+    it('accepts exact plain 212-byte payload and rejects 213-byte plain payload', async () => {
+      const transport = new ChronikNetworkTransport({ chronik: { broadcastTx: vi.fn() } as never })
+      const signer = new WalletSigner({
+        address: testAddress,
+        signatory: testSignatory,
+        utxos: testUtxos
+      })
+      const executor = new WalletPublisherExecutor({ transport, signer })
+
+      const payload212 = 'p'.repeat(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
+      expect(new TextEncoder().encode(payload212).length).toBe(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
+
+      const result212 = await executor.prepareAndSign({ authorized: true }, payload212)
+      const prep212 = result212.preparedReview as { preview: { eventDataByteLength: number; eventData: string } }
+      expect(prep212.preview.eventDataByteLength).toBe(212)
+      expect(prep212.preview.eventData).toBe(payload212)
+
+      await expect(
+        executor.prepareAndSign({ authorized: true }, 'p'.repeat(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES + 1))
+      ).rejects.toThrowError(Tm1Draft02EncodingError)
+    })
+
     it('accepts plain text message > 80 bytes but <= 212 bytes (protocol limit, not UI limit)', async () => {
       const transport = new ChronikNetworkTransport({ chronik: { broadcastTx: vi.fn() } as never })
       const signer = new WalletSigner({

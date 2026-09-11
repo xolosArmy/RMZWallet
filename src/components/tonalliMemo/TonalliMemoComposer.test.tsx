@@ -4,7 +4,13 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { TonalliMemoComposer } from './TonalliMemoComposer'
-import type { Tm1PublisherExecutor } from './types'
+import {
+  TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES,
+  TM1_NFT_DIRECTIVE_BYTES,
+  TM1_PROTOCOL_MAX_EVENT_DATA_BYTES,
+  tm1EffectiveUserMessageMaxBytes,
+  type Tm1PublisherExecutor
+} from './types'
 import * as nftServiceModule from '../../services/nftService'
 
 afterEach(() => {
@@ -47,6 +53,9 @@ describe('TonalliMemoComposer Integration', () => {
     // Publish button disabled when empty
     const btn = screen.getByTestId('publish-button-idle') as HTMLButtonElement
     expect(btn.disabled).toBe(true)
+
+    const counter = screen.getByTestId('memo-byte-counter')
+    expect(counter.textContent).toContain(`0/${TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES} bytes UTF-8`)
   })
 
   it('updates preview and enables publish button when user types a message', () => {
@@ -393,5 +402,157 @@ describe('TonalliMemoComposer Integration', () => {
 
     // Detected link pill is rendered below textarea
     expect(screen.getByTestId('memo-detected-links').textContent).toContain('https://xolosarmy.xyz')
+  })
+
+  it('uses the machine effective limit: 212 without NFT, 141 with NFT, and restores 212 on removal without truncating', async () => {
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    vi.spyOn(nftServiceModule, 'fetchOwnedNfts').mockResolvedValue([
+      { tokenId, name: 'Xolo Guía Espiritual', imageUrl: 'https://ipfs.io/ipfs/QmXolo/image.png' }
+    ])
+    vi.spyOn(nftServiceModule, 'fetchNftDetails').mockResolvedValue({
+      tokenId,
+      imageUrl: 'https://ipfs.io/ipfs/QmXolo/image.png',
+      metadata: { name: 'Xolo Guía Espiritual' }
+    })
+
+    const mockExecutor = createMockExecutor()
+    const text180 = 'a'.repeat(180)
+    render(
+      <TonalliMemoComposer
+        executor={mockExecutor}
+        initialAlias="satoshi.xec"
+        initialOwnerAddress="ecash:qqtest123"
+        initialMessage={text180}
+      />
+    )
+
+    const nftBudget = tm1EffectiveUserMessageMaxBytes(TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES, true)
+    expect(nftBudget).toBe(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES - TM1_NFT_DIRECTIVE_BYTES)
+
+    const textarea = screen.getByRole('textbox', { name: /mensaje de tonalli memo/i }) as HTMLTextAreaElement
+    expect(textarea.value).toBe(text180)
+    expect(screen.getByTestId('memo-byte-counter').textContent).toContain(
+      `180/${TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES} bytes UTF-8`
+    )
+    expect((screen.getByTestId('publish-button-idle') as HTMLButtonElement).disabled).toBe(false)
+
+    fireEvent.click(screen.getByTestId('memo-attach-nft-btn'))
+    await waitFor(() => {
+      expect(screen.getByTestId(`nft-select-item-${tokenId}`)).toBeTruthy()
+    })
+    fireEvent.click(screen.getByTestId(`nft-select-item-${tokenId}`))
+
+    expect(textarea.value).toBe(text180)
+    expect(screen.getByTestId('memo-byte-counter').textContent).toContain(`180/${nftBudget} bytes UTF-8`)
+    expect(screen.getByTestId('memo-byte-counter').className).toContain('byte-counter--error')
+    expect(screen.getByTestId('memo-overhead-breakdown').textContent).toContain(
+      `${180 + TM1_NFT_DIRECTIVE_BYTES}/${TM1_PROTOCOL_MAX_EVENT_DATA_BYTES} bytes`
+    )
+    expect((screen.getByTestId('publish-button-idle') as HTMLButtonElement).disabled).toBe(true)
+
+    const removeBtn = await screen.findByTestId('memo-nft-remove-btn')
+    fireEvent.click(removeBtn)
+
+    expect(textarea.value).toBe(text180)
+    expect(screen.getByTestId('memo-byte-counter').textContent).toContain(
+      `180/${TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES} bytes UTF-8`
+    )
+    expect(screen.getByTestId('memo-byte-counter').className).not.toContain('byte-counter--error')
+    expect((screen.getByTestId('publish-button-idle') as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('keeps NFT + 141 B user text publishable and blocks NFT + 142 B', () => {
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    vi.spyOn(nftServiceModule, 'fetchNftDetails').mockResolvedValue({
+      tokenId,
+      metadata: { name: 'Xolo #1' }
+    })
+    const mockExecutor = createMockExecutor()
+    const nftBudget = TM1_PROTOCOL_MAX_EVENT_DATA_BYTES - TM1_NFT_DIRECTIVE_BYTES
+
+    render(
+      <TonalliMemoComposer
+        executor={mockExecutor}
+        initialAlias="satoshi.xec"
+        initialOwnerAddress="ecash:qqtest123"
+        initialMessage={'a'.repeat(nftBudget)}
+        initialAttachedNft={{ tokenId, name: 'Xolo #1' }}
+      />
+    )
+
+    expect(screen.getByTestId('memo-byte-counter').textContent).toContain(`${nftBudget}/${nftBudget} bytes UTF-8`)
+    expect((screen.getByTestId('publish-button-idle') as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.getByTestId('preview-active-content').textContent).toContain('Payload: 212B')
+
+    const textarea = screen.getByRole('textbox', { name: /mensaje de tonalli memo/i })
+    fireEvent.change(textarea, { target: { value: 'a'.repeat(nftBudget + 1) } })
+
+    expect((screen.getByTestId('publish-button-idle') as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByTestId('preview-error-state').textContent).toContain('213 bytes UTF-8')
+  })
+
+  it('publishes a long URL that previously exceeded the 80 B wallet policy without altering the signed payload', async () => {
+    const mockExecutor = createMockExecutor()
+    const longUrl =
+      'https://xolosarmy.xyz/tonalli-memo/protocol/tm1-draft-02/event-data/full-capacity?ref=composer-byte-limit'
+    const urlBytes = new TextEncoder().encode(longUrl).length
+    expect(urlBytes).toBeGreaterThan(80)
+    expect(urlBytes).toBeLessThanOrEqual(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
+
+    render(
+      <TonalliMemoComposer
+        executor={mockExecutor}
+        initialAlias="satoshi.xec"
+        initialOwnerAddress="ecash:qqtest123"
+        initialMessage={longUrl}
+      />
+    )
+
+    const textarea = screen.getByRole('textbox', { name: /mensaje de tonalli memo/i }) as HTMLTextAreaElement
+    expect(textarea.value).toBe(longUrl)
+    expect(screen.getByTestId('memo-byte-counter').textContent).toContain(
+      `${urlBytes}/${TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES} bytes UTF-8`
+    )
+    expect(screen.getByTestId('memo-detected-links').textContent).toContain(longUrl)
+
+    const envelopeHex = screen.getByTestId('envelope-hex').textContent ?? ''
+    const expectedRawHex = Array.from(new TextEncoder().encode(longUrl))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('')
+    expect(envelopeHex).toContain(expectedRawHex)
+    expect(envelopeHex).not.toContain('3c61')
+
+    const publishBtn = screen.getByTestId('publish-button-idle') as HTMLButtonElement
+    expect(publishBtn.disabled).toBe(false)
+    fireEvent.click(publishBtn)
+
+    await waitFor(() => {
+      expect(mockExecutor.prepareAndSign).toHaveBeenCalledWith(
+        expect.anything(),
+        longUrl,
+        expect.anything()
+      )
+      expect(screen.getByTestId('publish-success-card')).toBeTruthy()
+    })
+  })
+
+  it('accepts exact plain 212 B in canonical preview and rejects 213 B', () => {
+    const mockExecutor = createMockExecutor()
+    render(
+      <TonalliMemoComposer
+        executor={mockExecutor}
+        initialAlias="satoshi.xec"
+        initialMessage={'a'.repeat(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)}
+      />
+    )
+
+    expect(screen.getByTestId('preview-active-content').textContent).toContain('Payload: 212B')
+    expect((screen.getByTestId('publish-button-idle') as HTMLButtonElement).disabled).toBe(false)
+
+    const textarea = screen.getByRole('textbox', { name: /mensaje de tonalli memo/i })
+    fireEvent.change(textarea, { target: { value: 'a'.repeat(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES + 1) } })
+
+    expect(screen.getByTestId('preview-error-state').textContent).toContain('213 bytes UTF-8')
+    expect((screen.getByTestId('publish-button-idle') as HTMLButtonElement).disabled).toBe(true)
   })
 })

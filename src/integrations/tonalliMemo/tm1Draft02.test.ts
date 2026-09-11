@@ -32,13 +32,26 @@ describe('TM1 Draft 0.2 preview encoder', () => {
     expect(preview.envelopeHex.startsWith('010107')).toBe(true)
   })
 
-  it('uses OP_PUSHDATA1 at the product limit and stays below the protocol script limit', () => {
+  it('uses OP_PUSHDATA1 at the product limit and stays at the protocol script limit', () => {
     const preview = encodeTm1Draft02Post({ eventData: 'a'.repeat(TM1_DRAFT_02_WALLET_MAX_EVENT_DATA_BYTES) })
 
-    expect(preview.eventDataByteLength).toBe(80)
-    expect(preview.envelopeByteLength).toBe(83)
-    expect(preview.scriptHex.startsWith(`6a04${TM1_DRAFT_02_LOKAD_ID_HEX}4c53`)).toBe(true)
-    expect(preview.scriptByteLength).toBe(91)
+    expect(preview.eventDataByteLength).toBe(212)
+    expect(preview.envelopeByteLength).toBe(215)
+    expect(preview.scriptHex.startsWith(`6a04${TM1_DRAFT_02_LOKAD_ID_HEX}4cd7`)).toBe(true)
+    expect(preview.scriptByteLength).toBe(223)
+  })
+
+  it('accepts exact 212 B eventData and rejects 213 B', () => {
+    const exact = encodeTm1Draft02Post({ eventData: 'a'.repeat(212) })
+    expect(exact.eventDataByteLength).toBe(212)
+    expect(exact.scriptByteLength).toBe(223)
+
+    expect(() => encodeTm1Draft02Post({ eventData: 'a'.repeat(213) })).toThrowError(Tm1Draft02EncodingError)
+    try {
+      encodeTm1Draft02Post({ eventData: 'a'.repeat(213) })
+    } catch (error) {
+      expect((error as Tm1Draft02EncodingError).code).toBe('EVENT_DATA_TOO_LARGE')
+    }
   })
 
   it('rejects empty data, oversized data, and invalid input indexes with stable codes', () => {

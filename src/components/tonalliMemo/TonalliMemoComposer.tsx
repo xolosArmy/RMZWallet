@@ -155,7 +155,7 @@ export function TonalliMemoComposer({
           value={state.message}
           onChange={setMessage}
           disabled={isFormDisabled || state.phase === 'success'}
-          maxBytes={state.maxBytes}
+          maxBytes={state.effectiveUserMessageMaxBytes}
           showOverheadDetails={true}
           attachedNftTokenId={state.attachedNft?.tokenId}
           wirePayloadBytes={state.wirePayloadByteLength}

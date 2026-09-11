@@ -5,7 +5,13 @@ import { renderHook, act, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { useTm1PublishMachine } from './useTm1PublishMachine'
 import TonalliMemoComposer from './TonalliMemoComposer'
-import type { Tm1PublisherExecutor } from './types'
+import {
+  TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES,
+  TM1_NFT_DIRECTIVE_BYTES,
+  TM1_PROTOCOL_MAX_EVENT_DATA_BYTES,
+  tm1EffectiveUserMessageMaxBytes,
+  type Tm1PublisherExecutor
+} from './types'
 import * as nftServiceModule from '../../services/nftService'
 
 function createMockExecutor(overrides: Partial<Tm1PublisherExecutor> = {}): Tm1PublisherExecutor {
@@ -80,10 +86,27 @@ describe('useTm1PublishMachine Hook', () => {
       expect(result.current.state.isValid).toBe(true)
     })
 
-    it('marks isValid false when canonical encoding fails (e.g. exceeds strict 80-byte encoder limit)', () => {
+    it('marks isValid true for a plain 81-byte message now within the 212 B protocol ceiling', () => {
       const mockExecutor = createMockExecutor()
-      // 81 bytes exceeds the strict 80-byte Draft 0.2 limit
-      const overLimitMessage = 'A'.repeat(81)
+      const message = 'A'.repeat(81)
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialMessage: message
+        })
+      )
+
+      expect(result.current.state.userMessageByteLength).toBe(81)
+      expect(result.current.state.effectiveUserMessageMaxBytes).toBe(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
+      expect(result.current.state.preview).not.toBeNull()
+      expect(result.current.state.previewError).toBeNull()
+      expect(result.current.state.isValid).toBe(true)
+    })
+
+    it('marks isValid false when canonical encoding fails (plain 213 B exceeds protocol wire limit)', () => {
+      const mockExecutor = createMockExecutor()
+      const overLimitMessage = 'A'.repeat(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES + 1)
 
       const { result } = renderHook(() =>
         useTm1PublishMachine({
@@ -95,7 +118,8 @@ describe('useTm1PublishMachine Hook', () => {
       expect(result.current.state.preview).toBeNull()
       expect(result.current.state.previewData).toBeNull()
       expect(result.current.state.previewError).toBeTruthy()
-      expect(result.current.state.previewError).toContain('81 bytes UTF-8')
+      expect(result.current.state.previewError).toContain('213 bytes UTF-8')
+      expect(result.current.state.isWirePayloadOverLimit).toBe(true)
       expect(result.current.state.isValid).toBe(false)
     })
 
@@ -911,7 +935,7 @@ describe('useTm1PublishMachine Hook', () => {
       expect(result.current.state.previewError).toBeNull()
     })
 
-    it('rejects maxBytes=50 with 51 B message as invalid', () => {
+    it('rejects maxBytes=50 with 51 B message as invalid while canonical preview still succeeds', () => {
       const mockExecutor = createMockExecutor()
       const { result } = renderHook(() =>
         useTm1PublishMachine({
@@ -923,9 +947,13 @@ describe('useTm1PublishMachine Hook', () => {
         })
       )
 
+      expect(result.current.state.effectiveUserMessageMaxBytes).toBe(50)
+      expect(result.current.state.isUserMessageOverLimit).toBe(true)
+      expect(result.current.state.isWirePayloadOverLimit).toBe(false)
       expect(result.current.state.isOverLimit).toBe(true)
       expect(result.current.state.isValid).toBe(false)
-      expect(result.current.state.previewError).toBeTruthy()
+      expect(result.current.state.preview).not.toBeNull()
+      expect(result.current.state.previewError).toBeNull()
     })
 
     it('custom maxBytes > 212 never permits wire > 212', () => {
@@ -990,6 +1018,299 @@ describe('useTm1PublishMachine Hook', () => {
       // prepareAndSign and broadcastAndFinalize must NOT be called
       expect(mockExecutor.prepareAndSign).not.toHaveBeenCalled()
       expect(mockExecutor.broadcastAndFinalize).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('Dynamic effective user-text budget (protocol 212 B, NFT overhead 71 B)', () => {
+    const tokenId = '8539b6f59912009f8f4fd322bf67266063233c101a4b54aa0a765ad0c9955ff8'
+    const ownerAddress = 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+    const nftUserBudget = TM1_PROTOCOL_MAX_EVENT_DATA_BYTES - TM1_NFT_DIRECTIVE_BYTES
+
+    it('defaults to 212 B without NFT and 141 B with NFT, derived from protocol constants', () => {
+      expect(TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES).toBe(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
+      expect(tm1EffectiveUserMessageMaxBytes(TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES, false)).toBe(212)
+      expect(tm1EffectiveUserMessageMaxBytes(TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES, true)).toBe(141)
+      expect(nftUserBudget).toBe(141)
+
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'Hola'
+        })
+      )
+
+      expect(result.current.state.maxBytes).toBe(TM1_PROTOCOL_MAX_EVENT_DATA_BYTES)
+      expect(result.current.state.effectiveUserMessageMaxBytes).toBe(212)
+
+      act(() => {
+        result.current.setAttachedNft({ tokenId, name: 'Xolo #1' })
+      })
+      expect(result.current.state.effectiveUserMessageMaxBytes).toBe(141)
+
+      act(() => {
+        result.current.setAttachedNft(null)
+      })
+      expect(result.current.state.effectiveUserMessageMaxBytes).toBe(212)
+    })
+
+    it('accepts exact plain 212 B and rejects plain 213 B', () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'a'.repeat(212)
+        })
+      )
+
+      expect(result.current.state.userMessageByteLength).toBe(212)
+      expect(result.current.state.wirePayloadByteLength).toBe(212)
+      expect(result.current.state.isUserMessageOverLimit).toBe(false)
+      expect(result.current.state.isWirePayloadOverLimit).toBe(false)
+      expect(result.current.state.preview).not.toBeNull()
+      expect(result.current.state.isValid).toBe(true)
+
+      act(() => {
+        result.current.setMessage('a'.repeat(213))
+      })
+      expect(result.current.state.wirePayloadByteLength).toBe(213)
+      expect(result.current.state.isUserMessageOverLimit).toBe(true)
+      expect(result.current.state.isWirePayloadOverLimit).toBe(true)
+      expect(result.current.state.preview).toBeNull()
+      expect(result.current.state.isValid).toBe(false)
+    })
+
+    it('accepts NFT + 141 B user text (wire 212) and rejects NFT + 142 B (wire 213)', () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'a'.repeat(141),
+          initialAttachedNft: { tokenId, name: 'Xolo #1' }
+        })
+      )
+
+      expect(result.current.state.effectiveUserMessageMaxBytes).toBe(141)
+      expect(result.current.state.userMessageByteLength).toBe(141)
+      expect(result.current.state.wirePayloadByteLength).toBe(212)
+      expect(result.current.state.isUserMessageOverLimit).toBe(false)
+      expect(result.current.state.isWirePayloadOverLimit).toBe(false)
+      expect(result.current.state.preview).not.toBeNull()
+      expect(result.current.state.isValid).toBe(true)
+
+      act(() => {
+        result.current.setMessage('a'.repeat(142))
+      })
+      expect(result.current.state.userMessageByteLength).toBe(142)
+      expect(result.current.state.wirePayloadByteLength).toBe(213)
+      expect(result.current.state.isUserMessageOverLimit).toBe(true)
+      expect(result.current.state.isWirePayloadOverLimit).toBe(true)
+      expect(result.current.state.preview).toBeNull()
+      expect(result.current.state.isValid).toBe(false)
+    })
+
+    it('keeps NFT-only memos valid (71 B wire) and empty plain memos invalid', () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: ''
+        })
+      )
+
+      expect(result.current.state.isValid).toBe(false)
+      expect(result.current.state.preview).toBeNull()
+
+      act(() => {
+        result.current.setAttachedNft({ tokenId, name: 'Xolo #1' })
+      })
+      expect(result.current.state.wirePayloadByteLength).toBe(TM1_NFT_DIRECTIVE_BYTES)
+      expect(result.current.state.preview).not.toBeNull()
+      expect(result.current.state.isValid).toBe(true)
+    })
+
+    it('A: 140 B text stays valid when attaching NFT; 141 valid; 142 invalid', () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'a'.repeat(140)
+        })
+      )
+
+      expect(result.current.state.isValid).toBe(true)
+
+      act(() => {
+        result.current.setAttachedNft({ tokenId, name: 'Xolo #1' })
+      })
+      expect(result.current.state.message).toBe('a'.repeat(140))
+      expect(result.current.state.effectiveUserMessageMaxBytes).toBe(141)
+      expect(result.current.state.isValid).toBe(true)
+
+      act(() => {
+        result.current.setMessage('a'.repeat(141))
+      })
+      expect(result.current.state.wirePayloadByteLength).toBe(212)
+      expect(result.current.state.isValid).toBe(true)
+
+      act(() => {
+        result.current.setMessage('a'.repeat(142))
+      })
+      expect(result.current.state.wirePayloadByteLength).toBe(213)
+      expect(result.current.state.isValid).toBe(false)
+    })
+
+    it('B: 180 B text is valid without NFT, invalid with NFT, and valid again after removal without truncating', () => {
+      const mockExecutor = createMockExecutor()
+      const text180 = 'a'.repeat(180)
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: text180
+        })
+      )
+
+      expect(result.current.state.isValid).toBe(true)
+      expect(result.current.state.effectiveUserMessageMaxBytes).toBe(212)
+
+      act(() => {
+        result.current.setAttachedNft({ tokenId, name: 'Xolo #1' })
+      })
+      expect(result.current.state.message).toBe(text180)
+      expect(result.current.state.userMessageByteLength).toBe(180)
+      expect(result.current.state.effectiveUserMessageMaxBytes).toBe(141)
+      expect(result.current.state.isUserMessageOverLimit).toBe(true)
+      expect(result.current.state.isValid).toBe(false)
+
+      act(() => {
+        result.current.setAttachedNft(null)
+      })
+      expect(result.current.state.message).toBe(text180)
+      expect(result.current.state.effectiveUserMessageMaxBytes).toBe(212)
+      expect(result.current.state.isUserMessageOverLimit).toBe(false)
+      expect(result.current.state.isValid).toBe(true)
+    })
+
+    it('preserves custom maxBytes as a policy ceiling that never exceeds the protocol-derived effective budget', () => {
+      const mockExecutor = createMockExecutor()
+
+      const cases: Array<{
+        maxBytes: number
+        attached: boolean
+        expected: number
+      }> = [
+        { maxBytes: 100, attached: false, expected: 100 },
+        { maxBytes: 100, attached: true, expected: 100 },
+        { maxBytes: 180, attached: false, expected: 180 },
+        { maxBytes: 180, attached: true, expected: 141 },
+        { maxBytes: 300, attached: false, expected: 212 },
+        { maxBytes: 300, attached: true, expected: 141 }
+      ]
+
+      for (const testCase of cases) {
+        const { result, unmount } = renderHook(() =>
+          useTm1PublishMachine({
+            executor: mockExecutor,
+            initialAlias: 'alice.xec',
+            initialOwnerAddress: ownerAddress,
+            initialMessage: 'ok',
+            initialAttachedNft: testCase.attached ? { tokenId, name: 'Xolo #1' } : null,
+            maxBytes: testCase.maxBytes
+          })
+        )
+
+        expect(result.current.state.maxBytes).toBe(testCase.maxBytes)
+        expect(result.current.state.effectiveUserMessageMaxBytes).toBe(testCase.expected)
+        expect(
+          tm1EffectiveUserMessageMaxBytes(testCase.maxBytes, testCase.attached)
+        ).toBe(testCase.expected)
+        unmount()
+      }
+    })
+
+    it('evaluates UTF-8 byte boundaries for Spanish, accents, and emoji without using character length', () => {
+      const mockExecutor = createMockExecutor()
+      // 206 ASCII + "é" (2 B) + "🌮" (4 B) = 212 B
+      const exact212 = `${'n'.repeat(206)}é🌮`
+      expect(exact212.length).toBeLessThan(212)
+      expect(new TextEncoder().encode(exact212).length).toBe(212)
+
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: exact212
+        })
+      )
+
+      expect(result.current.state.userMessageByteLength).toBe(212)
+      expect(result.current.state.isValid).toBe(true)
+
+      act(() => {
+        result.current.setMessage(`${exact212}!`)
+      })
+      expect(result.current.state.userMessageByteLength).toBe(213)
+      expect(result.current.state.isValid).toBe(false)
+
+      // NFT budget 141: 135 ASCII + "México" (7 chars, 8 bytes: é=2) = 143? Let's be exact.
+      // "México" = M(1)+é(2)+x(1)+i(1)+c(1)+o(1) = 7 bytes
+      const spanish = 'México'
+      expect(new TextEncoder().encode(spanish).length).toBe(7)
+      const nftExact141 = `${'a'.repeat(134)}${spanish}`
+      expect(new TextEncoder().encode(nftExact141).length).toBe(141)
+
+      act(() => {
+        result.current.setMessage(nftExact141)
+        result.current.setAttachedNft({ tokenId, name: 'Xolo #1' })
+      })
+      expect(result.current.state.userMessageByteLength).toBe(141)
+      expect(result.current.state.wirePayloadByteLength).toBe(212)
+      expect(result.current.state.isValid).toBe(true)
+
+      act(() => {
+        result.current.setMessage(`${nftExact141}!`)
+      })
+      expect(result.current.state.userMessageByteLength).toBe(142)
+      expect(result.current.state.wirePayloadByteLength).toBe(213)
+      expect(result.current.state.isValid).toBe(false)
+    })
+
+    it('blocks publish when the user-text budget fails even if the wire payload is still <= 212', async () => {
+      const mockExecutor = createMockExecutor()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor: mockExecutor,
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: ownerAddress,
+          initialMessage: 'a'.repeat(101),
+          maxBytes: 100
+        })
+      )
+
+      expect(result.current.state.wirePayloadByteLength).toBe(101)
+      expect(result.current.state.isWirePayloadOverLimit).toBe(false)
+      expect(result.current.state.isUserMessageOverLimit).toBe(true)
+      expect(result.current.state.preview).not.toBeNull()
+      expect(result.current.state.isValid).toBe(false)
+
+      await act(async () => {
+        await result.current.publish()
+      })
+      expect(mockExecutor.verifyOwnership).not.toHaveBeenCalled()
+      expect(mockExecutor.prepareAndSign).not.toHaveBeenCalled()
     })
   })
 })

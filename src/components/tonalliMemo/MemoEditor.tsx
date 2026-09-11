@@ -1,7 +1,7 @@
 import { useId, useMemo } from 'react'
 import {
   MAX_TM1_SCRIPT_BYTES,
-  TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES,
+  TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES,
   TM1_NFT_DIRECTIVE_BYTES,
   TM1_PROTOCOL_MAX_EVENT_DATA_BYTES,
   TM1_PROTOCOL_OVERHEAD_BYTES
@@ -26,7 +26,7 @@ export function MemoEditor({
   onChange,
   disabled = false,
   placeholder = 'Escribe tu mensaje oficial Tonalli Memo aquí...',
-  maxBytes = TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES,
+  maxBytes = TM1_DEFAULT_WALLET_MAX_USER_MESSAGE_BYTES,
   protocolMaxBytes = TM1_PROTOCOL_MAX_EVENT_DATA_BYTES,
   id: customId,
   showOverheadDetails = true,
@@ -155,8 +155,8 @@ export function MemoEditor({
               <strong>{protocolMaxBytes} bytes</strong>
             </div>
             <div>
-              <span className="muted">Borrador de texto:</span>
-              <strong>{maxBytes} bytes</strong>
+              <span className="muted">Texto:</span>
+              <strong>{currentBytes}/{maxBytes} bytes</strong>
             </div>
             {hasAttachment && (
               <>

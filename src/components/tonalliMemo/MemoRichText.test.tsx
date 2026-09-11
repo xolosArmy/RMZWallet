@@ -281,4 +281,19 @@ describe('URL Parser Utility Functions', () => {
     const urls = extractValidUrls(text)
     expect(urls).toEqual(['https://e.cash', 'https://xolosarmy.xyz'])
   })
+
+  it('linkifies a long URL (>80 B, <=212 B) without changing visible text or UTF-8 byte length', () => {
+    const longUrl =
+      'https://xolosarmy.xyz/tonalli-memo/protocol/tm1-draft-02/event-data/full-capacity?ref=composer-byte-limit'
+    const sourceBytes = new TextEncoder().encode(longUrl).length
+    expect(sourceBytes).toBeGreaterThan(80)
+    expect(sourceBytes).toBeLessThanOrEqual(212)
+
+    const { container } = render(<MemoRichText text={longUrl} />)
+    expect(container.textContent).toBe(longUrl)
+    expect(new TextEncoder().encode(container.textContent ?? '').length).toBe(sourceBytes)
+
+    const link = screen.getByRole('link', { name: longUrl })
+    expect(link.getAttribute('href')).toContain('https://xolosarmy.xyz/tonalli-memo/protocol/tm1-draft-02/event-data/full-capacity')
+  })
 })
