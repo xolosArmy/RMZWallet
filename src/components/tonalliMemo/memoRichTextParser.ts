@@ -7,14 +7,24 @@ export interface RichTextSegment {
 /**
  * Validates whether a candidate string is an absolute http or https URL.
  * Strictly forbids javascript:, data:, file:, vbscript:, and other schemes.
+ * Rejects userinfo/credentials (username or password) to prevent phishing attacks.
+ * Requires a valid, non-empty hostname.
  */
 export function validateHttpUrl(urlString: string): URL | null {
   try {
     const parsed = new URL(urlString)
-    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-      return parsed
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null
     }
-    return null
+    // Reject userinfo / credentials
+    if (parsed.username !== '' || parsed.password !== '') {
+      return null
+    }
+    // Require valid hostname
+    if (!parsed.hostname) {
+      return null
+    }
+    return parsed
   } catch {
     return null
   }

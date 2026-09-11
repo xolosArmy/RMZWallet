@@ -196,6 +196,32 @@ describe('MemoRichText - Safe Linkification', () => {
     expect(link.getAttribute('href')).toContain('genuine-bank.com')
   })
 
+  it('rechaza URLs con userinfo https://trusted.example@evil.example y mantiene texto completo visible sin link', () => {
+    const raw = 'Ingresa a https://trusted.example@evil.example de inmediato'
+    const { container } = render(<MemoRichText text={raw} />)
+
+    expect(screen.queryByRole('link')).toBeNull()
+    expect(container.textContent).toBe(raw)
+  })
+
+  it('rechaza URLs con credentials https://user:pass@example.com y mantiene texto completo visible sin link', () => {
+    const raw = 'Mira https://user:pass@example.com para probar credenciales'
+    const { container } = render(<MemoRichText text={raw} />)
+
+    expect(screen.queryByRole('link')).toBeNull()
+    expect(container.textContent).toBe(raw)
+  })
+
+  it('mantiene URLs estándar con path como links normales', () => {
+    const raw = 'Visita https://example.com/path para acceder al recurso'
+    const { container } = render(<MemoRichText text={raw} />)
+
+    const link = screen.getByRole('link', { name: 'https://example.com/path' })
+    expect(link).toBeTruthy()
+    expect(link.getAttribute('href')).toBe('https://example.com/path')
+    expect(container.textContent).toBe(raw)
+  })
+
   it('retorna null si text está vacío o no es string', () => {
     const { container: c1 } = render(<MemoRichText text="" />)
     expect(c1.innerHTML).toBe('')
@@ -206,9 +232,14 @@ describe('MemoRichText - Safe Linkification', () => {
 })
 
 describe('URL Parser Utility Functions', () => {
-  it('validateHttpUrl solo aprueba http y https válidos', () => {
+  it('validateHttpUrl solo aprueba http y https válidos y rechaza userinfo/credentials', () => {
     expect(validateHttpUrl('https://xolosarmy.xyz')).not.toBeNull()
     expect(validateHttpUrl('http://xolosarmy.xyz')).not.toBeNull()
+    expect(validateHttpUrl('https://example.com/path')).not.toBeNull()
+    expect(validateHttpUrl('https://trusted.example@evil.example')).toBeNull()
+    expect(validateHttpUrl('https://user:pass@example.com')).toBeNull()
+    expect(validateHttpUrl('http://user@example.com/')).toBeNull()
+    expect(validateHttpUrl('http://:pass@example.com/')).toBeNull()
     expect(validateHttpUrl('javascript:alert(1)')).toBeNull()
     expect(validateHttpUrl('data:text/plain;base64,123')).toBeNull()
     expect(validateHttpUrl('file:///tmp/test')).toBeNull()
