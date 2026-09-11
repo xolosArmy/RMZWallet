@@ -161,4 +161,24 @@ describe('MemoEditor Component', () => {
     const alert = screen.getByRole('alert')
     expect(alert.textContent).toContain('La carga wire total con el NFT adjunto excede el límite del protocolo (221/212 bytes)')
   })
+
+  it('keeps textarea plain text and counts exact UTF-8 bytes for URLs without injecting HTML or markdown', () => {
+    const handleChange = vi.fn()
+    const urlText = 'Visita https://xolosarmy.xyz para ver el protocolo'
+    const expectedBytes = new TextEncoder().encode(urlText).length
+
+    render(<MemoEditor value={urlText} onChange={handleChange} />)
+
+    const textarea = screen.getByRole('textbox', { name: /mensaje de tonalli memo/i }) as HTMLTextAreaElement
+    expect(textarea.value).toBe(urlText)
+    expect(textarea.value).not.toContain('<a')
+    expect(textarea.value).not.toContain('href=')
+    expect(textarea.value).not.toContain('[')
+
+    const counter = screen.getByTestId('memo-byte-counter')
+    expect(counter.textContent).toContain(`${expectedBytes}/${TM1_DEFAULT_WALLET_MAX_EVENT_DATA_BYTES} bytes UTF-8`)
+
+    const detectedLinks = screen.getByTestId('memo-detected-links')
+    expect(detectedLinks.textContent).toContain('https://xolosarmy.xyz')
+  })
 })

@@ -5,6 +5,7 @@ import { fetchTonalliMemoFeed } from '../integrations/tonalliMemo/client'
 import { abbreviateTxid, formatTonalliMemoTimestamp } from '../integrations/tonalliMemo/format'
 import type { TonalliMemoFeedItem } from '../integrations/tonalliMemo/types'
 import { MemoNftAttachmentCard } from '../components/tonalliMemo/MemoNftAttachmentCard'
+import { MemoRichText } from '../components/tonalliMemo/MemoRichText'
 
 type FeedState =
   | { status: 'loading'; items: TonalliMemoFeedItem[] }
@@ -116,7 +117,7 @@ function MemoFeed() {
                 </div>
               </div>
               {item.displayPayload ? (
-                <p className="tx-message memo-payload">{item.displayPayload}</p>
+                <p className="tx-message memo-payload"><MemoRichText text={item.displayPayload} /></p>
               ) : !item.attachment ? (
                 <p className="tx-message memo-payload">(sin payload)</p>
               ) : null}

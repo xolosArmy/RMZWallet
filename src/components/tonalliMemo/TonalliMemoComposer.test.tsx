@@ -373,4 +373,25 @@ describe('TonalliMemoComposer Integration', () => {
       )
     })
   })
+
+  it('preserves plain text and exact eventData in canonical preview when typing URLs', () => {
+    const mockExecutor = createMockExecutor()
+    render(<TonalliMemoComposer executor={mockExecutor} initialAlias="satoshi.xec" />)
+
+    const textarea = screen.getByRole('textbox', { name: /mensaje de tonalli memo/i })
+    const rawMessage = 'Web: https://xolosarmy.xyz'
+    fireEvent.change(textarea, { target: { value: rawMessage } })
+
+    // Canonical preview should show exact raw message encoded in envelope hex
+    const envelopeHex = screen.getByTestId('envelope-hex').textContent ?? ''
+    const expectedRawHex = Array.from(new TextEncoder().encode(rawMessage))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('')
+    expect(envelopeHex).toContain(expectedRawHex)
+    // Confirm no HTML '<a' (0x3c61) was injected into the canonical payload
+    expect(envelopeHex).not.toContain('3c61')
+
+    // Detected link pill is rendered below textarea
+    expect(screen.getByTestId('memo-detected-links').textContent).toContain('https://xolosarmy.xyz')
+  })
 })

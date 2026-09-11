@@ -6,6 +6,7 @@ import {
   TM1_PROTOCOL_MAX_EVENT_DATA_BYTES,
   TM1_PROTOCOL_OVERHEAD_BYTES
 } from './types'
+import { extractValidUrls } from './memoRichTextParser'
 
 export interface MemoEditorProps {
   value: string
@@ -41,6 +42,8 @@ export function MemoEditor({
   const currentBytes = useMemo(() => {
     return new TextEncoder().encode(value).length
   }, [value])
+
+  const detectedUrls = useMemo(() => extractValidUrls(value), [value])
 
   const hasAttachment = Boolean(attachedNftTokenId)
   const effectiveWireBytes = wirePayloadBytes ?? (hasAttachment ? currentBytes + TM1_NFT_DIRECTIVE_BYTES : currentBytes)
@@ -109,6 +112,19 @@ export function MemoEditor({
           data-status={isOverLimit ? 'error' : isNearLimit ? 'warning' : 'ok'}
         />
       </div>
+
+      {detectedUrls.length > 0 && (
+        <div className="memo-editor__detected-links" data-testid="memo-detected-links">
+          <span className="memo-field-label" style={{ display: 'inline', margin: 0 }}>
+            🔗 Enlace{detectedUrls.length > 1 ? 's' : ''} detectado{detectedUrls.length > 1 ? 's' : ''}:
+          </span>
+          {detectedUrls.map((url, i) => (
+            <span key={i} className="memo-editor__detected-link-pill" data-testid="memo-detected-link-item">
+              {url}
+            </span>
+          ))}
+        </div>
+      )}
 
       {isUserTextOverLimit && (
         <p className="tx-meta error-text" role="alert">

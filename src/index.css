@@ -607,6 +607,16 @@ textarea:focus-visible {
 .memo-field-grid p { margin: 2px 0 0; word-break: break-word; }
 .memo-field-label { display: block; color: var(--muted); font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
 .memo-payload { padding: 12px; border-radius: var(--radius-md); background: rgba(249, 248, 246, 0.04); border: 1px solid rgba(249, 248, 246, 0.1); white-space: pre-wrap; }
+.memo-rich-link {
+  color: var(--color-primary, #2db4ad);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  word-break: break-all;
+  transition: opacity 0.15s ease;
+  unicode-bidi: isolate;
+  direction: ltr;
+}
+.memo-rich-link:hover { opacity: 0.8; }
 .memo-tx-link { width: fit-content; color: #d9fffc; border-color: rgba(45, 180, 173, 0.38); }
 
 .cta {
@@ -921,6 +931,27 @@ code {
 
 .memo-editor__progress-bar[data-status="error"] {
   background: #ff6b6b;
+}
+
+.memo-editor__detected-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 0.8rem;
+}
+
+.memo-editor__detected-link-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: rgba(45, 180, 173, 0.12);
+  color: var(--color-primary);
+  border: 1px solid rgba(45, 180, 173, 0.3);
+  word-break: break-all;
+  font-family: 'JetBrains Mono', 'SFMono-Regular', monospace;
+  font-size: 0.75rem;
 }
 
 .memo-editor__overhead {
