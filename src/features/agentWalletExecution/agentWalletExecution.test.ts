@@ -9,17 +9,19 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { ALL_BIP143, Ecc, P2PKHSignatory, Script, toHex, TxBuilder } from 'ecash-lib'
-import type { HumanApprovalV1 } from '@xolosarmy/tonalli-core'
+import { ALL_BIP143, Ecc, P2PKHSignatory, Script, toHex, Tx, TxBuilder } from 'ecash-lib'
+import { humanApprovalV1Schema, type HumanApprovalV1 } from '@xolosarmy/tonalli-core'
 import type { WalletApprovalLedgerRecord } from '../agentWalletApprovalReceiver/types'
 import { createWalletExecutionComposition } from '../../internal/agentWalletExecutionHost'
 import {
   DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
   DurableStorageWalletExecutionLedger,
-  DurableTransactionalExecutionLedger,
-  WebLocksExecutionCoordinator
+  DurableTransactionalExecutionLedger
 } from './ledger'
-import { getInternalSignedTransaction } from '../../internal/settlementStore'
+import {
+  DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY,
+  storeInternalSignedTransaction
+} from '../../internal/settlementStore'
 import { InMemoryWalletExecutionLedger, MockStorage, TestExecutionLockCoordinator } from './testUtils'
 import { WalletExecutionError } from './errors'
 import {
@@ -28,6 +30,7 @@ import {
   computeCanonicalPlanHash,
   DEFAULT_FEE_POLICY,
   estimateP2pkhTransactionSize,
+  snapshotOwnedUtxos,
   validateOutputInvariants
 } from './plan'
 import type { ExecutionUtxoInput, WalletFeePolicy } from './types'
@@ -50,39 +53,55 @@ function createSyntheticSignatory() {
   return { signatory, publicKey, secretKey }
 }
 
+function createCanonicalHumanApproval(overrides: Record<string, unknown> = {}): HumanApprovalV1 {
+  return humanApprovalV1Schema.parse({
+    contractVersion: '1.0',
+    kind: 'human_approval',
+    approvalId: 'appr_456',
+    requestId: 'req_123',
+    intentId: 'intent_789',
+    decisionId: 'dec_101',
+    status: 'approved',
+    approver: FROM_ADDRESS,
+    recordedAt: FIXED_NOW + 10,
+    ...overrides
+  }) as HumanApprovalV1
+}
+
 function createFixtureLedgerRecord(overrides: Partial<WalletApprovalLedgerRecord> = {}): WalletApprovalLedgerRecord {
+  const humanApproval = overrides.humanApproval
+    ? createCanonicalHumanApproval(overrides.humanApproval as Record<string, unknown>)
+    : createCanonicalHumanApproval()
   return {
     operationId: 'req_123',
     requestId: 'req_123',
     approvalId: 'appr_456',
     intentId: 'intent_789',
     decisionId: 'dec_101',
-    contentHash: 'content_hash_abc',
+    contentHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     capabilityId: 'cap_xyz',
     effectiveExpiresAt: EXPIRES_AT,
     network: 'xec:mainnet',
-    amountSats: 250_000n, // 2,500 XEC
+    amountSats: '250000',
     fromAddress: FROM_ADDRESS,
     destination: DESTINATION_ADDRESS,
     presentationHash: 'pres_hash_def',
     recordedAt: FIXED_NOW + 10,
     status: 'approved',
-    humanApproval: {
-      schema: 'tonalli.human-approval',
-      version: 1,
-      approvalId: 'appr_456',
-      requestId: 'req_123',
-      intentId: 'intent_789',
-      decisionId: 'dec_101',
-      status: 'approved',
-      approver: FROM_ADDRESS,
-      network: 'xec:mainnet',
-      presentationHash: 'pres_hash_def',
-      contentHash: 'content_hash_abc',
-      recordedAt: FIXED_NOW + 10
-    },
-    ...overrides
+    ...overrides,
+    humanApproval
   }
+}
+
+function approvedAmountSats(record: WalletApprovalLedgerRecord): bigint {
+  return BigInt(record.amountSats)
+}
+
+function readStoredRawTx(storage: Storage, executionId: string): string | undefined {
+  const raw = storage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
+  if (!raw) return undefined
+  const parsed = JSON.parse(raw) as Record<string, string>
+  return parsed[executionId]
 }
 
 function createFixtureUtxos(sats = 500_000n): ExecutionUtxoInput[] {
@@ -106,6 +125,8 @@ function setupEngine(options: {
   signatoryProvider?: any
   storage?: Storage
   executionLedger?: any
+  lockCoordinator?: InstanceType<typeof TestExecutionLockCoordinator>
+  idGenerator?: () => string
 } = {}) {
   const record = options.record ?? createFixtureLedgerRecord()
   const utxos = options.utxos ?? createFixtureUtxos()
@@ -130,10 +151,14 @@ function setupEngine(options: {
     }
   }
 
+  const lockCoordinator = options.lockCoordinator ?? new TestExecutionLockCoordinator()
   const executionLedger =
     options.executionLedger ??
     (options.storage
-      ? new DurableTransactionalExecutionLedger({ storage: options.storage })
+      ? new DurableTransactionalExecutionLedger({
+          storage: options.storage,
+          lockCoordinator
+        })
       : new InMemoryWalletExecutionLedger())
 
   const sessionVerifier = {
@@ -167,8 +192,9 @@ function setupEngine(options: {
     signatoryProvider,
     feePolicy: options.feePolicy,
     storage: options.storage,
+    lockCoordinator,
     clock: () => clockTime,
-    idGenerator: () => 'test_id_1'
+    idGenerator: options.idGenerator ?? (() => 'test_id_1')
   })
 
   return {
@@ -199,8 +225,15 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
   describe('P0-1: Cross-Tab Transactional Exclusion & Generation CAS (Web Locks)', () => {
     it('concurrently reserves same approval from Tab A and Tab B: exactly one succeeds, loser gets DUPLICATE_EXECUTION', async () => {
       const sharedStorage = new MockStorage()
-      const ledgerA = new DurableTransactionalExecutionLedger({ storage: sharedStorage })
-      const ledgerB = new DurableTransactionalExecutionLedger({ storage: sharedStorage })
+      const sharedCoordinator = new TestExecutionLockCoordinator()
+      const ledgerA = new DurableTransactionalExecutionLedger({
+        storage: sharedStorage,
+        lockCoordinator: sharedCoordinator
+      })
+      const ledgerB = new DurableTransactionalExecutionLedger({
+        storage: sharedStorage,
+        lockCoordinator: sharedCoordinator
+      })
 
       const entryA = {
         executionId: 'exec_tab_a',
@@ -244,7 +277,10 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       expect(rejectionReason.code).toBe('DUPLICATE_EXECUTION')
 
       // Repeat after page reload / process restart (re-instantiating ledger on the same durable storage)
-      const ledgerC = new DurableTransactionalExecutionLedger({ storage: sharedStorage })
+      const ledgerC = new DurableTransactionalExecutionLedger({
+        storage: sharedStorage,
+        lockCoordinator: sharedCoordinator
+      })
       const entryC = {
         executionId: 'exec_tab_c',
         approvalId: 'appr_shared_1', // same approvalId
@@ -265,8 +301,15 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
 
     it('concurrently reserves two different approvals from Tab A and Tab B without lost update', async () => {
       const sharedStorage = new MockStorage()
-      const ledgerA = new DurableTransactionalExecutionLedger({ storage: sharedStorage })
-      const ledgerB = new DurableTransactionalExecutionLedger({ storage: sharedStorage })
+      const sharedCoordinator = new TestExecutionLockCoordinator()
+      const ledgerA = new DurableTransactionalExecutionLedger({
+        storage: sharedStorage,
+        lockCoordinator: sharedCoordinator
+      })
+      const ledgerB = new DurableTransactionalExecutionLedger({
+        storage: sharedStorage,
+        lockCoordinator: sharedCoordinator
+      })
 
       const entry1 = {
         executionId: 'exec_tab_1',
@@ -348,7 +391,8 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       })
       const { engine, record, uiHost } = setupEngine({
         storage,
-        executionLedger: testLedger
+        executionLedger: testLedger,
+        lockCoordinator: testCoordinator
       })
 
       const session = await engine.prepareExecution(record.humanApproval!)
@@ -399,10 +443,16 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     expect(publicStatus?.status).toBe('SIGNED')
     expect((publicStatus as any).rawSignedTxHex).toBeUndefined()
 
-    // Internal settlement store retains raw tx in private settlement store
-    const rawTx = await getInternalSignedTransaction(session.executionId, storage)
+    // Write-only settlement store retains raw tx; C2 has no retrieval API.
+    const rawTx = readStoredRawTx(storage, session.executionId)
     expect(rawTx).toBeDefined()
     expect(rawTx!.length).toBeGreaterThan(100)
+    const independentlyParsed = Tx.fromHex(rawTx!)
+    expect(independentlyParsed.outputs).toHaveLength(session.plan.outputs.length)
+    expect(independentlyParsed.outputs[0].sats).toBe(session.plan.outputs[0].sats)
+    expect(toHex(independentlyParsed.outputs[0].script.bytecode).toLowerCase()).toBe(
+      session.plan.outputs[0].scriptHex.toLowerCase()
+    )
   })
 
   // P0-1: Persistent Durable Ledger & Restart / Reopen Safety
@@ -435,7 +485,11 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     const record = createFixtureLedgerRecord()
 
     // Setup ledger directly to simulate crash during signing
-    const initialLedger = new DurableStorageWalletExecutionLedger({ storage })
+    const restartCoordinator = new TestExecutionLockCoordinator()
+    const initialLedger = new DurableStorageWalletExecutionLedger({
+      storage,
+      lockCoordinator: restartCoordinator
+    })
     await initialLedger.reserveExecutionAtomic({
       executionId: 'exec_crashed',
       approvalId: record.approvalId,
@@ -444,7 +498,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       decisionId: record.decisionId,
       fromAddress: record.fromAddress,
       destination: record.destination,
-      amountSats: record.amountSats,
+      amountSats: approvedAmountSats(record),
       network: 'xec:mainnet',
       reservedAt: FIXED_NOW
     })
@@ -455,7 +509,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
         intentId: record.intentId,
         fromAddress: record.fromAddress,
         destination: record.destination,
-        amountSats: record.amountSats
+        amountSats: approvedAmountSats(record)
       },
       availableUtxos: createFixtureUtxos()
     })
@@ -467,8 +521,15 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     expect(preCrashStatus?.status).toBe('SIGNING')
 
     // Restart process / re-instantiate ledger
-    const recoveredLedger = new DurableStorageWalletExecutionLedger({ storage })
-    const recoveredStatus = await recoveredLedger.get('exec_crashed')
+    const recoveredLedger = new DurableStorageWalletExecutionLedger({
+      storage,
+      lockCoordinator: restartCoordinator
+    })
+    let recoveredStatus = await recoveredLedger.get('exec_crashed')
+    for (let i = 0; i < 30 && recoveredStatus?.status === 'SIGNING'; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      recoveredStatus = await recoveredLedger.get('exec_crashed')
+    }
 
     // Must be reconciled to SIGNING_UNCERTAIN
     expect(recoveredStatus?.status).toBe('SIGNING_UNCERTAIN')
@@ -482,7 +543,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
 
   // P0-2: Local Confirmation Authority Isolation
   it('enforces that session alone does not expose signing method and public engine does not expose confirmation', async () => {
-    const { engine, record, uiHost } = setupEngine()
+    const { engine, record, uiHost } = setupEngine({ storage: new MockStorage() })
     const session = await engine.prepareExecution(record.humanApproval!)
 
     // Public engine strictly has NO confirm, sign, execute, or controller creation methods
@@ -522,8 +583,8 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     expect((executionLedger as any)._getRawSignedTxHexInternal).toBeUndefined()
     expect((executionLedger as any).getRawSignedTxHex).toBeUndefined()
 
-    // Private settlement storage retains raw signed tx, accessible only via internal settlement module
-    const internalHex = await getInternalSignedTransaction(session.executionId, storage)
+    // C2 is write-only: raw bytes are inspectable only via the storage payload, not a getter API.
+    const internalHex = readStoredRawTx(storage, session.executionId)
     expect(internalHex).toBeDefined()
     expect(typeof internalHex).toBe('string')
   })
@@ -720,7 +781,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
           inputs: builder.inputs,
           outputs: [
             {
-              sats: builder.outputs[0].sats,
+              sats: 'sats' in builder.outputs[0] ? builder.outputs[0].sats : 0n,
               script: Script.fromAddress(ALTERNATE_ADDRESS)
             },
             ...builder.outputs.slice(1)
@@ -761,7 +822,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       decisionId: record.decisionId,
       fromAddress: record.fromAddress,
       destination: record.destination,
-      amountSats: record.amountSats,
+      amountSats: approvedAmountSats(record),
       network: 'xec:mainnet',
       reservedAt: FIXED_NOW
     })
@@ -772,7 +833,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
         intentId: record.intentId,
         fromAddress: record.fromAddress,
         destination: record.destination,
-        amountSats: record.amountSats
+        amountSats: approvedAmountSats(record)
       },
       availableUtxos: createFixtureUtxos()
     })
@@ -830,7 +891,8 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
   it('fails closed when wallet custodian session changes before signing', async () => {
     const { engine, uiHost, record, setActiveAddress } = setupEngine()
 
-    const session = await engine.prepareExecution(record.humanApproval!)
+    const session = await engine.prepareExecution(record.humanApproval)
+    expect(session.executionId).toBeDefined()
     const controller = uiHost.getActiveController()
     expect(controller).toBeDefined()
 
@@ -852,5 +914,411 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     const updated = await executionLedger.get(session.executionId)
     expect(updated?.status).toBe('REJECTED')
     expect(updated?.uncertainReason).toBe('Custodian rejected plan.')
+  })
+
+  it('rejects a signer whose returned object looks correct but ser() emits a different transaction', async () => {
+    const coordinator = new TestExecutionLockCoordinator()
+    const storage = new MockStorage()
+    const deceptiveSigner = {
+      signTransaction: async (builder: TxBuilder) => {
+        const synthetic = createSyntheticSignatory()
+        const honestTx = (builder as unknown as { sign: (signatory?: unknown) => Tx }).sign(synthetic.signatory)
+        const maliciousTx = new Tx({
+          version: honestTx.version,
+          locktime: honestTx.locktime,
+          inputs: [
+            {
+              prevOut: { txid: '22'.repeat(32), outIdx: 99 },
+              script: honestTx.inputs[0]?.script,
+              sequence: 0xffffffff
+            }
+          ],
+          outputs: [
+            { sats: 1n, script: Script.fromAddress(ALTERNATE_ADDRESS) },
+            { sats: 2n, script: Script.fromAddress(ALTERNATE_ADDRESS) },
+            { sats: 3n, script: Script.fromAddress(ALTERNATE_ADDRESS) }
+          ]
+        })
+        return {
+          version: honestTx.version,
+          locktime: honestTx.locktime,
+          inputs: honestTx.inputs,
+          outputs: honestTx.outputs,
+          ser: () => maliciousTx.ser()
+        }
+      }
+    }
+
+    const { engine, uiHost, record, executionLedger } = setupEngine({
+      storage,
+      lockCoordinator: coordinator,
+      executionLedger: new DurableTransactionalExecutionLedger({
+        storage,
+        lockCoordinator: coordinator
+      }),
+      signatoryProvider: deceptiveSigner
+    })
+
+    const session = await engine.prepareExecution(record.humanApproval)
+    const controller = uiHost.getActiveController()
+    expect(controller).toBeDefined()
+
+    await expect(controller!.confirm()).rejects.toThrow(
+      expect.objectContaining({ code: 'SIGNED_TRANSACTION_MISMATCH' })
+    )
+
+    const ledgerRecord = await executionLedger.get(session.executionId)
+    expect(ledgerRecord?.status).toBe('SIGNING_UNCERTAIN')
+    expect(readStoredRawTx(storage, session.executionId)).toBeUndefined()
+  })
+
+  it('marks SIGNING_UNCERTAIN and issues no handle when raw signed bytes cannot be parsed', async () => {
+    const coordinator = new TestExecutionLockCoordinator()
+    const storage = new MockStorage()
+    const unparseableSigner = {
+      signTransaction: async (builder: TxBuilder) => {
+        const synthetic = createSyntheticSignatory()
+        const honestTx = (builder as unknown as { sign: (signatory?: unknown) => Tx }).sign(synthetic.signatory)
+        return {
+          version: honestTx.version,
+          locktime: honestTx.locktime,
+          inputs: honestTx.inputs,
+          outputs: honestTx.outputs,
+          ser: () => new Uint8Array([0xff, 0x00, 0x01])
+        }
+      }
+    }
+
+    const { engine, uiHost, record, executionLedger } = setupEngine({
+      storage,
+      lockCoordinator: coordinator,
+      executionLedger: new DurableTransactionalExecutionLedger({
+        storage,
+        lockCoordinator: coordinator
+      }),
+      signatoryProvider: unparseableSigner
+    })
+
+    const session = await engine.prepareExecution(record.humanApproval)
+    await expect(uiHost.getActiveController()!.confirm()).rejects.toThrow(
+      expect.objectContaining({ code: 'SIGNING_UNCERTAIN' })
+    )
+    const ledgerRecord = await executionLedger.get(session.executionId)
+    expect(ledgerRecord?.status).toBe('SIGNING_UNCERTAIN')
+  })
+
+  it('keeps the Wallet-owned UTXO snapshot after the provider mutates its original objects', async () => {
+    const providerOwnedUtxo = {
+      txid: '11'.repeat(32),
+      outIdx: 0,
+      sats: 500_000n,
+      lockingScriptHex: FROM_SCRIPT_HEX
+    }
+    const storage = new MockStorage()
+    const coordinator = new TestExecutionLockCoordinator()
+    const { engine, record, uiHost } = setupEngine({
+      storage,
+      lockCoordinator: coordinator,
+      executionLedger: new DurableTransactionalExecutionLedger({
+        storage,
+        lockCoordinator: coordinator
+      }),
+      utxos: [providerOwnedUtxo]
+    })
+
+    const session = await engine.prepareExecution(record.humanApproval)
+    const originalHash = session.plan.planHash
+    const originalTxid = session.plan.inputs[0].txid
+    const originalSats = session.plan.inputs[0].sats
+
+    providerOwnedUtxo.txid = 'ff'.repeat(32)
+    providerOwnedUtxo.outIdx = 99
+    providerOwnedUtxo.sats = 1n
+    providerOwnedUtxo.lockingScriptHex = '00'
+
+    expect(session.plan.inputs[0].txid).toBe(originalTxid)
+    expect(session.plan.inputs[0].sats).toBe(originalSats)
+    expect(session.plan.inputs[0]).not.toBe(providerOwnedUtxo)
+    expect(computeCanonicalPlanHash(session.plan)).toBe(originalHash)
+    expect(Object.isFrozen(session.plan.inputs[0])).toBe(true)
+    expect(Object.isFrozen(session.plan.inputs)).toBe(true)
+    expect(Object.isFrozen(session.plan.outputs[0])).toBe(true)
+
+    const rebuiltFromPlanSnapshot = buildPreparedExecutionPlan({
+      approved: {
+        approvalId: record.approvalId,
+        requestId: record.requestId,
+        intentId: record.intentId,
+        fromAddress: record.fromAddress,
+        destination: record.destination,
+        amountSats: approvedAmountSats(record)
+      },
+      availableUtxos: session.plan.inputs
+    })
+    expect(rebuiltFromPlanSnapshot.inputs[0].txid).toBe(originalTxid)
+    expect(rebuiltFromPlanSnapshot.planHash).toBe(originalHash)
+    expect(uiHost.getActiveController()?.executionId).toBe(session.executionId)
+  })
+
+  it('does not let provider mutation during transitionToSigning alter the signed plan', async () => {
+    const providerOwnedUtxo = {
+      txid: '11'.repeat(32),
+      outIdx: 0,
+      sats: 500_000n,
+      lockingScriptHex: FROM_SCRIPT_HEX
+    }
+    const storage = new MockStorage()
+    const coordinator = new TestExecutionLockCoordinator()
+    const delayedLedger = new DurableTransactionalExecutionLedger({
+      storage,
+      lockCoordinator: coordinator
+    })
+    const originalTransition = delayedLedger.transitionToSigning.bind(delayedLedger)
+    delayedLedger.transitionToSigning = async (executionId: string, signingAt: number) => {
+      await new Promise(resolve => setTimeout(resolve, 20))
+      providerOwnedUtxo.txid = 'aa'.repeat(32)
+      providerOwnedUtxo.sats = 7n
+      return originalTransition(executionId, signingAt)
+    }
+
+    const { engine, record, uiHost } = setupEngine({
+      storage,
+      lockCoordinator: coordinator,
+      executionLedger: delayedLedger,
+      utxos: [providerOwnedUtxo]
+    })
+
+    const session = await engine.prepareExecution(record.humanApproval)
+    const originalHash = session.plan.planHash
+    const handle = await uiHost.getActiveController()!.confirm()
+    expect(handle.status).toBe('SIGNED')
+    expect(handle.planHash).toBe(originalHash)
+    expect(session.plan.inputs[0].txid).toBe('11'.repeat(32))
+    expect(session.plan.inputs[0].sats).toBe(500_000n)
+  })
+
+  it('rejects an authoritative Gate 2B rejection even if the supplied receipt status is flipped to approved', async () => {
+    const rejectedRecord = createFixtureLedgerRecord({
+      status: 'rejected',
+      humanApproval: createCanonicalHumanApproval({ status: 'rejected' })
+    })
+    const { engine } = setupEngine({ record: rejectedRecord })
+
+    const forgedReceipt = createCanonicalHumanApproval({
+      status: 'approved',
+      approvalId: rejectedRecord.approvalId,
+      requestId: rejectedRecord.requestId,
+      intentId: rejectedRecord.intentId,
+      decisionId: rejectedRecord.decisionId,
+      recordedAt: rejectedRecord.recordedAt
+    })
+
+    await expect(engine.prepareExecution(forgedReceipt)).rejects.toThrow(
+      expect.objectContaining({ code: 'RECEIPT_NOT_APPROVED' })
+    )
+    expect(await engine.getExecutionStatus('exec_test_id_1')).toBeUndefined()
+  })
+
+  it('does not automatically re-sign after crash windows A-C', async () => {
+    const storage = new MockStorage()
+    const record = createFixtureLedgerRecord()
+    const coordinator = new TestExecutionLockCoordinator()
+
+    // A: crash before raw storage — SIGNING with no raw tx.
+    const ledgerA = new DurableTransactionalExecutionLedger({ storage, lockCoordinator: coordinator })
+    await ledgerA.reserveExecutionAtomic({
+      executionId: 'exec_crash_a',
+      approvalId: 'appr_crash_a',
+      requestId: 'req_crash_a',
+      intentId: record.intentId,
+      decisionId: record.decisionId,
+      fromAddress: record.fromAddress,
+      destination: record.destination,
+      amountSats: approvedAmountSats(record),
+      network: 'xec:mainnet',
+      reservedAt: FIXED_NOW
+    })
+    const planA = buildPreparedExecutionPlan({
+      approved: {
+        approvalId: 'appr_crash_a',
+        requestId: 'req_crash_a',
+        intentId: record.intentId,
+        fromAddress: record.fromAddress,
+        destination: record.destination,
+        amountSats: approvedAmountSats(record)
+      },
+      availableUtxos: createFixtureUtxos()
+    })
+    await ledgerA.setPlanPrepared('exec_crash_a', planA, FIXED_NOW + 1)
+    await ledgerA.transitionToSigning('exec_crash_a', FIXED_NOW + 2)
+
+    const recoveredA = new DurableTransactionalExecutionLedger({ storage, lockCoordinator: coordinator })
+    let recoveredAStatus = await recoveredA.get('exec_crash_a')
+    for (let i = 0; i < 30 && recoveredAStatus?.status === 'SIGNING'; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      recoveredAStatus = await recoveredA.get('exec_crash_a')
+    }
+    expect(recoveredAStatus?.status).toBe('SIGNING_UNCERTAIN')
+    expect(readStoredRawTx(storage, 'exec_crash_a')).toBeUndefined()
+    await expect(recoveredA.transitionToSigning('exec_crash_a', FIXED_NOW + 9)).rejects.toThrow(
+      expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' })
+    )
+
+    // B: persistence failure after signing → SIGNING_UNCERTAIN, no SIGNED, no automatic re-sign.
+    const failingStorage = new MockStorage()
+    const originalSetItem = failingStorage.setItem.bind(failingStorage)
+    failingStorage.setItem = (key: string, value: string) => {
+      if (key === DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY) {
+        throw new Error('settlement quota exceeded')
+      }
+      originalSetItem(key, value)
+    }
+    const { engine, uiHost, record: recordB, executionLedger } = setupEngine({
+      record: createFixtureLedgerRecord({
+        requestId: 'req_crash_b',
+        approvalId: 'appr_crash_b',
+        humanApproval: createCanonicalHumanApproval({
+          requestId: 'req_crash_b',
+          approvalId: 'appr_crash_b'
+        })
+      }),
+      storage: failingStorage,
+      lockCoordinator: coordinator,
+      executionLedger: new DurableTransactionalExecutionLedger({
+        storage: failingStorage,
+        lockCoordinator: coordinator
+      })
+    })
+    const sessionB = await engine.prepareExecution(recordB.humanApproval)
+    await expect(uiHost.getActiveController()!.confirm()).rejects.toThrow(
+      expect.objectContaining({ code: 'SIGNING_UNCERTAIN' })
+    )
+    expect((await executionLedger.get(sessionB.executionId))?.status).toBe('SIGNING_UNCERTAIN')
+    await expect(uiHost.getActiveController()!.confirm()).rejects.toThrow()
+
+    // C: raw storage succeeds, crash before ledger SIGNED. Orphan raw tx + SIGNING_UNCERTAIN is fail-closed.
+    const storageC = new MockStorage()
+    const ledgerC = new DurableTransactionalExecutionLedger({
+      storage: storageC,
+      lockCoordinator: coordinator
+    })
+    await ledgerC.reserveExecutionAtomic({
+      executionId: 'exec_crash_c',
+      approvalId: 'appr_crash_c',
+      requestId: 'req_crash_c',
+      intentId: record.intentId,
+      decisionId: record.decisionId,
+      fromAddress: record.fromAddress,
+      destination: record.destination,
+      amountSats: approvedAmountSats(record),
+      network: 'xec:mainnet',
+      reservedAt: FIXED_NOW
+    })
+    const planC = buildPreparedExecutionPlan({
+      approved: {
+        approvalId: 'appr_crash_c',
+        requestId: 'req_crash_c',
+        intentId: record.intentId,
+        fromAddress: record.fromAddress,
+        destination: record.destination,
+        amountSats: approvedAmountSats(record)
+      },
+      availableUtxos: createFixtureUtxos()
+    })
+    await ledgerC.setPlanPrepared('exec_crash_c', planC, FIXED_NOW + 1)
+    await ledgerC.transitionToSigning('exec_crash_c', FIXED_NOW + 2)
+    await storeInternalSignedTransaction('exec_crash_c', '0200000001deadbeef', {
+      storage: storageC,
+      lockCoordinator: coordinator
+    })
+    const recoveredC = new DurableTransactionalExecutionLedger({
+      storage: storageC,
+      lockCoordinator: coordinator
+    })
+    let recoveredCStatus = await recoveredC.get('exec_crash_c')
+    for (let i = 0; i < 30 && recoveredCStatus?.status === 'SIGNING'; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      recoveredCStatus = await recoveredC.get('exec_crash_c')
+    }
+    expect(recoveredCStatus?.status).toBe('SIGNING_UNCERTAIN')
+    expect(readStoredRawTx(storageC, 'exec_crash_c')).toBe('0200000001deadbeef')
+    await expect(recoveredC.transitionToSigning('exec_crash_c', FIXED_NOW + 9)).rejects.toThrow(
+      expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' })
+    )
+  })
+
+  it('persists both raw signed transactions when two tabs sign different approvals concurrently', async () => {
+    const sharedStorage = new MockStorage()
+    const sharedCoordinator = new TestExecutionLockCoordinator()
+    const recordA = createFixtureLedgerRecord({
+      requestId: 'req_conc_a',
+      approvalId: 'appr_conc_a',
+      humanApproval: createCanonicalHumanApproval({
+        requestId: 'req_conc_a',
+        approvalId: 'appr_conc_a'
+      })
+    })
+    const recordB = createFixtureLedgerRecord({
+      requestId: 'req_conc_b',
+      approvalId: 'appr_conc_b',
+      humanApproval: createCanonicalHumanApproval({
+        requestId: 'req_conc_b',
+        approvalId: 'appr_conc_b'
+      })
+    })
+
+    const tabA = setupEngine({
+      record: recordA,
+      storage: sharedStorage,
+      lockCoordinator: sharedCoordinator,
+      executionLedger: new DurableTransactionalExecutionLedger({
+        storage: sharedStorage,
+        lockCoordinator: sharedCoordinator
+      }),
+      idGenerator: () => 'conc_a'
+    })
+    const tabB = setupEngine({
+      record: recordB,
+      storage: sharedStorage,
+      lockCoordinator: sharedCoordinator,
+      executionLedger: new DurableTransactionalExecutionLedger({
+        storage: sharedStorage,
+        lockCoordinator: sharedCoordinator
+      }),
+      idGenerator: () => 'conc_b'
+    })
+
+    const sessionA = await tabA.engine.prepareExecution(recordA.humanApproval)
+    const sessionB = await tabB.engine.prepareExecution(recordB.humanApproval)
+
+    const results = await Promise.allSettled([
+      tabA.uiHost.getActiveController()!.confirm(),
+      tabB.uiHost.getActiveController()!.confirm()
+    ])
+
+    expect(results[0].status).toBe('fulfilled')
+    expect(results[1].status).toBe('fulfilled')
+    expect(readStoredRawTx(sharedStorage, sessionA.executionId)).toBeDefined()
+    expect(readStoredRawTx(sharedStorage, sessionB.executionId)).toBeDefined()
+    expect(Object.keys(JSON.parse(sharedStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)!))).toEqual(
+      expect.arrayContaining([sessionA.executionId, sessionB.executionId])
+    )
+    expect((await tabA.engine.getExecutionStatus(sessionA.executionId))?.status).toBe('SIGNED')
+    expect((await tabB.engine.getExecutionStatus(sessionB.executionId))?.status).toBe('SIGNED')
+  })
+
+  it('snapshotOwnedUtxos never retains provider object references', () => {
+    const providerOwned = {
+      txid: '11'.repeat(32),
+      outIdx: 0,
+      sats: 500_000n,
+      lockingScriptHex: FROM_SCRIPT_HEX
+    }
+    const owned = snapshotOwnedUtxos([providerOwned])
+    providerOwned.txid = 'ee'.repeat(32)
+    expect(owned[0].txid).toBe('11'.repeat(32))
+    expect(owned[0]).not.toBe(providerOwned)
+    expect(Object.isFrozen(owned[0])).toBe(true)
+    expect(Object.isFrozen(owned)).toBe(true)
   })
 })

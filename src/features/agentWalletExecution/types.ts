@@ -9,7 +9,8 @@
  * Invariants:
  * - Plain XEC mainnet payment only ("xec:mainnet").
  * - Zero transaction broadcast.
- * - Raw signed transaction material strictly retained inside Wallet execution boundary.
+ * - Raw signed transaction material is persisted write-only under an opaque executionId.
+ * - C2 exposes no raw-transaction retrieval API; trusted retrieval belongs to Gate C3.
  * - External callers receive only an opaque SignedExecutionHandle.
  * - Public status queries return PublicExecutionStatus (rawSignedTxHex strictly omitted).
  * - Private keys, seeds, mnemonics, and WIF never appear in any type or interface here.
@@ -126,8 +127,8 @@ export interface PublicExecutionStatus {
 
 /**
  * Internal durable execution record maintained in WalletExecutionLedger.
- * Retains raw signed transaction bytes internally within the Wallet execution boundary.
- * Never exposed via public engine APIs or barrel exports.
+ * Production public ledger state omits raw signed transaction bytes.
+ * C2 does not expose a retrieval API for raw signed transactions.
  */
 export interface InternalWalletExecutionRecord {
   readonly executionId: string
@@ -263,6 +264,9 @@ export interface AgentWalletExecutionEngineConfig {
   readonly signatoryProvider: WalletSignatoryProvider
   readonly feePolicy?: Partial<WalletFeePolicy>
   readonly storage?: Storage
+  readonly lockCoordinator?: {
+    requestExclusive<T>(lockName: string, operation: () => Promise<T>): Promise<T>
+  }
   readonly clock?: () => number
   readonly idGenerator?: () => string
 }

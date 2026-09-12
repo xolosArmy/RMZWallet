@@ -39,7 +39,8 @@ export const VALID_EXECUTION_STATE_TRANSITIONS: Readonly<
   SIGNED: [], // Strictly terminal
   REJECTED: [], // Strictly terminal
   FAILED: [], // Strictly terminal
-  SIGNING_UNCERTAIN: [] // Strictly terminal
+  SIGNING_UNCERTAIN: [], // Strictly terminal
+  EXPIRED: [] // Strictly terminal
 })
 
 /**
@@ -336,6 +337,7 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     rawSignedTxHex: string,
     signedAt: number
   ): Promise<void> {
+    void rawSignedTxHex
     return this.coordinator.requestExclusive(this.lockName, async () => {
       const data = this.loadData()
       const existing = data.records[executionId]

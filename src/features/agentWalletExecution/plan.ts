@@ -335,6 +335,41 @@ export function validateOutputInvariants(
 }
 
 /**
+ * Creates a Wallet-owned frozen copy of a UTXO input.
+ * Caller/provider object references are never retained.
+ */
+export function snapshotUtxoInput(utxo: ExecutionUtxoInput): ExecutionUtxoInput {
+  return Object.freeze({
+    txid: String(utxo.txid),
+    outIdx: Number(utxo.outIdx),
+    sats: BigInt(utxo.sats),
+    lockingScriptHex: String(utxo.lockingScriptHex)
+  })
+}
+
+/**
+ * Creates a Wallet-owned frozen copy of a transaction output.
+ */
+export function snapshotTxOutput(output: ExecutionTxOutput): ExecutionTxOutput {
+  return Object.freeze({
+    index: Number(output.index),
+    destination: String(output.destination),
+    scriptHex: String(output.scriptHex),
+    sats: BigInt(output.sats),
+    isChange: Boolean(output.isChange)
+  })
+}
+
+/**
+ * Defensively copies and deep-freezes provider UTXOs immediately after they are read.
+ */
+export function snapshotOwnedUtxos(
+  availableUtxos: readonly ExecutionUtxoInput[]
+): readonly ExecutionUtxoInput[] {
+  return Object.freeze(availableUtxos.map(snapshotUtxoInput))
+}
+
+/**
  * Builds an immutable, audited execution plan using deterministic UTXO selection.
  */
 export function buildPreparedExecutionPlan(params: {
@@ -349,22 +384,32 @@ export function buildPreparedExecutionPlan(params: {
   readonly availableUtxos: readonly ExecutionUtxoInput[]
   readonly feePolicy?: WalletFeePolicy
 }): WalletPreparedExecutionPlan {
-  const { approved, availableUtxos } = params
   const policy: WalletFeePolicy = params.feePolicy ?? DEFAULT_FEE_POLICY
+  const approved = Object.freeze({
+    approvalId: String(params.approved.approvalId),
+    requestId: String(params.approved.requestId),
+    intentId: String(params.approved.intentId),
+    fromAddress: String(params.approved.fromAddress),
+    destination: String(params.approved.destination),
+    amountSats: BigInt(params.approved.amountSats)
+  })
 
   if (approved.amountSats <= 0n) {
     throw new WalletExecutionError('OUTPUT_INVARIANT_VIOLATION', 'Approved amount must be strictly positive.')
   }
 
-  if (availableUtxos.length === 0) {
+  if (params.availableUtxos.length === 0) {
     throw new WalletExecutionError('INSUFFICIENT_FUNDS', 'No spendable UTXOs available for wallet address.')
   }
+
+  // Wallet-owned snapshot: never retain caller/provider-owned mutable objects.
+  const ownedUtxos = snapshotOwnedUtxos(params.availableUtxos)
 
   // Deterministic sorting of available UTXOs:
   // 1. Largest value first
   // 2. Tie-break by txid ascending
   // 3. Tie-break by outIdx ascending
-  const sortedUtxos = [...availableUtxos].sort((a, b) => {
+  const sortedUtxos = [...ownedUtxos].sort((a, b) => {
     if (a.sats > b.sats) return -1
     if (a.sats < b.sats) return 1
     const txidCmp = a.txid.localeCompare(b.txid)
@@ -419,10 +464,10 @@ export function buildPreparedExecutionPlan(params: {
   const estimatedSize = estimateP2pkhTransactionSize(selectedInputs.length, hasChange ? 2 : 1)
   assertFeePolicy(feeSats, estimatedSize, policy)
 
-  // Construct primary output
+  // Construct Wallet-owned frozen primary output (never aliases caller objects)
   const primaryScript = Script.fromAddress(approved.destination)
   const outputs: ExecutionTxOutput[] = [
-    Object.freeze({
+    snapshotTxOutput({
       index: 0,
       destination: approved.destination,
       scriptHex: toHex(primaryScript.bytecode),
@@ -431,11 +476,11 @@ export function buildPreparedExecutionPlan(params: {
     })
   ]
 
-  // Construct change output if applicable
+  // Construct Wallet-owned frozen change output if applicable
   if (hasChange && changeSats > 0n) {
     const changeScript = Script.fromAddress(approved.fromAddress)
     outputs.push(
-      Object.freeze({
+      snapshotTxOutput({
         index: 1,
         destination: approved.fromAddress,
         scriptHex: toHex(changeScript.bytecode),
@@ -447,6 +492,9 @@ export function buildPreparedExecutionPlan(params: {
 
   const effectiveFeeRate = Number(feeSats) / estimatedSize
 
+  const ownedInputs = Object.freeze(selectedInputs.map(snapshotUtxoInput))
+  const ownedOutputs = Object.freeze(outputs.map(snapshotTxOutput))
+
   const partialPlan: Omit<WalletPreparedExecutionPlan, 'planHash'> = {
     network: 'xec:mainnet',
     fromAddress: approved.fromAddress,
@@ -456,8 +504,8 @@ export function buildPreparedExecutionPlan(params: {
     changeAddress: hasChange ? approved.fromAddress : '',
     feeSats,
     feeRateSatsPerByte: Number(effectiveFeeRate.toFixed(4)),
-    inputs: Object.freeze(selectedInputs),
-    outputs: Object.freeze(outputs),
+    inputs: ownedInputs,
+    outputs: ownedOutputs,
     totalInputSats: selectedTotal,
     transactionVersion: 2,
     locktime: 0,
