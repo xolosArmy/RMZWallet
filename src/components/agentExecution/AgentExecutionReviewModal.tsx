@@ -14,9 +14,9 @@
 import { useState, useEffect, useCallback, type ReactElement } from 'react'
 import type {
   SignedExecutionHandle,
-  WalletExecutionReviewSession,
-  WalletLocalConfirmationController
+  WalletExecutionReviewSession
 } from '../../features/agentWalletExecution'
+import type { WalletLocalConfirmationController } from '../../features/agentWalletExecution/types'
 
 export interface AgentExecutionReviewModalProps {
   readonly session: WalletExecutionReviewSession

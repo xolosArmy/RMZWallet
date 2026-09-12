@@ -8,9 +8,9 @@ import { AgentExecutionReviewModal } from './AgentExecutionReviewModal'
 import type {
   SignedExecutionHandle,
   WalletExecutionReviewSession,
-  WalletExecutionReviewSnapshot,
-  WalletLocalConfirmationController
+  WalletExecutionReviewSnapshot
 } from '../../features/agentWalletExecution'
+import type { WalletLocalConfirmationController } from '../../features/agentWalletExecution/types'
 
 afterEach(() => {
   cleanup()

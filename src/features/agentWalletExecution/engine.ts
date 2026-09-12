@@ -22,7 +22,7 @@
 
 import { fromHex, Script, toHex, TxBuilder } from 'ecash-lib'
 import { WalletExecutionError } from './errors'
-import { DurableStorageWalletExecutionLedger } from './ledger'
+import { DurableTransactionalExecutionLedger } from './ledger'
 import {
   buildPreparedExecutionPlan,
   computeCanonicalPlanHash,
@@ -35,9 +35,11 @@ import type {
   ExecutionNetwork,
   PublicExecutionStatus,
   SignedExecutionHandle,
+  WalletExecutionComposition,
   WalletExecutionLedger,
   WalletExecutionReviewSession,
   WalletExecutionReviewSnapshot,
+  WalletExecutionUIHost,
   WalletFeePolicy,
   WalletLocalConfirmationController,
   WalletPreparedExecutionPlan
@@ -181,9 +183,9 @@ function formatBigIntToExactXEC(sats: bigint): string {
   return `${whole.toString()}.${fractionStr} XEC`
 }
 
-export function createAgentWalletExecutionEngine(
+export function createWalletExecutionComposition(
   config: AgentWalletExecutionEngineConfig
-): AgentWalletExecutionEngine {
+): WalletExecutionComposition {
   const {
     approvalLedger,
     sessionVerifier,
@@ -203,13 +205,18 @@ export function createAgentWalletExecutionEngine(
   // Durable execution ledger by default
   const executionLedger: WalletExecutionLedger =
     config.executionLedger ??
-    new DurableStorageWalletExecutionLedger({ storage: config.storage })
+    new DurableTransactionalExecutionLedger({ storage: config.storage })
 
   // Synchronous single-flight lock guards
   let isPreparing = false
   let activeExecutionId: string | null = null
   let activeCapability: InternalWalletExecutionCapability | null = null
   let activePlan: WalletPreparedExecutionPlan | null = null
+  let activeController: WalletLocalConfirmationController | null = null
+
+  const sessionPreparedListeners = new Set<
+    (session: WalletExecutionReviewSession, controller: WalletLocalConfirmationController) => void
+  >()
 
   async function executeSigningWithConfirmation(
     executionId: string,
@@ -234,13 +241,15 @@ export function createAgentWalletExecutionEngine(
     }
     // 2. Look up current ledger state
     const currentRecord = await executionLedger.get(executionId)
-    if (!currentRecord || currentRecord.state !== 'PREPARED') {
+    const currentStatus = currentRecord ? (currentRecord.status ?? (currentRecord as any).state) : undefined
+    if (!currentRecord || currentStatus !== 'PREPARED') {
       activeExecutionId = null
       activeCapability = null
       activePlan = null
+      activeController = null
       throw new WalletExecutionError(
         'INVALID_STATE_TRANSITION',
-        `Cannot execute signing from record state "${currentRecord?.state}". Expected "PREPARED".`
+        `Cannot execute signing from record state "${currentStatus}". Expected "PREPARED".`
       )
     }
 
@@ -490,80 +499,88 @@ export function createAgentWalletExecutionEngine(
     })
   }
 
-  return {
-    async prepareExecution(receipt: any): Promise<WalletExecutionReviewSession> {
-      // 1. Synchronous single-flight reservation check BEFORE any await (P1-1)
-      if (isPreparing || activeExecutionId !== null) {
+  async function prepareExecution(receipt: any): Promise<WalletExecutionReviewSession> {
+    // 1. Synchronous single-flight reservation check BEFORE any await (P1-1)
+    if (isPreparing || activeExecutionId !== null) {
+      throw new WalletExecutionError(
+        'CONCURRENT_EXECUTION_ACTIVE',
+        'An execution review session is already active or being prepared.'
+      )
+    }
+    isPreparing = true
+
+    let reservedExecutionId: string | null = null
+
+    try {
+      // 2. Structural receipt check
+      if (!receipt || typeof receipt !== 'object') {
+        throw new WalletExecutionError('INVALID_RECEIPT', 'Receipt must be a non-null object.')
+      }
+
+      if (receipt.status !== 'approved') {
         throw new WalletExecutionError(
-          'CONCURRENT_EXECUTION_ACTIVE',
-          'An execution review session is already active or being prepared.'
+          'RECEIPT_NOT_APPROVED',
+          `Cannot prepare execution for receipt status "${receipt.status}". Only approved receipts are executable.`
         )
       }
-      isPreparing = true
 
-      let reservedExecutionId: string | null = null
+      if (receipt.network !== 'xec:mainnet') {
+        throw new WalletExecutionError(
+          'UNSUPPORTED_NETWORK',
+          `Network "${receipt.network}" is not supported. Only "xec:mainnet" is supported.`
+        )
+      }
 
-      try {
-        // 2. Structural receipt check
-        if (!receipt || typeof receipt !== 'object') {
-          throw new WalletExecutionError('INVALID_RECEIPT', 'Receipt must be a non-null object.')
-        }
+      if (!receipt.approvalId || !receipt.requestId) {
+        throw new WalletExecutionError(
+          'INVALID_RECEIPT',
+          'Receipt is missing required approvalId or requestId.'
+        )
+      }
 
-        if (receipt.status !== 'approved') {
-          throw new WalletExecutionError(
-            'RECEIPT_NOT_APPROVED',
-            `Cannot prepare execution for receipt status "${receipt.status}". Only approved receipts are executable.`
-          )
-        }
+      const now = getNow()
 
-        if (receipt.network !== 'xec:mainnet') {
-          throw new WalletExecutionError(
-            'OUTPUT_INVARIANT_VIOLATION',
-            `Network "${receipt.network}" is not supported. Only "xec:mainnet" is permitted.`
-          )
-        }
+      // 3. Look up immutable approval record in approval ledger
+      const record = await approvalLedger.get(receipt.requestId)
+      if (!record) {
+        throw new WalletExecutionError(
+          'APPROVAL_NOT_FOUND',
+          `No recorded approval found for requestId "${receipt.requestId}".`
+        )
+      }
 
-        const now = getNow()
+      // 4. Verify active custodian session
+      const activeWalletSession = await sessionVerifier.verifyActiveSession()
+      if (!activeWalletSession.authenticated || !activeWalletSession.activeAddress) {
+        throw new WalletExecutionError(
+          'SESSION_REVALIDATION_FAILED',
+          `Active wallet session unauthenticated: ${activeWalletSession.error ?? 'unknown error'}.`
+        )
+      }
 
-        // 3. Lookup recorded approval in WalletApprovalLedger
-        const record = await approvalLedger.get(receipt.requestId)
-        if (!record) {
-          throw new WalletExecutionError(
-            'APPROVAL_NOT_FOUND',
-            `No recorded approval found for requestId "${receipt.requestId}".`
-          )
-        }
-
-        // 4. Verify active custodian session
-        const session = await sessionVerifier.verifyActiveSession()
-        if (!session.authenticated || !session.activeAddress) {
-          throw new WalletExecutionError(
-            'SESSION_REVALIDATION_FAILED',
-            `Active wallet session unauthenticated: ${session.error ?? 'unknown error'}.`
-          )
-        }
-
-        if (session.activeAddress !== record.fromAddress) {
-          throw new WalletExecutionError(
-            'SESSION_ADDRESS_MISMATCH',
-            `Active wallet session address "${session.activeAddress}" does not match approved fromAddress "${record.fromAddress}".`
-          )
-        }
+      if (activeWalletSession.activeAddress !== record.fromAddress) {
+        throw new WalletExecutionError(
+          'SESSION_ADDRESS_MISMATCH',
+          `Active wallet session address "${activeWalletSession.activeAddress}" does not match approved fromAddress "${record.fromAddress}".`
+        )
+      }
 
         // 5. At-most-once check: verify approval has not already been reserved or executed
         const existingByApproval = await executionLedger.getByApprovalId(record.approvalId)
         if (existingByApproval) {
+          const status = existingByApproval.status ?? (existingByApproval as any).state
           throw new WalletExecutionError(
             'DUPLICATE_EXECUTION',
-            `Execution already initiated for approvalId "${record.approvalId}" in state "${existingByApproval.state}".`
+            `Execution already initiated for approvalId "${record.approvalId}" in state "${status}".`
           )
         }
 
         const existingByRequest = await executionLedger.getByRequestId(record.requestId)
         if (existingByRequest) {
+          const status = existingByRequest.status ?? (existingByRequest as any).state
           throw new WalletExecutionError(
             'DUPLICATE_EXECUTION',
-            `Execution already initiated for requestId "${record.requestId}" in state "${existingByRequest.state}".`
+            `Execution already initiated for requestId "${record.requestId}" in state "${status}".`
           )
         }
 
@@ -715,8 +732,8 @@ export function createAgentWalletExecutionEngine(
         activeCapability = capability
         activePlan = plan
 
-        // 13. Return review-only session (P0-3: NO signing method on session!)
-        return Object.freeze({
+        // 13. Construct review-only session (P0-3: NO signing method on session!)
+        const session: WalletExecutionReviewSession = Object.freeze({
           executionId,
           plan,
           review,
@@ -725,6 +742,7 @@ export function createAgentWalletExecutionEngine(
               activeExecutionId = null
               activeCapability = null
               activePlan = null
+              activeController = null
             }
             capability.invalidate()
             await executionLedger.markRejected(
@@ -738,6 +756,7 @@ export function createAgentWalletExecutionEngine(
               activeExecutionId = null
               activeCapability = null
               activePlan = null
+              activeController = null
             }
             capability.invalidate()
             // P0-4: Dismiss durably transitions execution to terminal REJECTED
@@ -748,12 +767,43 @@ export function createAgentWalletExecutionEngine(
             )
           }
         })
+
+        // Wallet-owned local confirmation controller (strictly closure-confined to Wallet UI composition)
+        const localController: WalletLocalConfirmationController = Object.freeze({
+          executionId,
+          confirm: async (): Promise<SignedExecutionHandle> => {
+            const token = new InternalLocalExecutionConfirmationToken(
+              LOCAL_CONFIRMATION_TOKEN,
+              executionId
+            )
+            return executeSigningWithConfirmation(executionId, token)
+          },
+          reject: async (reason?: string): Promise<void> => {
+            return session.rejectExecution(reason)
+          },
+          dismiss: async (): Promise<void> => {
+            return session.dismiss()
+          }
+        })
+
+        activeController = localController
+
+        // Dispatch to Wallet UI host listeners
+        for (const listener of sessionPreparedListeners) {
+          try {
+            listener(session, localController)
+          } catch (err) {
+            console.error('Wallet UI host onSessionPrepared listener failed:', err)
+          }
+        }
+
+        return session
       } finally {
         isPreparing = false
       }
-    },
+    }
 
-    async getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined> {
+    async function getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined> {
       const record = await executionLedger.get(executionId)
       if (!record) return undefined
 
@@ -768,7 +818,7 @@ export function createAgentWalletExecutionEngine(
         destination: record.destination,
         amountSats: record.amountSats,
         network: record.network,
-        status: record.state,
+        status: record.status ?? (record as any).state,
         planHash: record.planHash,
         uncertainReason: record.uncertainReason,
         reservedAt: record.reservedAt,
@@ -777,34 +827,42 @@ export function createAgentWalletExecutionEngine(
         signedAt: record.signedAt,
         failedAt: record.failedAt
       })
-    },
+    }
 
-    createLocalConfirmationController(
-      session: WalletExecutionReviewSession
-    ): WalletLocalConfirmationController {
-      if (session.executionId !== activeExecutionId) {
-        throw new WalletExecutionError(
-          'CONCURRENT_EXECUTION_ACTIVE',
-          `Execution "${session.executionId}" is not the currently active execution session.`
-        )
-      }
+    const publicEngine: AgentWalletExecutionEngine = Object.freeze({
+      prepareExecution,
+      getExecutionStatus
+    })
 
-      return Object.freeze({
-        executionId: session.executionId,
-        confirm: async (): Promise<SignedExecutionHandle> => {
-          const token = new InternalLocalExecutionConfirmationToken(
-            LOCAL_CONFIRMATION_TOKEN,
-            session.executionId
-          )
-          return executeSigningWithConfirmation(session.executionId, token)
-        },
-        reject: async (reason?: string): Promise<void> => {
-          return session.rejectExecution(reason)
-        },
-        dismiss: async (): Promise<void> => {
-          return session.dismiss()
+    const walletUIHost: WalletExecutionUIHost = Object.freeze({
+      onSessionPrepared(
+        handler: (
+          session: WalletExecutionReviewSession,
+          localController: WalletLocalConfirmationController
+        ) => void
+      ): () => void {
+        sessionPreparedListeners.add(handler)
+        return () => {
+          sessionPreparedListeners.delete(handler)
         }
-      })
+      },
+      getActiveController(): WalletLocalConfirmationController | undefined {
+        return activeController ?? undefined
+      }
+    })
+
+    return {
+      publicEngine,
+      walletUIHost
     }
   }
-}
+
+  /**
+   * Helper that returns the public Agent-facing engine.
+   * Strictly exposes NO confirm, sign, execute, or local confirmation controller.
+   */
+  export function createAgentWalletExecutionEngine(
+    config: AgentWalletExecutionEngineConfig
+  ): AgentWalletExecutionEngine {
+    return createWalletExecutionComposition(config).publicEngine
+  }

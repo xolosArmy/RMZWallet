@@ -12,8 +12,14 @@ import { describe, expect, it, vi } from 'vitest'
 import { ALL_BIP143, Ecc, P2PKHSignatory, Script, toHex, TxBuilder } from 'ecash-lib'
 import type { HumanApprovalV1 } from '@xolosarmy/tonalli-core'
 import type { WalletApprovalLedgerRecord } from '../agentWalletApprovalReceiver/types'
-import { createAgentWalletExecutionEngine } from './engine'
-import { DurableStorageWalletExecutionLedger } from './ledger'
+import { createWalletExecutionComposition } from './engine'
+import {
+  DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
+  DurableStorageWalletExecutionLedger,
+  DurableTransactionalExecutionLedger,
+  getInternalSignedTransactionHex,
+  INTERNAL_SETTLEMENT_TOKEN
+} from './ledger'
 import { InMemoryWalletExecutionLedger, MockStorage } from './testUtils'
 import { WalletExecutionError } from './errors'
 import {
@@ -127,7 +133,7 @@ function setupEngine(options: {
   const executionLedger =
     options.executionLedger ??
     (options.storage
-      ? new DurableStorageWalletExecutionLedger({ storage: options.storage })
+      ? new DurableTransactionalExecutionLedger({ storage: options.storage })
       : new InMemoryWalletExecutionLedger())
 
   const sessionVerifier = {
@@ -153,7 +159,7 @@ function setupEngine(options: {
     }
   }
 
-  const engine = createAgentWalletExecutionEngine({
+  const composition = createWalletExecutionComposition({
     approvalLedger,
     executionLedger,
     sessionVerifier,
@@ -165,7 +171,9 @@ function setupEngine(options: {
   })
 
   return {
-    engine,
+    engine: composition.publicEngine,
+    composition,
+    uiHost: composition.walletUIHost,
     record,
     utxos,
     executionLedger,
@@ -185,9 +193,134 @@ function setupEngine(options: {
 }
 
 describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
+  // P0-1: Multi-Tab Web Locks Concurrency & CAS Generation
+  describe('P0-1: Cross-Tab Transactional Exclusion & Generation CAS (Web Locks)', () => {
+    it('concurrently reserves same approval from Tab A and Tab B: exactly one succeeds, loser gets DUPLICATE_EXECUTION', async () => {
+      const sharedStorage = new MockStorage()
+      const ledgerA = new DurableTransactionalExecutionLedger({ storage: sharedStorage })
+      const ledgerB = new DurableTransactionalExecutionLedger({ storage: sharedStorage })
+
+      const entryA = {
+        executionId: 'exec_tab_a',
+        approvalId: 'appr_shared_1',
+        requestId: 'req_shared_1',
+        intentId: 'intent_1',
+        decisionId: 'dec_1',
+        fromAddress: FROM_ADDRESS,
+        destination: DESTINATION_ADDRESS,
+        amountSats: 250_000n,
+        network: 'xec:mainnet' as const,
+        reservedAt: FIXED_NOW
+      }
+
+      const entryB = {
+        executionId: 'exec_tab_b',
+        approvalId: 'appr_shared_1', // identical approvalId
+        requestId: 'req_shared_1_b',
+        intentId: 'intent_1',
+        decisionId: 'dec_1',
+        fromAddress: FROM_ADDRESS,
+        destination: DESTINATION_ADDRESS,
+        amountSats: 250_000n,
+        network: 'xec:mainnet' as const,
+        reservedAt: FIXED_NOW
+      }
+
+      const results = await Promise.allSettled([
+        ledgerA.reserveExecutionAtomic(entryA),
+        ledgerB.reserveExecutionAtomic(entryB)
+      ])
+
+      const fulfilled = results.filter(r => r.status === 'fulfilled')
+      const rejected = results.filter(r => r.status === 'rejected')
+
+      expect(fulfilled).toHaveLength(1)
+      expect(rejected).toHaveLength(1)
+
+      const rejectionReason = (rejected[0] as PromiseRejectedResult).reason
+      expect(rejectionReason).toBeInstanceOf(WalletExecutionError)
+      expect(rejectionReason.code).toBe('DUPLICATE_EXECUTION')
+
+      // Repeat after page reload / process restart (re-instantiating ledger on the same durable storage)
+      const ledgerC = new DurableTransactionalExecutionLedger({ storage: sharedStorage })
+      const entryC = {
+        executionId: 'exec_tab_c',
+        approvalId: 'appr_shared_1', // same approvalId
+        requestId: 'req_shared_1_c',
+        intentId: 'intent_1',
+        decisionId: 'dec_1',
+        fromAddress: FROM_ADDRESS,
+        destination: DESTINATION_ADDRESS,
+        amountSats: 250_000n,
+        network: 'xec:mainnet' as const,
+        reservedAt: FIXED_NOW + 10
+      }
+
+      await expect(ledgerC.reserveExecutionAtomic(entryC)).rejects.toMatchObject({
+        code: 'DUPLICATE_EXECUTION'
+      })
+    })
+
+    it('concurrently reserves two different approvals from Tab A and Tab B without lost update', async () => {
+      const sharedStorage = new MockStorage()
+      const ledgerA = new DurableTransactionalExecutionLedger({ storage: sharedStorage })
+      const ledgerB = new DurableTransactionalExecutionLedger({ storage: sharedStorage })
+
+      const entry1 = {
+        executionId: 'exec_tab_1',
+        approvalId: 'appr_unique_1',
+        requestId: 'req_unique_1',
+        intentId: 'intent_1',
+        decisionId: 'dec_1',
+        fromAddress: FROM_ADDRESS,
+        destination: DESTINATION_ADDRESS,
+        amountSats: 100_000n,
+        network: 'xec:mainnet' as const,
+        reservedAt: FIXED_NOW
+      }
+
+      const entry2 = {
+        executionId: 'exec_tab_2',
+        approvalId: 'appr_unique_2',
+        requestId: 'req_unique_2',
+        intentId: 'intent_2',
+        decisionId: 'dec_2',
+        fromAddress: FROM_ADDRESS,
+        destination: DESTINATION_ADDRESS,
+        amountSats: 200_000n,
+        network: 'xec:mainnet' as const,
+        reservedAt: FIXED_NOW
+      }
+
+      const results = await Promise.allSettled([
+        ledgerA.reserveExecutionAtomic(entry1),
+        ledgerB.reserveExecutionAtomic(entry2)
+      ])
+
+      expect(results[0].status).toBe('fulfilled')
+      expect(results[1].status).toBe('fulfilled')
+
+      // Both records must exist durably without lost updates
+      const status1 = await ledgerA.get('exec_tab_1')
+      const status2 = await ledgerB.get('exec_tab_2')
+      expect(status1).toBeDefined()
+      expect(status2).toBeDefined()
+      expect(status1?.approvalId).toBe('appr_unique_1')
+      expect(status2?.approvalId).toBe('appr_unique_2')
+
+      // Verify generation CAS incremented twice
+      const raw = sharedStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)
+      expect(raw).toBeDefined()
+      const parsed = JSON.parse(raw!)
+      expect(parsed.generation).toBe(2)
+      expect(Object.keys(parsed.records)).toHaveLength(2)
+    })
+  })
+
   // P0 Focus Test 1: Complete Valid Execution Flow
   it('executes complete valid preparation, review snapshot, local confirmation, and offline signing', async () => {
-    const { engine, record, executionLedger } = setupEngine()
+    const storage = new MockStorage()
+    const { engine, uiHost, record, executionLedger } = setupEngine({ storage })
 
     const session = await engine.prepareExecution(record.humanApproval!)
     expect(session.executionId).toBe('exec_test_id_1')
@@ -195,21 +328,26 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     expect(session.review.feeXEC).toMatch(/XEC/)
     expect(session.review.network).toBe('xec:mainnet')
 
-    // Local confirmation controller
-    const controller = engine.createLocalConfirmationController(session)
-    const handle = await controller.confirm()
+    // Local confirmation controller from internal Wallet UI host
+    const controller = uiHost.getActiveController()
+    expect(controller).toBeDefined()
+    const handle = await controller!.confirm()
 
     expect(handle.status).toBe('SIGNED')
     expect(handle.approvalId).toBe(record.approvalId)
     expect(handle.requestId).toBe(record.requestId)
     expect(handle.planHash).toBe(session.plan.planHash)
 
-    // Verify raw signed tx is retained in ledger, not in handle
+    // Verify raw signed tx is retained in private settlement partition, not in handle or public status
     expect((handle as any).rawSignedTxHex).toBeUndefined()
-    const internalRecord = await executionLedger.get(session.executionId)
-    expect(internalRecord?.state).toBe('SIGNED')
-    expect(internalRecord?.rawSignedTxHex).toBeDefined()
-    expect(internalRecord?.rawSignedTxHex?.length).toBeGreaterThan(100)
+    const publicStatus = await executionLedger.get(session.executionId)
+    expect(publicStatus?.status).toBe('SIGNED')
+    expect((publicStatus as any).rawSignedTxHex).toBeUndefined()
+
+    // Internal settlement accessor can retrieve raw tx with valid token
+    const rawTx = await getInternalSignedTransactionHex(executionLedger, INTERNAL_SETTLEMENT_TOKEN, session.executionId)
+    expect(rawTx).toBeDefined()
+    expect(rawTx!.length).toBeGreaterThan(100)
   })
 
   // P0-1: Persistent Durable Ledger & Restart / Reopen Safety
@@ -220,8 +358,9 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     // Instance 1: Prepare and confirm
     const instance1 = setupEngine({ record, storage })
     const session = await instance1.engine.prepareExecution(record.humanApproval!)
-    const controller = instance1.engine.createLocalConfirmationController(session)
-    const handle = await controller.confirm()
+    const controller = instance1.uiHost.getActiveController()
+    expect(controller).toBeDefined()
+    const handle = await controller!.confirm()
     expect(handle.status).toBe('SIGNED')
 
     // Instance 2: Reopen with new engine on same storage
@@ -268,57 +407,81 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     await initialLedger.setPlanPrepared('exec_crashed', plan, FIXED_NOW + 1)
     await initialLedger.transitionToSigning('exec_crashed', FIXED_NOW + 2)
 
-    // Simulate process death and reopen with new ledger instance
-    const reopenedLedger = new DurableStorageWalletExecutionLedger({ storage })
-    const recovered = await reopenedLedger.get('exec_crashed')
-    expect(recovered?.state).toBe('SIGNING_UNCERTAIN')
-    expect(recovered?.uncertainReason).toContain('Process interrupted during signing')
+    // Verify it was in SIGNING
+    const preCrashStatus = await initialLedger.get('exec_crashed')
+    expect(preCrashStatus?.status).toBe('SIGNING')
 
-    // Transitioning from SIGNING_UNCERTAIN is prohibited (terminal state)
-    await expect(reopenedLedger.transitionToSigning('exec_crashed', FIXED_NOW + 3)).rejects.toThrow(
-      expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' })
-    )
+    // Restart process / re-instantiate ledger
+    const recoveredLedger = new DurableStorageWalletExecutionLedger({ storage })
+    const recoveredStatus = await recoveredLedger.get('exec_crashed')
+
+    // Must be reconciled to SIGNING_UNCERTAIN
+    expect(recoveredStatus?.status).toBe('SIGNING_UNCERTAIN')
+    expect(recoveredStatus?.uncertainReason).toContain('Process interrupted during signing')
+
+    // Automated retry is blocked
+    await expect(
+      recoveredLedger.transitionToSigning('exec_crashed', FIXED_NOW + 10)
+    ).rejects.toThrow(expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' }))
   })
 
-  // P0-2: Public API isolates rawSignedTxHex
-  it('strictly isolates rawSignedTxHex from public engine inspection APIs', async () => {
-    const { engine, record, executionLedger } = setupEngine()
+  // P0-2: Local Confirmation Authority Isolation
+  it('enforces that session alone does not expose signing method and public engine does not expose confirmation', async () => {
+    const { engine, record, uiHost } = setupEngine()
     const session = await engine.prepareExecution(record.humanApproval!)
-    const controller = engine.createLocalConfirmationController(session)
-    await controller.confirm()
+
+    // Public engine strictly has NO confirm, sign, execute, or controller creation methods
+    expect((engine as any).createLocalConfirmationController).toBeUndefined()
+    expect((engine as any).confirm).toBeUndefined()
+    expect((engine as any).sign).toBeUndefined()
+    expect((engine as any).execute).toBeUndefined()
+
+    // Public review session has NO confirm or signing method
+    expect((session as any).confirm).toBeUndefined()
+    expect((session as any).confirmExecution).toBeUndefined()
+    expect((session as any).sign).toBeUndefined()
+
+    // Calling controller strictly from Wallet-internal UI host succeeds
+    const controller = uiHost.getActiveController()
+    expect(controller).toBeDefined()
+    const handle = await controller!.confirm()
+    expect(handle.status).toBe('SIGNED')
+  })
+
+  // P0-3: Raw Signed Transaction Isolation
+  it('strictly isolates rawSignedTxHex from public engine and ledger inspection APIs', async () => {
+    const storage = new MockStorage()
+    const { engine, uiHost, record, executionLedger } = setupEngine({ storage })
+    const session = await engine.prepareExecution(record.humanApproval!)
+    const controller = uiHost.getActiveController()
+    expect(controller).toBeDefined()
+    await controller!.confirm()
 
     const publicStatus = await engine.getExecutionStatus(session.executionId)
     expect(publicStatus?.status).toBe('SIGNED')
     expect((publicStatus as any).rawSignedTxHex).toBeUndefined()
     expect((publicStatus as any).plan).toBeUndefined()
 
-    // Internal ledger method can retrieve raw tx for future settlement
-    const internalHex = await (executionLedger as any).getSignedTransactionHex?.(session.executionId)
+    // Public executionLedger has NO getSignedTransactionHex method
+    expect((executionLedger as any).getSignedTransactionHex).toBeUndefined()
+
+    // Private settlement storage retains raw signed tx, accessible only via internal settlement accessor with token
+    const internalHex = await getInternalSignedTransactionHex(executionLedger, INTERNAL_SETTLEMENT_TOKEN, session.executionId)
     expect(internalHex).toBeDefined()
     expect(typeof internalHex).toBe('string')
-  })
 
-  // P0-3: Final human confirmation is strictly enforced
-  it('enforces that session alone does not expose signing method and requires local authority', async () => {
-    const { engine, record } = setupEngine()
-    const session = await engine.prepareExecution(record.humanApproval!)
-
-    // Public review session has NO confirmExecution or signing method
-    expect((session as any).confirmExecution).toBeUndefined()
-    expect((session as any).sign).toBeUndefined()
-
-    // Calling controller from local UI succeeds
-    const controller = engine.createLocalConfirmationController(session)
-    const handle = await controller.confirm()
-    expect(handle.status).toBe('SIGNED')
+    // Unauthorized settlement access throws
+    await expect(
+      getInternalSignedTransactionHex(executionLedger, Symbol('unauthorized'), session.executionId)
+    ).rejects.toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
   })
 
   // P0-4: Dismiss invalidates execution durably
   it('durably invalidates execution when dismiss is called, preventing subsequent signing', async () => {
     const signerMock = vi.fn()
-    const { engine, record, executionLedger } = setupEngine({
+    const { engine, uiHost, record, executionLedger } = setupEngine({
       signatoryProvider: {
-        async getSignatory() {
+        getSignatory: async () => {
           signerMock()
           return createSyntheticSignatory().signatory
         }
@@ -326,22 +489,23 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     })
 
     const session = await engine.prepareExecution(record.humanApproval!)
-    const controller = engine.createLocalConfirmationController(session)
+    const controller = uiHost.getActiveController()
+    expect(controller).toBeDefined()
 
-    // Custodian dismisses modal
+    // Dismiss execution
     await session.dismiss()
 
-    // Check ledger state is durably REJECTED
-    const ledgerRecord = await executionLedger.get(session.executionId)
-    expect(ledgerRecord?.state).toBe('REJECTED')
-
-    // Subsequent confirm attempt MUST fail
-    await expect(controller.confirm()).rejects.toThrow(
+    // Subsequent confirm must fail
+    await expect(controller!.confirm()).rejects.toThrow(
       expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' })
     )
 
     // Signer was never invoked
     expect(signerMock).not.toHaveBeenCalled()
+
+    // Durable state must be REJECTED
+    const status = await executionLedger.get(session.executionId)
+    expect(status?.status).toBe('REJECTED')
   })
 
   // P1-1: Single-flight race prevention
@@ -455,13 +619,13 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     expect(computeCanonicalPlanHash(planMutLocktime)).not.toBe(baseHash)
   })
 
-  // P1-3: Output script must match declared address
-  it('strictly validates output scriptHex matches derived address script', () => {
+  // P1-3: Strict Destination Output Script Match
+  it('fails closed when output script does not exactly match approved destination', () => {
     const plan = buildPreparedExecutionPlan({
       approved: {
-        approvalId: 'appr_456',
-        requestId: 'req_123',
-        intentId: 'intent_789',
+        approvalId: 'appr_1',
+        requestId: 'req_1',
+        intentId: 'intent_1',
         fromAddress: FROM_ADDRESS,
         destination: DESTINATION_ADDRESS,
         amountSats: 250_000n
@@ -469,74 +633,67 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       availableUtxos: createFixtureUtxos()
     })
 
-    // Valid plan passes output invariant validation
-    expect(() =>
-      validateOutputInvariants(plan, {
-        destination: DESTINATION_ADDRESS,
-        amountSats: 250_000n,
-        fromAddress: FROM_ADDRESS,
-        network: 'xec:mainnet'
-      })
-    ).not.toThrow()
-
-    // Attacker modifies primary output script to another valid address script
-    const attackerScriptHex = toHex(Script.fromAddress(ALTERNATE_ADDRESS).bytecode)
-    const tamperedPlan: any = {
-      ...plan,
-      outputs: [
-        { ...plan.outputs[0], scriptHex: attackerScriptHex },
-        plan.outputs[1]
-      ]
-    }
+    // Modify the destination script to point to another address
+    const tamperedOutputs = [
+      {
+        ...plan.outputs[0],
+        scriptHex: FROM_SCRIPT_HEX // wrong script!
+      },
+      plan.outputs[1]
+    ]
 
     expect(() =>
-      validateOutputInvariants(tamperedPlan, {
-        destination: DESTINATION_ADDRESS,
-        amountSats: 250_000n,
-        fromAddress: FROM_ADDRESS,
-        network: 'xec:mainnet'
-      })
+      validateOutputInvariants(
+        { ...plan, outputs: tamperedOutputs },
+        {
+          destination: DESTINATION_ADDRESS,
+          amountSats: 250_000n,
+          fromAddress: FROM_ADDRESS,
+          network: 'xec:mainnet'
+        },
+        DEFAULT_FEE_POLICY
+      )
     ).toThrow(expect.objectContaining({ code: 'OUTPUT_INVARIANT_VIOLATION' }))
   })
 
-  // P1-4: Post-sign verification against adversarial signatory
-  it('detects adversarial signer modifying output script and fails closed to SIGNING_UNCERTAIN', async () => {
-    // Adversarial signatory provider that modifies the destination output
+  // P1-4: Post-Sign Verification of Serialized Transaction
+  it('fails closed if signed transaction does not match prepared plan outputs', async () => {
+    // Adversarial signatory that produces valid signature over tampered transaction
     const adversarialSigner = {
-      async signTransaction(txBuilder: any) {
-        // Tamper with output script
+      signTransaction: async (builder: TxBuilder) => {
+        // Tamper by modifying outputs in builder before signing
         const tamperedBuilder = new TxBuilder({
-          version: txBuilder.version,
-          locktime: txBuilder.locktime,
-          inputs: txBuilder.inputs,
+          version: builder.version,
+          locktime: builder.locktime,
+          inputs: builder.inputs,
           outputs: [
             {
-              sats: txBuilder.outputs[0].sats,
+              sats: builder.outputs[0].sats,
               script: Script.fromAddress(ALTERNATE_ADDRESS)
             },
-            ...(txBuilder.outputs.slice(1))
+            ...builder.outputs.slice(1)
           ]
         })
         const synthetic = createSyntheticSignatory()
-        // Sign tampered
-        return tamperedBuilder.sign()
+        return (tamperedBuilder as any).sign(synthetic.signatory)
       }
     }
 
-    const { engine, record, executionLedger } = setupEngine({
+    const { engine, uiHost, record, executionLedger } = setupEngine({
       signatoryProvider: adversarialSigner
     })
 
     const session = await engine.prepareExecution(record.humanApproval!)
-    const controller = engine.createLocalConfirmationController(session)
+    const controller = uiHost.getActiveController()
+    expect(controller).toBeDefined()
 
-    await expect(controller.confirm()).rejects.toThrow(
+    await expect(controller!.confirm()).rejects.toThrow(
       expect.objectContaining({ code: 'SIGNED_TRANSACTION_MISMATCH' })
     )
 
     // Ledger record must be marked SIGNING_UNCERTAIN
     const ledgerRecord = await executionLedger.get(session.executionId)
-    expect(ledgerRecord?.state).toBe('SIGNING_UNCERTAIN')
+    expect(ledgerRecord?.status).toBe('SIGNING_UNCERTAIN')
   })
 
   // P1-5: Terminal State Immutability
@@ -578,7 +735,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
 
     // State remains SIGNED
     const finalRecord = await ledger.get('exec_imm')
-    expect(finalRecord?.state).toBe('SIGNED')
+    expect(finalRecord?.status).toBe('SIGNED')
   })
 
   // Fee Policy Violation Tests
@@ -600,34 +757,36 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
 
   // TOCTOU / Stale UTXO Test
   it('fails closed and records FAILED if selected UTXO becomes unspendable before signing', async () => {
-    const { engine, record, executionLedger, setUtxos } = setupEngine()
+    const { engine, uiHost, record, executionLedger, setUtxos } = setupEngine()
 
     const session = await engine.prepareExecution(record.humanApproval!)
-    const controller = engine.createLocalConfirmationController(session)
+    const controller = uiHost.getActiveController()
+    expect(controller).toBeDefined()
 
     // Simulate UTXO spent in the interim
     setUtxos([])
 
-    await expect(controller.confirm()).rejects.toThrow(
+    await expect(controller!.confirm()).rejects.toThrow(
       expect.objectContaining({ code: 'UTXO_SELECTION_STALE' })
     )
 
     const updated = await executionLedger.get(session.executionId)
-    expect(updated?.state).toBe('FAILED')
+    expect(updated?.status).toBe('FAILED')
   })
 
   // Custodian Session Revalidation Failures
   it('fails closed when wallet custodian session changes before signing', async () => {
-    const { engine, record, setActiveAddress } = setupEngine()
+    const { engine, uiHost, record, setActiveAddress } = setupEngine()
 
     const session = await engine.prepareExecution(record.humanApproval!)
-    const controller = engine.createLocalConfirmationController(session)
+    const controller = uiHost.getActiveController()
+    expect(controller).toBeDefined()
 
     // Custodian changes active wallet address
     setActiveAddress(ALTERNATE_ADDRESS)
 
     // Confirm fails closed
-    await expect(controller.confirm()).rejects.toThrow(
+    await expect(controller!.confirm()).rejects.toThrow(
       expect.objectContaining({ code: 'SESSION_ADDRESS_MISMATCH' })
     )
   })
@@ -639,7 +798,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
 
     await session.rejectExecution('Custodian rejected plan.')
     const updated = await executionLedger.get(session.executionId)
-    expect(updated?.state).toBe('REJECTED')
+    expect(updated?.status).toBe('REJECTED')
     expect(updated?.uncertainReason).toBe('Custodian rejected plan.')
   })
 })

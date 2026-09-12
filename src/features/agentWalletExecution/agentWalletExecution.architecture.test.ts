@@ -10,13 +10,14 @@
  * 4. Raw signed transaction bytes (rawSignedTxHex) are strictly hidden from public types/exports.
  * 5. Module source code contains ZERO broadcast or network mutation functions.
  * 6. Module contains ZERO settlement or confirmation polling logic.
- * 7. HumanApprovalV1 receipt cannot invoke signing on its own.
- * 8. All production source files maintain strict capability privacy (AST inspection).
+ * 7. HumanApprovalV1 receipt + session cannot invoke signing without Wallet UI internal controller.
+ * 8. Public Agent-facing engine strictly lacks confirm, sign, execute, and createLocalConfirmationController.
+ * 9. All production source files maintain strict capability privacy (AST inspection).
  */
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import * as PublicModuleExports from './index'
 
 describe('agentWalletExecution Architecture & Security Boundaries', () => {
@@ -24,8 +25,11 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     const exportedKeys = Object.keys(PublicModuleExports)
 
     // Allowed production exports
+    expect(exportedKeys).toContain('createWalletExecutionComposition')
     expect(exportedKeys).toContain('createAgentWalletExecutionEngine')
+    expect(exportedKeys).toContain('DurableTransactionalExecutionLedger')
     expect(exportedKeys).toContain('DurableStorageWalletExecutionLedger')
+    expect(exportedKeys).toContain('WebLocksExecutionCoordinator')
     expect(exportedKeys).toContain('WalletExecutionError')
     expect(exportedKeys).toContain('DEFAULT_FEE_POLICY')
     expect(exportedKeys).toContain('estimateP2pkhTransactionSize')
@@ -50,14 +54,51 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect((PublicModuleExports as any).mnemonic).toBeUndefined()
     expect((PublicModuleExports as any).wif).toBeUndefined()
 
-    // FORBIDDEN exports: raw signed tx getters or fields
+    // FORBIDDEN exports: raw signed tx getters, internal records, or settlement tokens
     expect((PublicModuleExports as any).rawSignedTxHex).toBeUndefined()
     expect((PublicModuleExports as any).getSignedTxHex).toBeUndefined()
+    expect((PublicModuleExports as any).getSignedTransactionHex).toBeUndefined()
+    expect((PublicModuleExports as any).InternalWalletExecutionRecord).toBeUndefined()
+    expect((PublicModuleExports as any).SettlementRawTransactionAccessor).toBeUndefined()
+    expect((PublicModuleExports as any).INTERNAL_SETTLEMENT_TOKEN).toBeUndefined()
+    expect((PublicModuleExports as any).getInternalSignedTransactionHex).toBeUndefined()
+
+    // FORBIDDEN exports: local confirmation controller creation & controller type
+    expect((PublicModuleExports as any).createLocalConfirmationController).toBeUndefined()
+    expect((PublicModuleExports as any).WalletLocalConfirmationController).toBeUndefined()
+    expect((PublicModuleExports as any).confirm).toBeUndefined()
+    expect((PublicModuleExports as any).sign).toBeUndefined()
+    expect((PublicModuleExports as any).execute).toBeUndefined()
 
     // FORBIDDEN exports: network broadcast functions
     expect((PublicModuleExports as any).broadcastTx).toBeUndefined()
     expect((PublicModuleExports as any).broadcastTransaction).toBeUndefined()
     expect((PublicModuleExports as any).sendRawTransaction).toBeUndefined()
+  })
+
+  it('verifies public AgentWalletExecutionEngine has NO confirmation, signing, or execution methods', () => {
+    const dummyConfig: any = {
+      approvalLedger: { get: vi.fn(), getByApprovalId: vi.fn() },
+      sessionVerifier: { verifyActiveSession: vi.fn() },
+      utxoProvider: { getSpendableUtxos: vi.fn() },
+      signatoryProvider: { getSignatory: vi.fn() },
+      storage: {
+        getItem: vi.fn().mockReturnValue(null),
+        setItem: vi.fn(),
+        removeItem: vi.fn(),
+        clear: vi.fn(),
+        length: 0,
+        key: vi.fn()
+      }
+    }
+    const publicEngine = PublicModuleExports.createAgentWalletExecutionEngine(dummyConfig)
+
+    expect(typeof publicEngine.prepareExecution).toBe('function')
+    expect(typeof publicEngine.getExecutionStatus).toBe('function')
+    expect((publicEngine as any).confirm).toBeUndefined()
+    expect((publicEngine as any).sign).toBeUndefined()
+    expect((publicEngine as any).execute).toBeUndefined()
+    expect((publicEngine as any).createLocalConfirmationController).toBeUndefined()
   })
 
   it('verifies capability.ts does NOT exist in production source', () => {
@@ -76,6 +117,7 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     const sessionBody = sessionMatch![1]
 
     expect(sessionBody).not.toMatch(/confirmExecution/)
+    expect(sessionBody).not.toMatch(/confirm\(/)
     expect(sessionBody).not.toMatch(/sign\(/)
     expect(sessionBody).not.toMatch(/execute\(/)
     expect(sessionBody).toContain('rejectExecution')
@@ -89,6 +131,17 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     const publicStatusBody = publicStatusMatch![1]
 
     expect(publicStatusBody).not.toMatch(/rawSignedTxHex/)
+  })
+
+  it('verifies SignedExecutionHandle remains opaque without raw tx bytes', () => {
+    const typesContent = readFileSync(join(__dirname, 'types.ts'), 'utf-8')
+    const handleMatch = typesContent.match(/export interface SignedExecutionHandle \{([\s\S]*?)\}/)
+    expect(handleMatch).not.toBeNull()
+    const handleBody = handleMatch![1]
+
+    expect(handleBody).not.toMatch(/rawSignedTxHex/)
+    expect(handleBody).not.toMatch(/rawTx/)
+    expect(handleBody).not.toMatch(/txHex/)
   })
 
   it('verifies ZERO broadcast or network mutation functions exist in feature codebase', () => {
@@ -137,7 +190,7 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(typesContent).toContain("'SIGNING_UNCERTAIN'")
   })
 
-  it('verifies HumanApprovalV1 alone cannot invoke signing without WalletExecutionEngine and session', () => {
+  it('verifies possession of HumanApprovalV1 + WalletExecutionReviewSession + executionId cannot invoke signing', () => {
     const fakeReceipt = {
       schema: 'tonalli.human-approval',
       version: 1,
@@ -155,6 +208,16 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
 
     expect((fakeReceipt as any).sign).toBeUndefined()
     expect((fakeReceipt as any).execute).toBeUndefined()
+    expect((fakeReceipt as any).confirm).toBeUndefined()
     expect((fakeReceipt as any).confirmExecution).toBeUndefined()
+
+    const fakeSession: any = {
+      executionId: 'exec_fake',
+      plan: {},
+      review: {}
+    }
+    expect(fakeSession.confirm).toBeUndefined()
+    expect(fakeSession.sign).toBeUndefined()
+    expect(fakeSession.execute).toBeUndefined()
   })
 })

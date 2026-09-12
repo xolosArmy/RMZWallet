@@ -1,10 +1,16 @@
 /**
  * @file ledger.ts
  *
- * CANONICAL DURABLE WALLET EXECUTION LEDGER (Gate C2)
+ * CANONICAL DURABLE TRANSACTIONAL WALLET EXECUTION LEDGER (Gate C2)
  *
- * Enforces durable at-most-once execution, crash consistency, and terminal state immutability.
- * Backed by canonical wallet storage (Web Storage / localStorage).
+ * Enforces cross-tab transactional exclusion, durable at-most-once execution,
+ * crash consistency, and terminal state immutability.
+ *
+ * Coordination Primitive:
+ * - Atomic exclusion across same-origin tabs/contexts using Web Locks API (navigator.locks)
+ *   with unique durable indexes on approvalId, requestId, and executionId.
+ * - Single-transaction CAS generation tracking.
+ * - Private settlement storage partition for raw signed transaction isolation (P0-3).
  *
  * Allowed Transitions:
  * APPROVED -> EXECUTION_RESERVED -> PREPARED -> SIGNING -> SIGNED
@@ -14,13 +20,15 @@
 import { WalletExecutionError } from './errors'
 import type {
   ExecutionNetwork,
-  InternalWalletExecutionRecord,
+  PublicExecutionStatus,
   WalletExecutionLedger,
   WalletExecutionState,
   WalletPreparedExecutionPlan
 } from './types'
 
-export const DEFAULT_EXECUTION_LEDGER_STORAGE_KEY = 'rmzwallet_agent_execution_ledger_v1'
+export const DEFAULT_EXECUTION_LEDGER_STORAGE_KEY = 'rmzwallet_agent_execution_ledger_v2'
+export const DEFAULT_PRIVATE_SETTLEMENT_STORAGE_KEY = 'rmzwallet_agent_execution_private_settlement_v2'
+export const DEFAULT_EXECUTION_LOCK_NAME = 'rmzwallet:agent-execution:lock:v2'
 
 export const VALID_EXECUTION_STATE_TRANSITIONS: Readonly<
   Record<WalletExecutionState, readonly WalletExecutionState[]>
@@ -35,7 +43,45 @@ export const VALID_EXECUTION_STATE_TRANSITIONS: Readonly<
   SIGNING_UNCERTAIN: [] // Strictly terminal
 })
 
-interface SerializedExecutionRecord {
+/**
+ * Coordination primitive port for atomic cross-tab/cross-context mutual exclusion.
+ */
+export interface ExecutionLockCoordinator {
+  requestExclusive<T>(lockName: string, operation: () => Promise<T>): Promise<T>
+}
+
+/**
+ * Production Web Locks coordinator providing cross-tab atomic exclusion in modern browsers & Node 24.
+ */
+export class WebLocksExecutionCoordinator implements ExecutionLockCoordinator {
+  private readonly fallbackQueues = new Map<string, Promise<unknown>>()
+
+  async requestExclusive<T>(lockName: string, operation: () => Promise<T>): Promise<T> {
+    if (typeof navigator !== 'undefined' && navigator.locks?.request) {
+      return navigator.locks.request(lockName, { mode: 'exclusive' }, operation)
+    }
+
+    // Fallback for isolated environments lacking Web Locks: sequential promise queue
+    let resolveQueue: (() => void) | undefined
+    const queuePromise = new Promise<void>(res => {
+      resolveQueue = res
+    })
+    const prevQueue = this.fallbackQueues.get(lockName) ?? Promise.resolve()
+    this.fallbackQueues.set(lockName, queuePromise)
+
+    await prevQueue
+    try {
+      return await operation()
+    } finally {
+      resolveQueue?.()
+      if (this.fallbackQueues.get(lockName) === queuePromise) {
+        this.fallbackQueues.delete(lockName)
+      }
+    }
+  }
+}
+
+interface SerializedExecutionStateEntry {
   readonly executionId: string
   readonly approvalId: string
   readonly requestId: string
@@ -46,182 +92,68 @@ interface SerializedExecutionRecord {
   readonly amountSats: string
   readonly network: ExecutionNetwork
   readonly state: WalletExecutionState
-  readonly rawSignedTxHex?: string
+  readonly planHash?: string
   readonly uncertainReason?: string
   readonly reservedAt: number
   readonly preparedAt?: number
   readonly signingAt?: number
   readonly signedAt?: number
   readonly failedAt?: number
-  readonly plan?: {
-    readonly network: ExecutionNetwork
-    readonly fromAddress: string
-    readonly destination: string
-    readonly paymentAmountSats: string
-    readonly changeAmountSats: string
-    readonly changeAddress: string
-    readonly feeSats: string
-    readonly feeRateSatsPerByte: number
-    readonly inputs: readonly {
-      readonly txid: string
-      readonly outIdx: number
-      readonly sats: string
-      readonly lockingScriptHex: string
-    }[]
-    readonly outputs: readonly {
-      readonly index: number
-      readonly destination: string
-      readonly scriptHex: string
-      readonly sats: string
-      readonly isChange: boolean
-    }[]
-    readonly totalInputSats: string
-    readonly transactionVersion: number
-    readonly locktime: number
-    readonly planHash: string
-    readonly approvalId: string
-    readonly requestId: string
-    readonly intentId: string
-  }
 }
 
-interface DurableLedgerStoragePayload {
-  readonly version: 1
+interface DurableLedgerStoragePayloadV2 {
+  readonly schemaVersion: 2
   generation: number
-  records: Record<string, SerializedExecutionRecord>
+  records: Record<string, SerializedExecutionStateEntry>
   approvalIdIndex: Record<string, string>
   requestIdIndex: Record<string, string>
 }
 
-function serializeRecord(record: InternalWalletExecutionRecord): SerializedExecutionRecord {
-  return {
-    executionId: record.executionId,
-    approvalId: record.approvalId,
-    requestId: record.requestId,
-    intentId: record.intentId,
-    decisionId: record.decisionId,
-    fromAddress: record.fromAddress,
-    destination: record.destination,
-    amountSats: record.amountSats.toString(),
-    network: record.network,
-    state: record.state,
-    rawSignedTxHex: record.rawSignedTxHex,
-    uncertainReason: record.uncertainReason,
-    reservedAt: record.reservedAt,
-    preparedAt: record.preparedAt,
-    signingAt: record.signingAt,
-    signedAt: record.signedAt,
-    failedAt: record.failedAt,
-    plan: record.plan
-      ? {
-          network: record.plan.network,
-          fromAddress: record.plan.fromAddress,
-          destination: record.plan.destination,
-          paymentAmountSats: record.plan.paymentAmountSats.toString(),
-          changeAmountSats: record.plan.changeAmountSats.toString(),
-          changeAddress: record.plan.changeAddress,
-          feeSats: record.plan.feeSats.toString(),
-          feeRateSatsPerByte: record.plan.feeRateSatsPerByte,
-          inputs: record.plan.inputs.map(i => ({
-            txid: i.txid,
-            outIdx: i.outIdx,
-            sats: i.sats.toString(),
-            lockingScriptHex: i.lockingScriptHex
-          })),
-          outputs: record.plan.outputs.map(o => ({
-            index: o.index,
-            destination: o.destination,
-            scriptHex: o.scriptHex,
-            sats: o.sats.toString(),
-            isChange: o.isChange
-          })),
-          totalInputSats: record.plan.totalInputSats.toString(),
-          transactionVersion: record.plan.transactionVersion,
-          locktime: record.plan.locktime,
-          planHash: record.plan.planHash,
-          approvalId: record.plan.approvalId,
-          requestId: record.plan.requestId,
-          intentId: record.plan.intentId
-        }
-      : undefined
-  }
-}
-
-function deserializeRecord(serialized: SerializedExecutionRecord): InternalWalletExecutionRecord {
-  const plan: WalletPreparedExecutionPlan | undefined = serialized.plan
-    ? Object.freeze({
-        network: serialized.plan.network,
-        fromAddress: serialized.plan.fromAddress,
-        destination: serialized.plan.destination,
-        paymentAmountSats: BigInt(serialized.plan.paymentAmountSats),
-        changeAmountSats: BigInt(serialized.plan.changeAmountSats),
-        changeAddress: serialized.plan.changeAddress,
-        feeSats: BigInt(serialized.plan.feeSats),
-        feeRateSatsPerByte: serialized.plan.feeRateSatsPerByte,
-        inputs: Object.freeze(
-          serialized.plan.inputs.map(i =>
-            Object.freeze({
-              txid: i.txid,
-              outIdx: i.outIdx,
-              sats: BigInt(i.sats),
-              lockingScriptHex: i.lockingScriptHex
-            })
-          )
-        ),
-        outputs: Object.freeze(
-          serialized.plan.outputs.map(o =>
-            Object.freeze({
-              index: o.index,
-              destination: o.destination,
-              scriptHex: o.scriptHex,
-              sats: BigInt(o.sats),
-              isChange: o.isChange
-            })
-          )
-        ),
-        totalInputSats: BigInt(serialized.plan.totalInputSats),
-        transactionVersion: serialized.plan.transactionVersion,
-        locktime: serialized.plan.locktime,
-        planHash: serialized.plan.planHash,
-        approvalId: serialized.plan.approvalId,
-        requestId: serialized.plan.requestId,
-        intentId: serialized.plan.intentId
-      })
-    : undefined
-
+function toPublicStatus(entry: SerializedExecutionStateEntry): PublicExecutionStatus {
   return Object.freeze({
-    executionId: serialized.executionId,
-    approvalId: serialized.approvalId,
-    requestId: serialized.requestId,
-    intentId: serialized.intentId,
-    decisionId: serialized.decisionId,
-    fromAddress: serialized.fromAddress,
-    destination: serialized.destination,
-    amountSats: BigInt(serialized.amountSats),
-    network: serialized.network,
-    state: serialized.state,
-    rawSignedTxHex: serialized.rawSignedTxHex,
-    uncertainReason: serialized.uncertainReason,
-    reservedAt: serialized.reservedAt,
-    preparedAt: serialized.preparedAt,
-    signingAt: serialized.signingAt,
-    signedAt: serialized.signedAt,
-    failedAt: serialized.failedAt,
-    plan,
-    planHash: plan?.planHash
+    executionId: entry.executionId,
+    approvalId: entry.approvalId,
+    requestId: entry.requestId,
+    intentId: entry.intentId,
+    decisionId: entry.decisionId,
+    fromAddress: entry.fromAddress,
+    destination: entry.destination,
+    amountSats: BigInt(entry.amountSats),
+    network: entry.network,
+    status: entry.state,
+    planHash: entry.planHash,
+    uncertainReason: entry.uncertainReason,
+    reservedAt: entry.reservedAt,
+    preparedAt: entry.preparedAt,
+    signingAt: entry.signingAt,
+    signedAt: entry.signedAt,
+    failedAt: entry.failedAt
   })
 }
 
-export interface DurableStorageWalletExecutionLedgerOptions {
+// Module-private token for internal settlement accessor
+export const INTERNAL_SETTLEMENT_TOKEN = Symbol('WalletInternalSettlementToken')
+
+export interface DurableTransactionalExecutionLedgerOptions {
   readonly storage?: Storage | null
   readonly storageKey?: string
+  readonly settlementStorageKey?: string
+  readonly lockName?: string
+  readonly lockCoordinator?: ExecutionLockCoordinator
 }
 
-export class DurableStorageWalletExecutionLedger implements WalletExecutionLedger {
+/**
+ * Production durable transactional execution ledger backed by Storage and Web Locks.
+ * Ensures that two concurrent tabs cannot both reserve the same approval.
+ */
+export class DurableTransactionalExecutionLedger implements WalletExecutionLedger {
   private readonly storage: Storage
   private readonly storageKey: string
+  private readonly settlementStorageKey: string
+  private readonly lockName: string
+  private readonly coordinator: ExecutionLockCoordinator
 
-  constructor(options?: DurableStorageWalletExecutionLedgerOptions) {
+  constructor(options?: DurableTransactionalExecutionLedgerOptions) {
     const resolvedStorage = options?.storage ?? (typeof window !== 'undefined' ? window.localStorage : null)
     if (!resolvedStorage) {
       throw new WalletExecutionError(
@@ -231,16 +163,19 @@ export class DurableStorageWalletExecutionLedger implements WalletExecutionLedge
     }
     this.storage = resolvedStorage
     this.storageKey = options?.storageKey ?? DEFAULT_EXECUTION_LEDGER_STORAGE_KEY
+    this.settlementStorageKey = options?.settlementStorageKey ?? DEFAULT_PRIVATE_SETTLEMENT_STORAGE_KEY
+    this.lockName = options?.lockName ?? DEFAULT_EXECUTION_LOCK_NAME
+    this.coordinator = options?.lockCoordinator ?? new WebLocksExecutionCoordinator()
 
-    // Initialize & reconcile crash consistency on startup
-    this.reconcileInterruptedSignings()
+    // Reconcile crash consistency on startup under atomic lock
+    void this.reconcileInterruptedSignings()
   }
 
-  private loadData(): DurableLedgerStoragePayload {
+  private loadData(): DurableLedgerStoragePayloadV2 {
     const raw = this.storage.getItem(this.storageKey)
     if (!raw) {
       return {
-        version: 1,
+        schemaVersion: 2,
         generation: 0,
         records: {},
         approvalIdIndex: {},
@@ -248,8 +183,8 @@ export class DurableStorageWalletExecutionLedger implements WalletExecutionLedge
       }
     }
     try {
-      const parsed = JSON.parse(raw) as DurableLedgerStoragePayload
-      if (!parsed || parsed.version !== 1 || typeof parsed.records !== 'object') {
+      const parsed = JSON.parse(raw) as DurableLedgerStoragePayloadV2
+      if (!parsed || parsed.schemaVersion !== 2 || typeof parsed.records !== 'object') {
         throw new Error('Invalid storage schema')
       }
       return parsed
@@ -261,7 +196,7 @@ export class DurableStorageWalletExecutionLedger implements WalletExecutionLedge
     }
   }
 
-  private saveData(data: DurableLedgerStoragePayload): void {
+  private saveData(data: DurableLedgerStoragePayloadV2): void {
     data.generation += 1
     try {
       this.storage.setItem(this.storageKey, JSON.stringify(data))
@@ -273,27 +208,61 @@ export class DurableStorageWalletExecutionLedger implements WalletExecutionLedge
     }
   }
 
+  private saveSettlementBlob(executionId: string, rawSignedTxHex: string): void {
+    try {
+      const raw = this.storage.getItem(this.settlementStorageKey)
+      const settlementStore: Record<string, string> = raw ? JSON.parse(raw) : {}
+      settlementStore[executionId] = rawSignedTxHex
+      this.storage.setItem(this.settlementStorageKey, JSON.stringify(settlementStore))
+    } catch (err) {
+      throw new WalletExecutionError(
+        'STORAGE_MUTATION_FAILED',
+        `Failed to persist private settlement blob: ${err instanceof Error ? err.message : String(err)}`
+      )
+    }
+  }
+
+  /**
+   * Module-internal accessor for private settlement data.
+   * Strictly requires the INTERNAL_SETTLEMENT_TOKEN symbol.
+   */
+  _getRawSignedTxHexInternal(token: symbol, executionId: string): string | undefined {
+    if (token !== INTERNAL_SETTLEMENT_TOKEN) {
+      throw new WalletExecutionError('FORBIDDEN', 'Unauthorized settlement access.')
+    }
+    try {
+      const raw = this.storage.getItem(this.settlementStorageKey)
+      if (!raw) return undefined
+      const settlementStore = JSON.parse(raw) as Record<string, string>
+      return settlementStore[executionId]
+    } catch {
+      return undefined
+    }
+  }
+
   /**
    * Crash probe & recovery: If the process crashes while a record is in SIGNING,
    * it must be reconciled to SIGNING_UNCERTAIN upon restart to prevent automated retries.
    */
-  private reconcileInterruptedSignings(): void {
-    const data = this.loadData()
-    let changed = false
-    for (const [id, record] of Object.entries(data.records)) {
-      if (record.state === 'SIGNING') {
-        data.records[id] = {
-          ...record,
-          state: 'SIGNING_UNCERTAIN',
-          uncertainReason: 'Process interrupted during signing; reconciled to SIGNING_UNCERTAIN on reopen.',
-          failedAt: Math.floor(Date.now() / 1000)
+  private async reconcileInterruptedSignings(): Promise<void> {
+    await this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
+      let changed = false
+      for (const [id, record] of Object.entries(data.records)) {
+        if (record.state === 'SIGNING') {
+          data.records[id] = {
+            ...record,
+            state: 'SIGNING_UNCERTAIN',
+            uncertainReason: 'Process interrupted during signing; reconciled to SIGNING_UNCERTAIN on reopen.',
+            failedAt: Math.floor(Date.now() / 1000)
+          }
+          changed = true
         }
-        changed = true
       }
-    }
-    if (changed) {
-      this.saveData(data)
-    }
+      if (changed) {
+        this.saveData(data)
+      }
+    })
   }
 
   private assertTransition(currentState: WalletExecutionState, targetState: WalletExecutionState): void {
@@ -318,48 +287,50 @@ export class DurableStorageWalletExecutionLedger implements WalletExecutionLedge
     network: ExecutionNetwork
     reservedAt: number
   }): Promise<void> {
-    const data = this.loadData()
+    return this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
 
-    if (data.approvalIdIndex[entry.approvalId]) {
-      throw new WalletExecutionError(
-        'DUPLICATE_EXECUTION',
-        `An execution record for approvalId "${entry.approvalId}" already exists.`
-      )
-    }
+      if (data.approvalIdIndex[entry.approvalId]) {
+        throw new WalletExecutionError(
+          'DUPLICATE_EXECUTION',
+          `An execution record for approvalId "${entry.approvalId}" already exists.`
+        )
+      }
 
-    if (data.requestIdIndex[entry.requestId]) {
-      throw new WalletExecutionError(
-        'DUPLICATE_EXECUTION',
-        `An execution record for requestId "${entry.requestId}" already exists.`
-      )
-    }
+      if (data.requestIdIndex[entry.requestId]) {
+        throw new WalletExecutionError(
+          'DUPLICATE_EXECUTION',
+          `An execution record for requestId "${entry.requestId}" already exists.`
+        )
+      }
 
-    if (data.records[entry.executionId]) {
-      throw new WalletExecutionError(
-        'DUPLICATE_EXECUTION',
-        `An execution record for executionId "${entry.executionId}" already exists.`
-      )
-    }
+      if (data.records[entry.executionId]) {
+        throw new WalletExecutionError(
+          'DUPLICATE_EXECUTION',
+          `An execution record for executionId "${entry.executionId}" already exists.`
+        )
+      }
 
-    const record: InternalWalletExecutionRecord = Object.freeze({
-      executionId: entry.executionId,
-      approvalId: entry.approvalId,
-      requestId: entry.requestId,
-      intentId: entry.intentId,
-      decisionId: entry.decisionId,
-      fromAddress: entry.fromAddress,
-      destination: entry.destination,
-      amountSats: entry.amountSats,
-      network: entry.network,
-      state: 'EXECUTION_RESERVED',
-      reservedAt: entry.reservedAt
+      const serialized: SerializedExecutionStateEntry = {
+        executionId: entry.executionId,
+        approvalId: entry.approvalId,
+        requestId: entry.requestId,
+        intentId: entry.intentId,
+        decisionId: entry.decisionId,
+        fromAddress: entry.fromAddress,
+        destination: entry.destination,
+        amountSats: entry.amountSats.toString(),
+        network: entry.network,
+        state: 'EXECUTION_RESERVED',
+        reservedAt: entry.reservedAt
+      }
+
+      data.records[entry.executionId] = serialized
+      data.approvalIdIndex[entry.approvalId] = entry.executionId
+      data.requestIdIndex[entry.requestId] = entry.executionId
+
+      this.saveData(data)
     })
-
-    data.records[entry.executionId] = serializeRecord(record)
-    data.approvalIdIndex[entry.approvalId] = entry.executionId
-    data.requestIdIndex[entry.requestId] = entry.executionId
-
-    this.saveData(data)
   }
 
   async setPlanPrepared(
@@ -367,45 +338,44 @@ export class DurableStorageWalletExecutionLedger implements WalletExecutionLedge
     plan: WalletPreparedExecutionPlan,
     preparedAt: number
   ): Promise<void> {
-    const data = this.loadData()
-    const serialized = data.records[executionId]
-    if (!serialized) {
-      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
-    }
+    return this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
+      const existing = data.records[executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
+      }
 
-    this.assertTransition(serialized.state, 'PREPARED')
+      this.assertTransition(existing.state, 'PREPARED')
 
-    const existing = deserializeRecord(serialized)
-    const updated: InternalWalletExecutionRecord = Object.freeze({
-      ...existing,
-      plan,
-      planHash: plan.planHash,
-      state: 'PREPARED',
-      preparedAt
+      data.records[executionId] = {
+        ...existing,
+        state: 'PREPARED',
+        planHash: plan.planHash,
+        preparedAt
+      }
+
+      this.saveData(data)
     })
-
-    data.records[executionId] = serializeRecord(updated)
-    this.saveData(data)
   }
 
   async transitionToSigning(executionId: string, signingAt: number): Promise<void> {
-    const data = this.loadData()
-    const serialized = data.records[executionId]
-    if (!serialized) {
-      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
-    }
+    return this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
+      const existing = data.records[executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
+      }
 
-    this.assertTransition(serialized.state, 'SIGNING')
+      this.assertTransition(existing.state, 'SIGNING')
 
-    const existing = deserializeRecord(serialized)
-    const updated: InternalWalletExecutionRecord = Object.freeze({
-      ...existing,
-      state: 'SIGNING',
-      signingAt
+      data.records[executionId] = {
+        ...existing,
+        state: 'SIGNING',
+        signingAt
+      }
+
+      this.saveData(data)
     })
-
-    data.records[executionId] = serializeRecord(updated)
-    this.saveData(data)
   }
 
   async transitionToSigned(
@@ -413,24 +383,27 @@ export class DurableStorageWalletExecutionLedger implements WalletExecutionLedge
     rawSignedTxHex: string,
     signedAt: number
   ): Promise<void> {
-    const data = this.loadData()
-    const serialized = data.records[executionId]
-    if (!serialized) {
-      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
-    }
+    return this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
+      const existing = data.records[executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
+      }
 
-    this.assertTransition(serialized.state, 'SIGNED')
+      this.assertTransition(existing.state, 'SIGNED')
 
-    const existing = deserializeRecord(serialized)
-    const updated: InternalWalletExecutionRecord = Object.freeze({
-      ...existing,
-      state: 'SIGNED',
-      rawSignedTxHex,
-      signedAt
+      // Save raw signed transaction to private settlement partition
+      this.saveSettlementBlob(executionId, rawSignedTxHex)
+
+      // Update public ledger record (strictly omits raw signed tx bytes)
+      data.records[executionId] = {
+        ...existing,
+        state: 'SIGNED',
+        signedAt
+      }
+
+      this.saveData(data)
     })
-
-    data.records[executionId] = serializeRecord(updated)
-    this.saveData(data)
   }
 
   async markSigningUncertain(
@@ -438,94 +411,105 @@ export class DurableStorageWalletExecutionLedger implements WalletExecutionLedge
     reason: string,
     timestamp: number
   ): Promise<void> {
-    const data = this.loadData()
-    const serialized = data.records[executionId]
-    if (!serialized) {
-      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
-    }
+    return this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
+      const existing = data.records[executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
+      }
 
-    this.assertTransition(serialized.state, 'SIGNING_UNCERTAIN')
+      this.assertTransition(existing.state, 'SIGNING_UNCERTAIN')
 
-    const existing = deserializeRecord(serialized)
-    const updated: InternalWalletExecutionRecord = Object.freeze({
-      ...existing,
-      state: 'SIGNING_UNCERTAIN',
-      uncertainReason: reason,
-      failedAt: timestamp
+      data.records[executionId] = {
+        ...existing,
+        state: 'SIGNING_UNCERTAIN',
+        uncertainReason: reason,
+        failedAt: timestamp
+      }
+
+      this.saveData(data)
     })
-
-    data.records[executionId] = serializeRecord(updated)
-    this.saveData(data)
   }
 
   async markFailed(executionId: string, reason: string, timestamp: number): Promise<void> {
-    const data = this.loadData()
-    const serialized = data.records[executionId]
-    if (!serialized) return
+    return this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
+      const existing = data.records[executionId]
+      if (!existing) return
 
-    this.assertTransition(serialized.state, 'FAILED')
+      this.assertTransition(existing.state, 'FAILED')
 
-    const existing = deserializeRecord(serialized)
-    const updated: InternalWalletExecutionRecord = Object.freeze({
-      ...existing,
-      state: 'FAILED',
-      uncertainReason: reason,
-      failedAt: timestamp
+      data.records[executionId] = {
+        ...existing,
+        state: 'FAILED',
+        uncertainReason: reason,
+        failedAt: timestamp
+      }
+
+      this.saveData(data)
     })
-
-    data.records[executionId] = serializeRecord(updated)
-    this.saveData(data)
   }
 
   async markRejected(executionId: string, reason: string, timestamp: number): Promise<void> {
-    const data = this.loadData()
-    const serialized = data.records[executionId]
-    if (!serialized) return
+    return this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
+      const existing = data.records[executionId]
+      if (!existing) return
 
-    this.assertTransition(serialized.state, 'REJECTED')
+      this.assertTransition(existing.state, 'REJECTED')
 
-    const existing = deserializeRecord(serialized)
-    const updated: InternalWalletExecutionRecord = Object.freeze({
-      ...existing,
-      state: 'REJECTED',
-      uncertainReason: reason,
-      failedAt: timestamp
+      data.records[executionId] = {
+        ...existing,
+        state: 'REJECTED',
+        uncertainReason: reason,
+        failedAt: timestamp
+      }
+
+      this.saveData(data)
     })
-
-    data.records[executionId] = serializeRecord(updated)
-    this.saveData(data)
   }
 
-  async get(executionId: string): Promise<InternalWalletExecutionRecord | undefined> {
+  async get(executionId: string): Promise<PublicExecutionStatus | undefined> {
     const data = this.loadData()
-    const serialized = data.records[executionId]
-    return serialized ? deserializeRecord(serialized) : undefined
+    const entry = data.records[executionId]
+    return entry ? toPublicStatus(entry) : undefined
   }
 
-  async getByApprovalId(approvalId: string): Promise<InternalWalletExecutionRecord | undefined> {
+  async getByApprovalId(approvalId: string): Promise<PublicExecutionStatus | undefined> {
     const data = this.loadData()
     const executionId = data.approvalIdIndex[approvalId]
     if (!executionId) return undefined
-    const serialized = data.records[executionId]
-    return serialized ? deserializeRecord(serialized) : undefined
+    const entry = data.records[executionId]
+    return entry ? toPublicStatus(entry) : undefined
   }
 
-  async getByRequestId(requestId: string): Promise<InternalWalletExecutionRecord | undefined> {
+  async getByRequestId(requestId: string): Promise<PublicExecutionStatus | undefined> {
     const data = this.loadData()
     const executionId = data.requestIdIndex[requestId]
     if (!executionId) return undefined
-    const serialized = data.records[executionId]
-    return serialized ? deserializeRecord(serialized) : undefined
+    const entry = data.records[executionId]
+    return entry ? toPublicStatus(entry) : undefined
   }
 
   async has(approvalId: string): Promise<boolean> {
     const data = this.loadData()
     return Boolean(data.approvalIdIndex[approvalId])
   }
+}
 
-  async getSignedTransactionHex(executionId: string): Promise<string | undefined> {
-    const data = this.loadData()
-    const serialized = data.records[executionId]
-    return serialized?.rawSignedTxHex
-  }
+/**
+ * Backward compatibility alias for DurableTransactionalExecutionLedger.
+ */
+export { DurableTransactionalExecutionLedger as DurableStorageWalletExecutionLedger }
+
+/**
+ * Module-private settlement accessor function.
+ * Unexported from index.ts.
+ */
+export async function getInternalSignedTransactionHex(
+  ledger: DurableTransactionalExecutionLedger,
+  token: symbol,
+  executionId: string
+): Promise<string | undefined> {
+  return ledger._getRawSignedTxHexInternal(token, executionId)
 }

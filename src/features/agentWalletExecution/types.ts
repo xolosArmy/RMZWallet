@@ -211,7 +211,8 @@ export interface WalletSessionVerifier {
 }
 
 /**
- * Durable or in-memory execution ledger enforcing at-most-once execution and crash consistency.
+ * Public execution ledger port for tracking execution state across lifecycle transitions.
+ * Strictly does NOT expose raw signed transaction bytes or private keys.
  */
 export interface WalletExecutionLedger {
   reserveExecutionAtomic(entry: {
@@ -251,15 +252,13 @@ export interface WalletExecutionLedger {
 
   markRejected(executionId: string, reason: string, timestamp: number): Promise<void>
 
-  get(executionId: string): Promise<InternalWalletExecutionRecord | undefined>
+  get(executionId: string): Promise<PublicExecutionStatus | undefined>
 
-  getByApprovalId(approvalId: string): Promise<InternalWalletExecutionRecord | undefined>
+  getByApprovalId(approvalId: string): Promise<PublicExecutionStatus | undefined>
 
-  getByRequestId(requestId: string): Promise<InternalWalletExecutionRecord | undefined>
+  getByRequestId(requestId: string): Promise<PublicExecutionStatus | undefined>
 
   has(approvalId: string): Promise<boolean>
-
-  getSignedTransactionHex?(executionId: string): Promise<string | undefined>
 }
 
 /**
@@ -281,12 +280,33 @@ export interface AgentWalletExecutionEngineConfig {
 }
 
 /**
- * Canonical Agent Wallet Execution Engine.
- * Note: prepareExecution returns a review-only session.
- * Signing requires the Wallet-local confirmation path.
+ * Canonical Agent Wallet Execution Engine (Public / Agent-facing API).
+ * Strictly contains NO signing, confirm, execute, or local controller creation methods.
+ * Possession of this interface alone cannot invoke signing.
  */
 export interface AgentWalletExecutionEngine {
   prepareExecution(receipt: HumanApprovalV1): Promise<WalletExecutionReviewSession>
   getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined>
-  createLocalConfirmationController(session: WalletExecutionReviewSession): WalletLocalConfirmationController
+}
+
+/**
+ * Wallet UI Host interface for binding the local review UI to the active execution session.
+ * Exclusively provided to the Wallet application container (never to external agents).
+ */
+export interface WalletExecutionUIHost {
+  onSessionPrepared(
+    handler: (
+      session: WalletExecutionReviewSession,
+      localController: WalletLocalConfirmationController
+    ) => void
+  ): () => void
+  getActiveController(): WalletLocalConfirmationController | undefined
+}
+
+/**
+ * Full Wallet Execution Composition combining the public engine with the internal UI host.
+ */
+export interface WalletExecutionComposition {
+  readonly publicEngine: AgentWalletExecutionEngine
+  readonly walletUIHost: WalletExecutionUIHost
 }

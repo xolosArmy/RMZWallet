@@ -10,6 +10,7 @@ import { VALID_EXECUTION_STATE_TRANSITIONS } from './ledger'
 import type {
   ExecutionNetwork,
   InternalWalletExecutionRecord,
+  PublicExecutionStatus,
   WalletExecutionLedger,
   WalletExecutionState,
   WalletPreparedExecutionPlan
@@ -224,24 +225,45 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     this.commitUpdate(updated)
   }
 
-  async get(executionId: string): Promise<InternalWalletExecutionRecord | undefined> {
-    return this.recordsByExecutionId.get(executionId)
+  private toPublicStatus(record: InternalWalletExecutionRecord): PublicExecutionStatus {
+    return Object.freeze({
+      executionId: record.executionId,
+      approvalId: record.approvalId,
+      requestId: record.requestId,
+      intentId: record.intentId,
+      decisionId: record.decisionId,
+      fromAddress: record.fromAddress,
+      destination: record.destination,
+      amountSats: record.amountSats,
+      network: record.network,
+      status: record.state,
+      planHash: record.planHash,
+      uncertainReason: record.uncertainReason,
+      reservedAt: record.reservedAt,
+      preparedAt: record.preparedAt,
+      signingAt: record.signingAt,
+      signedAt: record.signedAt,
+      failedAt: record.failedAt
+    })
   }
 
-  async getByApprovalId(approvalId: string): Promise<InternalWalletExecutionRecord | undefined> {
-    return this.recordsByApprovalId.get(approvalId)
+  async get(executionId: string): Promise<PublicExecutionStatus | undefined> {
+    const record = this.recordsByExecutionId.get(executionId)
+    return record ? this.toPublicStatus(record) : undefined
   }
 
-  async getByRequestId(requestId: string): Promise<InternalWalletExecutionRecord | undefined> {
-    return this.recordsByRequestId.get(requestId)
+  async getByApprovalId(approvalId: string): Promise<PublicExecutionStatus | undefined> {
+    const record = this.recordsByApprovalId.get(approvalId)
+    return record ? this.toPublicStatus(record) : undefined
+  }
+
+  async getByRequestId(requestId: string): Promise<PublicExecutionStatus | undefined> {
+    const record = this.recordsByRequestId.get(requestId)
+    return record ? this.toPublicStatus(record) : undefined
   }
 
   async has(approvalId: string): Promise<boolean> {
     return this.recordsByApprovalId.has(approvalId)
-  }
-
-  async getSignedTransactionHex(executionId: string): Promise<string | undefined> {
-    return this.recordsByExecutionId.get(executionId)?.rawSignedTxHex
   }
 
   clear(): void {

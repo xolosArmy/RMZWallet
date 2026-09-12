@@ -9,19 +9,29 @@
  * Boundary Rules:
  * - Module-private execution capability and tokens are NOT exported.
  * - Private keys, seeds, mnemonics, and WIF are NEVER exported or handled here.
- * - Raw signed transaction bytes are retained inside Wallet execution ledger and NEVER returned externally.
+ * - Raw signed transaction bytes are retained inside private Wallet settlement storage and NEVER returned externally.
  * - External callers receive only an opaque SignedExecutionHandle or PublicExecutionStatus.
+ * - Public Agent-facing engine contains ZERO confirmation, signing, or execution methods.
  * - Zero broadcast or network mutation functions are present.
  */
 
-export { createAgentWalletExecutionEngine } from './engine'
 export {
+  createWalletExecutionComposition,
+  createAgentWalletExecutionEngine
+} from './engine'
+
+export {
+  DurableTransactionalExecutionLedger,
   DurableStorageWalletExecutionLedger,
+  WebLocksExecutionCoordinator,
   DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
   VALID_EXECUTION_STATE_TRANSITIONS
 } from './ledger'
+export type { ExecutionLockCoordinator, DurableTransactionalExecutionLedgerOptions } from './ledger'
+
 export { WalletExecutionError } from './errors'
 export type { WalletExecutionErrorCode } from './errors'
+
 export {
   DEFAULT_FEE_POLICY,
   estimateP2pkhTransactionSize,
@@ -43,11 +53,12 @@ export type {
   PublicExecutionStatus,
   SignedExecutionHandle,
   WalletExecutionReviewSession,
-  WalletLocalConfirmationController,
   WalletUtxoProvider,
   WalletSignatoryProvider,
   WalletSessionVerifier,
   WalletExecutionLedger,
   AgentWalletExecutionEngineConfig,
-  AgentWalletExecutionEngine
+  AgentWalletExecutionEngine,
+  WalletExecutionComposition,
+  WalletExecutionUIHost
 } from './types'
