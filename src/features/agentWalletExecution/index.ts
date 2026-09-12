@@ -10,19 +10,26 @@
  * - Module-private execution capability and tokens are NOT exported.
  * - Private keys, seeds, mnemonics, and WIF are NEVER exported or handled here.
  * - Raw signed transaction bytes are retained inside Wallet execution ledger and NEVER returned externally.
- * - Callers receive only an opaque SignedExecutionHandle.
+ * - External callers receive only an opaque SignedExecutionHandle or PublicExecutionStatus.
  * - Zero broadcast or network mutation functions are present.
  */
 
 export { createAgentWalletExecutionEngine } from './engine'
-export { InMemoryWalletExecutionLedger } from './ledger'
+export {
+  DurableStorageWalletExecutionLedger,
+  DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
+  VALID_EXECUTION_STATE_TRANSITIONS
+} from './ledger'
 export { WalletExecutionError } from './errors'
 export type { WalletExecutionErrorCode } from './errors'
 export {
   DEFAULT_FEE_POLICY,
   estimateP2pkhTransactionSize,
   assertFeePolicy,
-  validateOutputInvariants
+  validateOutputInvariants,
+  computeCanonicalPlanHash,
+  computePlanHashSync,
+  canonicalJsonStringify
 } from './plan'
 
 export type {
@@ -33,9 +40,10 @@ export type {
   WalletExecutionReviewSnapshot,
   WalletFeePolicy,
   WalletExecutionState,
-  WalletExecutionRecord,
+  PublicExecutionStatus,
   SignedExecutionHandle,
-  WalletExecutionSession,
+  WalletExecutionReviewSession,
+  WalletLocalConfirmationController,
   WalletUtxoProvider,
   WalletSignatoryProvider,
   WalletSessionVerifier,

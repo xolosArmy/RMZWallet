@@ -29,6 +29,11 @@ export type WalletExecutionErrorCode =
   | 'EXECUTION_LOCKED'
   | 'CONCURRENT_EXECUTION_ACTIVE'
   | 'INVALID_STATE_TRANSITION'
+  | 'STORAGE_UNAVAILABLE'
+  | 'STORAGE_MUTATION_FAILED'
+  | 'SIGNED_TRANSACTION_MISMATCH'
+  | 'LOCAL_CONFIRMATION_REQUIRED'
+  | 'EXECUTION_DISMISSED'
 
 export class WalletExecutionError extends Error {
   readonly code: WalletExecutionErrorCode

@@ -7,8 +7,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentExecutionReviewModal } from './AgentExecutionReviewModal'
 import type {
   SignedExecutionHandle,
+  WalletExecutionReviewSession,
   WalletExecutionReviewSnapshot,
-  WalletExecutionSession
+  WalletLocalConfirmationController
 } from '../../features/agentWalletExecution'
 
 afterEach(() => {
@@ -31,10 +32,11 @@ const MOCK_REVIEW: WalletExecutionReviewSnapshot = {
   planHash: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0'
 }
 
-function createMockSession(overrides: Partial<WalletExecutionSession> = {}): WalletExecutionSession {
+function createMockSession(
+  overrides: Partial<WalletExecutionReviewSession> = {}
+): WalletExecutionReviewSession {
   return {
     executionId: 'exec_test_001',
-    handle: 'exec_test_001',
     plan: {
       network: 'xec:mainnet',
       fromAddress: MOCK_REVIEW.fundingAddress,
@@ -55,7 +57,18 @@ function createMockSession(overrides: Partial<WalletExecutionSession> = {}): Wal
       planHash: MOCK_REVIEW.planHash
     },
     review: MOCK_REVIEW,
-    confirmExecution: vi.fn().mockResolvedValue({
+    rejectExecution: vi.fn().mockResolvedValue(undefined),
+    dismiss: vi.fn().mockResolvedValue(undefined),
+    ...overrides
+  }
+}
+
+function createMockController(
+  overrides: Partial<WalletLocalConfirmationController> = {}
+): WalletLocalConfirmationController {
+  return {
+    executionId: 'exec_test_001',
+    confirm: vi.fn().mockResolvedValue({
       executionId: 'exec_test_001',
       approvalId: MOCK_REVIEW.approvalId,
       requestId: MOCK_REVIEW.requestId,
@@ -63,8 +76,8 @@ function createMockSession(overrides: Partial<WalletExecutionSession> = {}): Wal
       planHash: MOCK_REVIEW.planHash,
       signedAt: 1800000050
     } satisfies SignedExecutionHandle),
-    rejectExecution: vi.fn().mockResolvedValue(undefined),
-    dismiss: vi.fn(),
+    reject: vi.fn().mockResolvedValue(undefined),
+    dismiss: vi.fn().mockResolvedValue(undefined),
     ...overrides
   }
 }
@@ -114,14 +127,16 @@ describe('AgentExecutionReviewModal Component (Gate C2)', () => {
     expect(screen.getByText(MOCK_REVIEW.planHash)).toBeTruthy()
   })
 
-  it('calls session.confirmExecution and onExecutionSuccess on confirmation', async () => {
+  it('calls controller.confirm and onExecutionSuccess on confirmation', async () => {
     const session = createMockSession()
+    const controller = createMockController()
     const onSuccess = vi.fn()
     const onClose = vi.fn()
 
     render(
       <AgentExecutionReviewModal
         session={session}
+        controller={controller}
         isOpen={true}
         onExecutionSuccess={onSuccess}
         onClose={onClose}
@@ -132,7 +147,7 @@ describe('AgentExecutionReviewModal Component (Gate C2)', () => {
     fireEvent.click(confirmButton)
 
     await waitFor(() => {
-      expect(session.confirmExecution).toHaveBeenCalledTimes(1)
+      expect(controller.confirm).toHaveBeenCalledTimes(1)
       expect(onSuccess).toHaveBeenCalledWith(
         expect.objectContaining({
           status: 'SIGNED',
@@ -144,14 +159,16 @@ describe('AgentExecutionReviewModal Component (Gate C2)', () => {
     })
   })
 
-  it('calls session.rejectExecution and onExecutionRejected when cancelled', async () => {
+  it('calls controller.reject and onExecutionRejected when cancelled', async () => {
     const session = createMockSession()
+    const controller = createMockController()
     const onRejected = vi.fn()
     const onClose = vi.fn()
 
     render(
       <AgentExecutionReviewModal
         session={session}
+        controller={controller}
         isOpen={true}
         onExecutionRejected={onRejected}
         onClose={onClose}
@@ -162,21 +179,23 @@ describe('AgentExecutionReviewModal Component (Gate C2)', () => {
     fireEvent.click(rejectButton)
 
     await waitFor(() => {
-      expect(session.rejectExecution).toHaveBeenCalledWith('Execution rejected by custodian.')
+      expect(controller.reject).toHaveBeenCalledWith('Execution rejected by custodian.')
       expect(onRejected).toHaveBeenCalledTimes(1)
       expect(onClose).toHaveBeenCalledTimes(1)
     })
   })
 
-  it('displays error alert when confirmExecution throws', async () => {
-    const session = createMockSession({
-      confirmExecution: vi.fn().mockRejectedValue(new Error('Signing device disconnected.'))
+  it('displays error alert when controller.confirm throws', async () => {
+    const session = createMockSession()
+    const controller = createMockController({
+      confirm: vi.fn().mockRejectedValue(new Error('Signing device disconnected.'))
     })
     const onError = vi.fn()
 
     render(
       <AgentExecutionReviewModal
         session={session}
+        controller={controller}
         isOpen={true}
         onError={onError}
         onClose={vi.fn()}
@@ -193,13 +212,15 @@ describe('AgentExecutionReviewModal Component (Gate C2)', () => {
     })
   })
 
-  it('calls session.dismiss and onClose when Escape key is pressed', async () => {
+  it('calls controller.dismiss and onClose when Escape key is pressed', async () => {
     const session = createMockSession()
+    const controller = createMockController()
     const onClose = vi.fn()
 
     render(
       <AgentExecutionReviewModal
         session={session}
+        controller={controller}
         isOpen={true}
         onClose={onClose}
       />
@@ -207,7 +228,9 @@ describe('AgentExecutionReviewModal Component (Gate C2)', () => {
 
     fireEvent.keyDown(window, { key: 'Escape' })
 
-    expect(session.dismiss).toHaveBeenCalledTimes(1)
-    expect(onClose).toHaveBeenCalledTimes(1)
+    await waitFor(() => {
+      expect(controller.dismiss).toHaveBeenCalledTimes(1)
+      expect(onClose).toHaveBeenCalledTimes(1)
+    })
   })
 })

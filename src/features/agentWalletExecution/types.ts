@@ -10,7 +10,8 @@
  * - Plain XEC mainnet payment only ("xec:mainnet").
  * - Zero transaction broadcast.
  * - Raw signed transaction material strictly retained inside Wallet execution boundary.
- * - External caller receives only an opaque SignedExecutionHandle.
+ * - External callers receive only an opaque SignedExecutionHandle.
+ * - Public status queries return PublicExecutionStatus (rawSignedTxHex strictly omitted).
  * - Private keys, seeds, mnemonics, and WIF never appear in any type or interface here.
  */
 
@@ -100,10 +101,35 @@ export type WalletExecutionState =
   | 'FAILED'
 
 /**
- * Durable execution record maintained in WalletExecutionLedger.
- * Retains raw signed transaction bytes internally.
+ * Public execution status visible to external/agent callers.
+ * Raw signed transaction hex and private internal details are strictly omitted.
  */
-export interface WalletExecutionRecord {
+export interface PublicExecutionStatus {
+  readonly executionId: string
+  readonly approvalId: string
+  readonly requestId: string
+  readonly intentId: string
+  readonly decisionId: string
+  readonly fromAddress: string
+  readonly destination: string
+  readonly amountSats: bigint
+  readonly network: ExecutionNetwork
+  readonly status: WalletExecutionState
+  readonly planHash?: string
+  readonly uncertainReason?: string
+  readonly reservedAt: number
+  readonly preparedAt?: number
+  readonly signingAt?: number
+  readonly signedAt?: number
+  readonly failedAt?: number
+}
+
+/**
+ * Internal durable execution record maintained in WalletExecutionLedger.
+ * Retains raw signed transaction bytes internally within the Wallet execution boundary.
+ * Never exposed via public engine APIs or barrel exports.
+ */
+export interface InternalWalletExecutionRecord {
   readonly executionId: string
   readonly approvalId: string
   readonly requestId: string
@@ -139,16 +165,27 @@ export interface SignedExecutionHandle {
 }
 
 /**
- * Active execution session providing final human review and local authenticated confirmation.
+ * Review-only execution session provided to Agent-facing caller.
+ * Strictly does NOT provide a signing or confirmation method.
  */
-export interface WalletExecutionSession {
+export interface WalletExecutionReviewSession {
   readonly executionId: string
-  readonly handle: string
-  readonly plan: WalletPreparedExecutionPlan
-  readonly review: WalletExecutionReviewSnapshot
-  readonly confirmExecution: () => Promise<SignedExecutionHandle>
-  readonly rejectExecution: (reason?: string) => Promise<void>
-  readonly dismiss: () => void
+  readonly plan: Readonly<WalletPreparedExecutionPlan>
+  readonly review: Readonly<WalletExecutionReviewSnapshot>
+  rejectExecution(reason?: string): Promise<void>
+  dismiss(): Promise<void>
+}
+
+/**
+ * Wallet-owned local confirmation controller.
+ * Gated by a Wallet-local one-use confirmation authority.
+ * Exclusively used by Wallet-internal review UI (AgentExecutionReviewModal).
+ */
+export interface WalletLocalConfirmationController {
+  readonly executionId: string
+  confirm(): Promise<SignedExecutionHandle>
+  reject(reason?: string): Promise<void>
+  dismiss(): Promise<void>
 }
 
 /**
@@ -214,13 +251,15 @@ export interface WalletExecutionLedger {
 
   markRejected(executionId: string, reason: string, timestamp: number): Promise<void>
 
-  get(executionId: string): Promise<WalletExecutionRecord | undefined>
+  get(executionId: string): Promise<InternalWalletExecutionRecord | undefined>
 
-  getByApprovalId(approvalId: string): Promise<WalletExecutionRecord | undefined>
+  getByApprovalId(approvalId: string): Promise<InternalWalletExecutionRecord | undefined>
 
-  getByRequestId(requestId: string): Promise<WalletExecutionRecord | undefined>
+  getByRequestId(requestId: string): Promise<InternalWalletExecutionRecord | undefined>
 
   has(approvalId: string): Promise<boolean>
+
+  getSignedTransactionHex?(executionId: string): Promise<string | undefined>
 }
 
 /**
@@ -231,16 +270,23 @@ export interface AgentWalletExecutionEngineConfig {
     get(requestId: string): Promise<WalletApprovalLedgerRecord | undefined>
     getByApprovalId?(approvalId: string): Promise<WalletApprovalLedgerRecord | undefined>
   }
-  readonly executionLedger: WalletExecutionLedger
+  readonly executionLedger?: WalletExecutionLedger
   readonly sessionVerifier: WalletSessionVerifier
   readonly utxoProvider: WalletUtxoProvider
   readonly signatoryProvider: WalletSignatoryProvider
   readonly feePolicy?: Partial<WalletFeePolicy>
+  readonly storage?: Storage
   readonly clock?: () => number
   readonly idGenerator?: () => string
 }
 
+/**
+ * Canonical Agent Wallet Execution Engine.
+ * Note: prepareExecution returns a review-only session.
+ * Signing requires the Wallet-local confirmation path.
+ */
 export interface AgentWalletExecutionEngine {
-  prepareExecution(receipt: HumanApprovalV1): Promise<WalletExecutionSession>
-  getExecutionRecord(executionId: string): Promise<WalletExecutionRecord | undefined>
+  prepareExecution(receipt: HumanApprovalV1): Promise<WalletExecutionReviewSession>
+  getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined>
+  createLocalConfirmationController(session: WalletExecutionReviewSession): WalletLocalConfirmationController
 }

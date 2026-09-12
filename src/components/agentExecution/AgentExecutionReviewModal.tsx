@@ -7,18 +7,21 @@
  * - Displays immutable transaction plan review snapshot before cryptographic signing.
  * - Prominent visual banner: "Firma local en dispositivo; NO transmite a la red."
  * - Separates network fee clearly from payment amount and calculates total wallet debit.
- * - Confirm action invokes session.confirmExecution() within Wallet boundary.
+ * - Confirm action invokes local confirmation authority within Wallet boundary.
  * - Component has ZERO capability to broadcast or export raw signed transaction bytes.
  */
 
 import { useState, useEffect, useCallback, type ReactElement } from 'react'
 import type {
   SignedExecutionHandle,
-  WalletExecutionSession
+  WalletExecutionReviewSession,
+  WalletLocalConfirmationController
 } from '../../features/agentWalletExecution'
 
 export interface AgentExecutionReviewModalProps {
-  readonly session: WalletExecutionSession
+  readonly session: WalletExecutionReviewSession
+  readonly controller?: WalletLocalConfirmationController
+  readonly onConfirmLocal?: () => Promise<SignedExecutionHandle>
   readonly isOpen: boolean
   readonly onExecutionSuccess?: (handle: SignedExecutionHandle) => void
   readonly onExecutionRejected?: () => void
@@ -62,6 +65,8 @@ const DetailRow = ({
 
 export function AgentExecutionReviewModal({
   session,
+  controller,
+  onConfirmLocal,
   isOpen,
   onExecutionSuccess,
   onExecutionRejected,
@@ -71,17 +76,25 @@ export function AgentExecutionReviewModal({
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
-  const handleDismiss = useCallback(() => {
+  const handleDismiss = useCallback(async () => {
     if (!isSubmitting) {
-      session.dismiss()
+      try {
+        if (controller) {
+          await controller.dismiss()
+        } else {
+          await session.dismiss()
+        }
+      } catch {
+        // fail-safe ignore
+      }
       onClose()
     }
-  }, [isSubmitting, session, onClose])
+  }, [isSubmitting, controller, session, onClose])
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        handleDismiss()
+        void handleDismiss()
       }
     }
     if (isOpen) {
@@ -99,7 +112,15 @@ export function AgentExecutionReviewModal({
     setIsSubmitting(true)
     setErrorMessage(null)
     try {
-      const handle = await session.confirmExecution()
+      const handle = controller
+        ? await controller.confirm()
+        : onConfirmLocal
+        ? await onConfirmLocal()
+        : await (session as any).confirmExecution?.()
+
+      if (!handle) {
+        throw new Error('Local confirmation authority required to execute signing.')
+      }
       onExecutionSuccess?.(handle)
       onClose()
     } catch (err) {
@@ -116,7 +137,11 @@ export function AgentExecutionReviewModal({
     setIsSubmitting(true)
     setErrorMessage(null)
     try {
-      await session.rejectExecution('Execution rejected by custodian.')
+      if (controller) {
+        await controller.reject('Execution rejected by custodian.')
+      } else {
+        await session.rejectExecution('Execution rejected by custodian.')
+      }
       onExecutionRejected?.()
       onClose()
     } catch (err) {
