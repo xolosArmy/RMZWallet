@@ -27,7 +27,6 @@ import type {
 } from './types'
 
 export const DEFAULT_EXECUTION_LEDGER_STORAGE_KEY = 'rmzwallet_agent_execution_ledger_v2'
-export const DEFAULT_PRIVATE_SETTLEMENT_STORAGE_KEY = 'rmzwallet_agent_execution_private_settlement_v2'
 export const DEFAULT_EXECUTION_LOCK_NAME = 'rmzwallet:agent-execution:lock:v2'
 
 export const VALID_EXECUTION_STATE_TRANSITIONS: Readonly<
@@ -52,32 +51,22 @@ export interface ExecutionLockCoordinator {
 
 /**
  * Production Web Locks coordinator providing cross-tab atomic exclusion in modern browsers & Node 24.
+ *
+ * Runtime Assumptions:
+ * - Requires W3C Web Locks API (`navigator.locks.request`). Supported in Chrome 69+, Firefox 96+, Safari 15.4+, Edge 79+, Node.js 24+.
+ * - In environments where `navigator.locks?.request` is absent, fails closed with `COORDINATION_UNAVAILABLE`.
+ * - NEVER automatically falls back to an in-memory queue in production.
  */
 export class WebLocksExecutionCoordinator implements ExecutionLockCoordinator {
-  private readonly fallbackQueues = new Map<string, Promise<unknown>>()
-
   async requestExclusive<T>(lockName: string, operation: () => Promise<T>): Promise<T> {
-    if (typeof navigator !== 'undefined' && navigator.locks?.request) {
-      return navigator.locks.request(lockName, { mode: 'exclusive' }, operation)
+    if (typeof navigator === 'undefined' || !navigator.locks?.request) {
+      throw new WalletExecutionError(
+        'COORDINATION_UNAVAILABLE',
+        'Cross-context coordination primitive (navigator.locks.request) is unavailable. Execution fails closed.'
+      )
     }
 
-    // Fallback for isolated environments lacking Web Locks: sequential promise queue
-    let resolveQueue: (() => void) | undefined
-    const queuePromise = new Promise<void>(res => {
-      resolveQueue = res
-    })
-    const prevQueue = this.fallbackQueues.get(lockName) ?? Promise.resolve()
-    this.fallbackQueues.set(lockName, queuePromise)
-
-    await prevQueue
-    try {
-      return await operation()
-    } finally {
-      resolveQueue?.()
-      if (this.fallbackQueues.get(lockName) === queuePromise) {
-        this.fallbackQueues.delete(lockName)
-      }
-    }
+    return navigator.locks.request(lockName, { mode: 'exclusive' }, operation)
   }
 }
 
@@ -131,13 +120,9 @@ function toPublicStatus(entry: SerializedExecutionStateEntry): PublicExecutionSt
   })
 }
 
-// Module-private token for internal settlement accessor
-export const INTERNAL_SETTLEMENT_TOKEN = Symbol('WalletInternalSettlementToken')
-
 export interface DurableTransactionalExecutionLedgerOptions {
   readonly storage?: Storage | null
   readonly storageKey?: string
-  readonly settlementStorageKey?: string
   readonly lockName?: string
   readonly lockCoordinator?: ExecutionLockCoordinator
 }
@@ -149,7 +134,6 @@ export interface DurableTransactionalExecutionLedgerOptions {
 export class DurableTransactionalExecutionLedger implements WalletExecutionLedger {
   private readonly storage: Storage
   private readonly storageKey: string
-  private readonly settlementStorageKey: string
   private readonly lockName: string
   private readonly coordinator: ExecutionLockCoordinator
 
@@ -163,12 +147,13 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     }
     this.storage = resolvedStorage
     this.storageKey = options?.storageKey ?? DEFAULT_EXECUTION_LEDGER_STORAGE_KEY
-    this.settlementStorageKey = options?.settlementStorageKey ?? DEFAULT_PRIVATE_SETTLEMENT_STORAGE_KEY
     this.lockName = options?.lockName ?? DEFAULT_EXECUTION_LOCK_NAME
     this.coordinator = options?.lockCoordinator ?? new WebLocksExecutionCoordinator()
 
     // Reconcile crash consistency on startup under atomic lock
-    void this.reconcileInterruptedSignings()
+    void this.reconcileInterruptedSignings().catch(() => {
+      // If coordinator fails on startup (e.g. locks unavailable), subsequent operations fail closed
+    })
   }
 
   private loadData(): DurableLedgerStoragePayloadV2 {
@@ -205,38 +190,6 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
         'STORAGE_MUTATION_FAILED',
         `Failed to persist durable execution ledger data: ${err instanceof Error ? err.message : String(err)}`
       )
-    }
-  }
-
-  private saveSettlementBlob(executionId: string, rawSignedTxHex: string): void {
-    try {
-      const raw = this.storage.getItem(this.settlementStorageKey)
-      const settlementStore: Record<string, string> = raw ? JSON.parse(raw) : {}
-      settlementStore[executionId] = rawSignedTxHex
-      this.storage.setItem(this.settlementStorageKey, JSON.stringify(settlementStore))
-    } catch (err) {
-      throw new WalletExecutionError(
-        'STORAGE_MUTATION_FAILED',
-        `Failed to persist private settlement blob: ${err instanceof Error ? err.message : String(err)}`
-      )
-    }
-  }
-
-  /**
-   * Module-internal accessor for private settlement data.
-   * Strictly requires the INTERNAL_SETTLEMENT_TOKEN symbol.
-   */
-  _getRawSignedTxHexInternal(token: symbol, executionId: string): string | undefined {
-    if (token !== INTERNAL_SETTLEMENT_TOKEN) {
-      throw new WalletExecutionError('FORBIDDEN', 'Unauthorized settlement access.')
-    }
-    try {
-      const raw = this.storage.getItem(this.settlementStorageKey)
-      if (!raw) return undefined
-      const settlementStore = JSON.parse(raw) as Record<string, string>
-      return settlementStore[executionId]
-    } catch {
-      return undefined
     }
   }
 
@@ -392,9 +345,6 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
 
       this.assertTransition(existing.state, 'SIGNED')
 
-      // Save raw signed transaction to private settlement partition
-      this.saveSettlementBlob(executionId, rawSignedTxHex)
-
       // Update public ledger record (strictly omits raw signed tx bytes)
       data.records[executionId] = {
         ...existing,
@@ -501,15 +451,3 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
  * Backward compatibility alias for DurableTransactionalExecutionLedger.
  */
 export { DurableTransactionalExecutionLedger as DurableStorageWalletExecutionLedger }
-
-/**
- * Module-private settlement accessor function.
- * Unexported from index.ts.
- */
-export async function getInternalSignedTransactionHex(
-  ledger: DurableTransactionalExecutionLedger,
-  token: symbol,
-  executionId: string
-): Promise<string | undefined> {
-  return ledger._getRawSignedTxHexInternal(token, executionId)
-}

@@ -35,15 +35,18 @@ import type {
   ExecutionNetwork,
   PublicExecutionStatus,
   SignedExecutionHandle,
-  WalletExecutionComposition,
   WalletExecutionLedger,
   WalletExecutionReviewSession,
   WalletExecutionReviewSnapshot,
-  WalletExecutionUIHost,
   WalletFeePolicy,
-  WalletLocalConfirmationController,
   WalletPreparedExecutionPlan
 } from './types'
+import type {
+  WalletExecutionComposition,
+  WalletExecutionUIHost,
+  WalletLocalConfirmationController
+} from '../../internal/agentWalletExecutionHost/types'
+import { storeInternalSignedTransaction } from '../../internal/settlementStore'
 
 // Module-private symbols for closure-encapsulated capabilities
 const INTERNAL_CAPABILITY_TOKEN = Symbol('WalletExecutionCapabilityToken')
@@ -478,7 +481,10 @@ export function createWalletExecutionComposition(
       )
     }
 
-    // 11. Commit to SIGNED with raw tx retained inside Wallet boundary
+    // 10. Retain raw signed transaction strictly in Wallet-internal settlement store
+    await storeInternalSignedTransaction(executionId, rawSignedTxHex, config.storage)
+
+    // 11. Commit to SIGNED with public ledger strictly omitting raw tx bytes
     const signedAt = getNow()
     await executionLedger.transitionToSigned(executionId, rawSignedTxHex, signedAt)
 

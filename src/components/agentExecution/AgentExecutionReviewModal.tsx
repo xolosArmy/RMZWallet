@@ -16,7 +16,7 @@ import type {
   SignedExecutionHandle,
   WalletExecutionReviewSession
 } from '../../features/agentWalletExecution'
-import type { WalletLocalConfirmationController } from '../../features/agentWalletExecution/types'
+import type { WalletLocalConfirmationController } from '../../internal/agentWalletExecutionHost'
 
 export interface AgentExecutionReviewModalProps {
   readonly session: WalletExecutionReviewSession

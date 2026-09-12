@@ -7,6 +7,7 @@
 
 import { WalletExecutionError } from './errors'
 import { VALID_EXECUTION_STATE_TRANSITIONS } from './ledger'
+import type { ExecutionLockCoordinator } from './ledger'
 import type {
   ExecutionNetwork,
   InternalWalletExecutionRecord,
@@ -15,6 +16,33 @@ import type {
   WalletExecutionState,
   WalletPreparedExecutionPlan
 } from './types'
+
+/**
+ * Explicit test/simulation coordinator using an in-process serialized Promise queue.
+ * Strictly for test suites; NEVER used as an automatic fallback in production.
+ */
+export class TestExecutionLockCoordinator implements ExecutionLockCoordinator {
+  private readonly queues = new Map<string, Promise<unknown>>()
+
+  async requestExclusive<T>(lockName: string, operation: () => Promise<T>): Promise<T> {
+    let resolveQueue: (() => void) | undefined
+    const queuePromise = new Promise<void>(res => {
+      resolveQueue = res
+    })
+    const prevQueue = this.queues.get(lockName) ?? Promise.resolve()
+    this.queues.set(lockName, queuePromise)
+
+    await prevQueue
+    try {
+      return await operation()
+    } finally {
+      resolveQueue?.()
+      if (this.queues.get(lockName) === queuePromise) {
+        this.queues.delete(lockName)
+      }
+    }
+  }
+}
 
 export class MockStorage implements Storage {
   private items = new Map<string, string>()

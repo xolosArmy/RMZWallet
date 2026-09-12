@@ -177,18 +177,6 @@ export interface WalletExecutionReviewSession {
 }
 
 /**
- * Wallet-owned local confirmation controller.
- * Gated by a Wallet-local one-use confirmation authority.
- * Exclusively used by Wallet-internal review UI (AgentExecutionReviewModal).
- */
-export interface WalletLocalConfirmationController {
-  readonly executionId: string
-  confirm(): Promise<SignedExecutionHandle>
-  reject(reason?: string): Promise<void>
-  dismiss(): Promise<void>
-}
-
-/**
  * Read-only UTXO provider port. Read access is permitted; broadcast is NOT.
  */
 export interface WalletUtxoProvider {
@@ -287,26 +275,4 @@ export interface AgentWalletExecutionEngineConfig {
 export interface AgentWalletExecutionEngine {
   prepareExecution(receipt: HumanApprovalV1): Promise<WalletExecutionReviewSession>
   getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined>
-}
-
-/**
- * Wallet UI Host interface for binding the local review UI to the active execution session.
- * Exclusively provided to the Wallet application container (never to external agents).
- */
-export interface WalletExecutionUIHost {
-  onSessionPrepared(
-    handler: (
-      session: WalletExecutionReviewSession,
-      localController: WalletLocalConfirmationController
-    ) => void
-  ): () => void
-  getActiveController(): WalletLocalConfirmationController | undefined
-}
-
-/**
- * Full Wallet Execution Composition combining the public engine with the internal UI host.
- */
-export interface WalletExecutionComposition {
-  readonly publicEngine: AgentWalletExecutionEngine
-  readonly walletUIHost: WalletExecutionUIHost
 }

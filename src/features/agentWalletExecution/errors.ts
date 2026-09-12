@@ -34,6 +34,7 @@ export type WalletExecutionErrorCode =
   | 'SIGNED_TRANSACTION_MISMATCH'
   | 'LOCAL_CONFIRMATION_REQUIRED'
   | 'EXECUTION_DISMISSED'
+  | 'COORDINATION_UNAVAILABLE'
 
 export class WalletExecutionError extends Error {
   readonly code: WalletExecutionErrorCode

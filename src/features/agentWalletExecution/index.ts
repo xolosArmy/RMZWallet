@@ -16,7 +16,6 @@
  */
 
 export {
-  createWalletExecutionComposition,
   createAgentWalletExecutionEngine
 } from './engine'
 
@@ -58,7 +57,5 @@ export type {
   WalletSessionVerifier,
   WalletExecutionLedger,
   AgentWalletExecutionEngineConfig,
-  AgentWalletExecutionEngine,
-  WalletExecutionComposition,
-  WalletExecutionUIHost
+  AgentWalletExecutionEngine
 } from './types'

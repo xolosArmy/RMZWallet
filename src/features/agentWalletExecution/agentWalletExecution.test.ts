@@ -12,15 +12,15 @@ import { describe, expect, it, vi } from 'vitest'
 import { ALL_BIP143, Ecc, P2PKHSignatory, Script, toHex, TxBuilder } from 'ecash-lib'
 import type { HumanApprovalV1 } from '@xolosarmy/tonalli-core'
 import type { WalletApprovalLedgerRecord } from '../agentWalletApprovalReceiver/types'
-import { createWalletExecutionComposition } from './engine'
+import { createWalletExecutionComposition } from '../../internal/agentWalletExecutionHost'
 import {
   DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
   DurableStorageWalletExecutionLedger,
   DurableTransactionalExecutionLedger,
-  getInternalSignedTransactionHex,
-  INTERNAL_SETTLEMENT_TOKEN
+  WebLocksExecutionCoordinator
 } from './ledger'
-import { InMemoryWalletExecutionLedger, MockStorage } from './testUtils'
+import { getInternalSignedTransaction } from '../../internal/settlementStore'
+import { InMemoryWalletExecutionLedger, MockStorage, TestExecutionLockCoordinator } from './testUtils'
 import { WalletExecutionError } from './errors'
 import {
   assertFeePolicy,
@@ -166,6 +166,7 @@ function setupEngine(options: {
     utxoProvider,
     signatoryProvider,
     feePolicy: options.feePolicy,
+    storage: options.storage,
     clock: () => clockTime,
     idGenerator: () => 'test_id_1'
   })
@@ -177,6 +178,7 @@ function setupEngine(options: {
     record,
     utxos,
     executionLedger,
+    storage: options.storage,
     setActiveAddress: (addr: string) => {
       activeAddress = addr
     },
@@ -315,6 +317,59 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       expect(parsed.generation).toBe(2)
       expect(Object.keys(parsed.records)).toHaveLength(2)
     })
+
+    it('fails closed before reservation/signing when navigator.locks is unavailable in production composition', async () => {
+      const originalNavigator = globalThis.navigator
+      try {
+        vi.stubGlobal('navigator', {})
+        const storage = new MockStorage()
+        const productionLedger = new DurableTransactionalExecutionLedger({ storage })
+        const { engine, record } = setupEngine({
+          storage,
+          executionLedger: productionLedger
+        })
+
+        await expect(engine.prepareExecution(record.humanApproval!)).rejects.toThrowError(
+          expect.objectContaining({
+            code: 'COORDINATION_UNAVAILABLE'
+          })
+        )
+      } finally {
+        vi.stubGlobal('navigator', originalNavigator)
+      }
+    })
+
+    it('allows tests to execute when explicitly providing TestExecutionLockCoordinator', async () => {
+      const storage = new MockStorage()
+      const testCoordinator = new TestExecutionLockCoordinator()
+      const testLedger = new DurableTransactionalExecutionLedger({
+        storage,
+        lockCoordinator: testCoordinator
+      })
+      const { engine, record, uiHost } = setupEngine({
+        storage,
+        executionLedger: testLedger
+      })
+
+      const session = await engine.prepareExecution(record.humanApproval!)
+      expect(session.executionId).toBe('exec_test_id_1')
+      const controller = uiHost.getActiveController()
+      expect(controller).toBeDefined()
+      const handle = await controller!.confirm()
+      expect(handle.status).toBe('SIGNED')
+    })
+
+    it('verifies public barrel import cannot obtain the local confirmation controller', async () => {
+      const publicBarrel = await import('./index')
+      expect((publicBarrel as any).createWalletExecutionComposition).toBeUndefined()
+      expect((publicBarrel as any).WalletExecutionComposition).toBeUndefined()
+      expect((publicBarrel as any).WalletExecutionUIHost).toBeUndefined()
+      expect((publicBarrel as any).WalletLocalConfirmationController).toBeUndefined()
+      expect((publicBarrel as any).walletUIHost).toBeUndefined()
+      expect((publicBarrel as any).getActiveController).toBeUndefined()
+      expect((publicBarrel as any).confirm).toBeUndefined()
+      expect((publicBarrel as any).sign).toBeUndefined()
+    })
   })
 
   // P0 Focus Test 1: Complete Valid Execution Flow
@@ -344,8 +399,8 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     expect(publicStatus?.status).toBe('SIGNED')
     expect((publicStatus as any).rawSignedTxHex).toBeUndefined()
 
-    // Internal settlement accessor can retrieve raw tx with valid token
-    const rawTx = await getInternalSignedTransactionHex(executionLedger, INTERNAL_SETTLEMENT_TOKEN, session.executionId)
+    // Internal settlement store retains raw tx in private settlement store
+    const rawTx = await getInternalSignedTransaction(session.executionId, storage)
     expect(rawTx).toBeDefined()
     expect(rawTx!.length).toBeGreaterThan(100)
   })
@@ -462,18 +517,15 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     expect((publicStatus as any).rawSignedTxHex).toBeUndefined()
     expect((publicStatus as any).plan).toBeUndefined()
 
-    // Public executionLedger has NO getSignedTransactionHex method
+    // Public executionLedger has NO getSignedTransactionHex or _getRawSignedTxHexInternal methods
     expect((executionLedger as any).getSignedTransactionHex).toBeUndefined()
+    expect((executionLedger as any)._getRawSignedTxHexInternal).toBeUndefined()
+    expect((executionLedger as any).getRawSignedTxHex).toBeUndefined()
 
-    // Private settlement storage retains raw signed tx, accessible only via internal settlement accessor with token
-    const internalHex = await getInternalSignedTransactionHex(executionLedger, INTERNAL_SETTLEMENT_TOKEN, session.executionId)
+    // Private settlement storage retains raw signed tx, accessible only via internal settlement module
+    const internalHex = await getInternalSignedTransaction(session.executionId, storage)
     expect(internalHex).toBeDefined()
     expect(typeof internalHex).toBe('string')
-
-    // Unauthorized settlement access throws
-    await expect(
-      getInternalSignedTransactionHex(executionLedger, Symbol('unauthorized'), session.executionId)
-    ).rejects.toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
   })
 
   // P0-4: Dismiss invalidates execution durably

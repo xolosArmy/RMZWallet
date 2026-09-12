@@ -10,7 +10,7 @@ import type {
   WalletExecutionReviewSession,
   WalletExecutionReviewSnapshot
 } from '../../features/agentWalletExecution'
-import type { WalletLocalConfirmationController } from '../../features/agentWalletExecution/types'
+import type { WalletLocalConfirmationController } from '../../internal/agentWalletExecutionHost'
 
 afterEach(() => {
   cleanup()

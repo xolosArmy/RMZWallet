@@ -25,7 +25,7 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     const exportedKeys = Object.keys(PublicModuleExports)
 
     // Allowed production exports
-    expect(exportedKeys).toContain('createWalletExecutionComposition')
+    expect(exportedKeys).not.toContain('createWalletExecutionComposition')
     expect(exportedKeys).toContain('createAgentWalletExecutionEngine')
     expect(exportedKeys).toContain('DurableTransactionalExecutionLedger')
     expect(exportedKeys).toContain('DurableStorageWalletExecutionLedger')
@@ -37,8 +37,16 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(exportedKeys).toContain('validateOutputInvariants')
     expect(exportedKeys).toContain('computeCanonicalPlanHash')
 
+    // FORBIDDEN exports: Wallet UI host / composition authority
+    expect((PublicModuleExports as any).createWalletExecutionComposition).toBeUndefined()
+    expect((PublicModuleExports as any).WalletExecutionComposition).toBeUndefined()
+    expect((PublicModuleExports as any).WalletExecutionUIHost).toBeUndefined()
+    expect((PublicModuleExports as any).walletUIHost).toBeUndefined()
+    expect((PublicModuleExports as any).getActiveController).toBeUndefined()
+
     // FORBIDDEN export: in-memory test double must remain test-only
     expect((PublicModuleExports as any).InMemoryWalletExecutionLedger).toBeUndefined()
+    expect((PublicModuleExports as any).TestExecutionLockCoordinator).toBeUndefined()
 
     // FORBIDDEN exports: module-private capability and tokens
     expect((PublicModuleExports as any).WalletExecutionCapability).toBeUndefined()
@@ -62,6 +70,7 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect((PublicModuleExports as any).SettlementRawTransactionAccessor).toBeUndefined()
     expect((PublicModuleExports as any).INTERNAL_SETTLEMENT_TOKEN).toBeUndefined()
     expect((PublicModuleExports as any).getInternalSignedTransactionHex).toBeUndefined()
+    expect((PublicModuleExports as any).DEFAULT_PRIVATE_SETTLEMENT_STORAGE_KEY).toBeUndefined()
 
     // FORBIDDEN exports: local confirmation controller creation & controller type
     expect((PublicModuleExports as any).createLocalConfirmationController).toBeUndefined()
@@ -74,6 +83,44 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect((PublicModuleExports as any).broadcastTx).toBeUndefined()
     expect((PublicModuleExports as any).broadcastTransaction).toBeUndefined()
     expect((PublicModuleExports as any).sendRawTransaction).toBeUndefined()
+  })
+
+  it('verifies deep import of ledger.ts does NOT export settlement tokens or raw tx accessors', async () => {
+    const ledgerModule = await import('./ledger')
+    const ledgerKeys = Object.keys(ledgerModule)
+
+    expect(ledgerKeys).not.toContain('INTERNAL_SETTLEMENT_TOKEN')
+    expect(ledgerKeys).not.toContain('getInternalSignedTransactionHex')
+    expect(ledgerKeys).not.toContain('_getRawSignedTxHexInternal')
+    expect(ledgerKeys).not.toContain('DEFAULT_PRIVATE_SETTLEMENT_STORAGE_KEY')
+    expect((ledgerModule as any).INTERNAL_SETTLEMENT_TOKEN).toBeUndefined()
+    expect((ledgerModule as any).getInternalSignedTransactionHex).toBeUndefined()
+
+    // Prototype check: DurableTransactionalExecutionLedger has NO raw tx retrieval methods
+    const proto = (ledgerModule.DurableTransactionalExecutionLedger as any).prototype
+    expect(proto.getSignedTransactionHex).toBeUndefined()
+    expect(proto._getRawSignedTxHexInternal).toBeUndefined()
+    expect(proto.getRawSignedTxHex).toBeUndefined()
+  })
+
+  it('verifies WebLocksExecutionCoordinator fails closed when navigator.locks is unavailable', async () => {
+    const coordinator = new PublicModuleExports.WebLocksExecutionCoordinator()
+    const originalNavigator = globalThis.navigator
+
+    try {
+      // Simulate absence of Web Locks
+      vi.stubGlobal('navigator', {})
+
+      await expect(
+        coordinator.requestExclusive('test_lock', async () => 'should_not_run')
+      ).rejects.toThrowError(
+        expect.objectContaining({
+          code: 'COORDINATION_UNAVAILABLE'
+        })
+      )
+    } finally {
+      vi.stubGlobal('navigator', originalNavigator)
+    }
   })
 
   it('verifies public AgentWalletExecutionEngine has NO confirmation, signing, or execution methods', () => {
