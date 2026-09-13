@@ -29,6 +29,7 @@ import {
   WebLocksExecutionCoordinator
 } from './ledger'
 import {
+  assertUniqueUtxoOutpoints,
   buildPreparedExecutionPlan,
   computeCanonicalPlanHash,
   DEFAULT_FEE_POLICY,
@@ -563,26 +564,39 @@ export function createWalletExecutionComposition(
     }
 
     return executionLedger.runWithSigningLock(executionId, async () => {
-    // Fresh clock immediately before PREPARED -> SIGNING. Do not reuse confirmNow.
-    const signingNow = getNow()
-    if (signingNow >= capability.effectiveExpiresAt) {
+    try {
+      assertUniqueUtxoOutpoints(plan.inputs)
+    } catch (dupErr) {
       activeExecutionId = null
       activeCapability = null
       activePlan = null
       activeController = null
       capability.invalidate()
-      await executionLedger.markExpired(
+      await executionLedger.markFailed(
         executionId,
-        'Approval expired immediately before SIGNING',
-        signingNow
+        dupErr instanceof Error ? dupErr.message : String(dupErr),
+        getNow()
       )
-      throw new WalletExecutionError(
-        'APPROVAL_EXPIRED',
-        'Approval expired immediately before SIGNING. Cryptographic signing was not started.'
-      )
+      throw dupErr
     }
 
-    await executionLedger.transitionToSigning(executionId, signingNow, plan)
+    try {
+      await executionLedger.transitionToSigningIfValid({
+        executionId,
+        plan,
+        effectiveExpiresAt: capability.effectiveExpiresAt,
+        now: getNow
+      })
+    } catch (transitionErr) {
+      if (transitionErr instanceof WalletExecutionError && transitionErr.code === 'APPROVAL_EXPIRED') {
+        activeExecutionId = null
+        activeCapability = null
+        activePlan = null
+        activeController = null
+        capability.invalidate()
+      }
+      throw transitionErr
+    }
 
     // 9. Wallet-owned signing. The signer-returned object is discarded as an authority source.
     let rawSignedTxHex: string
@@ -717,7 +731,7 @@ export function createWalletExecutionComposition(
     // 12. Only after durable raw-tx persistence: transition SIGNING → SIGNED.
     const signedAt = getNow()
     try {
-      await executionLedger.transitionToSigned(executionId, rawSignedTxHex, signedAt)
+      await executionLedger.transitionToSigned(executionId, signedAt)
     } catch (commitErr) {
       const commitReason = commitErr instanceof Error ? commitErr.message : String(commitErr)
       try {

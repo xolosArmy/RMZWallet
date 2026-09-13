@@ -188,6 +188,28 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(publicStatusBody).not.toMatch(/rawSignedTxHex/)
   })
 
+  it('verifies WalletExecutionLedger never carries signed transaction bytes', () => {
+    const typesContent = readFileSync(join(__dirname, 'types.ts'), 'utf-8')
+    const ledgerStart = typesContent.indexOf('export interface WalletExecutionLedger')
+    const ledgerEnd = typesContent.indexOf('export interface AgentWalletExecutionEngineConfig')
+    expect(ledgerStart).toBeGreaterThan(-1)
+    expect(ledgerEnd).toBeGreaterThan(ledgerStart)
+    const ledgerBody = typesContent.slice(ledgerStart, ledgerEnd)
+    expect(ledgerBody).not.toMatch(/rawSignedTxHex/)
+    expect(ledgerBody).not.toMatch(/\brawTx\b/)
+    expect(ledgerBody).not.toMatch(/\btxHex\b/)
+    expect(ledgerBody).toContain('transitionToSigned(executionId: string, signedAt: number)')
+    expect(ledgerBody).toContain('transitionToSigningIfValid')
+
+    const ledgerSource = readFileSync(join(__dirname, 'ledger.ts'), 'utf-8')
+    expect(ledgerSource).not.toMatch(/rawSignedTxHex/)
+    expect(ledgerSource).not.toMatch(/\brawTx\b/)
+    expect(ledgerSource).not.toMatch(/\btxHex\b/)
+
+    const testUtilsSource = readFileSync(join(__dirname, 'testUtils.ts'), 'utf-8')
+    expect(testUtilsSource).not.toMatch(/rawSignedTxHex/)
+  })
+
   it('verifies SignedExecutionHandle remains opaque without raw tx bytes', () => {
     const typesContent = readFileSync(join(__dirname, 'types.ts'), 'utf-8')
     const handleMatch = typesContent.match(/export interface SignedExecutionHandle \{([\s\S]*?)\}/)

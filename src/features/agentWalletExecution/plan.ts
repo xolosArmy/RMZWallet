@@ -10,6 +10,7 @@
 import { Script, sha256, toHex } from 'ecash-lib'
 import { XEC_DUST_SATS } from '../../config/xecFees'
 import { WalletExecutionError } from './errors'
+import { canonicalOutpointKey } from './ledger'
 import type {
   ExecutionTxOutput,
   ExecutionUtxoInput,
@@ -332,6 +333,8 @@ export function validateOutputInvariants(
       `Invalid locktime ${plan.locktime}. Expected 0.`
     )
   }
+
+  assertUniqueUtxoOutpoints(plan.inputs)
 }
 
 /**
@@ -370,6 +373,24 @@ export function snapshotOwnedUtxos(
 }
 
 /**
+ * Fail closed if a UTXO snapshot contains the same prevout more than once.
+ * Duplicate outpoints are an invalid provider snapshot, not a silent-dedup case.
+ */
+export function assertUniqueUtxoOutpoints(utxos: readonly ExecutionUtxoInput[]): void {
+  const seen = new Set<string>()
+  for (const utxo of utxos) {
+    const key = canonicalOutpointKey(utxo.txid, utxo.outIdx)
+    if (seen.has(key)) {
+      throw new WalletExecutionError(
+        'DUPLICATE_UTXO_OUTPOINT',
+        `Duplicate UTXO outpoint "${key}" in provider snapshot. Coin selection is prohibited.`
+      )
+    }
+    seen.add(key)
+  }
+}
+
+/**
  * Builds an immutable, audited execution plan using deterministic UTXO selection.
  */
 export function buildPreparedExecutionPlan(params: {
@@ -404,6 +425,9 @@ export function buildPreparedExecutionPlan(params: {
 
   // Wallet-owned snapshot: never retain caller/provider-owned mutable objects.
   const ownedUtxos = snapshotOwnedUtxos(params.availableUtxos)
+
+  // Duplicate outpoints fail closed BEFORE sorting, coin selection, fees, or hashing.
+  assertUniqueUtxoOutpoints(ownedUtxos)
 
   // Deterministic sorting of available UTXOs:
   // 1. Largest value first

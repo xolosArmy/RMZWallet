@@ -12,7 +12,7 @@
  * - Raw signed transaction material is persisted write-only under an opaque executionId.
  * - C2 exposes no raw-transaction retrieval API; trusted retrieval belongs to Gate C3.
  * - External callers receive only an opaque SignedExecutionHandle.
- * - Public status queries return PublicExecutionStatus (rawSignedTxHex strictly omitted).
+ * - Public status queries omit signed transaction bytes.
  * - Private keys, seeds, mnemonics, and WIF never appear in any type or interface here.
  */
 
@@ -143,7 +143,6 @@ export interface InternalWalletExecutionRecord {
   readonly plan?: WalletPreparedExecutionPlan
   readonly planHash?: string
   readonly state: WalletExecutionState
-  readonly rawSignedTxHex?: string
   readonly uncertainReason?: string
   readonly reservedAt: number
   readonly preparedAt?: number
@@ -228,17 +227,14 @@ export interface WalletExecutionLedger {
     preparedAt: number
   ): Promise<void>
 
-  transitionToSigning(
-    executionId: string,
-    signingAt: number,
-    plan: WalletPreparedExecutionPlan
-  ): Promise<void>
+  transitionToSigningIfValid(params: {
+    readonly executionId: string
+    readonly plan: WalletPreparedExecutionPlan
+    readonly effectiveExpiresAt: number
+    readonly now: () => number
+  }): Promise<void>
 
-  transitionToSigned(
-    executionId: string,
-    rawSignedTxHex: string,
-    signedAt: number
-  ): Promise<void>
+  transitionToSigned(executionId: string, signedAt: number): Promise<void>
 
   markSigningUncertain(
     executionId: string,

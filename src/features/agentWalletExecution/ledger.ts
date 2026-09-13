@@ -422,21 +422,33 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     })
   }
 
-  async transitionToSigning(
-    executionId: string,
-    signingAt: number,
-    plan: WalletPreparedExecutionPlan
-  ): Promise<void> {
+  async transitionToSigningIfValid(params: {
+    readonly executionId: string
+    readonly plan: WalletPreparedExecutionPlan
+    readonly effectiveExpiresAt: number
+    readonly now: () => number
+  }): Promise<void> {
+    const { executionId, plan, effectiveExpiresAt, now } = params
     return this.coordinator.requestExclusive(this.lockName, async () => {
       const data = this.loadData()
       const existing = data.records[executionId]
       if (!existing) {
         throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
       }
-
-      this.assertTransition(existing.state, 'SIGNING')
+      if (existing.state !== 'PREPARED') {
+        throw new WalletExecutionError(
+          'INVALID_STATE_TRANSITION',
+          `Cannot transition execution record from terminal state "${existing.state}" to "SIGNING".`
+        )
+      }
 
       const planKeys = plan.inputs.map(input => canonicalOutpointKey(input.txid, input.outIdx))
+      if (new Set(planKeys).size !== planKeys.length) {
+        throw new WalletExecutionError(
+          'DUPLICATE_UTXO_OUTPOINT',
+          `Plan for execution "${executionId}" contains duplicate input outpoints.`
+        )
+      }
       const reserved = existing.reservedOutpoints ?? planKeys
       if (reserved.length !== planKeys.length || reserved.some((key, i) => key !== planKeys[i])) {
         throw new WalletExecutionError(
@@ -453,6 +465,25 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
         }
       }
 
+      const signingAt = now()
+      if (signingAt >= effectiveExpiresAt) {
+        this.assertTransition(existing.state, 'EXPIRED')
+        this.releaseOutpoints(data, executionId, existing.reservedOutpoints)
+        data.records[executionId] = {
+          ...existing,
+          state: 'EXPIRED',
+          uncertainReason: 'Approval expired inside PREPARED -> SIGNING exclusive mutation.',
+          failedAt: signingAt,
+          reservedOutpoints: []
+        }
+        this.saveData(data)
+        throw new WalletExecutionError(
+          'APPROVAL_EXPIRED',
+          'Approval expired inside the exclusive PREPARED -> SIGNING mutation. Cryptographic signing was not started.'
+        )
+      }
+
+      this.assertTransition(existing.state, 'SIGNING')
       data.records[executionId] = {
         ...existing,
         state: 'SIGNING',
@@ -464,12 +495,7 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     })
   }
 
-  async transitionToSigned(
-    executionId: string,
-    rawSignedTxHex: string,
-    signedAt: number
-  ): Promise<void> {
-    void rawSignedTxHex
+  async transitionToSigned(executionId: string, signedAt: number): Promise<void> {
     return this.coordinator.requestExclusive(this.lockName, async () => {
       const data = this.loadData()
       const existing = data.records[executionId]

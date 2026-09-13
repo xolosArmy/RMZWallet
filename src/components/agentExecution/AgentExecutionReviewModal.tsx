@@ -12,21 +12,28 @@
  */
 
 import { useState, useEffect, useCallback, type ReactElement } from 'react'
-import type {
-  SignedExecutionHandle,
-  WalletExecutionReviewSession
+import {
+  WalletExecutionError,
+  type SignedExecutionHandle,
+  type WalletExecutionReviewSession
 } from '../../features/agentWalletExecution'
 import type { WalletLocalConfirmationController } from '../../internal/agentWalletExecutionHost'
 
 export interface AgentExecutionReviewModalProps {
   readonly session: WalletExecutionReviewSession
-  readonly controller?: WalletLocalConfirmationController
-  readonly onConfirmLocal?: () => Promise<SignedExecutionHandle>
+  readonly controller: WalletLocalConfirmationController
   readonly isOpen: boolean
   readonly onExecutionSuccess?: (handle: SignedExecutionHandle) => void
   readonly onExecutionRejected?: () => void
   readonly onError?: (error: Error) => void
   readonly onClose: () => void
+}
+
+function executionBindingError(sessionId: string, controllerId: string): WalletExecutionError {
+  return new WalletExecutionError(
+    'EXECUTION_BINDING_MISMATCH',
+    `Displayed session "${sessionId}" is not bound to confirmation controller "${controllerId}". Signing is prohibited.`
+  )
 }
 
 const DetailRow = ({
@@ -66,7 +73,6 @@ const DetailRow = ({
 export function AgentExecutionReviewModal({
   session,
   controller,
-  onConfirmLocal,
   isOpen,
   onExecutionSuccess,
   onExecutionRejected,
@@ -75,11 +81,12 @@ export function AgentExecutionReviewModal({
 }: AgentExecutionReviewModalProps): ReactElement | null {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const isBound = controller.executionId === session.executionId
 
   const handleDismiss = useCallback(async () => {
     if (!isSubmitting) {
       try {
-        if (controller) {
+        if (controller.executionId === session.executionId) {
           await controller.dismiss()
         } else {
           await session.dismiss()
@@ -109,18 +116,19 @@ export function AgentExecutionReviewModal({
 
   const handleConfirm = async () => {
     if (isSubmitting) return
+    if (controller.executionId !== session.executionId) {
+      const error = executionBindingError(session.executionId, controller.executionId)
+      setErrorMessage(error.message)
+      onError?.(error)
+      return
+    }
     setIsSubmitting(true)
     setErrorMessage(null)
     try {
-      const handle = controller
-        ? await controller.confirm()
-        : onConfirmLocal
-        ? await onConfirmLocal()
-        : await (session as any).confirmExecution?.()
-
-      if (!handle) {
-        throw new Error('Local confirmation authority required to execute signing.')
+      if (controller.executionId !== session.executionId) {
+        throw executionBindingError(session.executionId, controller.executionId)
       }
+      const handle = await controller.confirm()
       onExecutionSuccess?.(handle)
       onClose()
     } catch (err) {
@@ -137,7 +145,7 @@ export function AgentExecutionReviewModal({
     setIsSubmitting(true)
     setErrorMessage(null)
     try {
-      if (controller) {
+      if (controller.executionId === session.executionId) {
         await controller.reject('Execution rejected by custodian.')
       } else {
         await session.rejectExecution('Execution rejected by custodian.')
@@ -222,6 +230,22 @@ export function AgentExecutionReviewModal({
           <DetailRow label="ID de Solicitud" value={review.requestId} />
           <DetailRow label="Hash de Plan" value={review.planHash} />
 
+          {!isBound && (
+            <div
+              role="alert"
+              style={{
+                marginTop: 8,
+                padding: '8px 12px',
+                backgroundColor: '#450a0a',
+                border: '1px solid #991b1b',
+                borderRadius: 4,
+                color: '#fca5a5',
+                fontSize: 12
+              }}
+            >
+              {executionBindingError(session.executionId, controller.executionId).message}
+            </div>
+          )}
           {errorMessage && (
             <div
               role="alert"
@@ -270,7 +294,7 @@ export function AgentExecutionReviewModal({
           <button
             type="button"
             onClick={handleConfirm}
-            disabled={isSubmitting}
+            disabled={isSubmitting || !isBound}
             style={{
               padding: '8px 20px',
               borderRadius: 6,
@@ -279,8 +303,8 @@ export function AgentExecutionReviewModal({
               color: '#ffffff',
               fontSize: 14,
               fontWeight: 600,
-              cursor: isSubmitting ? 'not-allowed' : 'pointer',
-              opacity: isSubmitting ? 0.5 : 1
+              cursor: isSubmitting || !isBound ? 'not-allowed' : 'pointer',
+              opacity: isSubmitting || !isBound ? 0.5 : 1
             }}
           >
             {isSubmitting ? 'Firmando...' : 'Confirmar y Firmar'}

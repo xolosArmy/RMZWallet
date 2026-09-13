@@ -88,6 +88,7 @@ describe('AgentExecutionReviewModal Component (Gate C2)', () => {
     render(
       <AgentExecutionReviewModal
         session={session}
+        controller={createMockController()}
         isOpen={false}
         onClose={vi.fn()}
       />
@@ -101,6 +102,7 @@ describe('AgentExecutionReviewModal Component (Gate C2)', () => {
     render(
       <AgentExecutionReviewModal
         session={session}
+        controller={createMockController()}
         isOpen={true}
         onClose={vi.fn()}
       />
@@ -231,6 +233,68 @@ describe('AgentExecutionReviewModal Component (Gate C2)', () => {
     await waitFor(() => {
       expect(controller.dismiss).toHaveBeenCalledTimes(1)
       expect(onClose).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('rejects confirm when session A is displayed with controller B', async () => {
+    const session = createMockSession()
+    const controllerB = createMockController({ executionId: 'exec_other' })
+    const onError = vi.fn()
+
+    render(
+      <AgentExecutionReviewModal
+        session={session}
+        controller={controllerB}
+        isOpen={true}
+        onError={onError}
+        onClose={vi.fn()}
+      />
+    )
+
+    const confirmButton = screen.getByRole('button', { name: 'Confirmar y Firmar' }) as HTMLButtonElement
+    expect(confirmButton.disabled).toBe(true)
+    expect(screen.getByRole('alert').textContent).toMatch(/EXECUTION_BINDING_MISMATCH|not bound/)
+
+    fireEvent.click(confirmButton)
+    await waitFor(() => {
+      expect(controllerB.confirm).not.toHaveBeenCalled()
+    })
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it('detects a controller swap after render and refuses to sign', async () => {
+    const session = createMockSession()
+    const controllerA = createMockController()
+    const controllerB = createMockController({ executionId: 'exec_other' })
+    const onError = vi.fn()
+    const onClose = vi.fn()
+
+    const { rerender } = render(
+      <AgentExecutionReviewModal
+        session={session}
+        controller={controllerA}
+        isOpen={true}
+        onError={onError}
+        onClose={onClose}
+      />
+    )
+
+    rerender(
+      <AgentExecutionReviewModal
+        session={session}
+        controller={controllerB}
+        isOpen={true}
+        onError={onError}
+        onClose={onClose}
+      />
+    )
+
+    const confirmButton = screen.getByRole('button', { name: 'Confirmar y Firmar' }) as HTMLButtonElement
+    expect(confirmButton.disabled).toBe(true)
+    fireEvent.click(confirmButton)
+    await waitFor(() => {
+      expect(controllerA.confirm).not.toHaveBeenCalled()
+      expect(controllerB.confirm).not.toHaveBeenCalled()
     })
   })
 })

@@ -15,6 +15,7 @@ import type { WalletApprovalLedgerRecord } from '../agentWalletApprovalReceiver/
 import { createWalletExecutionComposition } from '../../internal/agentWalletExecutionHost'
 import {
   DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
+  DEFAULT_EXECUTION_LOCK_NAME,
   DurableStorageWalletExecutionLedger,
   DurableTransactionalExecutionLedger,
   canonicalOutpointKey,
@@ -25,6 +26,7 @@ import { InMemoryWalletExecutionLedger, MockStorage, TestExecutionLockCoordinato
 import { WalletExecutionError } from './errors'
 import {
   assertFeePolicy,
+  assertUniqueUtxoOutpoints,
   buildPreparedExecutionPlan,
   computeCanonicalPlanHash,
   DEFAULT_FEE_POLICY,
@@ -518,7 +520,12 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       availableUtxos: createFixtureUtxos()
     })
     await initialLedger.setPlanPrepared('exec_crashed', plan, FIXED_NOW + 1)
-    await initialLedger.transitionToSigning('exec_crashed', FIXED_NOW + 2, plan)
+    await initialLedger.transitionToSigningIfValid({
+      executionId: 'exec_crashed',
+      plan,
+      effectiveExpiresAt: EXPIRES_AT,
+      now: () => FIXED_NOW + 2
+    })
 
     // Verify it was in SIGNING
     const preCrashStatus = await initialLedger.get('exec_crashed')
@@ -538,7 +545,12 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
 
     // Automated retry is blocked
     await expect(
-      recoveredLedger.transitionToSigning('exec_crashed', FIXED_NOW + 10, plan)
+      recoveredLedger.transitionToSigningIfValid({
+        executionId: 'exec_crashed',
+        plan,
+        effectiveExpiresAt: EXPIRES_AT,
+        now: () => FIXED_NOW + 10
+      })
     ).rejects.toThrow(expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' }))
   })
 
@@ -839,8 +851,13 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       availableUtxos: createFixtureUtxos()
     })
     await ledger.setPlanPrepared('exec_imm', plan, FIXED_NOW + 1)
-    await ledger.transitionToSigning('exec_imm', FIXED_NOW + 2, plan)
-    await ledger.transitionToSigned('exec_imm', '0200000001...', FIXED_NOW + 3)
+    await ledger.transitionToSigningIfValid({
+      executionId: 'exec_imm',
+      plan,
+      effectiveExpiresAt: EXPIRES_AT,
+      now: () => FIXED_NOW + 2
+    })
+    await ledger.transitionToSigned('exec_imm', FIXED_NOW + 3)
 
     // Attempting to reject a SIGNED record throws INVALID_STATE_TRANSITION
     await expect(ledger.markRejected('exec_imm', 'too late', FIXED_NOW + 4)).rejects.toThrow(
@@ -1074,12 +1091,12 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       storage,
       lockCoordinator: coordinator
     })
-    const originalTransition = delayedLedger.transitionToSigning.bind(delayedLedger)
-    delayedLedger.transitionToSigning = async (executionId, signingAt, plan) => {
+    const originalTransition = delayedLedger.transitionToSigningIfValid.bind(delayedLedger)
+    delayedLedger.transitionToSigningIfValid = async params => {
       await new Promise(resolve => setTimeout(resolve, 20))
       providerOwnedUtxo.txid = 'aa'.repeat(32)
       providerOwnedUtxo.sats = 7n
-      return originalTransition(executionId, signingAt, plan)
+      return originalTransition(params)
     }
 
     const { engine, record, uiHost } = setupEngine({
@@ -1152,16 +1169,26 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       availableUtxos: createFixtureUtxos()
     })
     await ledgerA.setPlanPrepared('exec_crash_a', planA, FIXED_NOW + 1)
-    await ledgerA.transitionToSigning('exec_crash_a', FIXED_NOW + 2, planA)
+    await ledgerA.transitionToSigningIfValid({
+      executionId: 'exec_crash_a',
+      plan: planA,
+      effectiveExpiresAt: EXPIRES_AT,
+      now: () => FIXED_NOW + 2
+    })
 
     const recoveredA = new DurableTransactionalExecutionLedger({ storage, lockCoordinator: coordinator })
     await recoveredA.whenReady()
     const recoveredAStatus = await recoveredA.get('exec_crash_a')
     expect(recoveredAStatus?.status).toBe('SIGNING_UNCERTAIN')
     expect(readStoredRawTx(storage, 'exec_crash_a')).toBeUndefined()
-    await expect(recoveredA.transitionToSigning('exec_crash_a', FIXED_NOW + 9, planA)).rejects.toThrow(
-      expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' })
-    )
+    await expect(
+      recoveredA.transitionToSigningIfValid({
+        executionId: 'exec_crash_a',
+        plan: planA,
+        effectiveExpiresAt: EXPIRES_AT,
+        now: () => FIXED_NOW + 9
+      })
+    ).rejects.toThrow(expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' }))
 
     // B: persistence failure after signing → SIGNING_UNCERTAIN, no SIGNED, no automatic re-sign.
     const failingStorage = new MockStorage()
@@ -1226,7 +1253,12 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       availableUtxos: createFixtureUtxos()
     })
     await ledgerC.setPlanPrepared('exec_crash_c', planC, FIXED_NOW + 1)
-    await ledgerC.transitionToSigning('exec_crash_c', FIXED_NOW + 2, planC)
+    await ledgerC.transitionToSigningIfValid({
+      executionId: 'exec_crash_c',
+      plan: planC,
+      effectiveExpiresAt: EXPIRES_AT,
+      now: () => FIXED_NOW + 2
+    })
     storageC.setItem(
       DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY,
       JSON.stringify({ exec_crash_c: '0200000001deadbeef' })
@@ -1239,9 +1271,14 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     const recoveredCStatus = await recoveredC.get('exec_crash_c')
     expect(recoveredCStatus?.status).toBe('SIGNING_UNCERTAIN')
     expect(readStoredRawTx(storageC, 'exec_crash_c')).toBe('0200000001deadbeef')
-    await expect(recoveredC.transitionToSigning('exec_crash_c', FIXED_NOW + 9, planC)).rejects.toThrow(
-      expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' })
-    )
+    await expect(
+      recoveredC.transitionToSigningIfValid({
+        executionId: 'exec_crash_c',
+        plan: planC,
+        effectiveExpiresAt: EXPIRES_AT,
+        now: () => FIXED_NOW + 9
+      })
+    ).rejects.toThrow(expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' }))
   })
 
   it('persists both raw signed transactions when two tabs sign different approvals concurrently', async () => {
@@ -1383,7 +1420,12 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       reservedAt: FIXED_NOW
     })
     await ledgerA.setPlanPrepared('exec_live', plan, FIXED_NOW + 1)
-    await ledgerA.transitionToSigning('exec_live', FIXED_NOW + 2, plan)
+    await ledgerA.transitionToSigningIfValid({
+      executionId: 'exec_live',
+      plan,
+      effectiveExpiresAt: EXPIRES_AT,
+      now: () => FIXED_NOW + 2
+    })
 
     await coordinator.requestExclusive(executionSigningLockName('exec_live'), async () => {
       const ledgerB = new DurableTransactionalExecutionLedger({ storage, lockCoordinator: coordinator })
@@ -1507,6 +1549,140 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     await expect(blocked.engine.prepareExecution(blocked.record.humanApproval)).rejects.toThrow(
       expect.objectContaining({ code: 'OUTPOINT_ALREADY_RESERVED' })
     )
+  })
+
+  it('never passes signed transaction bytes through the injectable ledger port', async () => {
+    const inner = new InMemoryWalletExecutionLedger()
+    const calls: { method: string; args: unknown[] }[] = []
+    const recordingLedger = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver)
+        if (typeof value === 'function') {
+          return (...args: unknown[]) => {
+            calls.push({ method: String(prop), args })
+            return (value as (...innerArgs: unknown[]) => unknown).apply(target, args)
+          }
+        }
+        return value
+      }
+    }) as InMemoryWalletExecutionLedger
+
+    const { engine, uiHost, record } = setupEngine({
+      storage: new MockStorage(),
+      executionLedger: recordingLedger
+    })
+    const session = await engine.prepareExecution(record.humanApproval)
+    const handle = await uiHost.getActiveController()!.confirm()
+    expect(handle.status).toBe('SIGNED')
+
+    const signedCall = calls.find(call => call.method === 'transitionToSigned')
+    expect(signedCall).toBeDefined()
+    expect(signedCall!.args).toHaveLength(2)
+    expect(signedCall!.args[0]).toBe(session.executionId)
+    expect(typeof signedCall!.args[1]).toBe('number')
+
+    const seen = new Set<unknown>()
+    const visit = (value: unknown): void => {
+      if (value === null || value === undefined) return
+      if (typeof value === 'string') {
+        expect(value).not.toMatch(/rawSignedTxHex/)
+        if (/^[0-9a-f]+$/i.test(value)) {
+          expect(value.length).toBeLessThanOrEqual(64)
+        }
+        return
+      }
+      if (typeof value !== 'object') return
+      if (seen.has(value)) return
+      seen.add(value)
+      if (Array.isArray(value)) {
+        value.forEach(visit)
+        return
+      }
+      for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+        expect(key).not.toBe('rawSignedTxHex')
+        expect(key).not.toBe('rawTx')
+        expect(key).not.toBe('txHex')
+        visit(nested)
+      }
+    }
+    for (const call of calls) {
+      visit(call.args)
+    }
+  })
+
+  it('expires inside the exclusive PREPARED -> SIGNING mutation if the ledger lock is delayed', async () => {
+    const signerMock = vi.fn()
+    const storage = new MockStorage()
+    const coordinator = new TestExecutionLockCoordinator()
+    const ledger = new DurableTransactionalExecutionLedger({ storage, lockCoordinator: coordinator })
+    const { engine, uiHost, record, setClock } = setupEngine({
+      storage,
+      lockCoordinator: coordinator,
+      executionLedger: ledger,
+      signatoryProvider: {
+        getSignatory: async () => {
+          signerMock()
+          return createSyntheticSignatory().signatory
+        }
+      }
+    })
+    const session = await engine.prepareExecution(record.humanApproval)
+
+    let releaseLock!: () => void
+    const hold = new Promise<void>(resolve => {
+      releaseLock = resolve
+    })
+    const holding = coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      await hold
+    })
+    await new Promise(resolve => setTimeout(resolve, 20))
+
+    const confirmPromise = uiHost.getActiveController()!.confirm()
+    await new Promise(resolve => setTimeout(resolve, 40))
+    setClock(EXPIRES_AT + 5)
+    releaseLock()
+    await holding
+
+    await expect(confirmPromise).rejects.toThrow(expect.objectContaining({ code: 'APPROVAL_EXPIRED' }))
+    expect(signerMock).not.toHaveBeenCalled()
+    expect((await ledger.get(session.executionId))?.status).toBe('EXPIRED')
+  })
+
+  it('fails closed before PREPARED when the UTXO provider returns duplicate outpoints', async () => {
+    const duplicates: ExecutionUtxoInput[][] = [
+      [
+        ...createFixtureUtxos(),
+        { txid: '11'.repeat(32), outIdx: 0, sats: 500_000n, lockingScriptHex: FROM_SCRIPT_HEX }
+      ],
+      [
+        ...createFixtureUtxos(),
+        { txid: '11'.repeat(32), outIdx: 0, sats: 400_000n, lockingScriptHex: FROM_SCRIPT_HEX }
+      ],
+      [
+        ...createFixtureUtxos(),
+        { txid: '11'.repeat(32), outIdx: 0, sats: 500_000n, lockingScriptHex: DEST_SCRIPT_HEX }
+      ]
+    ]
+
+    for (const utxos of duplicates) {
+      const signerMock = vi.fn()
+      const { engine, record } = setupEngine({
+        utxos,
+        signatoryProvider: {
+          getSignatory: async () => {
+            signerMock()
+            return createSyntheticSignatory().signatory
+          }
+        }
+      })
+      await expect(engine.prepareExecution(record.humanApproval)).rejects.toThrow(
+        expect.objectContaining({ code: 'DUPLICATE_UTXO_OUTPOINT' })
+      )
+      expect(signerMock).not.toHaveBeenCalled()
+      expect(() =>
+        assertUniqueUtxoOutpoints(utxos)
+      ).toThrow(expect.objectContaining({ code: 'DUPLICATE_UTXO_OUTPOINT' }))
+    }
   })
 
   it('snapshotOwnedUtxos never retains provider object references', () => {

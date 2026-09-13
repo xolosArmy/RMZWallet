@@ -193,19 +193,31 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     this.commitUpdate(updated)
   }
 
-  async transitionToSigning(
-    executionId: string,
-    signingAt: number,
-    plan: WalletPreparedExecutionPlan
-  ): Promise<void> {
+  async transitionToSigningIfValid(params: {
+    readonly executionId: string
+    readonly plan: WalletPreparedExecutionPlan
+    readonly effectiveExpiresAt: number
+    readonly now: () => number
+  }): Promise<void> {
+    const { executionId, plan, effectiveExpiresAt, now } = params
     const existing = this.recordsByExecutionId.get(executionId)
     if (!existing) {
       throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
     }
-
-    this.assertTransition(existing.state, 'SIGNING')
+    if (existing.state !== 'PREPARED') {
+      throw new WalletExecutionError(
+        'INVALID_STATE_TRANSITION',
+        `Cannot transition execution record from terminal state "${existing.state}" to "SIGNING".`
+      )
+    }
 
     const planKeys = plan.inputs.map(input => canonicalOutpointKey(input.txid, input.outIdx))
+    if (new Set(planKeys).size !== planKeys.length) {
+      throw new WalletExecutionError(
+        'DUPLICATE_UTXO_OUTPOINT',
+        `Plan for execution "${executionId}" contains duplicate input outpoints.`
+      )
+    }
     for (const key of planKeys) {
       if (this.outpointReservations.get(key) !== executionId) {
         throw new WalletExecutionError(
@@ -213,6 +225,24 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
           `Execution "${executionId}" does not durably own outpoint "${key}".`
         )
       }
+    }
+
+    const signingAt = now()
+    if (signingAt >= effectiveExpiresAt) {
+      this.assertTransition(existing.state, 'EXPIRED')
+      this.releaseOwnedOutpoints(executionId, existing.reservedOutpoints)
+      const expired: InternalWalletExecutionRecord = Object.freeze({
+        ...existing,
+        state: 'EXPIRED',
+        uncertainReason: 'Approval expired inside PREPARED -> SIGNING exclusive mutation.',
+        failedAt: signingAt,
+        reservedOutpoints: []
+      })
+      this.commitUpdate(expired)
+      throw new WalletExecutionError(
+        'APPROVAL_EXPIRED',
+        'Approval expired inside the exclusive PREPARED -> SIGNING mutation. Cryptographic signing was not started.'
+      )
     }
 
     const updated: InternalWalletExecutionRecord = Object.freeze({
@@ -225,11 +255,7 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     this.commitUpdate(updated)
   }
 
-  async transitionToSigned(
-    executionId: string,
-    rawSignedTxHex: string,
-    signedAt: number
-  ): Promise<void> {
+  async transitionToSigned(executionId: string, signedAt: number): Promise<void> {
     const existing = this.recordsByExecutionId.get(executionId)
     if (!existing) {
       throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
@@ -240,7 +266,6 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     const updated: InternalWalletExecutionRecord = Object.freeze({
       ...existing,
       state: 'SIGNED',
-      rawSignedTxHex,
       signedAt
     })
 

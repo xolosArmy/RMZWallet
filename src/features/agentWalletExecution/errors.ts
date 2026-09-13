@@ -39,6 +39,8 @@ export type WalletExecutionErrorCode =
   | 'SETTLEMENT_ARTIFACT_ALREADY_EXISTS'
   | 'OUTPOINT_ALREADY_RESERVED'
   | 'OUTPOINT_RESERVATION_MISMATCH'
+  | 'DUPLICATE_UTXO_OUTPOINT'
+  | 'EXECUTION_BINDING_MISMATCH'
 
 export class WalletExecutionError extends Error {
   readonly code: WalletExecutionErrorCode
