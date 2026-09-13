@@ -25,6 +25,7 @@ import { fromHex, Script, toHex, toHexRev, Tx, TxBuilder } from 'ecash-lib'
 import { humanApprovalV1Schema, type HumanApprovalV1 } from '@xolosarmy/tonalli-core'
 import { WalletExecutionError } from './errors'
 import {
+  DEFAULT_REVIEW_LEASE_TTL_SECONDS,
   DurableTransactionalExecutionLedger,
   WebLocksExecutionCoordinator
 } from './ledger'
@@ -39,6 +40,7 @@ import {
 import type {
   AgentWalletExecutionEngine,
   AgentWalletExecutionEngineConfig,
+  ExecutionReviewLease,
   ExecutionNetwork,
   PublicExecutionStatus,
   SignedExecutionHandle,
@@ -46,7 +48,8 @@ import type {
   WalletExecutionReviewSession,
   WalletExecutionReviewSnapshot,
   WalletFeePolicy,
-  WalletPreparedExecutionPlan
+  WalletPreparedExecutionPlan,
+  WalletExecutionTrustedOptions
 } from './types'
 import type {
   WalletExecutionComposition,
@@ -320,7 +323,8 @@ function assertParsedTransactionMatchesPlan(parsedTx: Tx, plan: WalletPreparedEx
 }
 
 export function createWalletExecutionComposition(
-  config: AgentWalletExecutionEngineConfig
+  config: AgentWalletExecutionEngineConfig,
+  trusted?: WalletExecutionTrustedOptions
 ): WalletExecutionComposition {
   const {
     approvalLedger,
@@ -343,21 +347,29 @@ export function createWalletExecutionComposition(
     config.executionLedger ??
     new DurableTransactionalExecutionLedger({
       storage: config.storage,
-      lockCoordinator: config.lockCoordinator
+      lockCoordinator: config.lockCoordinator,
+      clock: getNow
     })
 
   const ledgerReady = executionLedger.whenReady()
+  const reviewOwnerId = `review_${createId()}`
+  const reviewLeaseTtlSeconds = trusted?.reviewLeaseTtlSeconds ?? DEFAULT_REVIEW_LEASE_TTL_SECONDS
+  const reviewHeartbeatMs = trusted?.reviewHeartbeatMs ?? 10_000
+  let reviewLeaseGeneration = 1
+  let reviewLockRelease: (() => void) | null = null
+  let reviewHeartbeatTimer: ReturnType<typeof setInterval> | null = null
 
   /**
-   * Closure-private write-once persistence. Not exported. Not a factory.
-   * Invoked only after independent post-sign byte verification.
+   * Wallet-private write-once persistence. NEVER uses Agent-injectable config.storage.
+   * Constructed only from trusted Wallet bootstrap options or origin localStorage.
    */
   async function persistVerifiedSignedTransactionOnce(
     executionId: string,
     rawSignedTxHex: string
   ): Promise<void> {
     const targetStorage =
-      config.storage ?? (typeof localStorage !== 'undefined' ? localStorage : undefined)
+      trusted?.privateSettlementStorage ??
+      (typeof localStorage !== 'undefined' ? localStorage : undefined)
     if (!targetStorage) {
       throw new WalletExecutionError(
         'STORAGE_UNAVAILABLE',
@@ -429,6 +441,52 @@ export function createWalletExecutionComposition(
     (session: WalletExecutionReviewSession, controller: WalletLocalConfirmationController) => void
   >()
 
+  function stopReviewHeartbeat(): void {
+    if (reviewHeartbeatTimer !== null) {
+      clearInterval(reviewHeartbeatTimer)
+      reviewHeartbeatTimer = null
+    }
+  }
+
+  function endLiveReview(): void {
+    stopReviewHeartbeat()
+    reviewLockRelease?.()
+    reviewLockRelease = null
+  }
+
+  async function beginLiveReview(executionId: string): Promise<void> {
+    endLiveReview()
+    let acquired!: () => void
+    const acquiredPromise = new Promise<void>(resolve => {
+      acquired = resolve
+    })
+    const hold = new Promise<void>(resolve => {
+      reviewLockRelease = resolve
+    })
+    void executionLedger.runWithReviewLock(executionId, async () => {
+      acquired()
+      await hold
+    })
+    await acquiredPromise
+    stopReviewHeartbeat()
+    reviewHeartbeatTimer = setInterval(() => {
+      void executionLedger
+        .renewReviewLease({
+          executionId,
+          ownerId: reviewOwnerId,
+          generation: reviewLeaseGeneration,
+          now: getNow(),
+          leaseTtlSeconds: reviewLeaseTtlSeconds
+        })
+        .then(next => {
+          reviewLeaseGeneration = next.generation
+        })
+        .catch(() => {
+          stopReviewHeartbeat()
+        })
+    }, reviewHeartbeatMs)
+  }
+
   async function executeSigningWithConfirmation(
     executionId: string,
     token: unknown
@@ -452,6 +510,7 @@ export function createWalletExecutionComposition(
     }
 
     await ledgerReady
+    endLiveReview()
 
     // 2. Look up current ledger state
     const currentRecord = await executionLedger.get(executionId)
@@ -968,7 +1027,13 @@ export function createWalletExecutionComposition(
         // 11. Bind plan to capability and atomically reserve outpoints + PREPARED.
         capability.bindPlan(plan)
         try {
-          await executionLedger.setPlanPrepared(executionId, plan, now)
+          reviewLeaseGeneration = 1
+          const reviewLease: ExecutionReviewLease = {
+            ownerId: reviewOwnerId,
+            generation: reviewLeaseGeneration,
+            leaseExpiresAt: now + reviewLeaseTtlSeconds
+          }
+          await executionLedger.setPlanPrepared(executionId, plan, now, reviewLease)
         } catch (preparedErr) {
           await executionLedger.markFailed(
             executionId,
@@ -1006,6 +1071,7 @@ export function createWalletExecutionComposition(
           plan,
           review,
           rejectExecution: async (reason?: string): Promise<void> => {
+            endLiveReview()
             if (activeExecutionId === executionId) {
               activeExecutionId = null
               activeCapability = null
@@ -1020,6 +1086,7 @@ export function createWalletExecutionComposition(
             )
           },
           dismiss: async (): Promise<void> => {
+            endLiveReview()
             if (activeExecutionId === executionId) {
               activeExecutionId = null
               activeCapability = null
@@ -1055,6 +1122,7 @@ export function createWalletExecutionComposition(
         })
 
         activeController = localController
+        await beginLiveReview(executionId)
 
         // Dispatch to Wallet UI host listeners
         for (const listener of sessionPreparedListeners) {

@@ -17,3 +17,13 @@ export type {
   WalletExecutionUIHost,
   WalletExecutionComposition
 } from './types'
+export {
+  TrustedWalletExecutionProvider,
+  resetTrustedExecutionShellForTests
+} from './TrustedWalletExecutionProvider'
+export type { TrustedWalletExecutionProviderProps } from './TrustedWalletExecutionProvider'
+export {
+  TrustedWalletExecutionContext,
+  useTrustedWalletExecution
+} from './TrustedWalletExecutionContext'
+export type { TrustedWalletExecutionContextValue } from './TrustedWalletExecutionContext'

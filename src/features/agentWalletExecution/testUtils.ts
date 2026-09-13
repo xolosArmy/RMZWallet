@@ -10,6 +10,7 @@ import { canonicalOutpointKey, VALID_EXECUTION_STATE_TRANSITIONS } from './ledge
 import type { ExecutionLockCoordinator } from './ledger'
 import type {
   ExecutionNetwork,
+  ExecutionReviewLease,
   InternalWalletExecutionRecord,
   PublicExecutionStatus,
   WalletExecutionLedger,
@@ -95,6 +96,10 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     return operation()
   }
 
+  async runWithReviewLock<T>(_executionId: string, operation: () => Promise<T>): Promise<T> {
+    return operation()
+  }
+
   private assertTransition(currentState: WalletExecutionState, targetState: WalletExecutionState): void {
     const allowed = VALID_EXECUTION_STATE_TRANSITIONS[currentState]
     if (!allowed.includes(targetState)) {
@@ -158,7 +163,8 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
   async setPlanPrepared(
     executionId: string,
     plan: WalletPreparedExecutionPlan,
-    preparedAt: number
+    preparedAt: number,
+    reviewLease: ExecutionReviewLease
   ): Promise<void> {
     const existing = this.recordsByExecutionId.get(executionId)
     if (!existing) {
@@ -187,10 +193,64 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
       planHash: plan.planHash,
       state: 'PREPARED',
       preparedAt,
-      reservedOutpoints
+      reservedOutpoints,
+      reviewOwnerId: reviewLease.ownerId,
+      reviewLeaseExpiresAt: reviewLease.leaseExpiresAt,
+      reviewLeaseGeneration: reviewLease.generation
     })
 
     this.commitUpdate(updated)
+  }
+
+  async renewReviewLease(params: {
+    readonly executionId: string
+    readonly ownerId: string
+    readonly generation: number
+    readonly now: number
+    readonly leaseTtlSeconds: number
+  }): Promise<ExecutionReviewLease> {
+    const existing = this.recordsByExecutionId.get(params.executionId)
+    if (!existing) {
+      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+    }
+    if (existing.state !== 'PREPARED') {
+      throw new WalletExecutionError(
+        'REVIEW_LEASE_REJECTED',
+        `Cannot renew review lease for execution "${params.executionId}" in state "${existing.state}".`
+      )
+    }
+    if (existing.reviewOwnerId !== params.ownerId || existing.reviewLeaseGeneration !== params.generation) {
+      throw new WalletExecutionError(
+        'REVIEW_LEASE_REJECTED',
+        `Stale review owner cannot renew lease for execution "${params.executionId}".`
+      )
+    }
+    const next: ExecutionReviewLease = {
+      ownerId: params.ownerId,
+      generation: params.generation + 1,
+      leaseExpiresAt: params.now + params.leaseTtlSeconds
+    }
+    this.commitUpdate(
+      Object.freeze({
+        ...existing,
+        reviewOwnerId: next.ownerId,
+        reviewLeaseGeneration: next.generation,
+        reviewLeaseExpiresAt: next.leaseExpiresAt
+      })
+    )
+    return next
+  }
+
+  async getReviewLease(executionId: string): Promise<ExecutionReviewLease | undefined> {
+    const record = this.recordsByExecutionId.get(executionId)
+    if (!record?.reviewOwnerId || record.reviewLeaseExpiresAt === undefined || record.reviewLeaseGeneration === undefined) {
+      return undefined
+    }
+    return {
+      ownerId: record.reviewOwnerId,
+      leaseExpiresAt: record.reviewLeaseExpiresAt,
+      generation: record.reviewLeaseGeneration
+    }
   }
 
   async transitionToSigningIfValid(params: {

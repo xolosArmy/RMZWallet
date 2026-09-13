@@ -27,8 +27,11 @@ export {
   DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
   DEFAULT_EXECUTION_LOCK_NAME,
   EXECUTION_SIGNING_LOCK_PREFIX,
+  EXECUTION_REVIEW_LOCK_PREFIX,
+  DEFAULT_REVIEW_LEASE_TTL_SECONDS,
   VALID_EXECUTION_STATE_TRANSITIONS,
   executionSigningLockName,
+  executionReviewLockName,
   canonicalOutpointKey
 } from './ledger'
 export type { ExecutionLockCoordinator, DurableTransactionalExecutionLedgerOptions } from './ledger'
@@ -61,6 +64,7 @@ export type {
   WalletSignatoryProvider,
   WalletSessionVerifier,
   WalletExecutionLedger,
+  ExecutionReviewLease,
   AgentWalletExecutionEngineConfig,
   AgentWalletExecutionEngine
 } from './types'

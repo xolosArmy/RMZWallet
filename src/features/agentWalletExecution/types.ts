@@ -150,6 +150,9 @@ export interface InternalWalletExecutionRecord {
   readonly signedAt?: number
   readonly failedAt?: number
   readonly reservedOutpoints?: readonly string[]
+  readonly reviewOwnerId?: string
+  readonly reviewLeaseExpiresAt?: number
+  readonly reviewLeaseGeneration?: number
 }
 
 /**
@@ -203,6 +206,12 @@ export interface WalletSessionVerifier {
  * Public execution ledger port for tracking execution state across lifecycle transitions.
  * Strictly does NOT expose raw signed transaction bytes or private keys.
  */
+export interface ExecutionReviewLease {
+  readonly ownerId: string
+  readonly leaseExpiresAt: number
+  readonly generation: number
+}
+
 export interface WalletExecutionLedger {
   reserveExecutionAtomic(entry: {
     executionId: string
@@ -221,11 +230,22 @@ export interface WalletExecutionLedger {
 
   runWithSigningLock<T>(executionId: string, operation: () => Promise<T>): Promise<T>
 
+  runWithReviewLock<T>(executionId: string, operation: () => Promise<T>): Promise<T>
+
   setPlanPrepared(
     executionId: string,
     plan: WalletPreparedExecutionPlan,
-    preparedAt: number
+    preparedAt: number,
+    reviewLease: ExecutionReviewLease
   ): Promise<void>
+
+  renewReviewLease(params: {
+    readonly executionId: string
+    readonly ownerId: string
+    readonly generation: number
+    readonly now: number
+    readonly leaseTtlSeconds: number
+  }): Promise<ExecutionReviewLease>
 
   transitionToSigningIfValid(params: {
     readonly executionId: string
@@ -270,6 +290,10 @@ export interface AgentWalletExecutionEngineConfig {
   readonly utxoProvider: WalletUtxoProvider
   readonly signatoryProvider: WalletSignatoryProvider
   readonly feePolicy?: Partial<WalletFeePolicy>
+  /**
+   * Public execution-ledger persistence only. NEVER used for raw signed transactions.
+   * Settlement persistence is Wallet-private and is not part of this Agent-facing config.
+   */
   readonly storage?: Storage
   readonly lockCoordinator?: {
     requestExclusive<T>(lockName: string, operation: () => Promise<T>): Promise<T>
@@ -280,6 +304,16 @@ export interface AgentWalletExecutionEngineConfig {
   }
   readonly clock?: () => number
   readonly idGenerator?: () => string
+}
+
+/**
+ * Trusted Wallet-only composition options. NEVER part of Agent-facing config.
+ * Must not be exported from the public agentWalletExecution barrel.
+ */
+export interface WalletExecutionTrustedOptions {
+  readonly privateSettlementStorage?: Storage
+  readonly reviewLeaseTtlSeconds?: number
+  readonly reviewHeartbeatMs?: number
 }
 
 /**

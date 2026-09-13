@@ -9,19 +9,22 @@
  * Canonical lock names:
  * - Global ledger lock: rmzwallet:agent-execution:lock:v2
  * - Per-execution signing lock: rmzwallet:agent-signing:<executionId>
+ * - Per-execution review lock: rmzwallet:agent-review:<executionId>
  * - Settlement-store lock: rmzwallet:internal-settlement:lock:v2
  *
  * Canonical lock ordering (deadlock prevention):
- * 1. Per-execution signing lock is the outermost lock of the signing critical section.
- * 2. Global ledger lock is acquired only for short mutations and NEVER while waiting
- *    for a per-execution signing lock.
- * 3. Settlement-store lock is acquired only for write-once raw-tx persist, after the
+ * 1. Per-execution review lock is held for a live PREPARED review (outermost for review).
+ * 2. Per-execution signing lock is the outermost lock of the signing critical section.
+ *    Review lock is released before the signing lock is acquired.
+ * 3. Global ledger lock is acquired only for short mutations and NEVER while waiting
+ *    for a per-execution review or signing lock.
+ * 4. Settlement-store lock is acquired only for write-once raw-tx persist, after the
  *    signing lock is already held, and is released before or without nesting a wait
  *    for the signing lock.
  *
- * Forbidden: hold global ledger lock → then wait for execution signing lock.
- * Recovery: snapshot SIGNING candidates under the ledger lock, release it, then
- * tryExclusive the per-execution signing lock (ifAvailable / non-blocking).
+ * Forbidden: hold global ledger lock → then wait for execution review/signing lock.
+ * Recovery: snapshot SIGNING/PREPARED candidates under the ledger lock, release it,
+ * then tryExclusive the matching per-execution lock (ifAvailable / non-blocking).
  *
  * Allowed Transitions:
  * APPROVED -> EXECUTION_RESERVED -> PREPARED -> SIGNING -> SIGNED
@@ -33,6 +36,7 @@
 import { WalletExecutionError } from './errors'
 import type {
   ExecutionNetwork,
+  ExecutionReviewLease,
   PublicExecutionStatus,
   WalletExecutionLedger,
   WalletExecutionState,
@@ -42,9 +46,15 @@ import type {
 export const DEFAULT_EXECUTION_LEDGER_STORAGE_KEY = 'rmzwallet_agent_execution_ledger_v2'
 export const DEFAULT_EXECUTION_LOCK_NAME = 'rmzwallet:agent-execution:lock:v2'
 export const EXECUTION_SIGNING_LOCK_PREFIX = 'rmzwallet:agent-signing:'
+export const EXECUTION_REVIEW_LOCK_PREFIX = 'rmzwallet:agent-review:'
+export const DEFAULT_REVIEW_LEASE_TTL_SECONDS = 30
 
 export function executionSigningLockName(executionId: string): string {
   return `${EXECUTION_SIGNING_LOCK_PREFIX}${executionId}`
+}
+
+export function executionReviewLockName(executionId: string): string {
+  return `${EXECUTION_REVIEW_LOCK_PREFIX}${executionId}`
 }
 
 export function canonicalOutpointKey(txid: string, outIdx: number): string {
@@ -136,6 +146,9 @@ interface SerializedExecutionStateEntry {
   readonly signedAt?: number
   readonly failedAt?: number
   readonly reservedOutpoints?: readonly string[]
+  readonly reviewOwnerId?: string
+  readonly reviewLeaseExpiresAt?: number
+  readonly reviewLeaseGeneration?: number
 }
 
 interface DurableLedgerStoragePayloadV3 {
@@ -185,6 +198,7 @@ export interface DurableTransactionalExecutionLedgerOptions {
   readonly storageKey?: string
   readonly lockName?: string
   readonly lockCoordinator?: ExecutionLockCoordinator
+  readonly clock?: () => number
 }
 
 /**
@@ -195,6 +209,7 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
   private readonly storageKey: string
   private readonly lockName: string
   private readonly coordinator: ExecutionLockCoordinator
+  private readonly clock: () => number
   private readonly ready: Promise<void>
 
   constructor(options?: DurableTransactionalExecutionLedgerOptions) {
@@ -209,7 +224,8 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     this.storageKey = options?.storageKey ?? DEFAULT_EXECUTION_LEDGER_STORAGE_KEY
     this.lockName = options?.lockName ?? DEFAULT_EXECUTION_LOCK_NAME
     this.coordinator = options?.lockCoordinator ?? new WebLocksExecutionCoordinator()
-    this.ready = this.reconcileInterruptedSignings()
+    this.clock = options?.clock ?? (() => Math.floor(Date.now() / 1000))
+    this.ready = this.reconcileInterruptedExecutions()
     this.ready.catch(() => {
       // Prevent unhandled rejection if callers have not yet awaited whenReady().
     })
@@ -221,6 +237,10 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
 
   async runWithSigningLock<T>(executionId: string, operation: () => Promise<T>): Promise<T> {
     return this.coordinator.requestExclusive(executionSigningLockName(executionId), operation)
+  }
+
+  async runWithReviewLock<T>(executionId: string, operation: () => Promise<T>): Promise<T> {
+    return this.coordinator.requestExclusive(executionReviewLockName(executionId), operation)
   }
 
   private loadData(): DurableLedgerStoragePayloadV3 {
@@ -281,36 +301,67 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
   }
 
   /**
-   * Live-signer-safe crash recovery. Does not blindly convert every SIGNING record.
+   * Live-signer/review-safe crash recovery.
+   * SIGNING: only abandoned signers (review/signing lock available) become SIGNING_UNCERTAIN.
+   * PREPARED: only expired leases whose review lock can be acquired become EXPIRED and release outpoints.
    */
-  private async reconcileInterruptedSignings(): Promise<void> {
-    const signingIds = await this.coordinator.requestExclusive(this.lockName, async () => {
+  private async reconcileInterruptedExecutions(): Promise<void> {
+    const snapshot = await this.coordinator.requestExclusive(this.lockName, async () => {
       const data = this.loadData()
-      return Object.keys(data.records).filter(id => data.records[id]?.state === 'SIGNING')
+      return {
+        signingIds: Object.keys(data.records).filter(id => data.records[id]?.state === 'SIGNING'),
+        preparedIds: Object.keys(data.records).filter(id => data.records[id]?.state === 'PREPARED')
+      }
     })
 
-    for (const executionId of signingIds) {
-      const attempt = await this.coordinator.tryExclusive(
-        executionSigningLockName(executionId),
-        async () => {
-          await this.coordinator.requestExclusive(this.lockName, async () => {
-            const data = this.loadData()
-            const record = data.records[executionId]
-            if (!record || record.state !== 'SIGNING') {
-              return
-            }
-            data.records[executionId] = {
-              ...record,
-              state: 'SIGNING_UNCERTAIN',
-              uncertainReason:
-                'Process interrupted during signing; reconciled to SIGNING_UNCERTAIN after acquiring abandoned signing lock.',
-              failedAt: Math.floor(Date.now() / 1000)
-            }
-            this.saveData(data)
-          })
-        }
-      )
-      void attempt
+    for (const executionId of snapshot.signingIds) {
+      await this.coordinator.tryExclusive(executionSigningLockName(executionId), async () => {
+        await this.coordinator.requestExclusive(this.lockName, async () => {
+          const data = this.loadData()
+          const record = data.records[executionId]
+          if (!record || record.state !== 'SIGNING') {
+            return
+          }
+          data.records[executionId] = {
+            ...record,
+            state: 'SIGNING_UNCERTAIN',
+            uncertainReason:
+              'Process interrupted during signing; reconciled to SIGNING_UNCERTAIN after acquiring abandoned signing lock.',
+            failedAt: this.clock()
+          }
+          this.saveData(data)
+        })
+      })
+    }
+
+    for (const executionId of snapshot.preparedIds) {
+      await this.coordinator.tryExclusive(executionReviewLockName(executionId), async () => {
+        await this.coordinator.requestExclusive(this.lockName, async () => {
+          const data = this.loadData()
+          const record = data.records[executionId]
+          if (!record || record.state !== 'PREPARED') {
+            return
+          }
+          const now = this.clock()
+          if ((record.reviewLeaseExpiresAt ?? 0) > now) {
+            return
+          }
+          this.assertTransition(record.state, 'EXPIRED')
+          this.releaseOutpoints(data, executionId, record.reservedOutpoints)
+          data.records[executionId] = {
+            ...record,
+            state: 'EXPIRED',
+            uncertainReason:
+              'Abandoned PREPARED review: lease expired and review lock was acquired. Outpoints released.',
+            failedAt: now,
+            reservedOutpoints: [],
+            reviewOwnerId: record.reviewOwnerId,
+            reviewLeaseExpiresAt: record.reviewLeaseExpiresAt,
+            reviewLeaseGeneration: record.reviewLeaseGeneration
+          }
+          this.saveData(data)
+        })
+      })
     }
   }
 
@@ -385,7 +436,8 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
   async setPlanPrepared(
     executionId: string,
     plan: WalletPreparedExecutionPlan,
-    preparedAt: number
+    preparedAt: number,
+    reviewLease: ExecutionReviewLease
   ): Promise<void> {
     return this.coordinator.requestExclusive(this.lockName, async () => {
       const data = this.loadData()
@@ -415,11 +467,68 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
         state: 'PREPARED',
         planHash: plan.planHash,
         preparedAt,
-        reservedOutpoints
+        reservedOutpoints,
+        reviewOwnerId: reviewLease.ownerId,
+        reviewLeaseExpiresAt: reviewLease.leaseExpiresAt,
+        reviewLeaseGeneration: reviewLease.generation
       }
 
       this.saveData(data)
     })
+  }
+
+  async renewReviewLease(params: {
+    readonly executionId: string
+    readonly ownerId: string
+    readonly generation: number
+    readonly now: number
+    readonly leaseTtlSeconds: number
+  }): Promise<ExecutionReviewLease> {
+    return this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
+      const existing = data.records[params.executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+      }
+      if (existing.state !== 'PREPARED') {
+        throw new WalletExecutionError(
+          'REVIEW_LEASE_REJECTED',
+          `Cannot renew review lease for execution "${params.executionId}" in state "${existing.state}".`
+        )
+      }
+      if (existing.reviewOwnerId !== params.ownerId || existing.reviewLeaseGeneration !== params.generation) {
+        throw new WalletExecutionError(
+          'REVIEW_LEASE_REJECTED',
+          `Stale review owner cannot renew lease for execution "${params.executionId}".`
+        )
+      }
+      const next: ExecutionReviewLease = {
+        ownerId: params.ownerId,
+        generation: params.generation + 1,
+        leaseExpiresAt: params.now + params.leaseTtlSeconds
+      }
+      data.records[params.executionId] = {
+        ...existing,
+        reviewOwnerId: next.ownerId,
+        reviewLeaseGeneration: next.generation,
+        reviewLeaseExpiresAt: next.leaseExpiresAt
+      }
+      this.saveData(data)
+      return next
+    })
+  }
+
+  async getReviewLease(executionId: string): Promise<ExecutionReviewLease | undefined> {
+    const data = this.loadData()
+    const record = data.records[executionId]
+    if (!record?.reviewOwnerId || record.reviewLeaseExpiresAt === undefined || record.reviewLeaseGeneration === undefined) {
+      return undefined
+    }
+    return {
+      ownerId: record.reviewOwnerId,
+      leaseExpiresAt: record.reviewLeaseExpiresAt,
+      generation: record.reviewLeaseGeneration
+    }
   }
 
   async transitionToSigningIfValid(params: {

@@ -7,6 +7,7 @@ import App from './App'
 import { WalletProvider } from './context/WalletContext'
 import { TonalliX402ApprovalProvider } from './context/TonalliX402ApprovalContext'
 import { AgentWalletApprovalProvider } from './components/agentApproval/AgentWalletApprovalProvider'
+import { TrustedWalletExecutionProvider } from './internal/agentWalletExecutionHost'
 
 const normalizeExternalSignHashRoute = () => {
   const hash = window.location.hash
@@ -37,9 +38,11 @@ createRoot(document.getElementById('root')!).render(
             with MISSING_LEDGER_DEPENDENCY) while it does not receive a trusted, durable ledger.
             Zero in-memory fallback ledger in production.
           */}
-          <AgentWalletApprovalProvider>
-            <App />
-          </AgentWalletApprovalProvider>
+          <TrustedWalletExecutionProvider>
+            <AgentWalletApprovalProvider>
+              <App />
+            </AgentWalletApprovalProvider>
+          </TrustedWalletExecutionProvider>
         </TonalliX402ApprovalProvider>
       </WalletProvider>
     </BrowserRouter>

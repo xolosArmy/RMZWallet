@@ -39,6 +39,9 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
 
     // FORBIDDEN exports: Wallet UI host / composition authority
     expect((PublicModuleExports as any).createWalletExecutionComposition).toBeUndefined()
+    expect((PublicModuleExports as any).WalletExecutionTrustedOptions).toBeUndefined()
+    expect((PublicModuleExports as any).TrustedWalletExecutionProvider).toBeUndefined()
+    expect((PublicModuleExports as any).privateSettlementStorage).toBeUndefined()
     expect((PublicModuleExports as any).WalletExecutionComposition).toBeUndefined()
     expect((PublicModuleExports as any).WalletExecutionUIHost).toBeUndefined()
     expect((PublicModuleExports as any).walletUIHost).toBeUndefined()
@@ -186,6 +189,26 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     const publicStatusBody = publicStatusMatch![1]
 
     expect(publicStatusBody).not.toMatch(/rawSignedTxHex/)
+  })
+
+  it('verifies AgentWalletExecutionEngineConfig has no settlement persistence dependency', () => {
+    const typesContent = readFileSync(join(__dirname, 'types.ts'), 'utf-8')
+    const start = typesContent.indexOf('export interface AgentWalletExecutionEngineConfig')
+    const end = typesContent.indexOf('export interface WalletExecutionTrustedOptions')
+    expect(start).toBeGreaterThan(-1)
+    expect(end).toBeGreaterThan(start)
+    const body = typesContent.slice(start, end)
+    expect(body).not.toMatch(/privateSettlementStorage/)
+    expect(body).not.toMatch(/settlementStorage/)
+    expect(body).not.toMatch(/rawSignedTxHex/)
+    expect(body).toMatch(/NEVER used for raw signed transactions/)
+
+    const engineSource = readFileSync(join(__dirname, 'engine.ts'), 'utf-8')
+    expect(engineSource).toMatch(/trusted\?\.privateSettlementStorage/)
+    expect(engineSource).not.toMatch(/config\.storage \?\? \(typeof localStorage/)
+
+    const mainSource = readFileSync(join(__dirname, '../../main.tsx'), 'utf-8')
+    expect(mainSource).toContain('TrustedWalletExecutionProvider')
   })
 
   it('verifies WalletExecutionLedger never carries signed transaction bytes', () => {
