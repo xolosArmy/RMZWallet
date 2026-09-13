@@ -22,9 +22,28 @@ import { DurableWalletApprovalLedger } from './durableWalletApprovalLedger'
 import type { AgentWalletExecutionEngine } from '../../features/agentWalletExecution'
 import { DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY } from '../settlementStore'
 
+const TEST_ONLY_PRIVATE_SETTLEMENT_STORAGE = Symbol.for(
+  'rmzwallet.testOnly.privateSettlementStorage'
+)
+
+function bindTestPrivateSettlementStorage(storage: Storage): void {
+  Object.defineProperty(globalThis, TEST_ONLY_PRIVATE_SETTLEMENT_STORAGE, {
+    value: storage,
+    configurable: true,
+    enumerable: false,
+    writable: true
+  })
+}
+
 afterEach(() => {
   cleanup()
   resetTrustedExecutionShellForTests()
+  Object.defineProperty(globalThis, TEST_ONLY_PRIVATE_SETTLEMENT_STORAGE, {
+    value: undefined,
+    configurable: true,
+    enumerable: false,
+    writable: true
+  })
 })
 
 const FROM_ADDRESS = 'ecash:qpumqqygwcnt999fz3gp5nxjy66ckg6esvxaqmtclv'
@@ -109,6 +128,7 @@ describe('TrustedWalletExecutionProvider production shell (Gate C2)', () => {
     const review = await receiver.prepareHandoff(encodeAgentWalletHandoffV1(REQUEST))
     const receipt = await receiver.approveHandle(review.handle)
 
+    bindTestPrivateSettlementStorage(settlementStorage)
     let engine: AgentWalletExecutionEngine | null = null
     render(
       <TrustedWalletExecutionProvider
@@ -137,7 +157,6 @@ describe('TrustedWalletExecutionProvider production shell (Gate C2)', () => {
           }
         }}
         ledgerStorage={ledgerStorage}
-        trustedSettlementStorage={settlementStorage}
         lockCoordinator={lockCoordinator}
         clock={() => CLOCK_NOW}
         idGenerator={() => 'shell_c2'}
@@ -290,8 +309,9 @@ describe('TrustedWalletExecutionProvider production shell (Gate C2)', () => {
     const settlementStorage = new MockStorage()
     const lockCoordinator = new TestExecutionLockCoordinator()
     const ports = testPorts(lockCoordinator, ledgerStorage)
+    bindTestPrivateSettlementStorage(settlementStorage)
     const first = render(
-      <TrustedWalletExecutionProvider {...ports} trustedSettlementStorage={settlementStorage}>
+      <TrustedWalletExecutionProvider {...ports}>
         <CaptureEngine onReady={() => undefined} />
       </TrustedWalletExecutionProvider>
     )
@@ -299,7 +319,7 @@ describe('TrustedWalletExecutionProvider production shell (Gate C2)', () => {
     await Promise.resolve()
     const engines: AgentWalletExecutionEngine[] = []
     render(
-      <TrustedWalletExecutionProvider {...ports} trustedSettlementStorage={settlementStorage}>
+      <TrustedWalletExecutionProvider {...ports}>
         <CaptureEngine onReady={value => engines.push(value)} />
       </TrustedWalletExecutionProvider>
     )
@@ -333,6 +353,7 @@ describe('TrustedWalletExecutionProvider production shell (Gate C2)', () => {
     const receipt = await receiver.approveHandle(review.handle)
     expect(await approvalLedger.get(REQUEST.requestId)).toBeDefined()
 
+    bindTestPrivateSettlementStorage(settlementStorage)
     let engine: AgentWalletExecutionEngine | null = null
     render(
       <TrustedWalletExecutionProvider
@@ -361,7 +382,6 @@ describe('TrustedWalletExecutionProvider production shell (Gate C2)', () => {
           }
         }}
         ledgerStorage={ledgerStorage}
-        trustedSettlementStorage={settlementStorage}
         lockCoordinator={lockCoordinator}
         clock={() => CLOCK_NOW}
         idGenerator={() => 'prod_c2'}

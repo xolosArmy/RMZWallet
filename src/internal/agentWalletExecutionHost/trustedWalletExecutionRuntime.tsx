@@ -16,6 +16,7 @@ import { fromHex, Script, toHex, toHexRev, Tx, TxBuilder } from 'ecash-lib'
 import { humanApprovalV1Schema, type HumanApprovalV1 } from '@xolosarmy/tonalli-core'
 import { AgentExecutionReviewModal } from '../../components/agentExecution/AgentExecutionReviewModal'
 import { createProductionWalletRuntime } from './productionWalletAdapters'
+import { xolosWalletService } from '../../services/XolosWalletService'
 import { WalletExecutionError } from '../../features/agentWalletExecution/errors'
 import {
   DEFAULT_REVIEW_LEASE_TTL_SECONDS,
@@ -60,6 +61,42 @@ import {
 const TEST_ONLY_CREATE_WALLET_EXECUTION_COMPOSITION = Symbol.for(
   'rmzwallet.testOnly.createWalletExecutionComposition'
 )
+const TEST_ONLY_PRIVATE_SETTLEMENT_STORAGE = Symbol.for(
+  'rmzwallet.testOnly.privateSettlementStorage'
+)
+
+type ReviewSigningHandoffPhase = 'IDLE' | 'REVIEW_ACTIVE' | 'HANDOFF_TO_SIGNING' | 'SIGNING_DURABLE'
+
+function resolveFileLocalPrivateSettlementStorage(): Storage | undefined {
+  if (import.meta.env?.VITEST) {
+    const override = (globalThis as Record<symbol, unknown>)[TEST_ONLY_PRIVATE_SETTLEMENT_STORAGE]
+    if (override && typeof (override as Storage).setItem === 'function') {
+      return override as Storage
+    }
+  }
+  return typeof localStorage !== 'undefined' ? localStorage : undefined
+}
+
+function createFileLocalProductionSignatoryProvider(): AgentWalletExecutionEngineConfig['signatoryProvider'] {
+  return {
+    async getSignatory(address: string) {
+      const activeAddress = xolosWalletService.getAddress()
+      if (!activeAddress) {
+        throw new WalletExecutionError(
+          'SESSION_REVALIDATION_FAILED',
+          'Wallet is locked; production signatory refuses to mint a placeholder.'
+        )
+      }
+      if (activeAddress !== address) {
+        throw new WalletExecutionError(
+          'SESSION_ADDRESS_MISMATCH',
+          `Active wallet address "${activeAddress}" does not match requested signatory address "${address}".`
+        )
+      }
+      return xolosWalletService.getSignatory()
+    }
+  }
+}
 
 // Module-private symbols for closure-encapsulated capabilities
 const INTERNAL_CAPABILITY_TOKEN = Symbol('WalletExecutionCapabilityToken')
@@ -363,7 +400,8 @@ function createWalletExecutionComposition(
   let reviewHeartbeatTimer: ReturnType<typeof setInterval> | null = null
   let recoveryTimer: ReturnType<typeof setTimeout> | null = null
   let disposed = false
-  let signingCriticalSectionActive = false
+  let handoffPhase: ReviewSigningHandoffPhase = 'IDLE'
+  let preSigningAbort: AbortController | null = null
 
   /**
    * Wallet-private write-once persistence. NEVER uses Agent-injectable config.storage.
@@ -374,8 +412,7 @@ function createWalletExecutionComposition(
     rawSignedTxHex: string
   ): Promise<void> {
     const targetStorage =
-      trusted?.privateSettlementStorage ??
-      (typeof localStorage !== 'undefined' ? localStorage : undefined)
+      trusted?.privateSettlementStorage ?? resolveFileLocalPrivateSettlementStorage()
     if (!targetStorage) {
       throw new WalletExecutionError(
         'STORAGE_UNAVAILABLE',
@@ -510,17 +547,18 @@ function createWalletExecutionComposition(
     disposed = true
     isPreparing = false
     cancelScheduledRecovery()
-    stopReviewHeartbeat()
     sessionPreparedListeners.clear()
-    const controller = activeController
-    if (controller) {
-      activeController = null
-    }
-    if (!signingCriticalSectionActive) {
+    activeController = null
+    preSigningAbort?.abort()
+    if (handoffPhase !== 'SIGNING_DURABLE') {
       endLiveReview()
-      activeExecutionId = null
-      activeCapability = null
-      activePlan = null
+      if (handoffPhase !== 'HANDOFF_TO_SIGNING') {
+        activeExecutionId = null
+        activeCapability = null
+        activePlan = null
+      }
+    } else {
+      stopReviewHeartbeat()
     }
   }
 
@@ -542,6 +580,7 @@ function createWalletExecutionComposition(
       endLiveReview()
       return
     }
+    handoffPhase = 'REVIEW_ACTIVE'
     stopReviewHeartbeat()
     reviewHeartbeatTimer = setInterval(() => {
       if (disposed) {
@@ -596,10 +635,46 @@ function createWalletExecutionComposition(
 
     await ledgerReady
 
+    async function abortablePreSigning<T>(operation: Promise<T>): Promise<T> {
+      const abort = preSigningAbort
+      if (!abort) {
+        return operation
+      }
+      if (abort.signal.aborted || disposed) {
+        throw new WalletExecutionError(
+          'COMPOSITION_DISPOSED',
+          'Pre-SIGNING handoff was cancelled before cryptographic signing.'
+        )
+      }
+      return new Promise<T>((resolve, reject) => {
+        const onAbort = () => {
+          reject(
+            new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Pre-SIGNING handoff was cancelled before cryptographic signing.'
+            )
+          )
+        }
+        abort.signal.addEventListener('abort', onAbort, { once: true })
+        operation.then(
+          value => {
+            abort.signal.removeEventListener('abort', onAbort)
+            resolve(value)
+          },
+          error => {
+            abort.signal.removeEventListener('abort', onAbort)
+            reject(error)
+          }
+        )
+      })
+    }
+
     // Canonical handoff: review lock remains held. Signing lock is acquired next.
     // Review lock is released only after durable SIGNING is committed.
     return executionLedger.runWithSigningLock(executionId, async () => {
-    signingCriticalSectionActive = true
+    handoffPhase = 'HANDOFF_TO_SIGNING'
+    preSigningAbort = new AbortController()
+    let durableSigningCommitted = false
     try {
     // 2. Look up current ledger state
     const currentRecord = await executionLedger.get(executionId)
@@ -645,8 +720,15 @@ function createWalletExecutionComposition(
       throw new WalletExecutionError('APPROVAL_EXPIRED', 'Approval expired during review.')
     }
 
+    if (disposed || preSigningAbort?.signal.aborted) {
+      throw new WalletExecutionError(
+        'COMPOSITION_DISPOSED',
+        'Pre-SIGNING handoff was cancelled before cryptographic signing.'
+      )
+    }
+
     // 5. Revalidate active custodian session immediately before signing
-    const preSignSession = await sessionVerifier.verifyActiveSession()
+    const preSignSession = await abortablePreSigning(sessionVerifier.verifyActiveSession())
     if (!preSignSession.authenticated || !preSignSession.activeAddress) {
       activeExecutionId = null
       activeCapability = null
@@ -670,7 +752,7 @@ function createWalletExecutionComposition(
     }
 
     // 6. Re-read and revalidate UTXOs immediately before signing
-    const latestUtxos = await utxoProvider.getSpendableUtxos(plan.fromAddress)
+    const latestUtxos = await abortablePreSigning(utxoProvider.getSpendableUtxos(plan.fromAddress))
     for (const planInput of plan.inputs) {
       const match = latestUtxos.find(
         u => u.txid === planInput.txid && u.outIdx === planInput.outIdx && u.sats === planInput.sats
@@ -746,6 +828,8 @@ function createWalletExecutionComposition(
     }
 
     // Durable SIGNING is committed. Release review ownership only now.
+    durableSigningCommitted = true
+    handoffPhase = 'SIGNING_DURABLE'
     endLiveReview()
 
     // 9. Wallet-owned signing. The signer-returned object is discarded as an authority source.
@@ -915,7 +999,32 @@ function createWalletExecutionComposition(
       signedAt
     })
     } finally {
-      signingCriticalSectionActive = false
+      if (!durableSigningCommitted) {
+        endLiveReview()
+        handoffPhase = 'IDLE'
+        preSigningAbort = null
+        try {
+          const current = await executionLedger.get(executionId)
+          const status = current ? (current.status ?? (current as { state?: string }).state) : undefined
+          if (status === 'PREPARED') {
+            await executionLedger.markFailed(
+              executionId,
+              'Pre-SIGNING handoff aborted or failed before durable SIGNING. Outpoints released.',
+              getNow()
+            )
+          }
+        } catch {
+          // Already terminal or ledger unavailable; review ownership is still released.
+        }
+        if (activeExecutionId === executionId) {
+          activeExecutionId = null
+          activeCapability = null
+          activePlan = null
+          activeController = null
+        }
+      } else {
+        preSigningAbort = null
+      }
     }
     })
   }
@@ -1097,12 +1206,13 @@ function createWalletExecutionComposition(
         reservedAt: now
       })
 
-      // 9. Read UTXOs and immediately take a Wallet-owned frozen snapshot.
-      const availableUtxos = snapshotOwnedUtxos(await utxoProvider.getSpendableUtxos(record.fromAddress))
-
-      // 10. Build immutable execution plan from the Wallet-owned snapshot.
+      // 9-11. Every operation after reservation and before durable PREPARED is
+      // inside this explicit pre-PREPARED failure boundary.
       let plan: WalletPreparedExecutionPlan
       try {
+        const availableUtxos = snapshotOwnedUtxos(
+          await utxoProvider.getSpendableUtxos(record.fromAddress)
+        )
         plan = buildPreparedExecutionPlan({
           approved: {
             approvalId: record.approvalId,
@@ -1115,33 +1225,22 @@ function createWalletExecutionComposition(
           availableUtxos,
           feePolicy
         })
-        } catch (planErr) {
-          await executionLedger.markFailed(
-            executionId,
-            planErr instanceof Error ? planErr.message : String(planErr),
-            getNow()
-          )
-          throw planErr
-        }
-
-        // 11. Bind plan to capability and atomically reserve outpoints + PREPARED.
         capability.bindPlan(plan)
-        try {
-          reviewLeaseGeneration = 1
-          const committedLease = await executionLedger.setPlanPrepared(executionId, plan, {
-            ownerId: reviewOwnerId,
-            generation: reviewLeaseGeneration,
-            leaseTtlSeconds: reviewLeaseTtlSeconds
-          })
-          reviewLeaseGeneration = committedLease.generation
-        } catch (preparedErr) {
-          await executionLedger.markFailed(
-            executionId,
-            preparedErr instanceof Error ? preparedErr.message : String(preparedErr),
-            getNow()
-          )
-          throw preparedErr
-        }
+        reviewLeaseGeneration = 1
+        const committedLease = await executionLedger.setPlanPrepared(executionId, plan, {
+          ownerId: reviewOwnerId,
+          generation: reviewLeaseGeneration,
+          leaseTtlSeconds: reviewLeaseTtlSeconds
+        })
+        reviewLeaseGeneration = committedLease.generation
+      } catch (prePreparedErr) {
+        await executionLedger.markFailed(
+          executionId,
+          prePreparedErr instanceof Error ? prePreparedErr.message : String(prePreparedErr),
+          getNow()
+        )
+        throw prePreparedErr
+      }
 
         // 12. Construct human-readable review snapshot
         const review: WalletExecutionReviewSnapshot = Object.freeze({
@@ -1340,10 +1439,6 @@ export interface TrustedWalletExecutionProviderProps {
    * Public execution-ledger Storage only. NEVER used for raw signed transactions.
    */
   readonly ledgerStorage?: Storage
-  /**
-   * Trusted-bootstrap-only settlement persistence. Not part of AgentWalletExecutionEngineConfig.
-   */
-  readonly trustedSettlementStorage?: Storage
   readonly reviewLeaseTtlSeconds?: number
   readonly reviewHeartbeatMs?: number
 }
@@ -1415,7 +1510,6 @@ export function TrustedWalletExecutionProvider({
   clock,
   idGenerator,
   ledgerStorage,
-  trustedSettlementStorage,
   reviewLeaseTtlSeconds,
   reviewHeartbeatMs
 }: TrustedWalletExecutionProviderProps): ReactElement {
@@ -1427,8 +1521,7 @@ export function TrustedWalletExecutionProvider({
         utxoProvider ||
         signatoryProvider ||
         lockCoordinator ||
-        ledgerStorage ||
-        trustedSettlementStorage
+        ledgerStorage
     )
     if (testsSupplyAdapters) {
       return null
@@ -1441,17 +1534,15 @@ export function TrustedWalletExecutionProvider({
     utxoProvider,
     signatoryProvider,
     lockCoordinator,
-    ledgerStorage,
-    trustedSettlementStorage
+    ledgerStorage
   ])
 
   const resolvedApprovalLedger = approvalLedger ?? productionRuntime?.approvalLedger
   const resolvedSessionVerifier = sessionVerifier ?? productionRuntime?.sessionVerifier
   const resolvedUtxoProvider = utxoProvider ?? productionRuntime?.utxoProvider
-  const resolvedSignatoryProvider = signatoryProvider ?? productionRuntime?.signatoryProvider
+  const resolvedSignatoryProvider =
+    signatoryProvider ?? (resolvedApprovalLedger ? createFileLocalProductionSignatoryProvider() : undefined)
   const resolvedLedgerStorage = ledgerStorage ?? productionRuntime?.ledgerStorage
-  const resolvedSettlementStorage =
-    trustedSettlementStorage ?? productionRuntime?.trustedSettlementStorage
 
   const c2Enabled = Boolean(
     resolvedApprovalLedger &&
@@ -1460,7 +1551,6 @@ export function TrustedWalletExecutionProvider({
       resolvedSignatoryProvider
   )
 
-  const settlementStorageRef = useRef<Storage | undefined>(resolvedSettlementStorage)
   const compositionRef = useRef<WalletExecutionComposition | null>(null)
   if (c2Enabled && compositionRef.current === null) {
     compositionRef.current = getOrCreateShell(
@@ -1477,9 +1567,7 @@ export function TrustedWalletExecutionProvider({
         idGenerator
       },
       {
-        privateSettlementStorage:
-          settlementStorageRef.current ??
-          (typeof localStorage !== 'undefined' ? localStorage : undefined),
+        privateSettlementStorage: resolveFileLocalPrivateSettlementStorage(),
         reviewLeaseTtlSeconds,
         reviewHeartbeatMs
       }

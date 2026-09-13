@@ -3,6 +3,9 @@
  *
  * Real production Gate 2B / Gate C2 adapters constructed from RMZWallet services.
  * No permissive empty or throwing placeholder defaults.
+ *
+ * This module MUST NOT create, return, or export a Wallet signatory, signing
+ * provider, or any function capable of yielding one.
  */
 
 import { Script, toHex } from 'ecash-lib'
@@ -10,23 +13,56 @@ import { DurableWalletApprovalLedger } from './durableWalletApprovalLedger'
 import type { WalletApprovalLedger } from '../../features/agentWalletApprovalReceiver/types'
 import type {
   AgentWalletExecutionEngineConfig,
-  WalletSignatoryProvider,
+  ExecutionUtxoInput,
   WalletUtxoProvider
 } from '../../features/agentWalletExecution/types'
-import { WalletExecutionError } from '../../features/agentWalletExecution/errors'
 import { getChronik } from '../../services/ChronikClient'
 import { xolosWalletService } from '../../services/XolosWalletService'
+import { isImmatureCoinbaseUtxo } from '../../services/coinbaseMaturity'
 
 export interface ProductionWalletRuntime {
   readonly approvalLedger: WalletApprovalLedger
   readonly sessionVerifier: AgentWalletExecutionEngineConfig['sessionVerifier']
   readonly utxoProvider: WalletUtxoProvider
-  readonly signatoryProvider: WalletSignatoryProvider
   readonly ledgerStorage: Storage
-  readonly trustedSettlementStorage: Storage
 }
 
-export function createProductionSessionVerifier(): AgentWalletExecutionEngineConfig['sessionVerifier'] {
+export interface ProductionChronikUtxoLike {
+  readonly outpoint: { readonly txid: string; readonly outIdx: number }
+  readonly sats: number | bigint | string
+  readonly token?: unknown
+  readonly isCoinbase?: boolean
+  readonly blockHeight?: number
+}
+
+export function selectSpendableXecUtxosForExecution(
+  utxos: readonly ProductionChronikUtxoLike[],
+  lockingScriptHex: string,
+  tipHeight: number | undefined
+): ExecutionUtxoInput[] {
+  return utxos
+    .filter(utxo => !utxo.token)
+    .filter(utxo => !isImmatureCoinbaseUtxo(utxo, tipHeight))
+    .map(utxo => ({
+      txid: String(utxo.outpoint.txid),
+      outIdx: Number(utxo.outpoint.outIdx),
+      sats: BigInt(utxo.sats),
+      lockingScriptHex
+    }))
+}
+
+export async function resolveCanonicalTipHeight(
+  blockchainInfo: () => Promise<{ tipHeight?: number }>
+): Promise<number | undefined> {
+  try {
+    const info = await blockchainInfo()
+    return typeof info?.tipHeight === 'number' ? info.tipHeight : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function createProductionSessionVerifier(): AgentWalletExecutionEngineConfig['sessionVerifier'] {
   return {
     async verifyActiveSession() {
       const activeAddress = xolosWalletService.getAddress()
@@ -38,40 +74,17 @@ export function createProductionSessionVerifier(): AgentWalletExecutionEngineCon
   }
 }
 
-export function createProductionUtxoProvider(): WalletUtxoProvider {
+function createProductionUtxoProvider(): WalletUtxoProvider {
   return {
     async getSpendableUtxos(address: string) {
       const scriptHex = toHex(Script.fromAddress(address).bytecode)
       const result = await getChronik().address(address).utxos()
-      return result.utxos
-        .filter(utxo => !utxo.token)
-        .map(utxo => ({
-          txid: String(utxo.outpoint.txid),
-          outIdx: Number(utxo.outpoint.outIdx),
-          sats: BigInt(utxo.sats),
-          lockingScriptHex: scriptHex
-        }))
-    }
-  }
-}
-
-export function createProductionSignatoryProvider(): WalletSignatoryProvider {
-  return {
-    async getSignatory(address: string) {
-      const activeAddress = xolosWalletService.getAddress()
-      if (!activeAddress) {
-        throw new WalletExecutionError(
-          'SESSION_REVALIDATION_FAILED',
-          'Wallet is locked; production signatory refuses to mint a placeholder.'
-        )
+      const hasCoinbase = result.utxos.some(utxo => Boolean(utxo.isCoinbase))
+      let tipHeight: number | undefined
+      if (hasCoinbase) {
+        tipHeight = await resolveCanonicalTipHeight(() => getChronik().blockchainInfo())
       }
-      if (activeAddress !== address) {
-        throw new WalletExecutionError(
-          'SESSION_ADDRESS_MISMATCH',
-          `Active wallet address "${activeAddress}" does not match requested signatory address "${address}".`
-        )
-      }
-      return xolosWalletService.getSignatory()
+      return selectSpendableXecUtxosForExecution(result.utxos, scriptHex, tipHeight)
     }
   }
 }
@@ -79,6 +92,9 @@ export function createProductionSignatoryProvider(): WalletSignatoryProvider {
 /**
  * Construct the shared production Wallet runtime.
  * Returns null when required durable dependencies cannot be constructed (fail closed).
+ *
+ * NEVER returns a signatory, signing provider, walletUIHost, controller,
+ * private settlement storage, or raw-tx accessor.
  */
 export function createProductionWalletRuntime(): ProductionWalletRuntime | null {
   const storage = typeof localStorage !== 'undefined' ? localStorage : undefined
@@ -94,9 +110,7 @@ export function createProductionWalletRuntime(): ProductionWalletRuntime | null 
       approvalLedger,
       sessionVerifier: createProductionSessionVerifier(),
       utxoProvider: createProductionUtxoProvider(),
-      signatoryProvider: createProductionSignatoryProvider(),
-      ledgerStorage: storage,
-      trustedSettlementStorage: storage
+      ledgerStorage: storage
     }
   } catch {
     return null

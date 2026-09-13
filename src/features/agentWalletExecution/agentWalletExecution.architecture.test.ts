@@ -212,7 +212,6 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(body).toMatch(/NEVER used for raw signed transactions/)
 
     const engineSource = readFileSync(join(__dirname, 'engine.ts'), 'utf-8')
-    expect(engineSource).toMatch(/trusted\?\.privateSettlementStorage/)
     expect(engineSource).not.toMatch(/config\.storage \?\? \(typeof localStorage/)
     expect(engineSource).not.toMatch(/export function createWalletExecutionComposition/)
     expect(engineSource).not.toMatch(/export \{ createWalletExecutionComposition/)
@@ -222,15 +221,23 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
       'utf-8'
     )
     expect(runtimeSource).toMatch(/trusted\?\.privateSettlementStorage/)
+    expect(runtimeSource).toMatch(/resolveFileLocalPrivateSettlementStorage/)
     expect(runtimeSource).not.toMatch(/export function createWalletExecutionComposition/)
     expect(runtimeSource).not.toMatch(/export \{[^}]*createWalletExecutionComposition/)
     expect(runtimeSource).toMatch(/function createWalletExecutionComposition\(/)
+    expect(runtimeSource).not.toMatch(/readonly trustedSettlementStorage/)
+    expect(runtimeSource).toMatch(/createFileLocalProductionSignatoryProvider/)
+    expect(runtimeSource).not.toMatch(/export function createFileLocalProductionSignatoryProvider/)
+    expect(runtimeSource).not.toMatch(/export function createProductionSignatoryProvider/)
 
     const mainSource = readFileSync(join(__dirname, '../../main.tsx'), 'utf-8')
     expect(mainSource).toContain('TrustedWalletExecutionProvider')
     expect(mainSource).toContain('createProductionWalletRuntime')
     expect(mainSource).toContain('TrustedGate2bToC2Bridge')
     expect(mainSource).toContain('productionWalletRuntime?.approvalLedger')
+    expect(mainSource).not.toMatch(/signatoryProvider/)
+    expect(mainSource).not.toMatch(/trustedSettlementStorage/)
+    expect(mainSource).not.toMatch(/getSignatory/)
   })
 
   it('verifies WalletExecutionLedger never carries signed transaction bytes', () => {
@@ -440,5 +447,59 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
       expect(exportFactory.test(content), `exported factory in ${file}`).toBe(false)
       expect(exportNamed.test(content), `re-exported factory in ${file}`).toBe(false)
     }
+  })
+
+  it('rejects Agent-facing deep import of a production Wallet signatory or settlement writer', async () => {
+    const publicModule = await import('./index')
+    const engineModule = await import('./engine')
+    const hostModule = await import('../../internal/agentWalletExecutionHost')
+    const adaptersModule = await import(
+      '../../internal/agentWalletExecutionHost/productionWalletAdapters'
+    )
+    const runtimeModule = await import('../../internal/agentWalletExecutionHost/trustedWalletExecutionRuntime')
+    const providerModule = await import(
+      '../../internal/agentWalletExecutionHost/TrustedWalletExecutionProvider'
+    )
+
+    const modules = [publicModule, engineModule, hostModule, adaptersModule, runtimeModule, providerModule]
+    const forbidden = [
+      'createProductionSignatoryProvider',
+      'getSignatory',
+      'createSignatory',
+      'signatoryProvider',
+      'trustedSettlementStorage',
+      'privateSettlementStorage',
+      'persistVerifiedSignedTransactionOnce'
+    ]
+    for (const mod of modules) {
+      const record = mod as Record<string, unknown>
+      for (const name of forbidden) {
+        expect(record[name], `${name} must not be a production export`).toBeUndefined()
+        expect(Object.keys(record)).not.toContain(name)
+      }
+    }
+
+    const runtime = adaptersModule.createProductionWalletRuntime
+    expect(typeof runtime).toBe('function')
+    const created = runtime()
+    if (created) {
+      expect(created).not.toHaveProperty('signatoryProvider')
+      expect(created).not.toHaveProperty('getSignatory')
+      expect(created).not.toHaveProperty('trustedSettlementStorage')
+      expect(created).not.toHaveProperty('privateSettlementStorage')
+      expect(created).not.toHaveProperty('walletUIHost')
+    }
+
+    const propsMatch = readFileSync(
+      join(__dirname, '../../internal/agentWalletExecutionHost/trustedWalletExecutionRuntime.tsx'),
+      'utf-8'
+    ).match(/export interface TrustedWalletExecutionProviderProps \{([\s\S]*?)\n\}/)
+    expect(propsMatch).not.toBeNull()
+    const propsBody = propsMatch![1]
+    expect(propsBody).not.toMatch(/trustedSettlementStorage/)
+    expect(propsBody).not.toMatch(/privateSettlementStorage/)
+    expect(propsBody).not.toMatch(/SettlementStore/)
+    expect(propsBody).not.toMatch(/rawTxWriter/)
+    expect(propsBody).not.toMatch(/persistSignedTx/)
   })
 })

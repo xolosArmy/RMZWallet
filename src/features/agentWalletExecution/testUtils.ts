@@ -241,7 +241,7 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     if (recoverableOwners.size > 0) {
       for (const ownerId of recoverableOwners) {
         const recovered = await this.tryRecoverAbandonedPrepared(ownerId)
-        if (recovered !== 'reclaimed') {
+        if (recovered === 'still_live') {
           throw new WalletExecutionError(
             'OUTPOINT_ALREADY_RESERVED',
             `Outpoint is already reserved by execution "${ownerId}" and could not be reclaimed.`

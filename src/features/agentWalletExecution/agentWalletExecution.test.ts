@@ -37,6 +37,7 @@ import {
   DurableTransactionalExecutionLedger,
   WebLocksExecutionCoordinator,
   canonicalOutpointKey,
+  executionReviewLockName,
   executionSigningLockName
 } from './ledger'
 import { DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY } from '../../internal/settlementStore'
@@ -156,6 +157,7 @@ function setupEngine(options: {
   lockCoordinator?: InstanceType<typeof TestExecutionLockCoordinator>
   idGenerator?: () => string
   onSpendableUtxos?: () => Promise<void>
+  onVerifyActiveSession?: () => Promise<void>
   reviewLeaseTtlSeconds?: number
   reviewHeartbeatMs?: number
 } = {}) {
@@ -196,6 +198,9 @@ function setupEngine(options: {
 
   const sessionVerifier = {
     async verifyActiveSession() {
+      if (options.onVerifyActiveSession) {
+        await options.onVerifyActiveSession()
+      }
       return {
         authenticated,
         activeAddress: authenticated ? activeAddress : undefined
@@ -2168,4 +2173,276 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     )
     expect((await executionLedger.get(session.executionId))?.status).toBe('PREPARED')
   })
+
+  it('terminalizes EXECUTION_RESERVED to FAILED when Chronik rejects after reservation', async () => {
+    const signerMock = vi.fn()
+    const { engine, record, executionLedger } = setupEngine({
+      storage: new MockStorage(),
+      onSpendableUtxos: async () => {
+        throw new Error('chronik rejected')
+      },
+      signatoryProvider: {
+        getSignatory: async () => {
+          signerMock()
+          return createSyntheticSignatory().signatory
+        }
+      }
+    })
+    await expect(engine.prepareExecution(record.humanApproval)).rejects.toThrow(/chronik rejected/)
+    const status = await executionLedger.get('exec_test_id_1')
+    expect(status?.status).toBe('FAILED')
+    expect(signerMock).not.toHaveBeenCalled()
+    expect(
+      await (executionLedger as DurableTransactionalExecutionLedger).getOutpointReservation(
+        canonicalOutpointKey('11'.repeat(32), 0)
+      )
+    ).toBeUndefined()
+    await expect(engine.prepareExecution(record.humanApproval)).rejects.toThrow(
+      expect.objectContaining({ code: 'DUPLICATE_EXECUTION' })
+    )
+    expect(signerMock).not.toHaveBeenCalled()
+  })
+
+  it('terminalizes EXECUTION_RESERVED to FAILED when Chronik payload conversion throws', async () => {
+    const signerMock = vi.fn()
+    const { engine, record, executionLedger } = setupEngine({
+      storage: new MockStorage(),
+      utxos: [
+        {
+          txid: '11'.repeat(32),
+          outIdx: 0,
+          sats: undefined as unknown as bigint,
+          lockingScriptHex: FROM_SCRIPT_HEX
+        }
+      ],
+      signatoryProvider: {
+        getSignatory: async () => {
+          signerMock()
+          return createSyntheticSignatory().signatory
+        }
+      }
+    })
+    await expect(engine.prepareExecution(record.humanApproval)).rejects.toThrow()
+    expect((await executionLedger.get('exec_test_id_1'))?.status).toBe('FAILED')
+    expect(signerMock).not.toHaveBeenCalled()
+    expect(
+      await (executionLedger as DurableTransactionalExecutionLedger).getOutpointReservation(
+        canonicalOutpointKey('11'.repeat(32), 0)
+      )
+    ).toBeUndefined()
+    await expect(engine.prepareExecution(record.humanApproval)).rejects.toThrow(
+      expect.objectContaining({ code: 'DUPLICATE_EXECUTION' })
+    )
+  })
+
+  it('reconciles abandoned EXECUTION_RESERVED records to FAILED at startup', async () => {
+    const storage = new MockStorage()
+    const coordinator = new TestExecutionLockCoordinator()
+    const ledgerA = new DurableTransactionalExecutionLedger({
+      storage,
+      lockCoordinator: coordinator,
+      clock: () => FIXED_NOW
+    })
+    await ledgerA.whenReady()
+    const record = createFixtureLedgerRecord()
+    await ledgerA.reserveExecutionAtomic({
+      executionId: 'exec_reserved_crash',
+      approvalId: record.approvalId,
+      requestId: record.requestId,
+      intentId: record.intentId,
+      decisionId: record.decisionId,
+      fromAddress: record.fromAddress,
+      destination: record.destination,
+      amountSats: approvedAmountSats(record),
+      network: 'xec:mainnet',
+      reservedAt: FIXED_NOW
+    })
+    expect((await ledgerA.get('exec_reserved_crash'))?.status).toBe('EXECUTION_RESERVED')
+
+    const ledgerB = new DurableTransactionalExecutionLedger({
+      storage,
+      lockCoordinator: coordinator,
+      clock: () => FIXED_NOW + 5
+    })
+    await ledgerB.whenReady()
+    expect((await ledgerB.get('exec_reserved_crash'))?.status).toBe('FAILED')
+    expect(await ledgerB.getOutpointReservation(canonicalOutpointKey('11'.repeat(32), 0))).toBeUndefined()
+  })
+
+  it('retries PREPARED commit once when concurrent recovery returns not_prepared', async () => {
+    const storage = new MockStorage()
+    const inner = new TestExecutionLockCoordinator()
+    let injected = false
+    let now = 9_000
+    const recoverer = new DurableTransactionalExecutionLedger({
+      storage,
+      lockCoordinator: inner,
+      clock: () => now
+    })
+    await recoverer.whenReady()
+    const record = createFixtureLedgerRecord({
+      requestId: 'req_np',
+      approvalId: 'appr_np',
+      humanApproval: createCanonicalHumanApproval({ requestId: 'req_np', approvalId: 'appr_np' })
+    })
+    const plan = buildPreparedExecutionPlan({
+      approved: {
+        approvalId: record.approvalId,
+        requestId: record.requestId,
+        intentId: record.intentId,
+        fromAddress: record.fromAddress,
+        destination: record.destination,
+        amountSats: approvedAmountSats(record)
+      },
+      availableUtxos: createFixtureUtxos()
+    })
+    await recoverer.reserveExecutionAtomic({
+      executionId: 'exec_abandoned_np',
+      approvalId: 'appr_abandoned_np',
+      requestId: 'req_abandoned_np',
+      intentId: record.intentId,
+      decisionId: record.decisionId,
+      fromAddress: record.fromAddress,
+      destination: record.destination,
+      amountSats: approvedAmountSats(record),
+      network: 'xec:mainnet',
+      reservedAt: 8_990
+    })
+    await recoverer.setPlanPrepared('exec_abandoned_np', plan, {
+      ownerId: 'owner_gone',
+      generation: 1,
+      leaseTtlSeconds: 1
+    })
+
+    let allowInject = false
+    let globalOps = 0
+    const wrappingCoordinator = {
+      requestExclusive: async <T>(lockName: string, operation: () => Promise<T>): Promise<T> => {
+        const result = await inner.requestExclusive(lockName, operation)
+        if (allowInject && lockName === DEFAULT_EXECUTION_LOCK_NAME) {
+          globalOps += 1
+          if (globalOps === 2 && !injected) {
+            injected = true
+            const recovered = await recoverer.tryRecoverAbandonedPrepared('exec_abandoned_np')
+            expect(recovered).toBe('reclaimed')
+          }
+        }
+        return result
+      },
+      tryExclusive: <T>(lockName: string, operation: () => Promise<T>) =>
+        inner.tryExclusive(lockName, operation)
+    }
+
+    const newLedger = new DurableTransactionalExecutionLedger({
+      storage,
+      lockCoordinator: wrappingCoordinator,
+      clock: () => now
+    })
+    await newLedger.whenReady()
+    now = 9_010
+    allowInject = true
+    await newLedger.reserveExecutionAtomic({
+      executionId: 'exec_new_np',
+      approvalId: record.approvalId,
+      requestId: record.requestId,
+      intentId: record.intentId,
+      decisionId: record.decisionId,
+      fromAddress: record.fromAddress,
+      destination: record.destination,
+      amountSats: approvedAmountSats(record),
+      network: 'xec:mainnet',
+      reservedAt: 9_010
+    })
+    const lease = await newLedger.setPlanPrepared('exec_new_np', plan, {
+      ownerId: 'owner_new',
+      generation: 1,
+      leaseTtlSeconds: 30
+    })
+    expect(lease.ownerId).toBe('owner_new')
+    expect((await newLedger.get('exec_new_np'))?.status).toBe('PREPARED')
+    expect((await newLedger.get('exec_abandoned_np'))?.status).toBe('EXPIRED')
+    expect(await newLedger.getOutpointReservation(canonicalOutpointKey(plan.inputs[0].txid, 0))).toBe(
+      'exec_new_np'
+    )
+  })
+
+  it('releases review ownership and does not invoke the signer if disposed during session revalidation', async () => {
+    await assertDisposeDuringPreSigningHandoff('session')
+  })
+
+  it('releases review ownership and does not invoke the signer if disposed during UTXO revalidation', async () => {
+    await assertDisposeDuringPreSigningHandoff('utxo')
+  })
+
+  it('releases review ownership and does not invoke the signer if disposed while signing lock is held before durable SIGNING', async () => {
+    await assertDisposeDuringPreSigningHandoff('lock')
+  })
 })
+
+async function assertDisposeDuringPreSigningHandoff(
+  hang: 'session' | 'utxo' | 'lock'
+): Promise<void> {
+  const signerMock = vi.fn()
+  const storage = new MockStorage()
+  const coordinator = new TestExecutionLockCoordinator()
+  let hangResolve!: () => void
+  const hung = new Promise<void>(resolve => {
+    hangResolve = resolve
+  })
+  let prepared = false
+  const { engine, composition, uiHost, record, executionLedger } = setupEngine({
+    storage,
+    lockCoordinator: coordinator,
+    executionLedger: new DurableTransactionalExecutionLedger({
+      storage,
+      lockCoordinator: coordinator,
+      clock: () => FIXED_NOW + 20
+    }),
+    onVerifyActiveSession: async () => {
+      if (prepared && (hang === 'session' || hang === 'lock')) {
+        await hung
+      }
+    },
+    onSpendableUtxos: async () => {
+      if (prepared && hang === 'utxo') {
+        await hung
+      }
+    },
+    signatoryProvider: {
+      getSignatory: async () => {
+        signerMock()
+        return createSyntheticSignatory().signatory
+      }
+    }
+  })
+  const session = await engine.prepareExecution(record.humanApproval)
+  prepared = true
+  const confirmPromise = uiHost.getActiveController()!.confirm()
+  for (let i = 0; i < 50; i++) {
+    const attempt = await coordinator.tryExclusive(
+      executionSigningLockName(session.executionId),
+      async () => 'probe'
+    )
+    if (!attempt.acquired) {
+      break
+    }
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  composition.dispose()
+  hangResolve()
+  await expect(confirmPromise).rejects.toThrow(
+    expect.objectContaining({ code: 'COMPOSITION_DISPOSED' })
+  )
+  expect(signerMock).not.toHaveBeenCalled()
+  const reviewAttempt = await coordinator.tryExclusive(
+    executionReviewLockName(session.executionId),
+    async () => 'acquired'
+  )
+  expect(reviewAttempt.acquired).toBe(true)
+  expect((await executionLedger.get(session.executionId))?.status).toBe('FAILED')
+  expect(
+    await (executionLedger as DurableTransactionalExecutionLedger).getOutpointReservation(
+      canonicalOutpointKey('11'.repeat(32), 0)
+    )
+  ).toBeUndefined()
+}

@@ -46,9 +46,7 @@ createRoot(document.getElementById('root')!).render(
             approvalLedger={productionWalletRuntime?.approvalLedger}
             sessionVerifier={productionWalletRuntime?.sessionVerifier}
             utxoProvider={productionWalletRuntime?.utxoProvider}
-            signatoryProvider={productionWalletRuntime?.signatoryProvider}
             ledgerStorage={productionWalletRuntime?.ledgerStorage}
-            trustedSettlementStorage={productionWalletRuntime?.trustedSettlementStorage}
           >
             <AgentWalletApprovalProvider ledger={productionWalletRuntime?.approvalLedger}>
               <TrustedGate2bToC2Bridge>

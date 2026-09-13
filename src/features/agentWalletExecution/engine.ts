@@ -11,9 +11,10 @@
  * AgentWalletExecutionEngine (prepare/status). It never returns walletUIHost,
  * controller, dispose, or private settlement storage.
  *
- * Settlement persistence uses trusted?.privateSettlementStorage and NEVER
- * config.storage. Raw signed transactions are write-once inside the trusted
- * bootstrap closure.
+ * Settlement persistence uses trusted?.privateSettlementStorage only inside the
+ * unexported test factory. Production bootstrap instantiates private settlement
+ * storage in a file-local closure and NEVER accepts it from callers.
+ * config.storage is NEVER used for raw signed transactions.
  */
 
 export { createAgentWalletExecutionEngine } from '../../internal/agentWalletExecutionHost/trustedWalletExecutionRuntime'

@@ -304,10 +304,33 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
    * Live-signer/review-safe crash recovery.
    * SIGNING: only abandoned signers (review/signing lock available) become SIGNING_UNCERTAIN.
    * PREPARED: only expired leases whose review lock can be acquired become EXPIRED and release outpoints.
+   * EXECUTION_RESERVED: never entered PREPARED/SIGNING; terminalize to FAILED and release outpoints.
    */
   private async reconcileInterruptedExecutions(): Promise<void> {
     const snapshot = await this.coordinator.requestExclusive(this.lockName, async () => {
       const data = this.loadData()
+      const reservedIds = Object.keys(data.records).filter(
+        id => data.records[id]?.state === 'EXECUTION_RESERVED'
+      )
+      for (const executionId of reservedIds) {
+        const record = data.records[executionId]
+        if (!record || record.state !== 'EXECUTION_RESERVED') {
+          continue
+        }
+        this.assertTransition(record.state, 'FAILED')
+        this.releaseOutpoints(data, executionId, record.reservedOutpoints)
+        data.records[executionId] = {
+          ...record,
+          state: 'FAILED',
+          uncertainReason:
+            'Abandoned EXECUTION_RESERVED: never reached PREPARED. Terminalized at startup. Outpoints released.',
+          failedAt: this.clock(),
+          reservedOutpoints: []
+        }
+      }
+      if (reservedIds.length > 0) {
+        this.saveData(data)
+      }
       return {
         signingIds: Object.keys(data.records).filter(id => data.records[id]?.state === 'SIGNING'),
         preparedIds: Object.keys(data.records).filter(id => data.records[id]?.state === 'PREPARED')
@@ -512,13 +535,15 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     }
 
     const recovered = await this.tryRecoverAbandonedPrepared(first.ownerId)
-    if (recovered !== 'reclaimed') {
+    if (recovered === 'still_live') {
       throw new WalletExecutionError(
         'OUTPOINT_ALREADY_RESERVED',
         `Outpoint is already reserved by execution "${first.ownerId}" and could not be reclaimed.`
       )
     }
 
+    // reclaimed OR not_prepared (concurrent recovery already terminalized the owner):
+    // re-read durable reservations and retry the PREPARED commit exactly once.
     return this.coordinator.requestExclusive(this.lockName, async () => {
       const data = this.loadData()
       return this.commitPreparedInsideLedgerLock(data, executionId, plan, reviewOwnership)
