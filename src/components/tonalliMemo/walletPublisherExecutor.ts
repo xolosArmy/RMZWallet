@@ -1,5 +1,9 @@
 import type { ChronikClient, ScriptUtxo } from 'chronik-client'
 import { getChronik } from '../../services/ChronikClient'
+import {
+  COINBASE_MATURITY_CONFIRMATIONS,
+  isImmatureCoinbaseUtxo
+} from '../../services/coinbaseMaturity'
 import { fromHex, toHex, Script, Tx, TxBuilder, sha256 } from 'ecash-lib'
 import { xolosWalletService, type FirmaInputOwner } from '../../services/XolosWalletService'
 import { FEE_RATE_SATS_PER_BYTE, XEC_DUST_SATS } from '../../config/xecFees'
@@ -35,7 +39,7 @@ export {
   createTm1ProductionRecoveryStore
 }
 
-export const COINBASE_MATURITY_CONFIRMATIONS = 100
+export { COINBASE_MATURITY_CONFIRMATIONS, isImmatureCoinbaseUtxo }
 
 /**
  * Interface compatible with real Tm1AliasOwnershipVerificationPort and test mocks.
@@ -335,25 +339,8 @@ export class WalletSigner {
       }
     }
 
-    const isImmatureCoinbase = (utxo: ScriptUtxo): boolean => {
-      if (!utxo.isCoinbase) {
-        return false
-      }
-      // Exclude immature coinbase outputs until consensus maturity is proven.
-      // If tip height is unknown or UTXO is in mempool (blockHeight < 0), maturity cannot be proven.
-      if (
-        tipHeight === undefined ||
-        typeof utxo.blockHeight !== 'number' ||
-        utxo.blockHeight < 0
-      ) {
-        return true
-      }
-      const confirmations = tipHeight - utxo.blockHeight + 1
-      return confirmations < this.coinbaseMaturity
-    }
-
     const spendableUtxosTotal = normalizedUtxos.filter(
-      (item) => !item.utxo.token && !isImmatureCoinbase(item.utxo)
+      (item) => !item.utxo.token && !isImmatureCoinbaseUtxo(item.utxo, tipHeight, this.coinbaseMaturity)
     )
 
     if (spendableUtxosTotal.length === 0) {
