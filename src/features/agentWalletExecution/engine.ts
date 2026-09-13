@@ -24,7 +24,10 @@
 import { fromHex, Script, toHex, toHexRev, Tx, TxBuilder } from 'ecash-lib'
 import { humanApprovalV1Schema, type HumanApprovalV1 } from '@xolosarmy/tonalli-core'
 import { WalletExecutionError } from './errors'
-import { DurableTransactionalExecutionLedger } from './ledger'
+import {
+  DurableTransactionalExecutionLedger,
+  WebLocksExecutionCoordinator
+} from './ledger'
 import {
   buildPreparedExecutionPlan,
   computeCanonicalPlanHash,
@@ -49,7 +52,10 @@ import type {
   WalletExecutionUIHost,
   WalletLocalConfirmationController
 } from '../../internal/agentWalletExecutionHost/types'
-import { storeInternalSignedTransaction } from '../../internal/settlementStore'
+import {
+  DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY,
+  DEFAULT_SETTLEMENT_STORE_LOCK_NAME
+} from '../../internal/settlementStore'
 
 // Module-private symbols for closure-encapsulated capabilities
 const INTERNAL_CAPABILITY_TOKEN = Symbol('WalletExecutionCapabilityToken')
@@ -339,6 +345,78 @@ export function createWalletExecutionComposition(
       lockCoordinator: config.lockCoordinator
     })
 
+  const ledgerReady = executionLedger.whenReady()
+
+  /**
+   * Closure-private write-once persistence. Not exported. Not a factory.
+   * Invoked only after independent post-sign byte verification.
+   */
+  async function persistVerifiedSignedTransactionOnce(
+    executionId: string,
+    rawSignedTxHex: string
+  ): Promise<void> {
+    const targetStorage =
+      config.storage ?? (typeof localStorage !== 'undefined' ? localStorage : undefined)
+    if (!targetStorage) {
+      throw new WalletExecutionError(
+        'STORAGE_UNAVAILABLE',
+        'No durable settlement storage available. Raw signed transactions cannot be persisted.'
+      )
+    }
+    const coordinator = config.lockCoordinator ?? new WebLocksExecutionCoordinator()
+    await coordinator.requestExclusive(DEFAULT_SETTLEMENT_STORE_LOCK_NAME, async () => {
+      const raw = targetStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
+      let store: Record<string, string> = {}
+      if (raw) {
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(raw)
+        } catch (err) {
+          throw new WalletExecutionError(
+            'STORAGE_MUTATION_FAILED',
+            `Failed to parse settlement store payload: ${err instanceof Error ? err.message : String(err)}`
+          )
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new WalletExecutionError(
+            'STORAGE_MUTATION_FAILED',
+            'Settlement store payload is not a JSON object.'
+          )
+        }
+        store = parsed as Record<string, string>
+      }
+      if (Object.prototype.hasOwnProperty.call(store, executionId)) {
+        throw new WalletExecutionError(
+          'SETTLEMENT_ARTIFACT_ALREADY_EXISTS',
+          `A raw signed transaction already exists for execution "${executionId}". Write-once violation.`
+        )
+      }
+      store[executionId] = rawSignedTxHex
+      try {
+        targetStorage.setItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY, JSON.stringify(store))
+      } catch (err) {
+        throw new WalletExecutionError(
+          'STORAGE_MUTATION_FAILED',
+          `Failed to store settlement transaction: ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+      const confirmedRaw = targetStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
+      if (!confirmedRaw) {
+        throw new WalletExecutionError(
+          'STORAGE_MUTATION_FAILED',
+          'Settlement persistence confirmation failed: store is empty after write.'
+        )
+      }
+      const confirmed = JSON.parse(confirmedRaw) as Record<string, string>
+      if (confirmed[executionId] !== rawSignedTxHex) {
+        throw new WalletExecutionError(
+          'STORAGE_MUTATION_FAILED',
+          'Settlement persistence confirmation failed: stored artifact does not match verified bytes.'
+        )
+      }
+    })
+  }
+
   // Synchronous single-flight lock guards
   let isPreparing = false
   let activeExecutionId: string | null = null
@@ -371,6 +449,9 @@ export function createWalletExecutionComposition(
         'Confirmation token has already been consumed.'
       )
     }
+
+    await ledgerReady
+
     // 2. Look up current ledger state
     const currentRecord = await executionLedger.get(executionId)
     const currentStatus = currentRecord ? (currentRecord.status ?? (currentRecord as any).state) : undefined
@@ -405,12 +486,13 @@ export function createWalletExecutionComposition(
 
     const confirmNow = getNow()
 
-    // 4. Verify approval has not expired in the interim
     if (confirmNow >= capability.effectiveExpiresAt) {
       activeExecutionId = null
       activeCapability = null
       activePlan = null
-      await executionLedger.markFailed(executionId, 'Approval expired during review', confirmNow)
+      activeController = null
+      capability.invalidate()
+      await executionLedger.markExpired(executionId, 'Approval expired during review', confirmNow)
       throw new WalletExecutionError('APPROVAL_EXPIRED', 'Approval expired during review.')
     }
 
@@ -480,8 +562,27 @@ export function createWalletExecutionComposition(
       )
     }
 
-    // 8. Durable transition to SIGNING
-    await executionLedger.transitionToSigning(executionId, confirmNow)
+    return executionLedger.runWithSigningLock(executionId, async () => {
+    // Fresh clock immediately before PREPARED -> SIGNING. Do not reuse confirmNow.
+    const signingNow = getNow()
+    if (signingNow >= capability.effectiveExpiresAt) {
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      activeController = null
+      capability.invalidate()
+      await executionLedger.markExpired(
+        executionId,
+        'Approval expired immediately before SIGNING',
+        signingNow
+      )
+      throw new WalletExecutionError(
+        'APPROVAL_EXPIRED',
+        'Approval expired immediately before SIGNING. Cryptographic signing was not started.'
+      )
+    }
+
+    await executionLedger.transitionToSigning(executionId, signingNow, plan)
 
     // 9. Wallet-owned signing. The signer-returned object is discarded as an authority source.
     let rawSignedTxHex: string
@@ -597,12 +698,9 @@ export function createWalletExecutionComposition(
       )
     }
 
-    // 11. Persist verified raw bytes under settlement-store exclusive lock BEFORE SIGNED.
+    // 11. Persist verified raw bytes write-once under settlement-store exclusive lock BEFORE SIGNED.
     try {
-      await storeInternalSignedTransaction(executionId, rawSignedTxHex, {
-        storage: config.storage,
-        lockCoordinator: config.lockCoordinator
-      })
+      await persistVerifiedSignedTransactionOnce(executionId, rawSignedTxHex)
     } catch (persistErr) {
       const persistReason = persistErr instanceof Error ? persistErr.message : String(persistErr)
       await executionLedger.markSigningUncertain(executionId, persistReason, getNow())
@@ -643,7 +741,7 @@ export function createWalletExecutionComposition(
     activeCapability = null
     activePlan = null
 
-    // 13. Return opaque SignedExecutionHandle. STOP. Zero broadcast. No raw-tx read API.
+    // 13. Return opaque SignedExecutionHandle. STOP. Zero broadcast. No raw-tx read/write API.
     return Object.freeze({
       executionId,
       approvalId: plan.approvalId,
@@ -651,6 +749,7 @@ export function createWalletExecutionComposition(
       status: 'SIGNED',
       planHash: plan.planHash,
       signedAt
+    })
     })
   }
 
@@ -665,6 +764,8 @@ export function createWalletExecutionComposition(
     isPreparing = true
 
     try {
+      await ledgerReady
+
       // 2. Parse the incoming value with the canonical HumanApprovalV1 schema only.
       const receipt = parseCanonicalHumanApproval(receiptInput)
 
@@ -850,9 +951,18 @@ export function createWalletExecutionComposition(
           throw planErr
         }
 
-        // 11. Bind plan to capability and update ledger to PREPARED
+        // 11. Bind plan to capability and atomically reserve outpoints + PREPARED.
         capability.bindPlan(plan)
-        await executionLedger.setPlanPrepared(executionId, plan, now)
+        try {
+          await executionLedger.setPlanPrepared(executionId, plan, now)
+        } catch (preparedErr) {
+          await executionLedger.markFailed(
+            executionId,
+            preparedErr instanceof Error ? preparedErr.message : String(preparedErr),
+            getNow()
+          )
+          throw preparedErr
+        }
 
         // 12. Construct human-readable review snapshot
         const review: WalletExecutionReviewSnapshot = Object.freeze({

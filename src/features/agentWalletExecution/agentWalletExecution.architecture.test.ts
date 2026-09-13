@@ -74,6 +74,10 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect((PublicModuleExports as any).getSignedTransaction).toBeUndefined()
     expect((PublicModuleExports as any).getRawSignedTx).toBeUndefined()
     expect((PublicModuleExports as any).readSettlementTx).toBeUndefined()
+    expect((PublicModuleExports as any).storeInternalSignedTransaction).toBeUndefined()
+    expect((PublicModuleExports as any).writeSignedTransaction).toBeUndefined()
+    expect((PublicModuleExports as any).putSettlementArtifact).toBeUndefined()
+    expect((PublicModuleExports as any).replaceSettlementArtifact).toBeUndefined()
     expect((PublicModuleExports as any).DEFAULT_PRIVATE_SETTLEMENT_STORAGE_KEY).toBeUndefined()
 
     // FORBIDDEN exports: local confirmation controller creation & controller type
@@ -257,12 +261,23 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     for (const name of forbiddenReadExports) {
       expect((settlementModule as Record<string, unknown>)[name]).toBeUndefined()
     }
-    expect(typeof settlementModule.storeInternalSignedTransaction).toBe('function')
+    expect((settlementModule as Record<string, unknown>).storeInternalSignedTransaction).toBeUndefined()
+    expect((settlementModule as Record<string, unknown>).writeSignedTransaction).toBeUndefined()
+    expect((settlementModule as Record<string, unknown>).putSettlementArtifact).toBeUndefined()
+    expect((settlementModule as Record<string, unknown>).replaceSettlementArtifact).toBeUndefined()
+    expect((settlementModule as Record<string, unknown>).createSettlementWriter).toBeUndefined()
 
     const hostModule = await import('../../internal/agentWalletExecutionHost')
     for (const name of forbiddenReadExports) {
       expect((hostModule as Record<string, unknown>)[name]).toBeUndefined()
     }
+    expect((hostModule as Record<string, unknown>).storeInternalSignedTransaction).toBeUndefined()
+    expect((hostModule as Record<string, unknown>).persistVerifiedSignedTransactionOnce).toBeUndefined()
+
+    const engineModule = await import('./engine')
+    expect((engineModule as Record<string, unknown>).storeInternalSignedTransaction).toBeUndefined()
+    expect((engineModule as Record<string, unknown>).persistVerifiedSignedTransactionOnce).toBeUndefined()
+    expect((engineModule as Record<string, unknown>).writeSignedTransaction).toBeUndefined()
 
     const dir = __dirname
     const productionFiles = readdirSync(dir).filter(
@@ -284,7 +299,11 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(settlementSource).not.toMatch(/export async function getSignedTransaction/)
     expect(settlementSource).not.toMatch(/export async function getRawSignedTx/)
     expect(settlementSource).not.toMatch(/export async function readSettlementTx/)
+    expect(settlementSource).not.toMatch(/export async function storeInternalSignedTransaction/)
+    expect(settlementSource).not.toMatch(/export async function writeSignedTransaction/)
+    expect(settlementSource).not.toMatch(/export function createSettlement/)
     expect(settlementSource).toMatch(/localStorage provides persistence but NOT same-origin\/XSS isolation/)
+    expect(settlementSource).toMatch(/Same-origin arbitrary JavaScript\/XSS can access browser storage/)
     expect(settlementSource).not.toMatch(/cryptographic isolation/i)
     expect(settlementSource).not.toMatch(/process-level isolation is claimed/i)
   })

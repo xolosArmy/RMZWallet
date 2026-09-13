@@ -6,7 +6,7 @@
  */
 
 import { WalletExecutionError } from './errors'
-import { VALID_EXECUTION_STATE_TRANSITIONS } from './ledger'
+import { canonicalOutpointKey, VALID_EXECUTION_STATE_TRANSITIONS } from './ledger'
 import type { ExecutionLockCoordinator } from './ledger'
 import type {
   ExecutionNetwork,
@@ -42,6 +42,17 @@ export class TestExecutionLockCoordinator implements ExecutionLockCoordinator {
       }
     }
   }
+
+  async tryExclusive<T>(
+    lockName: string,
+    operation: () => Promise<T>
+  ): Promise<{ acquired: false } | { acquired: true; result: T }> {
+    if (this.queues.has(lockName)) {
+      return { acquired: false }
+    }
+    const result = await this.requestExclusive(lockName, operation)
+    return { acquired: true, result }
+  }
 }
 
 export class MockStorage implements Storage {
@@ -76,6 +87,13 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
   private readonly recordsByExecutionId = new Map<string, InternalWalletExecutionRecord>()
   private readonly recordsByApprovalId = new Map<string, InternalWalletExecutionRecord>()
   private readonly recordsByRequestId = new Map<string, InternalWalletExecutionRecord>()
+  private readonly outpointReservations = new Map<string, string>()
+
+  async whenReady(): Promise<void> {}
+
+  async runWithSigningLock<T>(_executionId: string, operation: () => Promise<T>): Promise<T> {
+    return operation()
+  }
 
   private assertTransition(currentState: WalletExecutionState, targetState: WalletExecutionState): void {
     const allowed = VALID_EXECUTION_STATE_TRANSITIONS[currentState]
@@ -149,18 +167,37 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
 
     this.assertTransition(existing.state, 'PREPARED')
 
+    const reservedOutpoints = plan.inputs.map(input => canonicalOutpointKey(input.txid, input.outIdx))
+    for (const key of reservedOutpoints) {
+      const owner = this.outpointReservations.get(key)
+      if (owner && owner !== executionId) {
+        throw new WalletExecutionError(
+          'OUTPOINT_ALREADY_RESERVED',
+          `Outpoint "${key}" is already reserved by execution "${owner}".`
+        )
+      }
+    }
+    for (const key of reservedOutpoints) {
+      this.outpointReservations.set(key, executionId)
+    }
+
     const updated: InternalWalletExecutionRecord = Object.freeze({
       ...existing,
       plan,
       planHash: plan.planHash,
       state: 'PREPARED',
-      preparedAt
+      preparedAt,
+      reservedOutpoints
     })
 
     this.commitUpdate(updated)
   }
 
-  async transitionToSigning(executionId: string, signingAt: number): Promise<void> {
+  async transitionToSigning(
+    executionId: string,
+    signingAt: number,
+    plan: WalletPreparedExecutionPlan
+  ): Promise<void> {
     const existing = this.recordsByExecutionId.get(executionId)
     if (!existing) {
       throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
@@ -168,10 +205,21 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
 
     this.assertTransition(existing.state, 'SIGNING')
 
+    const planKeys = plan.inputs.map(input => canonicalOutpointKey(input.txid, input.outIdx))
+    for (const key of planKeys) {
+      if (this.outpointReservations.get(key) !== executionId) {
+        throw new WalletExecutionError(
+          'OUTPOINT_RESERVATION_MISMATCH',
+          `Execution "${executionId}" does not durably own outpoint "${key}".`
+        )
+      }
+    }
+
     const updated: InternalWalletExecutionRecord = Object.freeze({
       ...existing,
       state: 'SIGNING',
-      signingAt
+      signingAt,
+      reservedOutpoints: planKeys
     })
 
     this.commitUpdate(updated)
@@ -226,12 +274,17 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     if (!existing) return
 
     this.assertTransition(existing.state, 'FAILED')
+    const release = existing.state === 'EXECUTION_RESERVED' || existing.state === 'PREPARED'
+    if (release) {
+      this.releaseOwnedOutpoints(executionId, existing.reservedOutpoints)
+    }
 
     const updated: InternalWalletExecutionRecord = Object.freeze({
       ...existing,
       state: 'FAILED',
       uncertainReason: reason,
-      failedAt: timestamp
+      failedAt: timestamp,
+      reservedOutpoints: release ? [] : existing.reservedOutpoints
     })
 
     this.commitUpdate(updated)
@@ -242,15 +295,45 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     if (!existing) return
 
     this.assertTransition(existing.state, 'REJECTED')
+    const release = existing.state === 'EXECUTION_RESERVED' || existing.state === 'PREPARED'
+    if (release) {
+      this.releaseOwnedOutpoints(executionId, existing.reservedOutpoints)
+    }
 
     const updated: InternalWalletExecutionRecord = Object.freeze({
       ...existing,
       state: 'REJECTED',
       uncertainReason: reason,
-      failedAt: timestamp
+      failedAt: timestamp,
+      reservedOutpoints: release ? [] : existing.reservedOutpoints
     })
 
     this.commitUpdate(updated)
+  }
+
+  async markExpired(executionId: string, reason: string, timestamp: number): Promise<void> {
+    const existing = this.recordsByExecutionId.get(executionId)
+    if (!existing) return
+
+    this.assertTransition(existing.state, 'EXPIRED')
+    const release = existing.state === 'EXECUTION_RESERVED' || existing.state === 'PREPARED'
+    if (release) {
+      this.releaseOwnedOutpoints(executionId, existing.reservedOutpoints)
+    }
+
+    const updated: InternalWalletExecutionRecord = Object.freeze({
+      ...existing,
+      state: 'EXPIRED',
+      uncertainReason: reason,
+      failedAt: timestamp,
+      reservedOutpoints: release ? [] : existing.reservedOutpoints
+    })
+
+    this.commitUpdate(updated)
+  }
+
+  async getOutpointReservation(outpointKey: string): Promise<string | undefined> {
+    return this.outpointReservations.get(outpointKey)
   }
 
   private toPublicStatus(record: InternalWalletExecutionRecord): PublicExecutionStatus {
@@ -298,6 +381,16 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     this.recordsByExecutionId.clear()
     this.recordsByApprovalId.clear()
     this.recordsByRequestId.clear()
+    this.outpointReservations.clear()
+  }
+
+  private releaseOwnedOutpoints(executionId: string, keys: readonly string[] | undefined): void {
+    if (!keys) return
+    for (const key of keys) {
+      if (this.outpointReservations.get(key) === executionId) {
+        this.outpointReservations.delete(key)
+      }
+    }
   }
 
   private commitUpdate(updated: InternalWalletExecutionRecord): void {

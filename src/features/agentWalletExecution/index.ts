@@ -10,7 +10,7 @@
  * - Module-private execution capability and tokens are NOT exported.
  * - Private keys, seeds, mnemonics, and WIF are NEVER exported or handled here.
  * - Raw signed transaction bytes are persisted write-only inside private Wallet settlement storage.
- * - C2 exposes no raw-transaction retrieval API. Retrieval is Gate C3 work.
+ * - C2 exposes no raw-transaction retrieval OR persistence API. Retrieval is Gate C3 work.
  * - External callers receive only an opaque SignedExecutionHandle or PublicExecutionStatus.
  * - Public Agent-facing engine contains ZERO confirmation, signing, or execution methods.
  * - Zero broadcast or network mutation functions are present.
@@ -25,7 +25,11 @@ export {
   DurableStorageWalletExecutionLedger,
   WebLocksExecutionCoordinator,
   DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
-  VALID_EXECUTION_STATE_TRANSITIONS
+  DEFAULT_EXECUTION_LOCK_NAME,
+  EXECUTION_SIGNING_LOCK_PREFIX,
+  VALID_EXECUTION_STATE_TRANSITIONS,
+  executionSigningLockName,
+  canonicalOutpointKey
 } from './ledger'
 export type { ExecutionLockCoordinator, DurableTransactionalExecutionLedgerOptions } from './ledger'
 

@@ -150,6 +150,7 @@ export interface InternalWalletExecutionRecord {
   readonly signingAt?: number
   readonly signedAt?: number
   readonly failedAt?: number
+  readonly reservedOutpoints?: readonly string[]
 }
 
 /**
@@ -217,13 +218,21 @@ export interface WalletExecutionLedger {
     reservedAt: number
   }): Promise<void>
 
+  whenReady(): Promise<void>
+
+  runWithSigningLock<T>(executionId: string, operation: () => Promise<T>): Promise<T>
+
   setPlanPrepared(
     executionId: string,
     plan: WalletPreparedExecutionPlan,
     preparedAt: number
   ): Promise<void>
 
-  transitionToSigning(executionId: string, signingAt: number): Promise<void>
+  transitionToSigning(
+    executionId: string,
+    signingAt: number,
+    plan: WalletPreparedExecutionPlan
+  ): Promise<void>
 
   transitionToSigned(
     executionId: string,
@@ -240,6 +249,8 @@ export interface WalletExecutionLedger {
   markFailed(executionId: string, reason: string, timestamp: number): Promise<void>
 
   markRejected(executionId: string, reason: string, timestamp: number): Promise<void>
+
+  markExpired(executionId: string, reason: string, timestamp: number): Promise<void>
 
   get(executionId: string): Promise<PublicExecutionStatus | undefined>
 
@@ -266,6 +277,10 @@ export interface AgentWalletExecutionEngineConfig {
   readonly storage?: Storage
   readonly lockCoordinator?: {
     requestExclusive<T>(lockName: string, operation: () => Promise<T>): Promise<T>
+    tryExclusive<T>(
+      lockName: string,
+      operation: () => Promise<T>
+    ): Promise<{ acquired: false } | { acquired: true; result: T }>
   }
   readonly clock?: () => number
   readonly idGenerator?: () => string

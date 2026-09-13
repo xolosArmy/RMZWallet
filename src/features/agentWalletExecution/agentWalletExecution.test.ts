@@ -16,12 +16,11 @@ import { createWalletExecutionComposition } from '../../internal/agentWalletExec
 import {
   DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
   DurableStorageWalletExecutionLedger,
-  DurableTransactionalExecutionLedger
+  DurableTransactionalExecutionLedger,
+  canonicalOutpointKey,
+  executionSigningLockName
 } from './ledger'
-import {
-  DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY,
-  storeInternalSignedTransaction
-} from '../../internal/settlementStore'
+import { DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY } from '../../internal/settlementStore'
 import { InMemoryWalletExecutionLedger, MockStorage, TestExecutionLockCoordinator } from './testUtils'
 import { WalletExecutionError } from './errors'
 import {
@@ -104,10 +103,10 @@ function readStoredRawTx(storage: Storage, executionId: string): string | undefi
   return parsed[executionId]
 }
 
-function createFixtureUtxos(sats = 500_000n): ExecutionUtxoInput[] {
+function createFixtureUtxos(sats = 500_000n, txid = '11'.repeat(32)): ExecutionUtxoInput[] {
   return [
     {
-      txid: '11'.repeat(32),
+      txid,
       outIdx: 0,
       sats,
       lockingScriptHex: FROM_SCRIPT_HEX
@@ -127,6 +126,7 @@ function setupEngine(options: {
   executionLedger?: any
   lockCoordinator?: InstanceType<typeof TestExecutionLockCoordinator>
   idGenerator?: () => string
+  onSpendableUtxos?: () => Promise<void>
 } = {}) {
   const record = options.record ?? createFixtureLedgerRecord()
   const utxos = options.utxos ?? createFixtureUtxos()
@@ -173,6 +173,9 @@ function setupEngine(options: {
   let currentUtxos = [...utxos]
   const utxoProvider = {
     async getSpendableUtxos(_address: string) {
+      if (options.onSpendableUtxos) {
+        await options.onSpendableUtxos()
+      }
       return [...currentUtxos]
     }
   }
@@ -490,6 +493,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       storage,
       lockCoordinator: restartCoordinator
     })
+    await initialLedger.whenReady()
     await initialLedger.reserveExecutionAtomic({
       executionId: 'exec_crashed',
       approvalId: record.approvalId,
@@ -514,7 +518,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       availableUtxos: createFixtureUtxos()
     })
     await initialLedger.setPlanPrepared('exec_crashed', plan, FIXED_NOW + 1)
-    await initialLedger.transitionToSigning('exec_crashed', FIXED_NOW + 2)
+    await initialLedger.transitionToSigning('exec_crashed', FIXED_NOW + 2, plan)
 
     // Verify it was in SIGNING
     const preCrashStatus = await initialLedger.get('exec_crashed')
@@ -525,11 +529,8 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       storage,
       lockCoordinator: restartCoordinator
     })
-    let recoveredStatus = await recoveredLedger.get('exec_crashed')
-    for (let i = 0; i < 30 && recoveredStatus?.status === 'SIGNING'; i++) {
-      await new Promise(resolve => setTimeout(resolve, 10))
-      recoveredStatus = await recoveredLedger.get('exec_crashed')
-    }
+    await recoveredLedger.whenReady()
+    const recoveredStatus = await recoveredLedger.get('exec_crashed')
 
     // Must be reconciled to SIGNING_UNCERTAIN
     expect(recoveredStatus?.status).toBe('SIGNING_UNCERTAIN')
@@ -537,7 +538,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
 
     // Automated retry is blocked
     await expect(
-      recoveredLedger.transitionToSigning('exec_crashed', FIXED_NOW + 10)
+      recoveredLedger.transitionToSigning('exec_crashed', FIXED_NOW + 10, plan)
     ).rejects.toThrow(expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' }))
   })
 
@@ -838,7 +839,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       availableUtxos: createFixtureUtxos()
     })
     await ledger.setPlanPrepared('exec_imm', plan, FIXED_NOW + 1)
-    await ledger.transitionToSigning('exec_imm', FIXED_NOW + 2)
+    await ledger.transitionToSigning('exec_imm', FIXED_NOW + 2, plan)
     await ledger.transitionToSigned('exec_imm', '0200000001...', FIXED_NOW + 3)
 
     // Attempting to reject a SIGNED record throws INVALID_STATE_TRANSITION
@@ -1074,11 +1075,11 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       lockCoordinator: coordinator
     })
     const originalTransition = delayedLedger.transitionToSigning.bind(delayedLedger)
-    delayedLedger.transitionToSigning = async (executionId: string, signingAt: number) => {
+    delayedLedger.transitionToSigning = async (executionId, signingAt, plan) => {
       await new Promise(resolve => setTimeout(resolve, 20))
       providerOwnedUtxo.txid = 'aa'.repeat(32)
       providerOwnedUtxo.sats = 7n
-      return originalTransition(executionId, signingAt)
+      return originalTransition(executionId, signingAt, plan)
     }
 
     const { engine, record, uiHost } = setupEngine({
@@ -1126,6 +1127,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
 
     // A: crash before raw storage — SIGNING with no raw tx.
     const ledgerA = new DurableTransactionalExecutionLedger({ storage, lockCoordinator: coordinator })
+    await ledgerA.whenReady()
     await ledgerA.reserveExecutionAtomic({
       executionId: 'exec_crash_a',
       approvalId: 'appr_crash_a',
@@ -1150,17 +1152,14 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       availableUtxos: createFixtureUtxos()
     })
     await ledgerA.setPlanPrepared('exec_crash_a', planA, FIXED_NOW + 1)
-    await ledgerA.transitionToSigning('exec_crash_a', FIXED_NOW + 2)
+    await ledgerA.transitionToSigning('exec_crash_a', FIXED_NOW + 2, planA)
 
     const recoveredA = new DurableTransactionalExecutionLedger({ storage, lockCoordinator: coordinator })
-    let recoveredAStatus = await recoveredA.get('exec_crash_a')
-    for (let i = 0; i < 30 && recoveredAStatus?.status === 'SIGNING'; i++) {
-      await new Promise(resolve => setTimeout(resolve, 10))
-      recoveredAStatus = await recoveredA.get('exec_crash_a')
-    }
+    await recoveredA.whenReady()
+    const recoveredAStatus = await recoveredA.get('exec_crash_a')
     expect(recoveredAStatus?.status).toBe('SIGNING_UNCERTAIN')
     expect(readStoredRawTx(storage, 'exec_crash_a')).toBeUndefined()
-    await expect(recoveredA.transitionToSigning('exec_crash_a', FIXED_NOW + 9)).rejects.toThrow(
+    await expect(recoveredA.transitionToSigning('exec_crash_a', FIXED_NOW + 9, planA)).rejects.toThrow(
       expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' })
     )
 
@@ -1202,6 +1201,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       storage: storageC,
       lockCoordinator: coordinator
     })
+    await ledgerC.whenReady()
     await ledgerC.reserveExecutionAtomic({
       executionId: 'exec_crash_c',
       approvalId: 'appr_crash_c',
@@ -1226,23 +1226,20 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
       availableUtxos: createFixtureUtxos()
     })
     await ledgerC.setPlanPrepared('exec_crash_c', planC, FIXED_NOW + 1)
-    await ledgerC.transitionToSigning('exec_crash_c', FIXED_NOW + 2)
-    await storeInternalSignedTransaction('exec_crash_c', '0200000001deadbeef', {
-      storage: storageC,
-      lockCoordinator: coordinator
-    })
+    await ledgerC.transitionToSigning('exec_crash_c', FIXED_NOW + 2, planC)
+    storageC.setItem(
+      DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY,
+      JSON.stringify({ exec_crash_c: '0200000001deadbeef' })
+    )
     const recoveredC = new DurableTransactionalExecutionLedger({
       storage: storageC,
       lockCoordinator: coordinator
     })
-    let recoveredCStatus = await recoveredC.get('exec_crash_c')
-    for (let i = 0; i < 30 && recoveredCStatus?.status === 'SIGNING'; i++) {
-      await new Promise(resolve => setTimeout(resolve, 10))
-      recoveredCStatus = await recoveredC.get('exec_crash_c')
-    }
+    await recoveredC.whenReady()
+    const recoveredCStatus = await recoveredC.get('exec_crash_c')
     expect(recoveredCStatus?.status).toBe('SIGNING_UNCERTAIN')
     expect(readStoredRawTx(storageC, 'exec_crash_c')).toBe('0200000001deadbeef')
-    await expect(recoveredC.transitionToSigning('exec_crash_c', FIXED_NOW + 9)).rejects.toThrow(
+    await expect(recoveredC.transitionToSigning('exec_crash_c', FIXED_NOW + 9, planC)).rejects.toThrow(
       expect.objectContaining({ code: 'INVALID_STATE_TRANSITION' })
     )
   })
@@ -1269,6 +1266,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
 
     const tabA = setupEngine({
       record: recordA,
+      utxos: createFixtureUtxos(500_000n, '11'.repeat(32)),
       storage: sharedStorage,
       lockCoordinator: sharedCoordinator,
       executionLedger: new DurableTransactionalExecutionLedger({
@@ -1279,6 +1277,7 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     })
     const tabB = setupEngine({
       record: recordB,
+      utxos: createFixtureUtxos(500_000n, '22'.repeat(32)),
       storage: sharedStorage,
       lockCoordinator: sharedCoordinator,
       executionLedger: new DurableTransactionalExecutionLedger({
@@ -1305,6 +1304,209 @@ describe('AgentWalletExecutionEngine Gate C2 Canonical Tests', () => {
     )
     expect((await tabA.engine.getExecutionStatus(sessionA.executionId))?.status).toBe('SIGNED')
     expect((await tabB.engine.getExecutionStatus(sessionB.executionId))?.status).toBe('SIGNED')
+  })
+
+  it('refuses a second settlement write for the same executionId', async () => {
+    const storage = new MockStorage()
+    const { engine, uiHost, record, executionLedger } = setupEngine({ storage })
+    const session = await engine.prepareExecution(record.humanApproval)
+    storage.setItem(
+      DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY,
+      JSON.stringify({ [session.executionId]: '00ffaabb' })
+    )
+    await expect(uiHost.getActiveController()!.confirm()).rejects.toThrow(
+      expect.objectContaining({ code: 'SIGNING_UNCERTAIN' })
+    )
+    expect(readStoredRawTx(storage, session.executionId)).toBe('00ffaabb')
+    expect((await executionLedger.get(session.executionId))?.status).toBe('SIGNING_UNCERTAIN')
+  })
+
+  it('does not invoke the signer when approval expires during UTXO revalidation', async () => {
+    const signerMock = vi.fn()
+    let confirmPhase = false
+    let setClockRef: (t: number) => void = () => {}
+    const { engine, uiHost, record, executionLedger, setClock } = setupEngine({
+      signatoryProvider: {
+        getSignatory: async () => {
+          signerMock()
+          return createSyntheticSignatory().signatory
+        }
+      },
+      onSpendableUtxos: async () => {
+        if (confirmPhase) {
+          setClockRef(EXPIRES_AT + 1)
+        }
+      }
+    })
+    setClockRef = setClock
+    const session = await engine.prepareExecution(record.humanApproval)
+    confirmPhase = true
+    await expect(uiHost.getActiveController()!.confirm()).rejects.toThrow(
+      expect.objectContaining({ code: 'APPROVAL_EXPIRED' })
+    )
+    expect(signerMock).not.toHaveBeenCalled()
+    expect((await executionLedger.get(session.executionId))?.status).toBe('EXPIRED')
+    expect(
+      await (executionLedger as InMemoryWalletExecutionLedger).getOutpointReservation(
+        canonicalOutpointKey('11'.repeat(32), 0)
+      )
+    ).toBeUndefined()
+  })
+
+  it('does not reconcile a live SIGNING execution held by another tab', async () => {
+    const storage = new MockStorage()
+    const coordinator = new TestExecutionLockCoordinator()
+    const ledgerA = new DurableTransactionalExecutionLedger({ storage, lockCoordinator: coordinator })
+    await ledgerA.whenReady()
+    const record = createFixtureLedgerRecord()
+    const plan = buildPreparedExecutionPlan({
+      approved: {
+        approvalId: record.approvalId,
+        requestId: record.requestId,
+        intentId: record.intentId,
+        fromAddress: record.fromAddress,
+        destination: record.destination,
+        amountSats: approvedAmountSats(record)
+      },
+      availableUtxos: createFixtureUtxos()
+    })
+    await ledgerA.reserveExecutionAtomic({
+      executionId: 'exec_live',
+      approvalId: record.approvalId,
+      requestId: record.requestId,
+      intentId: record.intentId,
+      decisionId: record.decisionId,
+      fromAddress: record.fromAddress,
+      destination: record.destination,
+      amountSats: approvedAmountSats(record),
+      network: 'xec:mainnet',
+      reservedAt: FIXED_NOW
+    })
+    await ledgerA.setPlanPrepared('exec_live', plan, FIXED_NOW + 1)
+    await ledgerA.transitionToSigning('exec_live', FIXED_NOW + 2, plan)
+
+    await coordinator.requestExclusive(executionSigningLockName('exec_live'), async () => {
+      const ledgerB = new DurableTransactionalExecutionLedger({ storage, lockCoordinator: coordinator })
+      await ledgerB.whenReady()
+      expect((await ledgerB.get('exec_live'))?.status).toBe('SIGNING')
+    })
+
+    const ledgerC = new DurableTransactionalExecutionLedger({ storage, lockCoordinator: coordinator })
+    await ledgerC.whenReady()
+    expect((await ledgerC.get('exec_live'))?.status).toBe('SIGNING_UNCERTAIN')
+    expect(await ledgerC.getOutpointReservation(canonicalOutpointKey(plan.inputs[0].txid, 0))).toBe(
+      'exec_live'
+    )
+  })
+
+  it('allows only one of two distinct approvals to PREPARE the same outpoint', async () => {
+    const sharedStorage = new MockStorage()
+    const sharedCoordinator = new TestExecutionLockCoordinator()
+    const sharedUtxos = createFixtureUtxos()
+    const recordA = createFixtureLedgerRecord({
+      requestId: 'req_out_a',
+      approvalId: 'appr_out_a',
+      humanApproval: createCanonicalHumanApproval({ requestId: 'req_out_a', approvalId: 'appr_out_a' })
+    })
+    const recordB = createFixtureLedgerRecord({
+      requestId: 'req_out_b',
+      approvalId: 'appr_out_b',
+      humanApproval: createCanonicalHumanApproval({ requestId: 'req_out_b', approvalId: 'appr_out_b' })
+    })
+    const tabA = setupEngine({
+      record: recordA,
+      utxos: sharedUtxos,
+      storage: sharedStorage,
+      lockCoordinator: sharedCoordinator,
+      executionLedger: new DurableTransactionalExecutionLedger({
+        storage: sharedStorage,
+        lockCoordinator: sharedCoordinator
+      }),
+      idGenerator: () => 'out_a'
+    })
+    const tabB = setupEngine({
+      record: recordB,
+      utxos: sharedUtxos,
+      storage: sharedStorage,
+      lockCoordinator: sharedCoordinator,
+      executionLedger: new DurableTransactionalExecutionLedger({
+        storage: sharedStorage,
+        lockCoordinator: sharedCoordinator
+      }),
+      idGenerator: () => 'out_b'
+    })
+
+    const sessionA = await tabA.engine.prepareExecution(recordA.humanApproval)
+    expect((await tabA.engine.getExecutionStatus(sessionA.executionId))?.status).toBe('PREPARED')
+    await expect(tabB.engine.prepareExecution(recordB.humanApproval)).rejects.toThrow(
+      expect.objectContaining({ code: 'OUTPOINT_ALREADY_RESERVED' })
+    )
+    expect((await tabB.engine.getExecutionStatus('exec_out_b'))?.status).toBe('FAILED')
+  })
+
+  it('releases outpoints on reject, expiry, and failure, but not on SIGNED or SIGNING_UNCERTAIN', async () => {
+    const outpoint = canonicalOutpointKey('11'.repeat(32), 0)
+
+    const rejected = setupEngine()
+    const rejectedSession = await rejected.engine.prepareExecution(rejected.record.humanApproval)
+    expect(await (rejected.executionLedger as InMemoryWalletExecutionLedger).getOutpointReservation(outpoint)).toBe(
+      rejectedSession.executionId
+    )
+    await rejectedSession.rejectExecution('custodian rejected')
+    expect(await (rejected.executionLedger as InMemoryWalletExecutionLedger).getOutpointReservation(outpoint)).toBeUndefined()
+
+    const failed = setupEngine({
+      record: createFixtureLedgerRecord({
+        requestId: 'req_fail_op',
+        approvalId: 'appr_fail_op',
+        humanApproval: createCanonicalHumanApproval({ requestId: 'req_fail_op', approvalId: 'appr_fail_op' })
+      })
+    })
+    const failedSession = await failed.engine.prepareExecution(failed.record.humanApproval)
+    failed.setUtxos([])
+    await expect(failed.uiHost.getActiveController()!.confirm()).rejects.toThrow(
+      expect.objectContaining({ code: 'UTXO_SELECTION_STALE' })
+    )
+    expect((await failed.executionLedger.get(failedSession.executionId))?.status).toBe('FAILED')
+    expect(await (failed.executionLedger as InMemoryWalletExecutionLedger).getOutpointReservation(outpoint)).toBeUndefined()
+
+    const signed = setupEngine({ storage: new MockStorage() })
+    const signedSession = await signed.engine.prepareExecution(signed.record.humanApproval)
+    await signed.uiHost.getActiveController()!.confirm()
+    expect((await signed.executionLedger.get(signedSession.executionId))?.status).toBe('SIGNED')
+    expect(await (signed.executionLedger as InMemoryWalletExecutionLedger).getOutpointReservation(outpoint)).toBe(
+      signedSession.executionId
+    )
+
+    const uncertain = setupEngine({
+      storage: new MockStorage(),
+      signatoryProvider: {
+        signTransaction: async () => {
+          throw new Error('hardware unplugged')
+        }
+      }
+    })
+    const uncertainSession = await uncertain.engine.prepareExecution(uncertain.record.humanApproval)
+    await expect(uncertain.uiHost.getActiveController()!.confirm()).rejects.toThrow(
+      expect.objectContaining({ code: 'SIGNING_UNCERTAIN' })
+    )
+    expect((await uncertain.executionLedger.get(uncertainSession.executionId))?.status).toBe('SIGNING_UNCERTAIN')
+    expect(
+      await (uncertain.executionLedger as InMemoryWalletExecutionLedger).getOutpointReservation(outpoint)
+    ).toBe(uncertainSession.executionId)
+
+    const blocked = setupEngine({
+      record: createFixtureLedgerRecord({
+        requestId: 'req_blocked',
+        approvalId: 'appr_blocked',
+        humanApproval: createCanonicalHumanApproval({ requestId: 'req_blocked', approvalId: 'appr_blocked' })
+      }),
+      executionLedger: uncertain.executionLedger,
+      idGenerator: () => 'blocked_after_uncertain'
+    })
+    await expect(blocked.engine.prepareExecution(blocked.record.humanApproval)).rejects.toThrow(
+      expect.objectContaining({ code: 'OUTPOINT_ALREADY_RESERVED' })
+    )
   })
 
   it('snapshotOwnedUtxos never retains provider object references', () => {

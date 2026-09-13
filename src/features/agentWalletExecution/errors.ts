@@ -36,6 +36,9 @@ export type WalletExecutionErrorCode =
   | 'LOCAL_CONFIRMATION_REQUIRED'
   | 'EXECUTION_DISMISSED'
   | 'COORDINATION_UNAVAILABLE'
+  | 'SETTLEMENT_ARTIFACT_ALREADY_EXISTS'
+  | 'OUTPOINT_ALREADY_RESERVED'
+  | 'OUTPOINT_RESERVATION_MISMATCH'
 
 export class WalletExecutionError extends Error {
   readonly code: WalletExecutionErrorCode
