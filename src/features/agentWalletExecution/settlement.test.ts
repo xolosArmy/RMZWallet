@@ -159,7 +159,7 @@ function setupTestHarness(options: {
     return { txid }
   }
 
-  let txImpl: (txid: string) => Promise<unknown> = async txid => {
+  let txImpl: ChronikBroadcastClient['tx'] = async txid => {
     txCalls.push(txid)
     return { txid }
   }
