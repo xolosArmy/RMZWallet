@@ -311,10 +311,13 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     }
   })
 
-  it('verifies terminal state is SIGNED / READY_FOR_SETTLEMENT and NEVER SETTLED', () => {
+  it('verifies Gate C3A settlement states exist and terminal state is SETTLED / SETTLEMENT_REJECTED', () => {
     const typesContent = readFileSync(join(__dirname, 'types.ts'), 'utf-8')
 
-    expect(typesContent).not.toMatch(/\|\s*'SETTLED'/)
+    expect(typesContent).toContain("'SETTLING'")
+    expect(typesContent).toContain("'SETTLED'")
+    expect(typesContent).toContain("'SETTLEMENT_UNCERTAIN'")
+    expect(typesContent).toContain("'SETTLEMENT_REJECTED'")
     expect(typesContent).toContain("'SIGNED'")
     expect(typesContent).toContain("'SIGNING_UNCERTAIN'")
   })

@@ -28,10 +28,12 @@ export {
   DEFAULT_EXECUTION_LOCK_NAME,
   EXECUTION_SIGNING_LOCK_PREFIX,
   EXECUTION_REVIEW_LOCK_PREFIX,
+  EXECUTION_SETTLEMENT_LOCK_PREFIX,
   DEFAULT_REVIEW_LEASE_TTL_SECONDS,
   VALID_EXECUTION_STATE_TRANSITIONS,
   executionSigningLockName,
   executionReviewLockName,
+  executionSettlementLockName,
   canonicalOutpointKey
 } from './ledger'
 export type { ExecutionLockCoordinator, DurableTransactionalExecutionLedgerOptions } from './ledger'
@@ -49,6 +51,11 @@ export {
   canonicalJsonStringify
 } from './plan'
 
+export {
+  deriveExpectedTxidFromRawTxHex,
+  isDefinitiveConsensusRejection
+} from './settlementUtils'
+
 export type {
   ExecutionNetwork,
   ExecutionUtxoInput,
@@ -59,6 +66,8 @@ export type {
   WalletExecutionState,
   PublicExecutionStatus,
   SignedExecutionHandle,
+  WalletSettlementReceiptV1,
+  ChronikBroadcastClient,
   WalletExecutionReviewSession,
   WalletUtxoProvider,
   WalletSignatoryProvider,

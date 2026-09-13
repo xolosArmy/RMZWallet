@@ -96,6 +96,10 @@ export type WalletExecutionState =
   | 'PREPARED'
   | 'SIGNING'
   | 'SIGNED'
+  | 'SETTLING'
+  | 'SETTLED'
+  | 'SETTLEMENT_UNCERTAIN'
+  | 'SETTLEMENT_REJECTED'
   | 'SIGNING_UNCERTAIN'
   | 'REJECTED'
   | 'EXPIRED'
@@ -122,7 +126,32 @@ export interface PublicExecutionStatus {
   readonly preparedAt?: number
   readonly signingAt?: number
   readonly signedAt?: number
+  readonly settlingAt?: number
+  readonly settledAt?: number
+  readonly expectedTxid?: string
   readonly failedAt?: number
+}
+
+/**
+ * Public, non-authority settlement receipt containing safe, immutable metadata (Gate C3A).
+ * Raw signed transaction bytes, private keys, and internal storage details are strictly omitted.
+ */
+export interface WalletSettlementReceiptV1 {
+  readonly status: 'settled'
+  readonly network: ExecutionNetwork
+  readonly executionId: string
+  readonly approvalId: string
+  readonly requestId?: string
+  readonly txid: string
+  readonly settledAt: number
+}
+
+/**
+ * Minimal Chronik client interface required for settlement broadcast and verification.
+ */
+export interface ChronikBroadcastClient {
+  broadcastTx(rawTx: Uint8Array): Promise<{ txid?: string } | { txid: string }>
+  tx(txid: string): Promise<{ txid: string; [key: string]: unknown }>
 }
 
 /**
@@ -148,6 +177,10 @@ export interface InternalWalletExecutionRecord {
   readonly preparedAt?: number
   readonly signingAt?: number
   readonly signedAt?: number
+  readonly settlingAt?: number
+  readonly settledAt?: number
+  readonly expectedTxid?: string
+  readonly settlementAttempt?: number
   readonly failedAt?: number
   readonly reservedOutpoints?: readonly string[]
   readonly reviewOwnerId?: string
@@ -265,6 +298,37 @@ export interface WalletExecutionLedger {
 
   transitionToSigned(executionId: string, signedAt: number): Promise<void>
 
+  runWithSettlementLock<T>(executionId: string, operation: () => Promise<T>): Promise<T>
+
+  transitionToSettling(params: {
+    readonly executionId: string
+    readonly expectedTxid: string
+    readonly settlingAt: number
+  }): Promise<void>
+
+  transitionToSettled(params: {
+    readonly executionId: string
+    readonly expectedTxid: string
+    readonly settledAt: number
+  }): Promise<void>
+
+  markSettlementUncertain(params: {
+    readonly executionId: string
+    readonly reason: string
+    readonly timestamp: number
+  }): Promise<void>
+
+  markSettlementRejected(params: {
+    readonly executionId: string
+    readonly reason: string
+    readonly timestamp: number
+    readonly releaseOutpoints?: boolean
+  }): Promise<void>
+
+  snapshotSettlingRecords(): Promise<
+    ReadonlyArray<{ readonly executionId: string; readonly expectedTxid?: string }>
+  >
+
   markSigningUncertain(
     executionId: string,
     reason: string,
@@ -300,6 +364,11 @@ export interface AgentWalletExecutionEngineConfig {
   readonly signatoryProvider: WalletSignatoryProvider
   readonly feePolicy?: Partial<WalletFeePolicy>
   /**
+   * Optional Chronik broadcast client for settlement execution.
+   * If omitted in production, defaults to shared getChronik() instance.
+   */
+  readonly chronik?: ChronikBroadcastClient
+  /**
    * Public execution-ledger persistence only. NEVER used for raw signed transactions.
    * Settlement persistence is Wallet-private and is not part of this Agent-facing config.
    */
@@ -333,4 +402,5 @@ export interface WalletExecutionTrustedOptions {
 export interface AgentWalletExecutionEngine {
   prepareExecution(receipt: HumanApprovalV1): Promise<WalletExecutionReviewSession>
   getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined>
+  settle(executionId: string): Promise<WalletSettlementReceiptV1>
 }

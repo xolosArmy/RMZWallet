@@ -21,7 +21,8 @@ import { WalletExecutionError } from '../../features/agentWalletExecution/errors
 import {
   DEFAULT_REVIEW_LEASE_TTL_SECONDS,
   DurableTransactionalExecutionLedger,
-  WebLocksExecutionCoordinator
+  WebLocksExecutionCoordinator,
+  executionSettlementLockName
 } from '../../features/agentWalletExecution/ledger'
 import {
   assertUniqueUtxoOutpoints,
@@ -31,6 +32,10 @@ import {
   snapshotOwnedUtxos,
   validateOutputInvariants
 } from '../../features/agentWalletExecution/plan'
+import {
+  deriveExpectedTxidFromRawTxHex,
+  isDefinitiveConsensusRejection
+} from '../../features/agentWalletExecution/settlementUtils'
 import type {
   AgentWalletExecutionEngine,
   AgentWalletExecutionEngineConfig,
@@ -42,8 +47,11 @@ import type {
   WalletExecutionReviewSnapshot,
   WalletFeePolicy,
   WalletPreparedExecutionPlan,
-  WalletExecutionTrustedOptions
+  WalletExecutionTrustedOptions,
+  WalletSettlementReceiptV1,
+  ChronikBroadcastClient
 } from '../../features/agentWalletExecution/types'
+import { getChronik } from '../../services/ChronikClient'
 import type {
   WalletExecutionComposition,
   WalletExecutionUIHost,
@@ -470,6 +478,49 @@ function createWalletExecutionComposition(
           'Settlement persistence confirmation failed: stored artifact does not match verified bytes.'
         )
       }
+    })
+  }
+
+  /**
+   * Module-private raw signed transaction reader.
+   * Scoped strictly to this composition closure.
+   * NEVER exposed via any public interface or exported getter.
+   */
+  async function getPrivateSignedTransaction(executionId: string): Promise<string> {
+    const targetStorage =
+      trusted?.privateSettlementStorage ?? resolveFileLocalPrivateSettlementStorage()
+    if (!targetStorage) {
+      throw new WalletExecutionError(
+        'STORAGE_UNAVAILABLE',
+        'No durable settlement storage available. Raw signed transaction cannot be retrieved.'
+      )
+    }
+    const coordinator = config.lockCoordinator ?? new WebLocksExecutionCoordinator()
+    return coordinator.requestExclusive(DEFAULT_SETTLEMENT_STORE_LOCK_NAME, async () => {
+      const raw = targetStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
+      if (!raw) {
+        throw new WalletExecutionError(
+          'SETTLEMENT_ARTIFACT_NOT_FOUND',
+          `No settlement artifact store found for execution "${executionId}".`
+        )
+      }
+      let parsed: Record<string, string>
+      try {
+        parsed = JSON.parse(raw) as Record<string, string>
+      } catch (err) {
+        throw new WalletExecutionError(
+          'STORAGE_MUTATION_FAILED',
+          `Failed to parse settlement store payload: ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+      const rawTxHex = parsed[executionId]
+      if (!rawTxHex) {
+        throw new WalletExecutionError(
+          'SETTLEMENT_ARTIFACT_NOT_FOUND',
+          `Raw signed transaction artifact not found for execution "${executionId}".`
+        )
+      }
+      return rawTxHex
     })
   }
 
@@ -1367,13 +1418,356 @@ function createWalletExecutionComposition(
         preparedAt: record.preparedAt,
         signingAt: record.signingAt,
         signedAt: record.signedAt,
+        settlingAt: record.settlingAt,
+        settledAt: record.settledAt,
+        expectedTxid: record.expectedTxid,
         failedAt: record.failedAt
       })
     }
 
+    /**
+     * Settle a SIGNED execution via Chronik broadcast and network verification (Gate C3A).
+     *
+     * State Machine:
+     * SIGNED -> SETTLING -> SETTLED
+     * SETTLING -> SETTLEMENT_UNCERTAIN
+     * SETTLING -> SETTLEMENT_REJECTED (definitive rejection only)
+     *
+     * Fencing & At-Most-Once Broadcast:
+     * Per-execution exclusive lock prevents concurrent broadcasts.
+     * TXID derived locally and committed before broadcast.
+     * Startup recovery queries network before any action; never blindly rebroadcasts.
+     *
+     * Boundary Rules:
+     * NEVER exports raw signed transaction bytes.
+     * Produces only an immutable WalletSettlementReceiptV1.
+     */
+    async function settleExecution(executionId: string): Promise<WalletSettlementReceiptV1> {
+      if (disposed) {
+        throw new WalletExecutionError('COMPOSITION_DISPOSED', 'Execution engine is disposed.')
+      }
+
+      await ledgerReady
+
+      return executionLedger.runWithSettlementLock(executionId, async () => {
+        if (disposed) {
+          throw new WalletExecutionError('COMPOSITION_DISPOSED', 'Execution engine is disposed.')
+        }
+
+        const currentStatus = await executionLedger.get(executionId)
+        if (!currentStatus) {
+          throw new WalletExecutionError(
+            'EXECUTION_NOT_FOUND',
+            `Execution record "${executionId}" not found.`
+          )
+        }
+
+        // Idempotent return if already settled
+        if (currentStatus.status === 'SETTLED') {
+          return Object.freeze({
+            status: 'settled',
+            network: currentStatus.network,
+            executionId: currentStatus.executionId,
+            approvalId: currentStatus.approvalId,
+            requestId: currentStatus.requestId,
+            txid: currentStatus.expectedTxid!,
+            settledAt: currentStatus.settledAt ?? currentStatus.signedAt ?? getNow()
+          })
+        }
+
+        // Terminal rejected check
+        if (currentStatus.status === 'SETTLEMENT_REJECTED') {
+          throw new WalletExecutionError(
+            'SETTLEMENT_REJECTED',
+            `Execution "${executionId}" has already been definitively rejected: ${currentStatus.uncertainReason ?? 'settlement rejected'}`
+          )
+        }
+
+        // Chronik client resolution
+        const chronik =
+          config.chronik ??
+          (typeof getChronik === 'function' ? (getChronik() as unknown as ChronikBroadcastClient) : undefined)
+        if (!chronik) {
+          throw new WalletExecutionError(
+            'STORAGE_UNAVAILABLE',
+            'Chronik client is not available for settlement broadcast.'
+          )
+        }
+
+        // Handle recovering SETTLING or SETTLEMENT_UNCERTAIN
+        if (currentStatus.status === 'SETTLING' || currentStatus.status === 'SETTLEMENT_UNCERTAIN') {
+          let expectedTxid = currentStatus.expectedTxid
+          if (!expectedTxid) {
+            const rawTxHex = await getPrivateSignedTransaction(executionId)
+            expectedTxid = deriveExpectedTxidFromRawTxHex(rawTxHex)
+          }
+
+          // Query network acceptance before any further action
+          let accepted = false
+          try {
+            const queryRes = await chronik.tx(expectedTxid)
+            if (queryRes && queryRes.txid?.toLowerCase() === expectedTxid.toLowerCase()) {
+              accepted = true
+            }
+          } catch {
+            accepted = false
+          }
+
+          if (accepted) {
+            const settledAt = getNow()
+            await executionLedger.transitionToSettled({
+              executionId,
+              expectedTxid,
+              settledAt
+            })
+            return Object.freeze({
+              status: 'settled',
+              network: currentStatus.network,
+              executionId: currentStatus.executionId,
+              approvalId: currentStatus.approvalId,
+              requestId: currentStatus.requestId,
+              txid: expectedTxid,
+              settledAt
+            })
+          }
+
+          // If previously SETTLEMENT_UNCERTAIN and not accepted, keep uncertain
+          if (currentStatus.status === 'SETTLEMENT_UNCERTAIN') {
+            throw new WalletExecutionError(
+              'SETTLEMENT_UNCERTAIN',
+              `Execution "${executionId}" settlement outcome is uncertain: ${currentStatus.uncertainReason ?? 'network acceptance could not be confirmed'}`
+            )
+          }
+
+          // If was SETTLING (abandoned attempt), mark uncertain
+          await executionLedger.markSettlementUncertain({
+            executionId,
+            reason: 'Previous settlement attempt interrupted; transaction not observed on network.',
+            timestamp: getNow()
+          })
+          throw new WalletExecutionError(
+            'SETTLEMENT_UNCERTAIN',
+            `Execution "${executionId}" settlement interrupted. Reconciled to SETTLEMENT_UNCERTAIN.`
+          )
+        }
+
+        // Only SIGNED state can initiate a new broadcast
+        if (currentStatus.status !== 'SIGNED') {
+          throw new WalletExecutionError(
+            'INVALID_SETTLEMENT_STATE',
+            `Cannot settle execution "${executionId}" in state "${currentStatus.status}". Execution must be in SIGNED state.`
+          )
+        }
+
+        // Retrieve raw signed tx from module-private storage
+        const rawSignedTxHex = await getPrivateSignedTransaction(executionId)
+
+        // Derive expectedTxid locally from verified signed bytes
+        const expectedTxid = deriveExpectedTxidFromRawTxHex(rawSignedTxHex)
+
+        // Bind and persist expectedTxid in durable SETTLING state BEFORE broadcast
+        const settlingAt = getNow()
+        await executionLedger.transitionToSettling({
+          executionId,
+          expectedTxid,
+          settlingAt
+        })
+
+        // Broadcast to Chronik
+        const rawTxBytes = fromHex(rawSignedTxHex)
+        let broadcastTxid: string | undefined
+        let broadcastError: unknown = null
+
+        try {
+          const res = await chronik.broadcastTx(rawTxBytes)
+          broadcastTxid = res?.txid?.toLowerCase()
+        } catch (err) {
+          broadcastError = err
+        }
+
+        // If broadcast threw, check whether the network actually accepted it or if it was rejected
+        if (broadcastError) {
+          // Check network acceptance (e.g. timeout on broadcast response, or already in mempool)
+          let accepted = false
+          try {
+            const queryRes = await chronik.tx(expectedTxid)
+            if (queryRes && queryRes.txid?.toLowerCase() === expectedTxid.toLowerCase()) {
+              accepted = true
+            }
+          } catch {
+            accepted = false
+          }
+
+          if (accepted) {
+            const settledAt = getNow()
+            await executionLedger.transitionToSettled({
+              executionId,
+              expectedTxid,
+              settledAt
+            })
+            return Object.freeze({
+              status: 'settled',
+              network: currentStatus.network,
+              executionId: currentStatus.executionId,
+              approvalId: currentStatus.approvalId,
+              requestId: currentStatus.requestId,
+              txid: expectedTxid,
+              settledAt
+            })
+          }
+
+          // If not accepted, check if it was a definitive consensus rejection
+          if (isDefinitiveConsensusRejection(broadcastError)) {
+            const timestamp = getNow()
+            const reason = broadcastError instanceof Error ? broadcastError.message : String(broadcastError)
+            await executionLedger.markSettlementRejected({
+              executionId,
+              reason: `Definitive consensus rejection: ${reason}`,
+              timestamp
+            })
+            throw new WalletExecutionError(
+              'SETTLEMENT_REJECTED',
+              `Settlement rejected by network consensus: ${reason}`,
+              broadcastError
+            )
+          }
+
+          // Ambiguous / network drop / 5xx -> SETTLEMENT_UNCERTAIN
+          const timestamp = getNow()
+          const reason = broadcastError instanceof Error ? broadcastError.message : String(broadcastError)
+          await executionLedger.markSettlementUncertain({
+            executionId,
+            reason: `Settlement broadcast uncertain: ${reason}`,
+            timestamp
+          })
+          throw new WalletExecutionError(
+            'SETTLEMENT_UNCERTAIN',
+            `Settlement broadcast outcome uncertain: ${reason}`,
+            broadcastError
+          )
+        }
+
+        // Broadcast returned normally: verify returnedTxid === expectedTxid
+        if (!broadcastTxid || broadcastTxid !== expectedTxid) {
+          // FAIL CLOSED
+          const timestamp = getNow()
+          await executionLedger.markSettlementUncertain({
+            executionId,
+            reason: `Chronik returned txid "${broadcastTxid}" does not match locally derived expected txid "${expectedTxid}".`,
+            timestamp
+          })
+          throw new WalletExecutionError(
+            'SETTLEMENT_TXID_MISMATCH',
+            `Chronik returned txid "${broadcastTxid}" does not match locally derived expected txid "${expectedTxid}".`
+          )
+        }
+
+        // Verify network acceptance via Chronik query
+        let verifiedAcceptance = false
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const queryRes = await chronik.tx(expectedTxid)
+            if (queryRes && queryRes.txid?.toLowerCase() === expectedTxid.toLowerCase()) {
+              verifiedAcceptance = true
+              break
+            }
+          } catch {
+            await new Promise(resolve => setTimeout(resolve, 50))
+          }
+        }
+
+        if (!verifiedAcceptance) {
+          const timestamp = getNow()
+          await executionLedger.markSettlementUncertain({
+            executionId,
+            reason: 'Broadcast succeeded but network acceptance could not be verified via Chronik index.',
+            timestamp
+          })
+          throw new WalletExecutionError(
+            'SETTLEMENT_UNCERTAIN',
+            'Broadcast succeeded but network acceptance could not be verified via Chronik index.'
+          )
+        }
+
+        // Transition to SETTLED
+        const settledAt = getNow()
+        await executionLedger.transitionToSettled({
+          executionId,
+          expectedTxid,
+          settledAt
+        })
+
+        return Object.freeze({
+          status: 'settled',
+          network: currentStatus.network,
+          executionId: currentStatus.executionId,
+          approvalId: currentStatus.approvalId,
+          requestId: currentStatus.requestId,
+          txid: expectedTxid,
+          settledAt
+        })
+      })
+    }
+
+    async function reconcileAbandonedSettlements(): Promise<void> {
+      const settlingList = await executionLedger.snapshotSettlingRecords()
+      if (settlingList.length === 0) return
+
+      const coordinator = config.lockCoordinator ?? new WebLocksExecutionCoordinator()
+      const chronik =
+        config.chronik ??
+        (typeof getChronik === 'function' ? (getChronik() as unknown as ChronikBroadcastClient) : undefined)
+
+      for (const item of settlingList) {
+        const { executionId, expectedTxid } = item
+        await coordinator.tryExclusive(executionSettlementLockName(executionId), async () => {
+          const record = await executionLedger.get(executionId)
+          if (!record || record.status !== 'SETTLING') {
+            return
+          }
+          let targetTxid = expectedTxid
+          if (!targetTxid) {
+            try {
+              const rawTxHex = await getPrivateSignedTransaction(executionId)
+              targetTxid = deriveExpectedTxidFromRawTxHex(rawTxHex)
+            } catch {
+              await executionLedger.markSettlementUncertain({
+                executionId,
+                reason: 'Abandoned SETTLING record without recoverable expectedTxid.',
+                timestamp: getNow()
+              })
+              return
+            }
+          }
+          if (chronik) {
+            try {
+              const observed = await chronik.tx(targetTxid)
+              if (observed && observed.txid?.toLowerCase() === targetTxid.toLowerCase()) {
+                await executionLedger.transitionToSettled({
+                  executionId,
+                  expectedTxid: targetTxid,
+                  settledAt: getNow()
+                })
+                return
+              }
+            } catch {
+              // Not found in mempool or chain
+            }
+          }
+          await executionLedger.markSettlementUncertain({
+            executionId,
+            reason:
+              'Abandoned SETTLING execution recovered at startup without network confirmation. Reconciled to SETTLEMENT_UNCERTAIN without rebroadcast.',
+            timestamp: getNow()
+          })
+        })
+      }
+    }
+
     const publicEngine: AgentWalletExecutionEngine = Object.freeze({
       prepareExecution,
-      getExecutionStatus
+      getExecutionStatus,
+      settle: settleExecution
     })
 
     const walletUIHost: WalletExecutionUIHost = Object.freeze({
@@ -1394,8 +1788,9 @@ function createWalletExecutionComposition(
       }
     })
 
-    void ledgerReady.then(() => {
+    void ledgerReady.then(async () => {
       schedulePreparedRecovery()
+      await reconcileAbandonedSettlements().catch(() => {})
     })
 
     return {
@@ -1435,6 +1830,7 @@ export interface TrustedWalletExecutionProviderProps {
   readonly lockCoordinator?: AgentWalletExecutionEngineConfig['lockCoordinator']
   readonly clock?: AgentWalletExecutionEngineConfig['clock']
   readonly idGenerator?: AgentWalletExecutionEngineConfig['idGenerator']
+  readonly chronik?: ChronikBroadcastClient
   /**
    * Public execution-ledger Storage only. NEVER used for raw signed transactions.
    */
@@ -1509,6 +1905,7 @@ export function TrustedWalletExecutionProvider({
   lockCoordinator,
   clock,
   idGenerator,
+  chronik,
   ledgerStorage,
   reviewLeaseTtlSeconds,
   reviewHeartbeatMs
@@ -1521,6 +1918,7 @@ export function TrustedWalletExecutionProvider({
         utxoProvider ||
         signatoryProvider ||
         lockCoordinator ||
+        chronik ||
         ledgerStorage
     )
     if (testsSupplyAdapters) {
@@ -1534,6 +1932,7 @@ export function TrustedWalletExecutionProvider({
     utxoProvider,
     signatoryProvider,
     lockCoordinator,
+    chronik,
     ledgerStorage
   ])
 
@@ -1563,6 +1962,7 @@ export function TrustedWalletExecutionProvider({
         feePolicy,
         storage: resolvedLedgerStorage,
         lockCoordinator,
+        chronik,
         clock,
         idGenerator
       },

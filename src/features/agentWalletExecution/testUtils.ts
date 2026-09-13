@@ -11,6 +11,7 @@ import {
   canonicalOutpointKey,
   DEFAULT_EXECUTION_LOCK_NAME,
   EXECUTION_REVIEW_LOCK_PREFIX,
+  EXECUTION_SETTLEMENT_LOCK_PREFIX,
   EXECUTION_SIGNING_LOCK_PREFIX,
   VALID_EXECUTION_STATE_TRANSITIONS
 } from './ledger'
@@ -22,6 +23,7 @@ const testLockOrderAls = new AsyncLocalStorage<readonly number[]>()
 export function testLockRank(lockName: string): number {
   if (lockName.startsWith(EXECUTION_REVIEW_LOCK_PREFIX)) return 10
   if (lockName.startsWith(EXECUTION_SIGNING_LOCK_PREFIX)) return 20
+  if (lockName.startsWith(EXECUTION_SETTLEMENT_LOCK_PREFIX)) return 25
   if (lockName === DEFAULT_EXECUTION_LOCK_NAME) return 30
   if (lockName === DEFAULT_SETTLEMENT_STORE_LOCK_NAME) return 40
   return 100
@@ -35,7 +37,7 @@ function assertTestLockOrder(lockName: string): void {
   if (rank < maxHeld) {
     throw new WalletExecutionError(
       'LOCK_ORDER_VIOLATION',
-      `Forbidden lock order: holding rank ${maxHeld} then acquiring "${lockName}" (rank ${rank}). Canonical order is review → signing → global ledger → settlement.`
+      `Forbidden lock order: holding rank ${maxHeld} then acquiring "${lockName}" (rank ${rank}). Canonical order is review → signing → settlement → global ledger → settlementStore.`
     )
   }
 }
@@ -138,6 +140,10 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
   }
 
   async runWithReviewLock<T>(_executionId: string, operation: () => Promise<T>): Promise<T> {
+    return operation()
+  }
+
+  async runWithSettlementLock<T>(_executionId: string, operation: () => Promise<T>): Promise<T> {
     return operation()
   }
 
@@ -454,6 +460,121 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     this.commitUpdate(updated)
   }
 
+  async transitionToSettling(params: {
+    readonly executionId: string
+    readonly expectedTxid: string
+    readonly settlingAt: number
+  }): Promise<void> {
+    const existing = this.recordsByExecutionId.get(params.executionId)
+    if (!existing) {
+      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+    }
+
+    this.assertTransition(existing.state, 'SETTLING')
+
+    const updated: InternalWalletExecutionRecord = Object.freeze({
+      ...existing,
+      state: 'SETTLING',
+      expectedTxid: params.expectedTxid.toLowerCase(),
+      settlingAt: params.settlingAt,
+      settlementAttempt: (existing.settlementAttempt ?? 0) + 1
+    })
+
+    this.commitUpdate(updated)
+  }
+
+  async transitionToSettled(params: {
+    readonly executionId: string
+    readonly expectedTxid: string
+    readonly settledAt: number
+  }): Promise<void> {
+    const existing = this.recordsByExecutionId.get(params.executionId)
+    if (!existing) {
+      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+    }
+
+    this.assertTransition(existing.state, 'SETTLED')
+
+    if (existing.expectedTxid && existing.expectedTxid.toLowerCase() !== params.expectedTxid.toLowerCase()) {
+      throw new WalletExecutionError(
+        'SETTLEMENT_TXID_MISMATCH',
+        `Cannot settle execution "${params.executionId}" with txid "${params.expectedTxid}" (expected "${existing.expectedTxid}").`
+      )
+    }
+
+    const updated: InternalWalletExecutionRecord = Object.freeze({
+      ...existing,
+      state: 'SETTLED',
+      expectedTxid: params.expectedTxid.toLowerCase(),
+      settledAt: params.settledAt
+    })
+
+    this.commitUpdate(updated)
+  }
+
+  async markSettlementUncertain(params: {
+    readonly executionId: string
+    readonly reason: string
+    readonly timestamp: number
+  }): Promise<void> {
+    const existing = this.recordsByExecutionId.get(params.executionId)
+    if (!existing) {
+      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+    }
+
+    this.assertTransition(existing.state, 'SETTLEMENT_UNCERTAIN')
+
+    const updated: InternalWalletExecutionRecord = Object.freeze({
+      ...existing,
+      state: 'SETTLEMENT_UNCERTAIN',
+      uncertainReason: params.reason,
+      failedAt: params.timestamp
+    })
+
+    this.commitUpdate(updated)
+  }
+
+  async markSettlementRejected(params: {
+    readonly executionId: string
+    readonly reason: string
+    readonly timestamp: number
+    readonly releaseOutpoints?: boolean
+  }): Promise<void> {
+    const existing = this.recordsByExecutionId.get(params.executionId)
+    if (!existing) {
+      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+    }
+
+    this.assertTransition(existing.state, 'SETTLEMENT_REJECTED')
+
+    const release = params.releaseOutpoints === true
+    if (release) {
+      this.releaseOwnedOutpoints(params.executionId, existing.reservedOutpoints)
+    }
+
+    const updated: InternalWalletExecutionRecord = Object.freeze({
+      ...existing,
+      state: 'SETTLEMENT_REJECTED',
+      uncertainReason: params.reason,
+      failedAt: params.timestamp,
+      reservedOutpoints: release ? [] : existing.reservedOutpoints
+    })
+
+    this.commitUpdate(updated)
+  }
+
+  async snapshotSettlingRecords(): Promise<
+    ReadonlyArray<{ readonly executionId: string; readonly expectedTxid?: string }>
+  > {
+    const results: Array<{ executionId: string; expectedTxid?: string }> = []
+    for (const record of this.recordsByExecutionId.values()) {
+      if (record.state === 'SETTLING') {
+        results.push({ executionId: record.executionId, expectedTxid: record.expectedTxid })
+      }
+    }
+    return results
+  }
+
   async markSigningUncertain(
     executionId: string,
     reason: string,
@@ -561,6 +682,9 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
       preparedAt: record.preparedAt,
       signingAt: record.signingAt,
       signedAt: record.signedAt,
+      settlingAt: record.settlingAt,
+      settledAt: record.settledAt,
+      expectedTxid: record.expectedTxid,
       failedAt: record.failedAt
     })
   }
