@@ -40,8 +40,10 @@ export interface WalletExecutionUIHost {
 
 /**
  * Full Wallet Execution Composition combining the public engine with the internal UI host.
+ * dispose is INTERNAL and must never be exposed on AgentWalletExecutionEngine.
  */
 export interface WalletExecutionComposition {
   readonly publicEngine: AgentWalletExecutionEngine
   readonly walletUIHost: WalletExecutionUIHost
+  dispose(): void
 }

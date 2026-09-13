@@ -17,7 +17,21 @@ import {
   InMemoryWalletApprovalLedger,
   createMockSessionVerifier
 } from '../agentWalletApprovalReceiver/testUtils'
-import { createWalletExecutionComposition } from '../../internal/agentWalletExecutionHost'
+import '../../internal/agentWalletExecutionHost/trustedWalletExecutionRuntime'
+import type { WalletExecutionComposition } from '../../internal/agentWalletExecutionHost'
+import type { AgentWalletExecutionEngineConfig } from './types'
+
+const createWalletExecutionComposition = (
+  config: AgentWalletExecutionEngineConfig
+): WalletExecutionComposition => {
+  const factory = (globalThis as Record<symbol, unknown>)[
+    Symbol.for('rmzwallet.testOnly.createWalletExecutionComposition')
+  ]
+  if (typeof factory !== 'function') {
+    throw new Error('Test-only composition factory is not registered.')
+  }
+  return (factory as (inner: AgentWalletExecutionEngineConfig) => WalletExecutionComposition)(config)
+}
 import { ALL_BIP143, Ecc, P2PKHSignatory } from 'ecash-lib'
 import { DurableTransactionalExecutionLedger } from './ledger'
 import { MockStorage, TestExecutionLockCoordinator } from './testUtils'

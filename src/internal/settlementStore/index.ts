@@ -4,8 +4,8 @@
  * Gate C2 settlement persistence constants and threat-model documentation.
  *
  * C2 SHALL NOT export a raw-transaction writer or reader.
- * The write-once persist path is closure-private to createWalletExecutionComposition
- * in features/agentWalletExecution/engine.ts. Trusted retrieval belongs to Gate C3.
+ * The write-once persist path is closure-private to the trusted Wallet bootstrap
+ * (trustedWalletExecutionRuntime.tsx). Trusted retrieval belongs to Gate C3.
  *
  * This module exports only storage/lock names so tests can inspect the durable
  * payload. It does NOT export:
@@ -28,10 +28,12 @@
  * - No in-memory lock fallback. Web Locks absence fails closed.
  *
  * Canonical lock ordering (see ledger.ts):
- *   per-execution signing lock
- *   → settlement-store lock (write-once persist, then release)
- *   → global ledger lock (SIGNING → SIGNED)
- * Never wait for a signing lock while holding the ledger or settlement lock.
+ *   per-execution review lock
+ *   → per-execution signing lock
+ *   → short global ledger lock
+ *   → settlement-store lock when needed
+ * Never wait for a review or signing lock while holding the ledger or settlement lock.
+ * Never acquire signing lock then attempt review lock.
  */
 
 export const DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY = 'rmzwallet_internal_settlement_v2'

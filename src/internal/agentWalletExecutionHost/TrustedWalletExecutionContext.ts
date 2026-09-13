@@ -4,7 +4,7 @@
  */
 
 import { createContext, useContext } from 'react'
-import type { AgentWalletExecutionEngine } from '../../features/agentWalletExecution'
+import type { AgentWalletExecutionEngine } from '../../features/agentWalletExecution/types'
 
 export interface TrustedWalletExecutionContextValue {
   readonly publicEngine: AgentWalletExecutionEngine | null

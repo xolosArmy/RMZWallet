@@ -235,9 +235,18 @@ export interface WalletExecutionLedger {
   setPlanPrepared(
     executionId: string,
     plan: WalletPreparedExecutionPlan,
-    preparedAt: number,
-    reviewLease: ExecutionReviewLease
-  ): Promise<void>
+    reviewOwnership: {
+      readonly ownerId: string
+      readonly generation: number
+      readonly leaseTtlSeconds: number
+    }
+  ): Promise<ExecutionReviewLease>
+
+  snapshotPreparedLeases(): Promise<
+    ReadonlyArray<{ readonly executionId: string; readonly leaseExpiresAt: number }>
+  >
+
+  tryRecoverAbandonedPrepared(executionId: string): Promise<'reclaimed' | 'still_live' | 'not_prepared'>
 
   renewReviewLease(params: {
     readonly executionId: string

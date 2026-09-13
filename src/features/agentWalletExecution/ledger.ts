@@ -13,16 +13,17 @@
  * - Settlement-store lock: rmzwallet:internal-settlement:lock:v2
  *
  * Canonical lock ordering (deadlock prevention):
- * 1. Per-execution review lock is held for a live PREPARED review (outermost for review).
- * 2. Per-execution signing lock is the outermost lock of the signing critical section.
- *    Review lock is released before the signing lock is acquired.
+ * 1. Per-execution review lock (outermost for a live PREPARED review).
+ * 2. Per-execution signing lock (acquired WHILE review ownership remains valid
+ *    on the confirmation handoff; review lock is released only AFTER durable SIGNING).
  * 3. Global ledger lock is acquired only for short mutations and NEVER while waiting
  *    for a per-execution review or signing lock.
  * 4. Settlement-store lock is acquired only for write-once raw-tx persist, after the
- *    signing lock is already held, and is released before or without nesting a wait
- *    for the signing lock.
+ *    signing lock is already held.
  *
+ * Canonical rank: review → signing → short global ledger → settlement-store.
  * Forbidden: hold global ledger lock → then wait for execution review/signing lock.
+ * Forbidden: acquire signing lock → then attempt review lock.
  * Recovery: snapshot SIGNING/PREPARED candidates under the ledger lock, release it,
  * then tryExclusive the matching per-execution lock (ifAvailable / non-blocking).
  *
@@ -210,7 +211,7 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
   private readonly lockName: string
   private readonly coordinator: ExecutionLockCoordinator
   private readonly clock: () => number
-  private readonly ready: Promise<void>
+  private ready: Promise<void> | null = null
 
   constructor(options?: DurableTransactionalExecutionLedgerOptions) {
     const resolvedStorage = options?.storage ?? (typeof window !== 'undefined' ? window.localStorage : null)
@@ -225,13 +226,12 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     this.lockName = options?.lockName ?? DEFAULT_EXECUTION_LOCK_NAME
     this.coordinator = options?.lockCoordinator ?? new WebLocksExecutionCoordinator()
     this.clock = options?.clock ?? (() => Math.floor(Date.now() / 1000))
-    this.ready = this.reconcileInterruptedExecutions()
-    this.ready.catch(() => {
-      // Prevent unhandled rejection if callers have not yet awaited whenReady().
-    })
   }
 
   async whenReady(): Promise<void> {
+    if (!this.ready) {
+      this.ready = this.reconcileInterruptedExecutions()
+    }
     await this.ready
   }
 
@@ -335,33 +335,7 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     }
 
     for (const executionId of snapshot.preparedIds) {
-      await this.coordinator.tryExclusive(executionReviewLockName(executionId), async () => {
-        await this.coordinator.requestExclusive(this.lockName, async () => {
-          const data = this.loadData()
-          const record = data.records[executionId]
-          if (!record || record.state !== 'PREPARED') {
-            return
-          }
-          const now = this.clock()
-          if ((record.reviewLeaseExpiresAt ?? 0) > now) {
-            return
-          }
-          this.assertTransition(record.state, 'EXPIRED')
-          this.releaseOutpoints(data, executionId, record.reservedOutpoints)
-          data.records[executionId] = {
-            ...record,
-            state: 'EXPIRED',
-            uncertainReason:
-              'Abandoned PREPARED review: lease expired and review lock was acquired. Outpoints released.',
-            failedAt: now,
-            reservedOutpoints: [],
-            reviewOwnerId: record.reviewOwnerId,
-            reviewLeaseExpiresAt: record.reviewLeaseExpiresAt,
-            reviewLeaseGeneration: record.reviewLeaseGeneration
-          }
-          this.saveData(data)
-        })
-      })
+      await this.tryRecoverAbandonedPrepared(executionId)
     }
   }
 
@@ -433,48 +407,175 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     })
   }
 
+  private commitPreparedInsideLedgerLock(
+    data: DurableLedgerStoragePayloadV3,
+    executionId: string,
+    plan: WalletPreparedExecutionPlan,
+    reviewOwnership: {
+      readonly ownerId: string
+      readonly generation: number
+      readonly leaseTtlSeconds: number
+    }
+  ): ExecutionReviewLease {
+    const existing = data.records[executionId]
+    if (!existing) {
+      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
+    }
+
+    this.assertTransition(existing.state, 'PREPARED')
+
+    const reservedOutpoints = plan.inputs.map(input => canonicalOutpointKey(input.txid, input.outIdx))
+    for (const key of reservedOutpoints) {
+      const owner = data.outpointReservations[key]
+      if (owner && owner !== executionId) {
+        throw new WalletExecutionError(
+          'OUTPOINT_ALREADY_RESERVED',
+          `Outpoint "${key}" is already reserved by execution "${owner}".`
+        )
+      }
+    }
+    for (const key of reservedOutpoints) {
+      data.outpointReservations[key] = executionId
+    }
+
+    // Fresh lease timestamp is sampled inside this exclusive mutation.
+    // There is no await between freshNow and durable commit.
+    const freshNow = this.clock()
+    const reviewLease: ExecutionReviewLease = {
+      ownerId: reviewOwnership.ownerId,
+      generation: reviewOwnership.generation,
+      leaseExpiresAt: freshNow + reviewOwnership.leaseTtlSeconds
+    }
+
+    data.records[executionId] = {
+      ...existing,
+      state: 'PREPARED',
+      planHash: plan.planHash,
+      preparedAt: freshNow,
+      reservedOutpoints,
+      reviewOwnerId: reviewLease.ownerId,
+      reviewLeaseExpiresAt: reviewLease.leaseExpiresAt,
+      reviewLeaseGeneration: reviewLease.generation
+    }
+
+    this.saveData(data)
+    return reviewLease
+  }
+
+  private inspectExpiredPreparedOutpointOwner(
+    data: DurableLedgerStoragePayloadV3,
+    executionId: string,
+    plan: WalletPreparedExecutionPlan
+  ): string | undefined {
+    const reservedOutpoints = plan.inputs.map(input => canonicalOutpointKey(input.txid, input.outIdx))
+    const now = this.clock()
+    for (const key of reservedOutpoints) {
+      const ownerId = data.outpointReservations[key]
+      if (!ownerId || ownerId === executionId) {
+        continue
+      }
+      const owner = data.records[ownerId]
+      if (
+        owner &&
+        owner.state === 'PREPARED' &&
+        (owner.reviewLeaseExpiresAt ?? 0) <= now
+      ) {
+        return ownerId
+      }
+    }
+    return undefined
+  }
+
   async setPlanPrepared(
     executionId: string,
     plan: WalletPreparedExecutionPlan,
-    preparedAt: number,
-    reviewLease: ExecutionReviewLease
-  ): Promise<void> {
+    reviewOwnership: {
+      readonly ownerId: string
+      readonly generation: number
+      readonly leaseTtlSeconds: number
+    }
+  ): Promise<ExecutionReviewLease> {
+    const first = await this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
+      const recoverableOwner = this.inspectExpiredPreparedOutpointOwner(data, executionId, plan)
+      if (recoverableOwner) {
+        return { kind: 'recover' as const, ownerId: recoverableOwner }
+      }
+      return {
+        kind: 'commit' as const,
+        lease: this.commitPreparedInsideLedgerLock(data, executionId, plan, reviewOwnership)
+      }
+    })
+
+    if (first.kind === 'commit') {
+      return first.lease
+    }
+
+    const recovered = await this.tryRecoverAbandonedPrepared(first.ownerId)
+    if (recovered !== 'reclaimed') {
+      throw new WalletExecutionError(
+        'OUTPOINT_ALREADY_RESERVED',
+        `Outpoint is already reserved by execution "${first.ownerId}" and could not be reclaimed.`
+      )
+    }
+
     return this.coordinator.requestExclusive(this.lockName, async () => {
       const data = this.loadData()
-      const existing = data.records[executionId]
-      if (!existing) {
-        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
-      }
-
-      this.assertTransition(existing.state, 'PREPARED')
-
-      const reservedOutpoints = plan.inputs.map(input => canonicalOutpointKey(input.txid, input.outIdx))
-      for (const key of reservedOutpoints) {
-        const owner = data.outpointReservations[key]
-        if (owner && owner !== executionId) {
-          throw new WalletExecutionError(
-            'OUTPOINT_ALREADY_RESERVED',
-            `Outpoint "${key}" is already reserved by execution "${owner}".`
-          )
-        }
-      }
-      for (const key of reservedOutpoints) {
-        data.outpointReservations[key] = executionId
-      }
-
-      data.records[executionId] = {
-        ...existing,
-        state: 'PREPARED',
-        planHash: plan.planHash,
-        preparedAt,
-        reservedOutpoints,
-        reviewOwnerId: reviewLease.ownerId,
-        reviewLeaseExpiresAt: reviewLease.leaseExpiresAt,
-        reviewLeaseGeneration: reviewLease.generation
-      }
-
-      this.saveData(data)
+      return this.commitPreparedInsideLedgerLock(data, executionId, plan, reviewOwnership)
     })
+  }
+
+  async snapshotPreparedLeases(): Promise<
+    ReadonlyArray<{ readonly executionId: string; readonly leaseExpiresAt: number }>
+  > {
+    return this.coordinator.requestExclusive(this.lockName, async () => {
+      const data = this.loadData()
+      const leases: Array<{ executionId: string; leaseExpiresAt: number }> = []
+      for (const [executionId, record] of Object.entries(data.records)) {
+        if (record.state !== 'PREPARED' || record.reviewLeaseExpiresAt === undefined) {
+          continue
+        }
+        leases.push({ executionId, leaseExpiresAt: record.reviewLeaseExpiresAt })
+      }
+      return leases
+    })
+  }
+
+  async tryRecoverAbandonedPrepared(
+    executionId: string
+  ): Promise<'reclaimed' | 'still_live' | 'not_prepared'> {
+    const attempt = await this.coordinator.tryExclusive(executionReviewLockName(executionId), async () => {
+      return this.coordinator.requestExclusive(this.lockName, async () => {
+        const data = this.loadData()
+        const record = data.records[executionId]
+        if (!record || record.state !== 'PREPARED') {
+          return 'not_prepared' as const
+        }
+        const now = this.clock()
+        if ((record.reviewLeaseExpiresAt ?? 0) > now) {
+          return 'still_live' as const
+        }
+        this.assertTransition(record.state, 'EXPIRED')
+        this.releaseOutpoints(data, executionId, record.reservedOutpoints)
+        data.records[executionId] = {
+          ...record,
+          state: 'EXPIRED',
+          uncertainReason:
+            'Abandoned PREPARED review: lease expired and review lock was acquired. Outpoints released.',
+          failedAt: now,
+          reservedOutpoints: [],
+          reviewOwnerId: record.reviewOwnerId,
+          reviewLeaseExpiresAt: record.reviewLeaseExpiresAt,
+          reviewLeaseGeneration: record.reviewLeaseGeneration
+        }
+        this.saveData(data)
+        return 'reclaimed' as const
+      })
+    })
+    if (!attempt.acquired) {
+      return 'still_live'
+    }
+    return attempt.result
   }
 
   async renewReviewLease(params: {

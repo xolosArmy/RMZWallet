@@ -42,6 +42,8 @@ export type WalletExecutionErrorCode =
   | 'DUPLICATE_UTXO_OUTPOINT'
   | 'EXECUTION_BINDING_MISMATCH'
   | 'REVIEW_LEASE_REJECTED'
+  | 'COMPOSITION_DISPOSED'
+  | 'LOCK_ORDER_VIOLATION'
 
 export class WalletExecutionError extends Error {
   readonly code: WalletExecutionErrorCode

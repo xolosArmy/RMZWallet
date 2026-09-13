@@ -147,6 +147,14 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
         clear: vi.fn(),
         length: 0,
         key: vi.fn()
+      },
+      lockCoordinator: {
+        async requestExclusive<T>(_lockName: string, operation: () => Promise<T>): Promise<T> {
+          return operation()
+        },
+        async tryExclusive<T>(_lockName: string, operation: () => Promise<T>) {
+          return { acquired: true as const, result: await operation() }
+        }
       }
     }
     const publicEngine = PublicModuleExports.createAgentWalletExecutionEngine(dummyConfig)
@@ -206,9 +214,23 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     const engineSource = readFileSync(join(__dirname, 'engine.ts'), 'utf-8')
     expect(engineSource).toMatch(/trusted\?\.privateSettlementStorage/)
     expect(engineSource).not.toMatch(/config\.storage \?\? \(typeof localStorage/)
+    expect(engineSource).not.toMatch(/export function createWalletExecutionComposition/)
+    expect(engineSource).not.toMatch(/export \{ createWalletExecutionComposition/)
+
+    const runtimeSource = readFileSync(
+      join(__dirname, '../../internal/agentWalletExecutionHost/trustedWalletExecutionRuntime.tsx'),
+      'utf-8'
+    )
+    expect(runtimeSource).toMatch(/trusted\?\.privateSettlementStorage/)
+    expect(runtimeSource).not.toMatch(/export function createWalletExecutionComposition/)
+    expect(runtimeSource).not.toMatch(/export \{[^}]*createWalletExecutionComposition/)
+    expect(runtimeSource).toMatch(/function createWalletExecutionComposition\(/)
 
     const mainSource = readFileSync(join(__dirname, '../../main.tsx'), 'utf-8')
     expect(mainSource).toContain('TrustedWalletExecutionProvider')
+    expect(mainSource).toContain('createProductionWalletRuntime')
+    expect(mainSource).toContain('TrustedGate2bToC2Bridge')
+    expect(mainSource).toContain('productionWalletRuntime?.approvalLedger')
   })
 
   it('verifies WalletExecutionLedger never carries signed transaction bytes', () => {
@@ -318,11 +340,17 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     }
     expect((hostModule as Record<string, unknown>).storeInternalSignedTransaction).toBeUndefined()
     expect((hostModule as Record<string, unknown>).persistVerifiedSignedTransactionOnce).toBeUndefined()
+    expect((hostModule as Record<string, unknown>).createWalletExecutionComposition).toBeUndefined()
+    expect(Object.keys(hostModule)).not.toContain('createWalletExecutionComposition')
 
     const engineModule = await import('./engine')
     expect((engineModule as Record<string, unknown>).storeInternalSignedTransaction).toBeUndefined()
     expect((engineModule as Record<string, unknown>).persistVerifiedSignedTransactionOnce).toBeUndefined()
     expect((engineModule as Record<string, unknown>).writeSignedTransaction).toBeUndefined()
+    expect((engineModule as Record<string, unknown>).createWalletExecutionComposition).toBeUndefined()
+    expect(Object.keys(engineModule)).toContain('createAgentWalletExecutionEngine')
+    expect(Object.keys(engineModule)).not.toContain('createWalletExecutionComposition')
+    expect(Object.keys(engineModule)).not.toContain('TrustedWalletExecutionProvider')
 
     const dir = __dirname
     const productionFiles = readdirSync(dir).filter(
@@ -382,5 +410,35 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(fakeSession.confirm).toBeUndefined()
     expect(fakeSession.sign).toBeUndefined()
     expect(fakeSession.execute).toBeUndefined()
+  })
+
+  it('rejects Agent-facing deep import of the composition factory at import level', async () => {
+    const publicModule = await import('./index')
+    const engineModule = await import('./engine')
+    const hostModule = await import('../../internal/agentWalletExecutionHost')
+    const runtimeModule = await import('../../internal/agentWalletExecutionHost/trustedWalletExecutionRuntime')
+    const providerModule = await import(
+      '../../internal/agentWalletExecutionHost/TrustedWalletExecutionProvider'
+    )
+
+    expect('createWalletExecutionComposition' in publicModule).toBe(false)
+    expect('createWalletExecutionComposition' in engineModule).toBe(false)
+    expect('createWalletExecutionComposition' in hostModule).toBe(false)
+    expect('createWalletExecutionComposition' in runtimeModule).toBe(false)
+    expect('createWalletExecutionComposition' in providerModule).toBe(false)
+    expect((runtimeModule as { createWalletExecutionComposition?: unknown }).createWalletExecutionComposition)
+      .toBeUndefined()
+
+    const hostDir = join(__dirname, '../../internal/agentWalletExecutionHost')
+    const hostFiles = readdirSync(hostDir).filter(
+      f => (f.endsWith('.ts') || f.endsWith('.tsx')) && !f.endsWith('.test.ts') && !f.endsWith('.test.tsx')
+    )
+    const exportFactory = /export\s+(?:async\s+)?function\s+createWalletExecutionComposition\b/
+    const exportNamed = /export\s+\{[^}]*\bcreateWalletExecutionComposition\b/
+    for (const file of hostFiles) {
+      const content = readFileSync(join(hostDir, file), 'utf-8')
+      expect(exportFactory.test(content), `exported factory in ${file}`).toBe(false)
+      expect(exportNamed.test(content), `re-exported factory in ${file}`).toBe(false)
+    }
   })
 })

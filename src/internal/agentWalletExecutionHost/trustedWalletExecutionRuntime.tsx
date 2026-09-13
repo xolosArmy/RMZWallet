@@ -1,0 +1,1549 @@
+/**
+ * @file trustedWalletExecutionRuntime.ts
+ *
+ * TRUSTED WALLET EXECUTION RUNTIME (Gate C2)
+ *
+ * The composition factory is FILE-LOCAL. It is not exported from this module,
+ * engine.ts, the public agentWalletExecution barrel, or the host barrel.
+ * Only TrustedWalletExecutionProvider (same trusted bootstrap) constructs
+ * walletUIHost / controller / private settlement persistence.
+ *
+ * Agent/public callers receive AgentWalletExecutionEngine only.
+ */
+
+import { useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from 'react'
+import { fromHex, Script, toHex, toHexRev, Tx, TxBuilder } from 'ecash-lib'
+import { humanApprovalV1Schema, type HumanApprovalV1 } from '@xolosarmy/tonalli-core'
+import { AgentExecutionReviewModal } from '../../components/agentExecution/AgentExecutionReviewModal'
+import { createProductionWalletRuntime } from './productionWalletAdapters'
+import { WalletExecutionError } from '../../features/agentWalletExecution/errors'
+import {
+  DEFAULT_REVIEW_LEASE_TTL_SECONDS,
+  DurableTransactionalExecutionLedger,
+  WebLocksExecutionCoordinator
+} from '../../features/agentWalletExecution/ledger'
+import {
+  assertUniqueUtxoOutpoints,
+  buildPreparedExecutionPlan,
+  computeCanonicalPlanHash,
+  DEFAULT_FEE_POLICY,
+  snapshotOwnedUtxos,
+  validateOutputInvariants
+} from '../../features/agentWalletExecution/plan'
+import type {
+  AgentWalletExecutionEngine,
+  AgentWalletExecutionEngineConfig,
+  ExecutionNetwork,
+  PublicExecutionStatus,
+  SignedExecutionHandle,
+  WalletExecutionLedger,
+  WalletExecutionReviewSession,
+  WalletExecutionReviewSnapshot,
+  WalletFeePolicy,
+  WalletPreparedExecutionPlan,
+  WalletExecutionTrustedOptions
+} from '../../features/agentWalletExecution/types'
+import type {
+  WalletExecutionComposition,
+  WalletExecutionUIHost,
+  WalletLocalConfirmationController
+} from './types'
+import {
+  TrustedWalletExecutionContext,
+  type TrustedWalletExecutionContextValue
+} from './TrustedWalletExecutionContext'
+import {
+  DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY,
+  DEFAULT_SETTLEMENT_STORE_LOCK_NAME
+} from '../settlementStore'
+
+const TEST_ONLY_CREATE_WALLET_EXECUTION_COMPOSITION = Symbol.for(
+  'rmzwallet.testOnly.createWalletExecutionComposition'
+)
+
+// Module-private symbols for closure-encapsulated capabilities
+const INTERNAL_CAPABILITY_TOKEN = Symbol('WalletExecutionCapabilityToken')
+const LOCAL_CONFIRMATION_TOKEN = Symbol('LocalExecutionConfirmationToken')
+
+interface ExecutionCapabilityBindings {
+  readonly capabilityId: string
+  readonly approvalId: string
+  readonly requestId: string
+  readonly intentId: string
+  readonly decisionId: string
+  readonly approvalStatus: 'approved'
+  readonly approver: string
+  readonly destination: string
+  readonly amountSats: bigint
+  readonly network: ExecutionNetwork
+  readonly contentHash: string
+  readonly effectiveExpiresAt: number
+}
+
+class InternalWalletExecutionCapability {
+  readonly capabilityId: string
+  readonly approvalId: string
+  readonly requestId: string
+  readonly intentId: string
+  readonly decisionId: string
+  readonly approvalStatus: 'approved'
+  readonly approver: string
+  readonly destination: string
+  readonly amountSats: bigint
+  readonly network: ExecutionNetwork
+  readonly contentHash: string
+  readonly effectiveExpiresAt: number
+
+  private _boundPlanHash: string | null = null
+  private _consumed = false
+  private _invalidated = false
+
+  constructor(token: symbol, bindings: ExecutionCapabilityBindings) {
+    if (token !== INTERNAL_CAPABILITY_TOKEN) {
+      throw new WalletExecutionError(
+        'INVALID_RECEIPT',
+        'Direct construction of WalletExecutionCapability is prohibited.'
+      )
+    }
+
+    this.capabilityId = bindings.capabilityId
+    this.approvalId = bindings.approvalId
+    this.requestId = bindings.requestId
+    this.intentId = bindings.intentId
+    this.decisionId = bindings.decisionId
+    this.approvalStatus = bindings.approvalStatus
+    this.approver = bindings.approver
+    this.destination = bindings.destination
+    this.amountSats = bindings.amountSats
+    this.network = bindings.network
+    this.contentHash = bindings.contentHash
+    this.effectiveExpiresAt = bindings.effectiveExpiresAt
+  }
+
+  get isConsumed(): boolean {
+    return this._consumed
+  }
+
+  get isInvalidated(): boolean {
+    return this._invalidated
+  }
+
+  get boundPlanHash(): string | null {
+    return this._boundPlanHash
+  }
+
+  bindPlan(plan: WalletPreparedExecutionPlan): void {
+    if (this._consumed || this._invalidated) {
+      throw new WalletExecutionError('DUPLICATE_EXECUTION', 'Execution capability is not active.')
+    }
+    if (this._boundPlanHash !== null) {
+      throw new WalletExecutionError('DUPLICATE_EXECUTION', 'Plan has already been bound to this capability.')
+    }
+    if (plan.approvalId !== this.approvalId || plan.requestId !== this.requestId) {
+      throw new WalletExecutionError('PLAN_HASH_MISMATCH', 'Plan does not match capability approval or request bindings.')
+    }
+    this._boundPlanHash = plan.planHash
+  }
+
+  consume(): void {
+    if (this._consumed || this._invalidated) {
+      throw new WalletExecutionError(
+        'DUPLICATE_EXECUTION',
+        'Execution capability has already been consumed or invalidated. Replay is strictly prohibited.'
+      )
+    }
+    this._consumed = true
+  }
+
+  invalidate(): void {
+    this._invalidated = true
+  }
+}
+
+class InternalLocalExecutionConfirmationToken {
+  readonly executionId: string
+  private _consumed = false
+
+  constructor(token: symbol, executionId: string) {
+    if (token !== LOCAL_CONFIRMATION_TOKEN) {
+      throw new WalletExecutionError(
+        'LOCAL_CONFIRMATION_REQUIRED',
+        'Direct construction of LocalExecutionConfirmationToken is prohibited.'
+      )
+    }
+    this.executionId = executionId
+  }
+
+  get isConsumed(): boolean {
+    return this._consumed
+  }
+
+  consume(): void {
+    if (this._consumed) {
+      throw new WalletExecutionError(
+        'DUPLICATE_EXECUTION',
+        'Local confirmation token has already been consumed. Replay is prohibited.'
+      )
+    }
+    this._consumed = true
+  }
+}
+
+function formatBigIntToExactXEC(sats: bigint): string {
+  if (sats < 0n) {
+    throw new Error(`[formatBigIntToExactXEC] Negative satoshis not supported: ${sats}`)
+  }
+  const whole = sats / 100n
+  const fraction = sats % 100n
+  const fractionStr = fraction.toString().padStart(2, '0')
+  return `${whole.toString()}.${fractionStr} XEC`
+}
+
+function canonicalPrevoutTxidHex(txid: string | Uint8Array): string {
+  if (typeof txid === 'string') {
+    return txid.toLowerCase()
+  }
+  return toHexRev(txid).toLowerCase()
+}
+
+function parseCanonicalHumanApproval(value: unknown): HumanApprovalV1 {
+  try {
+    return humanApprovalV1Schema.parse(value) as HumanApprovalV1
+  } catch (err) {
+    throw new WalletExecutionError(
+      'INVALID_RECEIPT',
+      `Value is not a canonical HumanApprovalV1: ${err instanceof Error ? err.message : String(err)}`,
+      err
+    )
+  }
+}
+
+function canonicalApprovedAmountSats(amountSats: string | bigint | number): bigint {
+  try {
+    const parsed = BigInt(amountSats)
+    if (parsed <= 0n) {
+      throw new Error('amountSats must be strictly positive')
+    }
+    return parsed
+  } catch (err) {
+    throw new WalletExecutionError(
+      'APPROVAL_FIELD_MISMATCH',
+      `Authoritative ledger amountSats is not a canonical positive integer: ${String(amountSats)}`,
+      err
+    )
+  }
+}
+
+/**
+ * Independently deserialize raw signed transaction hex with the canonical ecash-lib parser.
+ * The signer-returned object is not an authority source.
+ */
+function parseRawSignedTransaction(rawSignedTxHex: string): Tx {
+  if (typeof rawSignedTxHex !== 'string' || rawSignedTxHex.length < 2 || rawSignedTxHex.length % 2 !== 0) {
+    throw new WalletExecutionError(
+      'SIGNING_UNCERTAIN',
+      'Signed transaction bytes could not be parsed by the canonical transaction parser.'
+    )
+  }
+  try {
+    return Tx.fromHex(rawSignedTxHex)
+  } catch (err) {
+    throw new WalletExecutionError(
+      'SIGNING_UNCERTAIN',
+      'Signed transaction bytes could not be parsed by the canonical transaction parser.',
+      err
+    )
+  }
+}
+
+/**
+ * Verify ALL post-sign fields against the Wallet-owned immutable plan.
+ * Comparison uses only the independently parsed transaction.
+ */
+function assertParsedTransactionMatchesPlan(parsedTx: Tx, plan: WalletPreparedExecutionPlan): void {
+  if (parsedTx.version !== plan.transactionVersion) {
+    throw new WalletExecutionError(
+      'SIGNED_TRANSACTION_MISMATCH',
+      `Signed tx version ${parsedTx.version} !== plan ${plan.transactionVersion}`
+    )
+  }
+  if (parsedTx.locktime !== plan.locktime) {
+    throw new WalletExecutionError(
+      'SIGNED_TRANSACTION_MISMATCH',
+      `Signed tx locktime ${parsedTx.locktime} !== plan ${plan.locktime}`
+    )
+  }
+  if (parsedTx.inputs.length !== plan.inputs.length) {
+    throw new WalletExecutionError(
+      'SIGNED_TRANSACTION_MISMATCH',
+      `Signed tx input count ${parsedTx.inputs.length} !== plan ${plan.inputs.length}`
+    )
+  }
+  for (let i = 0; i < plan.inputs.length; i++) {
+    const txInput = parsedTx.inputs[i]
+    const planInput = plan.inputs[i]
+    const txPrevTxid = canonicalPrevoutTxidHex(txInput.prevOut.txid)
+    if (txPrevTxid !== planInput.txid.toLowerCase()) {
+      throw new WalletExecutionError(
+        'SIGNED_TRANSACTION_MISMATCH',
+        `Signed tx input ${i} prevout txid "${txPrevTxid}" !== plan "${planInput.txid}"`
+      )
+    }
+    if (txInput.prevOut.outIdx !== planInput.outIdx) {
+      throw new WalletExecutionError(
+        'SIGNED_TRANSACTION_MISMATCH',
+        `Signed tx input ${i} outIdx ${txInput.prevOut.outIdx} !== plan ${planInput.outIdx}`
+      )
+    }
+  }
+  if (parsedTx.outputs.length !== plan.outputs.length) {
+    throw new WalletExecutionError(
+      'SIGNED_TRANSACTION_MISMATCH',
+      `Signed tx output count ${parsedTx.outputs.length} !== plan ${plan.outputs.length}`
+    )
+  }
+  for (let j = 0; j < plan.outputs.length; j++) {
+    const txOutput = parsedTx.outputs[j]
+    const planOutput = plan.outputs[j]
+    const txSats = txOutput.sats ?? (txOutput as { value?: bigint }).value
+    if (BigInt(txSats) !== BigInt(planOutput.sats)) {
+      throw new WalletExecutionError(
+        'SIGNED_TRANSACTION_MISMATCH',
+        `Signed tx output ${j} sats ${txSats} !== plan ${planOutput.sats}`
+      )
+    }
+    const txScriptHex = toHex(txOutput.script.bytecode).toLowerCase()
+    if (txScriptHex !== planOutput.scriptHex.toLowerCase()) {
+      throw new WalletExecutionError(
+        'SIGNED_TRANSACTION_MISMATCH',
+        `Signed tx output ${j} script "${txScriptHex}" !== plan "${planOutput.scriptHex}"`
+      )
+    }
+  }
+}
+
+function createWalletExecutionComposition(
+  config: AgentWalletExecutionEngineConfig,
+  trusted?: WalletExecutionTrustedOptions
+): WalletExecutionComposition {
+  const {
+    approvalLedger,
+    sessionVerifier,
+    utxoProvider,
+    signatoryProvider,
+    clock,
+    idGenerator
+  } = config
+
+  const getNow = clock ?? (() => Math.floor(Date.now() / 1000))
+  const createId = idGenerator ?? (() => globalThis.crypto.randomUUID())
+  const feePolicy: WalletFeePolicy = {
+    ...DEFAULT_FEE_POLICY,
+    ...(config.feePolicy ?? {})
+  }
+
+  // Durable execution ledger by default
+  const executionLedger: WalletExecutionLedger =
+    config.executionLedger ??
+    new DurableTransactionalExecutionLedger({
+      storage: config.storage,
+      lockCoordinator: config.lockCoordinator,
+      clock: getNow
+    })
+
+  const ledgerReady = executionLedger.whenReady()
+  ledgerReady.catch(() => {
+    // Callers of prepareExecution/confirm still await ledgerReady and observe the error.
+  })
+  const reviewOwnerId = `review_${createId()}`
+  const reviewLeaseTtlSeconds = trusted?.reviewLeaseTtlSeconds ?? DEFAULT_REVIEW_LEASE_TTL_SECONDS
+  const reviewHeartbeatMs = trusted?.reviewHeartbeatMs ?? 10_000
+  let reviewLeaseGeneration = 1
+  let reviewLockRelease: (() => void) | null = null
+  let reviewHeartbeatTimer: ReturnType<typeof setInterval> | null = null
+  let recoveryTimer: ReturnType<typeof setTimeout> | null = null
+  let disposed = false
+  let signingCriticalSectionActive = false
+
+  /**
+   * Wallet-private write-once persistence. NEVER uses Agent-injectable config.storage.
+   * Constructed only from trusted Wallet bootstrap options or origin localStorage.
+   */
+  async function persistVerifiedSignedTransactionOnce(
+    executionId: string,
+    rawSignedTxHex: string
+  ): Promise<void> {
+    const targetStorage =
+      trusted?.privateSettlementStorage ??
+      (typeof localStorage !== 'undefined' ? localStorage : undefined)
+    if (!targetStorage) {
+      throw new WalletExecutionError(
+        'STORAGE_UNAVAILABLE',
+        'No durable settlement storage available. Raw signed transactions cannot be persisted.'
+      )
+    }
+    const coordinator = config.lockCoordinator ?? new WebLocksExecutionCoordinator()
+    await coordinator.requestExclusive(DEFAULT_SETTLEMENT_STORE_LOCK_NAME, async () => {
+      const raw = targetStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
+      let store: Record<string, string> = {}
+      if (raw) {
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(raw)
+        } catch (err) {
+          throw new WalletExecutionError(
+            'STORAGE_MUTATION_FAILED',
+            `Failed to parse settlement store payload: ${err instanceof Error ? err.message : String(err)}`
+          )
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new WalletExecutionError(
+            'STORAGE_MUTATION_FAILED',
+            'Settlement store payload is not a JSON object.'
+          )
+        }
+        store = parsed as Record<string, string>
+      }
+      if (Object.prototype.hasOwnProperty.call(store, executionId)) {
+        throw new WalletExecutionError(
+          'SETTLEMENT_ARTIFACT_ALREADY_EXISTS',
+          `A raw signed transaction already exists for execution "${executionId}". Write-once violation.`
+        )
+      }
+      store[executionId] = rawSignedTxHex
+      try {
+        targetStorage.setItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY, JSON.stringify(store))
+      } catch (err) {
+        throw new WalletExecutionError(
+          'STORAGE_MUTATION_FAILED',
+          `Failed to store settlement transaction: ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+      const confirmedRaw = targetStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
+      if (!confirmedRaw) {
+        throw new WalletExecutionError(
+          'STORAGE_MUTATION_FAILED',
+          'Settlement persistence confirmation failed: store is empty after write.'
+        )
+      }
+      const confirmed = JSON.parse(confirmedRaw) as Record<string, string>
+      if (confirmed[executionId] !== rawSignedTxHex) {
+        throw new WalletExecutionError(
+          'STORAGE_MUTATION_FAILED',
+          'Settlement persistence confirmation failed: stored artifact does not match verified bytes.'
+        )
+      }
+    })
+  }
+
+  // Synchronous single-flight lock guards
+  let isPreparing = false
+  let activeExecutionId: string | null = null
+  let activeCapability: InternalWalletExecutionCapability | null = null
+  let activePlan: WalletPreparedExecutionPlan | null = null
+  let activeController: WalletLocalConfirmationController | null = null
+
+  const sessionPreparedListeners = new Set<
+    (session: WalletExecutionReviewSession, controller: WalletLocalConfirmationController) => void
+  >()
+
+  function stopReviewHeartbeat(): void {
+    if (reviewHeartbeatTimer !== null) {
+      clearInterval(reviewHeartbeatTimer)
+      reviewHeartbeatTimer = null
+    }
+  }
+
+  function cancelScheduledRecovery(): void {
+    if (recoveryTimer !== null) {
+      clearTimeout(recoveryTimer)
+      recoveryTimer = null
+    }
+  }
+
+  function endLiveReview(): void {
+    stopReviewHeartbeat()
+    reviewLockRelease?.()
+    reviewLockRelease = null
+  }
+
+  function schedulePreparedRecovery(): void {
+    cancelScheduledRecovery()
+    if (disposed) return
+    void (async () => {
+      try {
+        await ledgerReady
+        const leases = await executionLedger.snapshotPreparedLeases()
+        if (disposed || leases.length === 0) return
+        const now = getNow()
+        const earliest = Math.min(...leases.map(lease => lease.leaseExpiresAt))
+        const rawDelay = (earliest - now) * 1000 + 25
+        const delayMs = Math.max(25, Math.min(rawDelay, 2_147_000_000))
+        recoveryTimer = setTimeout(() => {
+          void runScheduledRecovery()
+        }, delayMs)
+      } catch {
+        // Recovery is best-effort; the next prepare/conflict path still reclaims.
+      }
+    })()
+  }
+
+  async function runScheduledRecovery(): Promise<void> {
+    if (disposed) return
+    try {
+      const leases = await executionLedger.snapshotPreparedLeases()
+      const now = getNow()
+      for (const lease of leases) {
+        if (disposed) return
+        if (lease.leaseExpiresAt > now) continue
+        await executionLedger.tryRecoverAbandonedPrepared(lease.executionId)
+      }
+    } finally {
+      if (!disposed) {
+        schedulePreparedRecovery()
+      }
+    }
+  }
+
+  function disposeComposition(): void {
+    if (disposed) return
+    disposed = true
+    isPreparing = false
+    cancelScheduledRecovery()
+    stopReviewHeartbeat()
+    sessionPreparedListeners.clear()
+    const controller = activeController
+    if (controller) {
+      activeController = null
+    }
+    if (!signingCriticalSectionActive) {
+      endLiveReview()
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+    }
+  }
+
+  async function beginLiveReview(executionId: string): Promise<void> {
+    endLiveReview()
+    let acquired!: () => void
+    const acquiredPromise = new Promise<void>(resolve => {
+      acquired = resolve
+    })
+    const hold = new Promise<void>(resolve => {
+      reviewLockRelease = resolve
+    })
+    void executionLedger.runWithReviewLock(executionId, async () => {
+      acquired()
+      await hold
+    })
+    await acquiredPromise
+    if (disposed) {
+      endLiveReview()
+      return
+    }
+    stopReviewHeartbeat()
+    reviewHeartbeatTimer = setInterval(() => {
+      if (disposed) {
+        stopReviewHeartbeat()
+        return
+      }
+      void executionLedger
+        .renewReviewLease({
+          executionId,
+          ownerId: reviewOwnerId,
+          generation: reviewLeaseGeneration,
+          now: getNow(),
+          leaseTtlSeconds: reviewLeaseTtlSeconds
+        })
+        .then(next => {
+          reviewLeaseGeneration = next.generation
+        })
+        .catch(() => {
+          stopReviewHeartbeat()
+        })
+    }, reviewHeartbeatMs)
+  }
+
+  async function executeSigningWithConfirmation(
+    executionId: string,
+    token: unknown
+  ): Promise<SignedExecutionHandle> {
+    // 1. Verify token is a valid, unconsumed local confirmation token
+    if (
+      !(token instanceof InternalLocalExecutionConfirmationToken) ||
+      token.executionId !== executionId
+    ) {
+      throw new WalletExecutionError(
+        'LOCAL_CONFIRMATION_REQUIRED',
+        'Valid Wallet-local confirmation token required for signing.'
+      )
+    }
+
+    if (token.isConsumed) {
+      throw new WalletExecutionError(
+        'DUPLICATE_EXECUTION',
+        'Confirmation token has already been consumed.'
+      )
+    }
+
+    if (disposed) {
+      throw new WalletExecutionError(
+        'COMPOSITION_DISPOSED',
+        'Trusted Wallet execution composition has been disposed. Confirmation is no longer valid.'
+      )
+    }
+
+    await ledgerReady
+
+    // Canonical handoff: review lock remains held. Signing lock is acquired next.
+    // Review lock is released only after durable SIGNING is committed.
+    return executionLedger.runWithSigningLock(executionId, async () => {
+    signingCriticalSectionActive = true
+    try {
+    // 2. Look up current ledger state
+    const currentRecord = await executionLedger.get(executionId)
+    const currentStatus = currentRecord ? (currentRecord.status ?? (currentRecord as any).state) : undefined
+    if (!currentRecord || currentStatus !== 'PREPARED') {
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      activeController = null
+      throw new WalletExecutionError(
+        'INVALID_STATE_TRANSITION',
+        `Cannot execute signing from record state "${currentStatus}". Expected "PREPARED".`
+      )
+    }
+
+    // 3. Verify single-flight ownership
+    if (activeExecutionId !== executionId || !activeCapability || !activePlan) {
+      throw new WalletExecutionError(
+        'CONCURRENT_EXECUTION_ACTIVE',
+        `Execution "${executionId}" is not the currently active execution session.`
+      )
+    }
+
+    const capability = activeCapability
+    const plan = activePlan
+
+    if (capability.isConsumed || capability.isInvalidated) {
+      throw new WalletExecutionError(
+        'DUPLICATE_EXECUTION',
+        'Execution capability has already been consumed or invalidated.'
+      )
+    }
+
+    const confirmNow = getNow()
+
+    if (confirmNow >= capability.effectiveExpiresAt) {
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      activeController = null
+      capability.invalidate()
+      await executionLedger.markExpired(executionId, 'Approval expired during review', confirmNow)
+      throw new WalletExecutionError('APPROVAL_EXPIRED', 'Approval expired during review.')
+    }
+
+    // 5. Revalidate active custodian session immediately before signing
+    const preSignSession = await sessionVerifier.verifyActiveSession()
+    if (!preSignSession.authenticated || !preSignSession.activeAddress) {
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      await executionLedger.markFailed(executionId, 'Session unauthenticated before signing', confirmNow)
+      throw new WalletExecutionError(
+        'SESSION_REVALIDATION_FAILED',
+        'Custodian session revalidation failed before signing.'
+      )
+    }
+
+    if (preSignSession.activeAddress !== plan.fromAddress) {
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      await executionLedger.markFailed(executionId, 'Session address changed before signing', confirmNow)
+      throw new WalletExecutionError(
+        'SESSION_ADDRESS_MISMATCH',
+        `Session address changed to "${preSignSession.activeAddress}" before signing.`
+      )
+    }
+
+    // 6. Re-read and revalidate UTXOs immediately before signing
+    const latestUtxos = await utxoProvider.getSpendableUtxos(plan.fromAddress)
+    for (const planInput of plan.inputs) {
+      const match = latestUtxos.find(
+        u => u.txid === planInput.txid && u.outIdx === planInput.outIdx && u.sats === planInput.sats
+      )
+      if (!match) {
+        activeExecutionId = null
+        activeCapability = null
+        activePlan = null
+        await executionLedger.markFailed(executionId, 'Selected UTXO is no longer spendable', confirmNow)
+        throw new WalletExecutionError(
+          'UTXO_SELECTION_STALE',
+          `Selected input ${planInput.txid}:${planInput.outIdx} is no longer spendable.`
+        )
+      }
+    }
+
+    // 7. Anti-TOCTOU: Re-verify output invariants and re-verify plan hash
+    validateOutputInvariants(
+      plan,
+      {
+        destination: currentRecord.destination,
+        amountSats: currentRecord.amountSats,
+        fromAddress: currentRecord.fromAddress,
+        network: 'xec:mainnet'
+      },
+      feePolicy
+    )
+
+    const recomputedPlanHash = computeCanonicalPlanHash(plan)
+    if (recomputedPlanHash !== plan.planHash || capability.boundPlanHash !== plan.planHash) {
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      await executionLedger.markFailed(executionId, 'Plan hash mismatch detected', confirmNow)
+      throw new WalletExecutionError(
+        'PLAN_HASH_MISMATCH',
+        'Plan hash mismatch. Transaction plan was modified.'
+      )
+    }
+
+    try {
+      assertUniqueUtxoOutpoints(plan.inputs)
+    } catch (dupErr) {
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      activeController = null
+      capability.invalidate()
+      await executionLedger.markFailed(
+        executionId,
+        dupErr instanceof Error ? dupErr.message : String(dupErr),
+        getNow()
+      )
+      throw dupErr
+    }
+
+    try {
+      await executionLedger.transitionToSigningIfValid({
+        executionId,
+        plan,
+        effectiveExpiresAt: capability.effectiveExpiresAt,
+        now: getNow
+      })
+    } catch (transitionErr) {
+      if (transitionErr instanceof WalletExecutionError && transitionErr.code === 'APPROVAL_EXPIRED') {
+        activeExecutionId = null
+        activeCapability = null
+        activePlan = null
+        activeController = null
+        capability.invalidate()
+      }
+      throw transitionErr
+    }
+
+    // Durable SIGNING is committed. Release review ownership only now.
+    endLiveReview()
+
+    // 9. Wallet-owned signing. The signer-returned object is discarded as an authority source.
+    let rawSignedTxHex: string
+    try {
+      let signerReturned: { ser: () => Uint8Array }
+      if (typeof (signatoryProvider as any).signTransaction === 'function') {
+        const txBuilder = new TxBuilder({
+          version: plan.transactionVersion,
+          locktime: plan.locktime,
+          inputs: plan.inputs.map(input => ({
+            input: {
+              prevOut: { txid: input.txid, outIdx: input.outIdx },
+              signData: {
+                sats: input.sats,
+                outputScript: new Script(fromHex(input.lockingScriptHex))
+              }
+            }
+          })),
+          outputs: plan.outputs.map(output => ({
+            sats: output.sats,
+            script: new Script(fromHex(output.scriptHex))
+          }))
+        })
+
+        signerReturned = await (signatoryProvider as any).signTransaction(txBuilder)
+      } else {
+        const sigResult = await signatoryProvider.getSignatory(plan.fromAddress)
+        const signatory =
+          sigResult && typeof sigResult === 'object' && 'signatory' in sigResult
+            ? sigResult.signatory
+            : sigResult
+
+        if (!signatory) {
+          throw new Error('Signatory provider returned null or undefined signatory.')
+        }
+
+        const txBuilder = new TxBuilder({
+          version: plan.transactionVersion,
+          locktime: plan.locktime,
+          inputs: plan.inputs.map(input => ({
+            input: {
+              prevOut: { txid: input.txid, outIdx: input.outIdx },
+              signData: {
+                sats: input.sats,
+                outputScript: new Script(fromHex(input.lockingScriptHex))
+              }
+            },
+            signatory
+          })),
+          outputs: plan.outputs.map(output => ({
+            sats: output.sats,
+            script: new Script(fromHex(output.scriptHex))
+          }))
+        })
+
+        signerReturned = txBuilder.sign()
+      }
+
+      if (!signerReturned || typeof signerReturned.ser !== 'function') {
+        throw new Error('Signing provider did not return a serializable transaction.')
+      }
+      rawSignedTxHex = toHex(signerReturned.ser())
+    } catch (signErr) {
+      await executionLedger.markSigningUncertain(
+        executionId,
+        signErr instanceof Error ? signErr.message : String(signErr),
+        getNow()
+      )
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      throw new WalletExecutionError(
+        'SIGNING_UNCERTAIN',
+        'Signing error occurred. Execution marked SIGNING_UNCERTAIN to prevent automated duplicate signing.',
+        signErr
+      )
+    }
+
+    // 10. Independently deserialize raw bytes. Do not trust signer-returned collections.
+    let parsedSignedTx: Tx
+    try {
+      parsedSignedTx = parseRawSignedTransaction(rawSignedTxHex)
+    } catch (parseErr) {
+      const parseReason = parseErr instanceof Error ? parseErr.message : String(parseErr)
+      await executionLedger.markSigningUncertain(executionId, parseReason, getNow())
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      if (parseErr instanceof WalletExecutionError && parseErr.code === 'SIGNING_UNCERTAIN') {
+        throw parseErr
+      }
+      throw new WalletExecutionError(
+        'SIGNING_UNCERTAIN',
+        'Signed transaction bytes could not be parsed. No SignedExecutionHandle was issued.',
+        parseErr
+      )
+    }
+
+    try {
+      assertParsedTransactionMatchesPlan(parsedSignedTx, plan)
+    } catch (verifyErr) {
+      const mismatchReason = verifyErr instanceof Error ? verifyErr.message : String(verifyErr)
+      await executionLedger.markSigningUncertain(executionId, mismatchReason, getNow())
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      if (verifyErr instanceof WalletExecutionError && verifyErr.code === 'SIGNED_TRANSACTION_MISMATCH') {
+        throw verifyErr
+      }
+      throw new WalletExecutionError(
+        'SIGNED_TRANSACTION_MISMATCH',
+        `Post-sign verification failed: ${mismatchReason}`
+      )
+    }
+
+    // 11. Persist verified raw bytes write-once under settlement-store exclusive lock BEFORE SIGNED.
+    try {
+      await persistVerifiedSignedTransactionOnce(executionId, rawSignedTxHex)
+    } catch (persistErr) {
+      const persistReason = persistErr instanceof Error ? persistErr.message : String(persistErr)
+      await executionLedger.markSigningUncertain(executionId, persistReason, getNow())
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      throw new WalletExecutionError(
+        'SIGNING_UNCERTAIN',
+        'Raw signed transaction persistence failed after signing. Execution marked SIGNING_UNCERTAIN; automatic re-sign is prohibited.',
+        persistErr
+      )
+    }
+
+    // 12. Only after durable raw-tx persistence: transition SIGNING → SIGNED.
+    const signedAt = getNow()
+    try {
+      await executionLedger.transitionToSigned(executionId, signedAt)
+    } catch (commitErr) {
+      const commitReason = commitErr instanceof Error ? commitErr.message : String(commitErr)
+      try {
+        await executionLedger.markSigningUncertain(executionId, commitReason, getNow())
+      } catch {
+        // If the ledger cannot move off SIGNING, restart reconciliation still fail-closes.
+      }
+      activeExecutionId = null
+      activeCapability = null
+      activePlan = null
+      throw new WalletExecutionError(
+        'SIGNING_UNCERTAIN',
+        'Durable SIGNED transition failed after raw-tx persistence. Automatic re-sign is prohibited.',
+        commitErr
+      )
+    }
+
+    // Consume capability & release single-flight lock
+    capability.consume()
+    activeExecutionId = null
+    activeCapability = null
+    activePlan = null
+
+    // 13. Return opaque SignedExecutionHandle. STOP. Zero broadcast. No raw-tx read/write API.
+    return Object.freeze({
+      executionId,
+      approvalId: plan.approvalId,
+      requestId: plan.requestId,
+      status: 'SIGNED',
+      planHash: plan.planHash,
+      signedAt
+    })
+    } finally {
+      signingCriticalSectionActive = false
+    }
+    })
+  }
+
+  async function prepareExecution(receiptInput: unknown): Promise<WalletExecutionReviewSession> {
+    // 1. Synchronous single-flight reservation check BEFORE any await (P1-1)
+    if (disposed) {
+      throw new WalletExecutionError(
+        'COMPOSITION_DISPOSED',
+        'Trusted Wallet execution composition has been disposed. New prepared sessions are prohibited.'
+      )
+    }
+    if (isPreparing || activeExecutionId !== null) {
+      throw new WalletExecutionError(
+        'CONCURRENT_EXECUTION_ACTIVE',
+        'An execution review session is already active or being prepared.'
+      )
+    }
+    isPreparing = true
+
+    try {
+      await ledgerReady
+
+      // 2. Parse the incoming value with the canonical HumanApprovalV1 schema only.
+      const receipt = parseCanonicalHumanApproval(receiptInput)
+
+      if (receipt.status !== 'approved') {
+        throw new WalletExecutionError(
+          'RECEIPT_NOT_APPROVED',
+          `Cannot prepare execution for receipt status "${receipt.status}". Only approved receipts are executable.`
+        )
+      }
+
+      const now = getNow()
+
+      // 3. Look up immutable approval record in approval ledger
+      const record = await approvalLedger.get(receipt.requestId)
+      if (!record) {
+        throw new WalletExecutionError(
+          'APPROVAL_NOT_FOUND',
+          `No recorded approval found for requestId "${receipt.requestId}".`
+        )
+      }
+
+      const recordedHumanApproval = parseCanonicalHumanApproval(record.humanApproval)
+
+      // Authoritative Gate 2B decision must be approved. Rejected ledger records never execute,
+      // even if a caller mutates only the externally supplied receipt status.
+      if (record.status !== 'approved') {
+        throw new WalletExecutionError(
+          'RECEIPT_NOT_APPROVED',
+          `Authoritative WalletApprovalLedgerRecord status is "${record.status}". Rejected decisions cannot execute.`
+        )
+      }
+      if (recordedHumanApproval.status !== 'approved') {
+        throw new WalletExecutionError(
+          'RECEIPT_NOT_APPROVED',
+          `Authoritative stored HumanApprovalV1 status is "${recordedHumanApproval.status}". Rejected decisions cannot execute.`
+        )
+      }
+
+      if (record.network !== 'xec:mainnet') {
+        throw new WalletExecutionError(
+          'UNSUPPORTED_NETWORK',
+          `Network "${record.network}" is not supported. Only "xec:mainnet" is supported.`
+        )
+      }
+
+      // 4. Verify active custodian session
+      const activeWalletSession = await sessionVerifier.verifyActiveSession()
+      if (!activeWalletSession.authenticated || !activeWalletSession.activeAddress) {
+        throw new WalletExecutionError(
+          'SESSION_REVALIDATION_FAILED',
+          `Active wallet session unauthenticated: ${activeWalletSession.error ?? 'unknown error'}.`
+        )
+      }
+
+      if (activeWalletSession.activeAddress !== record.fromAddress) {
+        throw new WalletExecutionError(
+          'SESSION_ADDRESS_MISMATCH',
+          `Active wallet session address "${activeWalletSession.activeAddress}" does not match approved fromAddress "${record.fromAddress}".`
+        )
+      }
+
+      // 5. At-most-once check: verify approval has not already been reserved or executed
+      const existingByApproval = await executionLedger.getByApprovalId(record.approvalId)
+      if (existingByApproval) {
+        const status = existingByApproval.status ?? (existingByApproval as { state?: string }).state
+        throw new WalletExecutionError(
+          'DUPLICATE_EXECUTION',
+          `Execution already initiated for approvalId "${record.approvalId}" in state "${status}".`
+        )
+      }
+
+      const existingByRequest = await executionLedger.getByRequestId(record.requestId)
+      if (existingByRequest) {
+        const status = existingByRequest.status ?? (existingByRequest as { state?: string }).state
+        throw new WalletExecutionError(
+          'DUPLICATE_EXECUTION',
+          `Execution already initiated for requestId "${record.requestId}" in state "${status}".`
+        )
+      }
+
+      // 6. Bind canonical HumanApprovalV1 fields to the authoritative ledger record.
+      if (receipt.approvalId !== record.approvalId || receipt.approvalId !== recordedHumanApproval.approvalId) {
+        throw new WalletExecutionError(
+          'APPROVAL_FIELD_MISMATCH',
+          `approvalId mismatch: receipt "${receipt.approvalId}" !== ledger "${record.approvalId}".`
+        )
+      }
+      if (receipt.requestId !== record.requestId || receipt.requestId !== recordedHumanApproval.requestId) {
+        throw new WalletExecutionError(
+          'APPROVAL_FIELD_MISMATCH',
+          `requestId mismatch: receipt "${receipt.requestId}" !== ledger "${record.requestId}".`
+        )
+      }
+      if (receipt.intentId !== record.intentId || receipt.intentId !== recordedHumanApproval.intentId) {
+        throw new WalletExecutionError(
+          'APPROVAL_FIELD_MISMATCH',
+          `intentId mismatch: receipt "${receipt.intentId}" !== ledger "${record.intentId}".`
+        )
+      }
+      if (receipt.decisionId !== record.decisionId || receipt.decisionId !== recordedHumanApproval.decisionId) {
+        throw new WalletExecutionError(
+          'APPROVAL_FIELD_MISMATCH',
+          `decisionId mismatch: receipt "${receipt.decisionId}" !== ledger "${record.decisionId}".`
+        )
+      }
+      if (receipt.approver !== record.fromAddress || recordedHumanApproval.approver !== record.fromAddress) {
+        throw new WalletExecutionError(
+          'APPROVAL_FIELD_MISMATCH',
+          `approver mismatch: receipt "${receipt.approver}" !== ledger "${record.fromAddress}".`
+        )
+      }
+      if (receipt.recordedAt !== record.recordedAt || receipt.recordedAt !== recordedHumanApproval.recordedAt) {
+        throw new WalletExecutionError(
+          'APPROVAL_FIELD_MISMATCH',
+          `recordedAt mismatch: receipt ${receipt.recordedAt} !== ledger ${record.recordedAt}.`
+        )
+      }
+      if (now >= record.effectiveExpiresAt) {
+        throw new WalletExecutionError(
+          'APPROVAL_EXPIRED',
+          `Approval expired at ${record.effectiveExpiresAt}; current time is ${now}.`
+        )
+      }
+
+      const approvedAmountSats = canonicalApprovedAmountSats(record.amountSats)
+
+      // 7. Mint module-private execution capability
+      const capabilityId = `exec_cap_${createId()}`
+      const capability = new InternalWalletExecutionCapability(INTERNAL_CAPABILITY_TOKEN, {
+        capabilityId,
+        approvalId: record.approvalId,
+        requestId: record.requestId,
+        intentId: record.intentId,
+        decisionId: record.decisionId,
+        approvalStatus: 'approved',
+        approver: record.fromAddress,
+        destination: record.destination,
+        amountSats: approvedAmountSats,
+        network: 'xec:mainnet',
+        contentHash: record.contentHash,
+        effectiveExpiresAt: record.effectiveExpiresAt
+      })
+
+      // 8. Atomically reserve execution in durable ledger
+      const executionId = `exec_${createId()}`
+      await executionLedger.reserveExecutionAtomic({
+        executionId,
+        approvalId: record.approvalId,
+        requestId: record.requestId,
+        intentId: record.intentId,
+        decisionId: record.decisionId,
+        fromAddress: record.fromAddress,
+        destination: record.destination,
+        amountSats: approvedAmountSats,
+        network: 'xec:mainnet',
+        reservedAt: now
+      })
+
+      // 9. Read UTXOs and immediately take a Wallet-owned frozen snapshot.
+      const availableUtxos = snapshotOwnedUtxos(await utxoProvider.getSpendableUtxos(record.fromAddress))
+
+      // 10. Build immutable execution plan from the Wallet-owned snapshot.
+      let plan: WalletPreparedExecutionPlan
+      try {
+        plan = buildPreparedExecutionPlan({
+          approved: {
+            approvalId: record.approvalId,
+            requestId: record.requestId,
+            intentId: record.intentId,
+            fromAddress: record.fromAddress,
+            destination: record.destination,
+            amountSats: approvedAmountSats
+          },
+          availableUtxos,
+          feePolicy
+        })
+        } catch (planErr) {
+          await executionLedger.markFailed(
+            executionId,
+            planErr instanceof Error ? planErr.message : String(planErr),
+            getNow()
+          )
+          throw planErr
+        }
+
+        // 11. Bind plan to capability and atomically reserve outpoints + PREPARED.
+        capability.bindPlan(plan)
+        try {
+          reviewLeaseGeneration = 1
+          const committedLease = await executionLedger.setPlanPrepared(executionId, plan, {
+            ownerId: reviewOwnerId,
+            generation: reviewLeaseGeneration,
+            leaseTtlSeconds: reviewLeaseTtlSeconds
+          })
+          reviewLeaseGeneration = committedLease.generation
+        } catch (preparedErr) {
+          await executionLedger.markFailed(
+            executionId,
+            preparedErr instanceof Error ? preparedErr.message : String(preparedErr),
+            getNow()
+          )
+          throw preparedErr
+        }
+
+        // 12. Construct human-readable review snapshot
+        const review: WalletExecutionReviewSnapshot = Object.freeze({
+          recipient: plan.destination,
+          amountXEC: formatBigIntToExactXEC(plan.paymentAmountSats),
+          amountSats: plan.paymentAmountSats.toString(),
+          feeXEC: formatBigIntToExactXEC(plan.feeSats),
+          feeSats: plan.feeSats.toString(),
+          totalDebitXEC: formatBigIntToExactXEC(plan.paymentAmountSats + plan.feeSats),
+          totalDebitSats: (plan.paymentAmountSats + plan.feeSats).toString(),
+          fundingAddress: plan.fromAddress,
+          network: 'xec:mainnet',
+          approvalId: plan.approvalId,
+          requestId: plan.requestId,
+          intentId: plan.intentId,
+          planHash: plan.planHash
+        })
+
+        // Set active single-flight state
+        activeExecutionId = executionId
+        activeCapability = capability
+        activePlan = plan
+
+        // 13. Construct review-only session (P0-3: NO signing method on session!)
+        const session: WalletExecutionReviewSession = Object.freeze({
+          executionId,
+          plan,
+          review,
+          rejectExecution: async (reason?: string): Promise<void> => {
+            endLiveReview()
+            if (activeExecutionId === executionId) {
+              activeExecutionId = null
+              activeCapability = null
+              activePlan = null
+              activeController = null
+            }
+            capability.invalidate()
+            await executionLedger.markRejected(
+              executionId,
+              reason ?? 'Execution rejected by human custodian.',
+              getNow()
+            )
+          },
+          dismiss: async (): Promise<void> => {
+            endLiveReview()
+            if (activeExecutionId === executionId) {
+              activeExecutionId = null
+              activeCapability = null
+              activePlan = null
+              activeController = null
+            }
+            capability.invalidate()
+            // P0-4: Dismiss durably transitions execution to terminal REJECTED
+            await executionLedger.markRejected(
+              executionId,
+              'Execution dismissed by custodian.',
+              getNow()
+            )
+          }
+        })
+
+        // Wallet-owned local confirmation controller (strictly closure-confined to Wallet UI composition)
+        const localController: WalletLocalConfirmationController = Object.freeze({
+          executionId,
+          confirm: async (): Promise<SignedExecutionHandle> => {
+            if (disposed) {
+              throw new WalletExecutionError(
+                'COMPOSITION_DISPOSED',
+                'Local confirmation controller was invalidated. Stale confirm() is prohibited.'
+              )
+            }
+            const token = new InternalLocalExecutionConfirmationToken(
+              LOCAL_CONFIRMATION_TOKEN,
+              executionId
+            )
+            return executeSigningWithConfirmation(executionId, token)
+          },
+          reject: async (reason?: string): Promise<void> => {
+            return session.rejectExecution(reason)
+          },
+          dismiss: async (): Promise<void> => {
+            return session.dismiss()
+          }
+        })
+
+        activeController = localController
+        await beginLiveReview(executionId)
+        schedulePreparedRecovery()
+
+        // Dispatch to Wallet UI host listeners
+        for (const listener of sessionPreparedListeners) {
+          try {
+            listener(session, localController)
+          } catch (err) {
+            console.error('Wallet UI host onSessionPrepared listener failed:', err)
+          }
+        }
+
+        return session
+      } finally {
+        isPreparing = false
+      }
+    }
+
+    async function getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined> {
+      const record = await executionLedger.get(executionId)
+      if (!record) return undefined
+
+      // P0-2: Strip raw signed tx hex from public status
+      return Object.freeze({
+        executionId: record.executionId,
+        approvalId: record.approvalId,
+        requestId: record.requestId,
+        intentId: record.intentId,
+        decisionId: record.decisionId,
+        fromAddress: record.fromAddress,
+        destination: record.destination,
+        amountSats: record.amountSats,
+        network: record.network,
+        status: record.status ?? (record as any).state,
+        planHash: record.planHash,
+        uncertainReason: record.uncertainReason,
+        reservedAt: record.reservedAt,
+        preparedAt: record.preparedAt,
+        signingAt: record.signingAt,
+        signedAt: record.signedAt,
+        failedAt: record.failedAt
+      })
+    }
+
+    const publicEngine: AgentWalletExecutionEngine = Object.freeze({
+      prepareExecution,
+      getExecutionStatus
+    })
+
+    const walletUIHost: WalletExecutionUIHost = Object.freeze({
+      onSessionPrepared(
+        handler: (
+          session: WalletExecutionReviewSession,
+          localController: WalletLocalConfirmationController
+        ) => void
+      ): () => void {
+        sessionPreparedListeners.add(handler)
+        return () => {
+          sessionPreparedListeners.delete(handler)
+        }
+      },
+      getActiveController(): WalletLocalConfirmationController | undefined {
+        if (disposed) return undefined
+        return activeController ?? undefined
+      }
+    })
+
+    void ledgerReady.then(() => {
+      schedulePreparedRecovery()
+    })
+
+    return {
+      publicEngine,
+      walletUIHost,
+      dispose: disposeComposition
+    }
+  }
+
+  /**
+   * Helper that returns the public Agent-facing engine.
+   * Strictly exposes NO confirm, sign, execute, local confirmation controller, or dispose.
+   */
+  export function createAgentWalletExecutionEngine(
+    config: AgentWalletExecutionEngineConfig
+  ): AgentWalletExecutionEngine {
+    return createWalletExecutionComposition(config).publicEngine
+  }
+
+  if (import.meta.env?.VITEST) {
+    Object.defineProperty(globalThis, TEST_ONLY_CREATE_WALLET_EXECUTION_COMPOSITION, {
+      value: createWalletExecutionComposition,
+      configurable: true,
+      enumerable: false,
+      writable: false
+    })
+  }
+
+export interface TrustedWalletExecutionProviderProps {
+  readonly children: ReactNode
+  readonly approvalLedger?: AgentWalletExecutionEngineConfig['approvalLedger']
+  readonly executionLedger?: AgentWalletExecutionEngineConfig['executionLedger']
+  readonly sessionVerifier?: AgentWalletExecutionEngineConfig['sessionVerifier']
+  readonly utxoProvider?: AgentWalletExecutionEngineConfig['utxoProvider']
+  readonly signatoryProvider?: AgentWalletExecutionEngineConfig['signatoryProvider']
+  readonly feePolicy?: AgentWalletExecutionEngineConfig['feePolicy']
+  readonly lockCoordinator?: AgentWalletExecutionEngineConfig['lockCoordinator']
+  readonly clock?: AgentWalletExecutionEngineConfig['clock']
+  readonly idGenerator?: AgentWalletExecutionEngineConfig['idGenerator']
+  /**
+   * Public execution-ledger Storage only. NEVER used for raw signed transactions.
+   */
+  readonly ledgerStorage?: Storage
+  /**
+   * Trusted-bootstrap-only settlement persistence. Not part of AgentWalletExecutionEngineConfig.
+   */
+  readonly trustedSettlementStorage?: Storage
+  readonly reviewLeaseTtlSeconds?: number
+  readonly reviewHeartbeatMs?: number
+}
+
+interface ShellSlot {
+  composition: WalletExecutionComposition
+  refs: number
+  disposeScheduled: boolean
+}
+
+let shellSlot: ShellSlot | null = null
+
+export function resetTrustedExecutionShellForTests(): void {
+  if (shellSlot) {
+    try {
+      shellSlot.composition.dispose()
+    } catch {
+      // Test reset must not throw from a previous composition.
+    }
+  }
+  shellSlot = null
+}
+
+function getOrCreateShell(
+  publicConfig: AgentWalletExecutionEngineConfig,
+  trusted: WalletExecutionTrustedOptions
+): WalletExecutionComposition {
+  if (!shellSlot) {
+    shellSlot = {
+      composition: createWalletExecutionComposition(publicConfig, trusted),
+      refs: 0,
+      disposeScheduled: false
+    }
+  }
+  return shellSlot.composition
+}
+
+function releaseShell(): void {
+  if (!shellSlot) return
+  shellSlot.refs -= 1
+  if (shellSlot.refs > 0) return
+  const slot = shellSlot
+  slot.disposeScheduled = true
+  queueMicrotask(() => {
+    if (shellSlot !== slot || shellSlot.refs > 0) {
+      slot.disposeScheduled = false
+      return
+    }
+    slot.composition.dispose()
+    if (shellSlot === slot) {
+      shellSlot = null
+    }
+  })
+}
+
+/**
+ * Trusted Wallet application-shell bootstrap. Owns composition creation in a
+ * file-local closure. Agent/public code never receives the factory.
+ */
+export function TrustedWalletExecutionProvider({
+  children,
+  approvalLedger,
+  executionLedger,
+  sessionVerifier,
+  utxoProvider,
+  signatoryProvider,
+  feePolicy,
+  lockCoordinator,
+  clock,
+  idGenerator,
+  ledgerStorage,
+  trustedSettlementStorage,
+  reviewLeaseTtlSeconds,
+  reviewHeartbeatMs
+}: TrustedWalletExecutionProviderProps): ReactElement {
+  const productionRuntime = useMemo(() => {
+    const testsSupplyAdapters = Boolean(
+      approvalLedger ||
+        executionLedger ||
+        sessionVerifier ||
+        utxoProvider ||
+        signatoryProvider ||
+        lockCoordinator ||
+        ledgerStorage ||
+        trustedSettlementStorage
+    )
+    if (testsSupplyAdapters) {
+      return null
+    }
+    return createProductionWalletRuntime()
+  }, [
+    approvalLedger,
+    executionLedger,
+    sessionVerifier,
+    utxoProvider,
+    signatoryProvider,
+    lockCoordinator,
+    ledgerStorage,
+    trustedSettlementStorage
+  ])
+
+  const resolvedApprovalLedger = approvalLedger ?? productionRuntime?.approvalLedger
+  const resolvedSessionVerifier = sessionVerifier ?? productionRuntime?.sessionVerifier
+  const resolvedUtxoProvider = utxoProvider ?? productionRuntime?.utxoProvider
+  const resolvedSignatoryProvider = signatoryProvider ?? productionRuntime?.signatoryProvider
+  const resolvedLedgerStorage = ledgerStorage ?? productionRuntime?.ledgerStorage
+  const resolvedSettlementStorage =
+    trustedSettlementStorage ?? productionRuntime?.trustedSettlementStorage
+
+  const c2Enabled = Boolean(
+    resolvedApprovalLedger &&
+      resolvedSessionVerifier &&
+      resolvedUtxoProvider &&
+      resolvedSignatoryProvider
+  )
+
+  const settlementStorageRef = useRef<Storage | undefined>(resolvedSettlementStorage)
+  const compositionRef = useRef<WalletExecutionComposition | null>(null)
+  if (c2Enabled && compositionRef.current === null) {
+    compositionRef.current = getOrCreateShell(
+      {
+        approvalLedger: resolvedApprovalLedger!,
+        executionLedger,
+        sessionVerifier: resolvedSessionVerifier!,
+        utxoProvider: resolvedUtxoProvider!,
+        signatoryProvider: resolvedSignatoryProvider!,
+        feePolicy,
+        storage: resolvedLedgerStorage,
+        lockCoordinator,
+        clock,
+        idGenerator
+      },
+      {
+        privateSettlementStorage:
+          settlementStorageRef.current ??
+          (typeof localStorage !== 'undefined' ? localStorage : undefined),
+        reviewLeaseTtlSeconds,
+        reviewHeartbeatMs
+      }
+    )
+  }
+  const composition = compositionRef.current
+
+  const [session, setSession] = useState<WalletExecutionReviewSession | null>(null)
+  const [controller, setController] = useState<WalletLocalConfirmationController | null>(null)
+
+  useEffect(() => {
+    if (!composition) {
+      return
+    }
+    if (shellSlot) {
+      shellSlot.refs += 1
+      shellSlot.disposeScheduled = false
+    }
+    const unsubscribe = composition.walletUIHost.onSessionPrepared((nextSession, nextController) => {
+      setSession(nextSession)
+      setController(nextController)
+    })
+    return () => {
+      unsubscribe()
+      releaseShell()
+    }
+  }, [composition])
+
+  const clearActiveReview = () => {
+    setSession(null)
+    setController(null)
+  }
+
+  const contextValue = useMemo<TrustedWalletExecutionContextValue>(
+    () => ({
+      publicEngine: composition?.publicEngine ?? null
+    }),
+    [composition]
+  )
+
+  const bound =
+    session !== null && controller !== null && controller.executionId === session.executionId
+
+  if (!c2Enabled) {
+    return (
+      <TrustedWalletExecutionContext.Provider value={{ publicEngine: null }}>
+        {children}
+      </TrustedWalletExecutionContext.Provider>
+    )
+  }
+
+  return (
+    <TrustedWalletExecutionContext.Provider value={contextValue}>
+      {children}
+      {bound && session && controller ? (
+        <AgentExecutionReviewModal
+          session={session}
+          controller={controller}
+          isOpen={true}
+          onExecutionSuccess={clearActiveReview}
+          onExecutionRejected={clearActiveReview}
+          onClose={clearActiveReview}
+        />
+      ) : null}
+    </TrustedWalletExecutionContext.Provider>
+  )
+}

@@ -5,18 +5,40 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { createWalletExecutionComposition } from './index'
+import './trustedWalletExecutionRuntime'
+import * as HostBarrel from './index'
 import * as PublicBarrel from '../../features/agentWalletExecution'
+import type { WalletExecutionComposition } from './types'
+import type {
+  AgentWalletExecutionEngineConfig,
+  WalletExecutionTrustedOptions
+} from '../../features/agentWalletExecution/types'
 import { MockStorage, TestExecutionLockCoordinator } from '../../features/agentWalletExecution/testUtils'
 import { DurableTransactionalExecutionLedger } from '../../features/agentWalletExecution/ledger'
 
+const createWalletExecutionComposition = (
+  config: AgentWalletExecutionEngineConfig,
+  trusted?: WalletExecutionTrustedOptions
+): WalletExecutionComposition => {
+  const factory = (globalThis as Record<symbol, unknown>)[
+    Symbol.for('rmzwallet.testOnly.createWalletExecutionComposition')
+  ]
+  if (typeof factory !== 'function') {
+    throw new Error('Test-only composition factory is not registered.')
+  }
+  return (factory as typeof createWalletExecutionComposition)(config, trusted)
+}
+
 describe('Trusted Wallet UI Execution Host (src/internal/agentWalletExecutionHost)', () => {
-  it('confirms createWalletExecutionComposition is available from internal host but NOT from public barrel', () => {
-    expect(typeof createWalletExecutionComposition).toBe('function')
-    expect((PublicBarrel as any).createWalletExecutionComposition).toBeUndefined()
-    expect((PublicBarrel as any).WalletExecutionComposition).toBeUndefined()
-    expect((PublicBarrel as any).WalletExecutionUIHost).toBeUndefined()
-    expect((PublicBarrel as any).WalletLocalConfirmationController).toBeUndefined()
+  it('does not export createWalletExecutionComposition from the host barrel or public barrel', () => {
+    expect((HostBarrel as { createWalletExecutionComposition?: unknown }).createWalletExecutionComposition)
+      .toBeUndefined()
+    expect((PublicBarrel as { createWalletExecutionComposition?: unknown }).createWalletExecutionComposition)
+      .toBeUndefined()
+    expect((PublicBarrel as { WalletExecutionComposition?: unknown }).WalletExecutionComposition).toBeUndefined()
+    expect((PublicBarrel as { WalletExecutionUIHost?: unknown }).WalletExecutionUIHost).toBeUndefined()
+    expect((PublicBarrel as { WalletLocalConfirmationController?: unknown }).WalletLocalConfirmationController)
+      .toBeUndefined()
   })
 
   it('delivers local confirmation controller exclusively to walletUIHost listener', async () => {
@@ -24,7 +46,7 @@ describe('Trusted Wallet UI Execution Host (src/internal/agentWalletExecutionHos
     const lockCoordinator = new TestExecutionLockCoordinator()
     const executionLedger = new DurableTransactionalExecutionLedger({ storage, lockCoordinator })
 
-    const dummyConfig: any = {
+    const dummyConfig: AgentWalletExecutionEngineConfig = {
       approvalLedger: {
         get: vi.fn(),
         getByApprovalId: vi.fn()
@@ -42,20 +64,21 @@ describe('Trusted Wallet UI Execution Host (src/internal/agentWalletExecutionHos
       signatoryProvider: {
         getSignatory: vi.fn()
       },
-      storage
+      storage,
+      lockCoordinator
     }
 
     const composition = createWalletExecutionComposition(dummyConfig)
 
-    // Public engine has NO controller accessors or confirm/sign methods
-    expect((composition.publicEngine as any).walletUIHost).toBeUndefined()
-    expect((composition.publicEngine as any).getActiveController).toBeUndefined()
-    expect((composition.publicEngine as any).confirm).toBeUndefined()
-    expect((composition.publicEngine as any).sign).toBeUndefined()
+    expect((composition.publicEngine as { walletUIHost?: unknown }).walletUIHost).toBeUndefined()
+    expect((composition.publicEngine as { getActiveController?: unknown }).getActiveController).toBeUndefined()
+    expect((composition.publicEngine as { confirm?: unknown }).confirm).toBeUndefined()
+    expect((composition.publicEngine as { sign?: unknown }).sign).toBeUndefined()
+    expect((composition.publicEngine as { dispose?: unknown }).dispose).toBeUndefined()
 
-    // Host provides onSessionPrepared and getActiveController
     expect(typeof composition.walletUIHost.onSessionPrepared).toBe('function')
     expect(typeof composition.walletUIHost.getActiveController).toBe('function')
     expect(composition.walletUIHost.getActiveController()).toBeUndefined()
+    expect(typeof composition.dispose).toBe('function')
   })
 })

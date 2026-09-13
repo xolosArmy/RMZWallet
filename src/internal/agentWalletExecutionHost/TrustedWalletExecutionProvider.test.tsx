@@ -18,6 +18,7 @@ import {
   DurableTransactionalExecutionLedger
 } from '../../features/agentWalletExecution/ledger'
 import { MockStorage, TestExecutionLockCoordinator } from '../../features/agentWalletExecution/testUtils'
+import { DurableWalletApprovalLedger } from './durableWalletApprovalLedger'
 import type { AgentWalletExecutionEngine } from '../../features/agentWalletExecution'
 import { DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY } from '../settlementStore'
 
@@ -217,21 +218,45 @@ describe('TrustedWalletExecutionProvider production shell (Gate C2)', () => {
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 
+  function testPorts(lockCoordinator: TestExecutionLockCoordinator, ledgerStorage: MockStorage) {
+    return {
+      approvalLedger: {
+        async get() {
+          return undefined
+        }
+      },
+      sessionVerifier: {
+        async verifyActiveSession() {
+          return { authenticated: true, activeAddress: FROM_ADDRESS }
+        }
+      },
+      utxoProvider: {
+        async getSpendableUtxos() {
+          return []
+        }
+      },
+      signatoryProvider: {
+        async getSignatory() {
+          return createSignatory()
+        }
+      },
+      executionLedger: new DurableTransactionalExecutionLedger({
+        storage: ledgerStorage,
+        lockCoordinator,
+        clock: () => CLOCK_NOW
+      }),
+      ledgerStorage,
+      lockCoordinator
+    }
+  }
+
   it('keeps a single composition across StrictMode double mount', async () => {
     const engines: AgentWalletExecutionEngine[] = []
     const ledgerStorage = new MockStorage()
     const lockCoordinator = new TestExecutionLockCoordinator()
     render(
       <StrictMode>
-        <TrustedWalletExecutionProvider
-          executionLedger={new DurableTransactionalExecutionLedger({
-            storage: ledgerStorage,
-            lockCoordinator,
-            clock: () => CLOCK_NOW
-          })}
-          ledgerStorage={ledgerStorage}
-          lockCoordinator={lockCoordinator}
-        >
+        <TrustedWalletExecutionProvider {...testPorts(lockCoordinator, ledgerStorage)}>
           <CaptureEngine onReady={value => engines.push(value)} />
         </TrustedWalletExecutionProvider>
       </StrictMode>
@@ -250,20 +275,110 @@ describe('TrustedWalletExecutionProvider production shell (Gate C2)', () => {
     const ledgerStorage = new MockStorage()
     const lockCoordinator = new TestExecutionLockCoordinator()
     render(
-      <TrustedWalletExecutionProvider
-        executionLedger={new DurableTransactionalExecutionLedger({
-          storage: ledgerStorage,
-          lockCoordinator,
-          clock: () => CLOCK_NOW
-        })}
-        ledgerStorage={ledgerStorage}
-        lockCoordinator={lockCoordinator}
-      >
+      <TrustedWalletExecutionProvider {...testPorts(lockCoordinator, ledgerStorage)}>
         <Probe />
       </TrustedWalletExecutionProvider>
     )
     expect(captured).toEqual({ publicEngine: expect.any(Object) })
     expect((captured as { publicEngine: object }).publicEngine).not.toHaveProperty('walletUIHost')
     expect((captured as { publicEngine: object }).publicEngine).not.toHaveProperty('confirm')
+    expect((captured as { publicEngine: object }).publicEngine).not.toHaveProperty('dispose')
+  })
+
+  it('survives mount then unmount then remount without duplicate heartbeat or durable rejection', async () => {
+    const ledgerStorage = new MockStorage()
+    const settlementStorage = new MockStorage()
+    const lockCoordinator = new TestExecutionLockCoordinator()
+    const ports = testPorts(lockCoordinator, ledgerStorage)
+    const first = render(
+      <TrustedWalletExecutionProvider {...ports} trustedSettlementStorage={settlementStorage}>
+        <CaptureEngine onReady={() => undefined} />
+      </TrustedWalletExecutionProvider>
+    )
+    first.unmount()
+    await Promise.resolve()
+    const engines: AgentWalletExecutionEngine[] = []
+    render(
+      <TrustedWalletExecutionProvider {...ports} trustedSettlementStorage={settlementStorage}>
+        <CaptureEngine onReady={value => engines.push(value)} />
+      </TrustedWalletExecutionProvider>
+    )
+    await waitFor(() => expect(engines.length).toBeGreaterThan(0))
+    expect(engines[0]).not.toHaveProperty('dispose')
+  })
+
+  it('wires a shared durable Gate 2B ledger through production C2 publicEngine to SIGNED', async () => {
+    const approvalStorage = new MockStorage()
+    const lockCoordinator = new TestExecutionLockCoordinator()
+    const approvalLedger = new DurableWalletApprovalLedger({
+      storage: approvalStorage,
+      lockCoordinator
+    })
+    const ledgerStorage = new MockStorage()
+    const settlementStorage = new MockStorage()
+    const executionLedger = new DurableTransactionalExecutionLedger({
+      storage: ledgerStorage,
+      lockCoordinator,
+      clock: () => CLOCK_NOW
+    })
+    let receiverSeq = 0
+    const receiver = createAgentWalletApprovalReceiver({
+      ledger: approvalLedger,
+      sessionVerifier: createMockSessionVerifier(FROM_ADDRESS),
+      clock: () => CLOCK_NOW,
+      idGenerator: () => `prod_${++receiverSeq}`,
+      declaredOrigin: 'https://app.tonalli.cash'
+    })
+    const review = await receiver.prepareHandoff(encodeAgentWalletHandoffV1(REQUEST))
+    const receipt = await receiver.approveHandle(review.handle)
+    expect(await approvalLedger.get(REQUEST.requestId)).toBeDefined()
+
+    let engine: AgentWalletExecutionEngine | null = null
+    render(
+      <TrustedWalletExecutionProvider
+        approvalLedger={approvalLedger}
+        executionLedger={executionLedger}
+        sessionVerifier={{
+          async verifyActiveSession() {
+            return { authenticated: true, activeAddress: FROM_ADDRESS }
+          }
+        }}
+        utxoProvider={{
+          async getSpendableUtxos() {
+            return [
+              {
+                txid: '44'.repeat(32),
+                outIdx: 0,
+                sats: 1_000_000n,
+                lockingScriptHex: toHex(Script.fromAddress(FROM_ADDRESS).bytecode)
+              }
+            ]
+          }
+        }}
+        signatoryProvider={{
+          async getSignatory() {
+            return createSignatory()
+          }
+        }}
+        ledgerStorage={ledgerStorage}
+        trustedSettlementStorage={settlementStorage}
+        lockCoordinator={lockCoordinator}
+        clock={() => CLOCK_NOW}
+        idGenerator={() => 'prod_c2'}
+      >
+        <CaptureEngine onReady={value => { engine = value }} />
+      </TrustedWalletExecutionProvider>
+    )
+    await waitFor(() => expect(engine).not.toBeNull())
+    await engine!.prepareExecution(receipt)
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirmar y Firmar' }))
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull()
+    })
+    const raw = settlementStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
+    expect(raw).toBeTruthy()
+    expect(JSON.parse(raw!)['exec_prod_c2']).toBeDefined()
+    expect((await approvalLedger.get(REQUEST.requestId))?.status).toBe('approved')
   })
 })

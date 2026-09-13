@@ -5,9 +5,40 @@
  * In-memory ledgers and mock storages live strictly in testUtils and are NEVER exported in production index.ts.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { WalletExecutionError } from './errors'
-import { canonicalOutpointKey, VALID_EXECUTION_STATE_TRANSITIONS } from './ledger'
+import {
+  canonicalOutpointKey,
+  DEFAULT_EXECUTION_LOCK_NAME,
+  EXECUTION_REVIEW_LOCK_PREFIX,
+  EXECUTION_SIGNING_LOCK_PREFIX,
+  VALID_EXECUTION_STATE_TRANSITIONS
+} from './ledger'
 import type { ExecutionLockCoordinator } from './ledger'
+import { DEFAULT_SETTLEMENT_STORE_LOCK_NAME } from '../../internal/settlementStore'
+
+const testLockOrderAls = new AsyncLocalStorage<readonly number[]>()
+
+export function testLockRank(lockName: string): number {
+  if (lockName.startsWith(EXECUTION_REVIEW_LOCK_PREFIX)) return 10
+  if (lockName.startsWith(EXECUTION_SIGNING_LOCK_PREFIX)) return 20
+  if (lockName === DEFAULT_EXECUTION_LOCK_NAME) return 30
+  if (lockName === DEFAULT_SETTLEMENT_STORE_LOCK_NAME) return 40
+  return 100
+}
+
+function assertTestLockOrder(lockName: string): void {
+  const held = testLockOrderAls.getStore() ?? []
+  if (held.length === 0) return
+  const rank = testLockRank(lockName)
+  const maxHeld = Math.max(...held)
+  if (rank < maxHeld) {
+    throw new WalletExecutionError(
+      'LOCK_ORDER_VIOLATION',
+      `Forbidden lock order: holding rank ${maxHeld} then acquiring "${lockName}" (rank ${rank}). Canonical order is review → signing → global ledger → settlement.`
+    )
+  }
+}
 import type {
   ExecutionNetwork,
   ExecutionReviewLease,
@@ -26,22 +57,27 @@ export class TestExecutionLockCoordinator implements ExecutionLockCoordinator {
   private readonly queues = new Map<string, Promise<unknown>>()
 
   async requestExclusive<T>(lockName: string, operation: () => Promise<T>): Promise<T> {
-    let resolveQueue: (() => void) | undefined
-    const queuePromise = new Promise<void>(res => {
-      resolveQueue = res
-    })
-    const prevQueue = this.queues.get(lockName) ?? Promise.resolve()
-    this.queues.set(lockName, queuePromise)
+    assertTestLockOrder(lockName)
+    const parentHeld = testLockOrderAls.getStore() ?? []
+    const nextHeld = [...parentHeld, testLockRank(lockName)]
+    return testLockOrderAls.run(nextHeld, async () => {
+      let resolveQueue: (() => void) | undefined
+      const queuePromise = new Promise<void>(res => {
+        resolveQueue = res
+      })
+      const prevQueue = this.queues.get(lockName) ?? Promise.resolve()
+      this.queues.set(lockName, queuePromise)
 
-    await prevQueue
-    try {
-      return await operation()
-    } finally {
-      resolveQueue?.()
-      if (this.queues.get(lockName) === queuePromise) {
-        this.queues.delete(lockName)
+      await prevQueue
+      try {
+        return await operation()
+      } finally {
+        resolveQueue?.()
+        if (this.queues.get(lockName) === queuePromise) {
+          this.queues.delete(lockName)
+        }
       }
-    }
+    })
   }
 
   async tryExclusive<T>(
@@ -89,6 +125,11 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
   private readonly recordsByApprovalId = new Map<string, InternalWalletExecutionRecord>()
   private readonly recordsByRequestId = new Map<string, InternalWalletExecutionRecord>()
   private readonly outpointReservations = new Map<string, string>()
+  private readonly clock: () => number
+
+  constructor(clock?: () => number) {
+    this.clock = clock ?? (() => Math.floor(Date.now() / 1000))
+  }
 
   async whenReady(): Promise<void> {}
 
@@ -163,9 +204,12 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
   async setPlanPrepared(
     executionId: string,
     plan: WalletPreparedExecutionPlan,
-    preparedAt: number,
-    reviewLease: ExecutionReviewLease
-  ): Promise<void> {
+    reviewOwnership: {
+      readonly ownerId: string
+      readonly generation: number
+      readonly leaseTtlSeconds: number
+    }
+  ): Promise<ExecutionReviewLease> {
     const existing = this.recordsByExecutionId.get(executionId)
     if (!existing) {
       throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${executionId}" not found.`)
@@ -174,6 +218,37 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     this.assertTransition(existing.state, 'PREPARED')
 
     const reservedOutpoints = plan.inputs.map(input => canonicalOutpointKey(input.txid, input.outIdx))
+    const recoverableOwners = new Set<string>()
+    for (const key of reservedOutpoints) {
+      const owner = this.outpointReservations.get(key)
+      if (owner && owner !== executionId) {
+        const ownerRecord = this.recordsByExecutionId.get(owner)
+        const now = this.clock()
+        if (
+          ownerRecord &&
+          ownerRecord.state === 'PREPARED' &&
+          (ownerRecord.reviewLeaseExpiresAt ?? 0) <= now
+        ) {
+          recoverableOwners.add(owner)
+          continue
+        }
+        throw new WalletExecutionError(
+          'OUTPOINT_ALREADY_RESERVED',
+          `Outpoint "${key}" is already reserved by execution "${owner}".`
+        )
+      }
+    }
+    if (recoverableOwners.size > 0) {
+      for (const ownerId of recoverableOwners) {
+        const recovered = await this.tryRecoverAbandonedPrepared(ownerId)
+        if (recovered !== 'reclaimed') {
+          throw new WalletExecutionError(
+            'OUTPOINT_ALREADY_RESERVED',
+            `Outpoint is already reserved by execution "${ownerId}" and could not be reclaimed.`
+          )
+        }
+      }
+    }
     for (const key of reservedOutpoints) {
       const owner = this.outpointReservations.get(key)
       if (owner && owner !== executionId) {
@@ -187,12 +262,19 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
       this.outpointReservations.set(key, executionId)
     }
 
+    const freshNow = this.clock()
+    const reviewLease: ExecutionReviewLease = {
+      ownerId: reviewOwnership.ownerId,
+      generation: reviewOwnership.generation,
+      leaseExpiresAt: freshNow + reviewOwnership.leaseTtlSeconds
+    }
+
     const updated: InternalWalletExecutionRecord = Object.freeze({
       ...existing,
       plan,
       planHash: plan.planHash,
       state: 'PREPARED',
-      preparedAt,
+      preparedAt: freshNow,
       reservedOutpoints,
       reviewOwnerId: reviewLease.ownerId,
       reviewLeaseExpiresAt: reviewLease.leaseExpiresAt,
@@ -200,6 +282,46 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     })
 
     this.commitUpdate(updated)
+    return reviewLease
+  }
+
+  async snapshotPreparedLeases(): Promise<
+    ReadonlyArray<{ readonly executionId: string; readonly leaseExpiresAt: number }>
+  > {
+    const leases: Array<{ executionId: string; leaseExpiresAt: number }> = []
+    for (const record of this.recordsByExecutionId.values()) {
+      if (record.state !== 'PREPARED' || record.reviewLeaseExpiresAt === undefined) {
+        continue
+      }
+      leases.push({ executionId: record.executionId, leaseExpiresAt: record.reviewLeaseExpiresAt })
+    }
+    return leases
+  }
+
+  async tryRecoverAbandonedPrepared(
+    executionId: string
+  ): Promise<'reclaimed' | 'still_live' | 'not_prepared'> {
+    const existing = this.recordsByExecutionId.get(executionId)
+    if (!existing || existing.state !== 'PREPARED') {
+      return 'not_prepared'
+    }
+    const now = this.clock()
+    if ((existing.reviewLeaseExpiresAt ?? 0) > now) {
+      return 'still_live'
+    }
+    this.assertTransition(existing.state, 'EXPIRED')
+    this.releaseOwnedOutpoints(executionId, existing.reservedOutpoints)
+    this.commitUpdate(
+      Object.freeze({
+        ...existing,
+        state: 'EXPIRED' as const,
+        uncertainReason:
+          'Abandoned PREPARED review: lease expired and review lock was acquired. Outpoints released.',
+        failedAt: now,
+        reservedOutpoints: []
+      })
+    )
+    return 'reclaimed'
   }
 
   async renewReviewLease(params: {

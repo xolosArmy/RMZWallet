@@ -7,7 +7,11 @@ import App from './App'
 import { WalletProvider } from './context/WalletContext'
 import { TonalliX402ApprovalProvider } from './context/TonalliX402ApprovalContext'
 import { AgentWalletApprovalProvider } from './components/agentApproval/AgentWalletApprovalProvider'
-import { TrustedWalletExecutionProvider } from './internal/agentWalletExecutionHost'
+import {
+  TrustedGate2bToC2Bridge,
+  TrustedWalletExecutionProvider,
+  createProductionWalletRuntime
+} from './internal/agentWalletExecutionHost'
 
 const normalizeExternalSignHashRoute = () => {
   const hash = window.location.hash
@@ -26,21 +30,30 @@ const normalizeExternalSignHashRoute = () => {
 
 normalizeExternalSignHashRoute()
 
+const productionWalletRuntime = createProductionWalletRuntime()
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <BrowserRouter>
       <WalletProvider>
         <TonalliX402ApprovalProvider>
           {/*
-            CANONICAL WALLET-OWNED AGENT APPROVAL PROVIDER (Gate 2B)
-            Explicit Security Boundary:
-            AgentWalletApprovalProvider remains strictly non-operational (fails closed
-            with MISSING_LEDGER_DEPENDENCY) while it does not receive a trusted, durable ledger.
-            Zero in-memory fallback ledger in production.
+            Shared durable WalletApprovalLedger is constructed once and injected
+            into both Gate 2B and Gate C2. If production dependencies cannot be
+            constructed, both remain fail-closed (no empty/throwing C2 defaults).
           */}
-          <TrustedWalletExecutionProvider>
-            <AgentWalletApprovalProvider>
-              <App />
+          <TrustedWalletExecutionProvider
+            approvalLedger={productionWalletRuntime?.approvalLedger}
+            sessionVerifier={productionWalletRuntime?.sessionVerifier}
+            utxoProvider={productionWalletRuntime?.utxoProvider}
+            signatoryProvider={productionWalletRuntime?.signatoryProvider}
+            ledgerStorage={productionWalletRuntime?.ledgerStorage}
+            trustedSettlementStorage={productionWalletRuntime?.trustedSettlementStorage}
+          >
+            <AgentWalletApprovalProvider ledger={productionWalletRuntime?.approvalLedger}>
+              <TrustedGate2bToC2Bridge>
+                <App />
+              </TrustedGate2bToC2Bridge>
             </AgentWalletApprovalProvider>
           </TrustedWalletExecutionProvider>
         </TonalliX402ApprovalProvider>

@@ -12,12 +12,12 @@
  */
 
 import { useState, useEffect, useCallback, type ReactElement } from 'react'
-import {
-  WalletExecutionError,
-  type SignedExecutionHandle,
-  type WalletExecutionReviewSession
-} from '../../features/agentWalletExecution'
-import type { WalletLocalConfirmationController } from '../../internal/agentWalletExecutionHost'
+import { WalletExecutionError } from '../../features/agentWalletExecution/errors'
+import type {
+  SignedExecutionHandle,
+  WalletExecutionReviewSession
+} from '../../features/agentWalletExecution/types'
+import type { WalletLocalConfirmationController } from '../../internal/agentWalletExecutionHost/types'
 
 export interface AgentExecutionReviewModalProps {
   readonly session: WalletExecutionReviewSession

@@ -5,13 +5,11 @@
  *
  * Architectural Boundary:
  * - Strictly internal to the RMZWallet application shell.
- * - Imports engine internals to construct the dual composition:
- *     1. publicEngine: Exposed to Agents/protocols (lacks confirm, sign, execute, controller access).
- *     2. walletUIHost: Confined to trusted Wallet UI modal to receive local confirmation authority.
- * - Public agentWalletExecution barrel NEVER exports this module or its capabilities.
+ * - createWalletExecutionComposition is NOT exported from this barrel,
+ *   engine.ts, or any generic internal barrel.
+ * - Agent/public code receives ONLY publicEngine via TrustedWalletExecutionContext.
  */
 
-export { createWalletExecutionComposition } from '../../features/agentWalletExecution/engine'
 export type {
   WalletLocalConfirmationController,
   WalletExecutionUIHost,
@@ -27,3 +25,7 @@ export {
   useTrustedWalletExecution
 } from './TrustedWalletExecutionContext'
 export type { TrustedWalletExecutionContextValue } from './TrustedWalletExecutionContext'
+export { TrustedGate2bToC2Bridge } from './TrustedGate2bToC2Bridge'
+export { createProductionWalletRuntime } from './productionWalletAdapters'
+export type { ProductionWalletRuntime } from './productionWalletAdapters'
+export { DurableWalletApprovalLedger } from './durableWalletApprovalLedger'
