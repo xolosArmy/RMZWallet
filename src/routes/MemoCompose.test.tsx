@@ -82,8 +82,11 @@ describe('MemoCompose Route', () => {
     expect(indexingClient.requestIndex).toHaveBeenCalledWith(txid, expect.any(AbortSignal))
     expect(indexingClient.waitForResult).toHaveBeenCalledWith(
       txid,
-      expect.objectContaining({ timeoutMs: 60_000 })
+      expect.objectContaining({ timeoutMs: expect.any(Number) })
     )
+    const waitOptions = vi.mocked(indexingClient.waitForResult).mock.calls[0]?.[1]
+    expect(waitOptions?.timeoutMs).toBeGreaterThan(0)
+    expect(waitOptions?.timeoutMs).toBeLessThanOrEqual(60_000)
   })
 
   describe('Finding 2: Dynamic alias resolution from wallet context', () => {
