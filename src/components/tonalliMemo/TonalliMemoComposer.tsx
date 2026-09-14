@@ -8,6 +8,7 @@ import { MemoNftAttachmentCard } from './MemoNftAttachmentCard'
 import { fetchOwnedNfts, type NftAsset } from '../../services/nftService'
 import type { Tm1AttachedNft, Tm1PublisherExecutor } from './types'
 import type { Tm1PublicationRecoveryStore } from '../../integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
+import type { TonalliMemoIndexingClient } from '../../integrations/tonalliMemo/types'
 
 export interface TonalliMemoComposerProps {
   initialMessage?: string
@@ -17,6 +18,8 @@ export interface TonalliMemoComposerProps {
   maxBytes?: number
   executor: Tm1PublisherExecutor
   recoveryStore?: Tm1PublicationRecoveryStore
+  indexingClient?: TonalliMemoIndexingClient
+  indexingTimeoutMs?: number
   onSuccess?: (txid: string) => void
   onError?: (error: Error) => void
   explorerBaseUrl?: string
@@ -35,6 +38,8 @@ export function TonalliMemoComposer({
   maxBytes,
   executor,
   recoveryStore,
+  indexingClient,
+  indexingTimeoutMs,
   onSuccess,
   onError,
   explorerBaseUrl
@@ -46,6 +51,7 @@ export function TonalliMemoComposer({
     verifyOwnership,
     reconcilePending,
     publish,
+    retryIndexing,
     reset
   } = useTm1PublishMachine({
     initialMessage,
@@ -55,6 +61,8 @@ export function TonalliMemoComposer({
     maxBytes,
     executor,
     recoveryStore,
+    indexingClient,
+    indexingTimeoutMs,
     onSuccess,
     onError
   })
@@ -68,7 +76,11 @@ export function TonalliMemoComposer({
     state.phase === 'reconciling' ||
     state.phase === 'verifying_ownership' ||
     state.phase === 'requesting_authorization' ||
-    state.phase === 'broadcasting'
+    state.phase === 'broadcasting' ||
+    state.phase === 'indexing_pending' ||
+    state.phase === 'indexing_delayed' ||
+    state.phase === 'policy_rejected' ||
+    state.phase === 'success'
 
   const handleOpenNftSelector = async () => {
     setIsModalOpen(true)
@@ -154,7 +166,7 @@ export function TonalliMemoComposer({
         <MemoEditor
           value={state.message}
           onChange={setMessage}
-          disabled={isFormDisabled || state.phase === 'success'}
+          disabled={isFormDisabled}
           maxBytes={state.effectiveUserMessageMaxBytes}
           showOverheadDetails={true}
           attachedNftTokenId={state.attachedNft?.tokenId}
@@ -176,7 +188,7 @@ export function TonalliMemoComposer({
                   name: state.attachedNft.name,
                   imageUrl: state.attachedNft.imageUrl
                 }}
-                onRemove={isFormDisabled || state.phase === 'success' ? undefined : () => setAttachedNft(null)}
+                onRemove={isFormDisabled ? undefined : () => setAttachedNft(null)}
               />
             </div>
           ) : (
@@ -184,13 +196,13 @@ export function TonalliMemoComposer({
               type="button"
               className="button button--secondary small"
               onClick={handleOpenNftSelector}
-              disabled={isFormDisabled || state.phase === 'success'}
+              disabled={isFormDisabled}
               data-testid="memo-attach-nft-btn"
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: '0.35rem',
-                cursor: isFormDisabled || state.phase === 'success' ? 'not-allowed' : 'pointer'
+                cursor: isFormDisabled ? 'not-allowed' : 'pointer'
               }}
             >
               <span>📎</span>
@@ -362,10 +374,12 @@ export function TonalliMemoComposer({
         <PublishStateMachineButton
           phase={state.phase}
           onPublish={publish}
+          onRetryIndexing={retryIndexing}
           onReset={reset}
           disabled={!state.isValid || isFormDisabled}
           txid={state.txid}
           error={state.error}
+          policyStatus={state.policyStatus}
           explorerBaseUrl={explorerBaseUrl}
         />
       </div>

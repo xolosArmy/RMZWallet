@@ -13,6 +13,11 @@ import {
   type Tm1PublisherExecutor
 } from './types'
 import * as nftServiceModule from '../../services/nftService'
+import type {
+  TonalliMemoIndexingClient,
+  TonalliMemoIndexingResult,
+  TonalliMemoTxDetail
+} from '../../integrations/tonalliMemo/types'
 
 function createMockExecutor(overrides: Partial<Tm1PublisherExecutor> = {}): Tm1PublisherExecutor {
   return {
@@ -27,6 +32,15 @@ function createMockExecutor(overrides: Partial<Tm1PublisherExecutor> = {}): Tm1P
       submissionId: 'sub-1'
     }),
     ...overrides
+  }
+}
+
+function createMockIndexingClient(
+  results: TonalliMemoIndexingResult[]
+): TonalliMemoIndexingClient {
+  return {
+    requestIndex: vi.fn(async (txid: string) => ({ txid, status: 'queued' as const })),
+    waitForResult: vi.fn(async () => results.shift() ?? { status: 'timed_out' as const })
   }
 }
 
@@ -741,6 +755,141 @@ describe('useTm1PublishMachine Hook', () => {
       // 3. Strict assert: reconciliation notice displays failure warning
       expect(screen.getByTestId('memo-reconciling-state')).toBeDefined()
       expect(screen.getByTestId('reconciliation-error-text').textContent).toContain('STORAGE_UNAVAILABLE')
+    })
+  })
+
+  describe('post-broadcast indexing states', () => {
+    const publishedTxid =
+      'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+    const detail = { txid: publishedTxid } as TonalliMemoTxDetail
+
+    it('requests indexing and reports success only after the feed verifies the TXID', async () => {
+      const executor = createMockExecutor()
+      const indexingClient = createMockIndexingClient([
+        { status: 'verified', detail }
+      ])
+      const onSuccess = vi.fn()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor,
+          indexingClient,
+          initialMessage: 'Indexar esta publicación',
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq',
+          onSuccess
+        })
+      )
+
+      await act(async () => {
+        await result.current.publish()
+      })
+
+      expect(indexingClient.requestIndex).toHaveBeenCalledWith(
+        publishedTxid,
+        expect.any(AbortSignal)
+      )
+      expect(indexingClient.waitForResult).toHaveBeenCalledWith(
+        publishedTxid,
+        expect.objectContaining({ timeoutMs: 60_000 })
+      )
+      expect(result.current.state.phase).toBe('success')
+      expect(onSuccess).toHaveBeenCalledWith(publishedTxid)
+    })
+
+    it('keeps the on-chain TXID and retries indexing without broadcasting again', async () => {
+      const executor = createMockExecutor()
+      const indexingClient = createMockIndexingClient([
+        { status: 'timed_out' },
+        { status: 'verified', detail }
+      ])
+      const onError = vi.fn()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor,
+          indexingClient,
+          indexingTimeoutMs: 25,
+          initialMessage: 'Publicación demorada',
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq',
+          onError
+        })
+      )
+
+      await act(async () => {
+        await result.current.publish()
+      })
+      expect(result.current.state.phase).toBe('indexing_delayed')
+      expect(result.current.state.txid).toBe(publishedTxid)
+      expect(onError).not.toHaveBeenCalled()
+
+      await act(async () => {
+        await result.current.retryIndexing()
+      })
+
+      expect(result.current.state.phase).toBe('success')
+      expect(executor.broadcastAndFinalize).toHaveBeenCalledTimes(1)
+      expect(indexingClient.requestIndex).toHaveBeenCalledTimes(2)
+    })
+
+    it('continues polling when the direct index request fails temporarily', async () => {
+      const executor = createMockExecutor()
+      const indexingClient = createMockIndexingClient([
+        { status: 'verified', detail }
+      ])
+      vi.mocked(indexingClient.requestIndex).mockRejectedValueOnce(
+        new Error('INDEX_REQUEST_UNAVAILABLE')
+      )
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor,
+          indexingClient,
+          initialMessage: 'Recuperable mediante backfill',
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+        })
+      )
+
+      await act(async () => {
+        await result.current.publish()
+      })
+
+      expect(indexingClient.waitForResult).toHaveBeenCalledTimes(1)
+      expect(result.current.state.phase).toBe('success')
+      expect(result.current.state.error).toBeNull()
+    })
+
+    it('distinguishes an unauthorized transaction from an on-chain failure', async () => {
+      const executor = createMockExecutor()
+      const indexingClient = createMockIndexingClient([
+        {
+          status: 'policy_rejected',
+          detail,
+          verificationStatus: 'UNAUTHORIZED'
+        }
+      ])
+      const onSuccess = vi.fn()
+      const onError = vi.fn()
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor,
+          indexingClient,
+          initialMessage: 'Publicación no autorizada',
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq',
+          onSuccess,
+          onError
+        })
+      )
+
+      await act(async () => {
+        await result.current.publish()
+      })
+
+      expect(result.current.state.phase).toBe('policy_rejected')
+      expect(result.current.state.policyStatus).toBe('UNAUTHORIZED')
+      expect(result.current.state.txid).toBe(publishedTxid)
+      expect(onSuccess).not.toHaveBeenCalled()
+      expect(onError).not.toHaveBeenCalled()
     })
   })
 

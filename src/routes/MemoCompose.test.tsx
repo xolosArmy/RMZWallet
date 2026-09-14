@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { MemoCompose } from './MemoCompose'
 import type { Tm1PublisherExecutor } from '../components/tonalliMemo/types'
+import type { TonalliMemoIndexingClient } from '../integrations/tonalliMemo/types'
 
 // Mock TopBar to keep unit tests focused on MemoCompose
 vi.mock('../components/TopBar', () => ({
@@ -48,6 +49,43 @@ afterEach(() => {
 })
 
 describe('MemoCompose Route', () => {
+  it('delivers the broadcast TXID to indexing before reporting feed visibility', async () => {
+    const executor = createMockExecutor()
+    const txid = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+    const indexingClient: TonalliMemoIndexingClient = {
+      requestIndex: vi.fn(async () => ({ txid, status: 'queued' as const })),
+      waitForResult: vi.fn(async () => ({
+        status: 'verified' as const,
+        detail: {} as never
+      }))
+    }
+
+    render(
+      <MemoryRouter initialEntries={['/memo/compose']}>
+        <Routes>
+          <Route
+            path="/memo/compose"
+            element={
+              <MemoCompose executor={executor} indexingClient={indexingClient} />
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    )
+
+    fireEvent.change(screen.getByRole('textbox', { name: /mensaje de tonalli memo/i }), {
+      target: { value: 'Entrega directa del TXID' }
+    })
+    fireEvent.click(await screen.findByTestId('publish-button-idle'))
+
+    expect(await screen.findByTestId('publish-success-card')).toBeTruthy()
+    expect(indexingClient.requestIndex).toHaveBeenCalledWith(txid, expect.any(AbortSignal))
+    expect(indexingClient.waitForResult).toHaveBeenCalledWith(
+      txid,
+      expect.objectContaining({ timeoutMs: 60_000 })
+    )
+  })
+
   describe('Finding 2: Dynamic alias resolution from wallet context', () => {
     it('extracts active alias dynamically from wallet context and passes to composer', () => {
       mockWallet.alias = 'satoshixolos.xec'
@@ -472,4 +510,3 @@ describe('MemoCompose Route', () => {
     })
   })
 })
-

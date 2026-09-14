@@ -80,6 +80,9 @@ export type Tm1PublishPhase =
   | 'verifying_ownership'
   | 'requesting_authorization'
   | 'broadcasting'
+  | 'indexing_pending'
+  | 'indexing_delayed'
+  | 'policy_rejected'
   | 'success'
   | 'error'
 
@@ -141,6 +144,7 @@ export interface Tm1PublishState {
   readonly verificationStatus: Tm1VerificationStatus
   readonly verificationError: string | null
   readonly txid: string | null
+  readonly policyStatus: string | null
   readonly error: string | null
   readonly preview: Tm1Draft02PostPreview | null
   readonly previewData?: Tm1Draft02PostPreview | null
