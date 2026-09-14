@@ -49,6 +49,30 @@ export type TonalliMemoTxDetail = {
   verification: TonalliMemoVerification | null
 }
 
+export type TonalliMemoIndexRequestStatus = 'queued' | 'already_queued' | 'already_indexed'
+
+export type TonalliMemoIndexRequestResult = {
+  txid: string
+  status: TonalliMemoIndexRequestStatus
+}
+
+export type TonalliMemoIndexingResult =
+  | { status: 'verified'; detail: TonalliMemoTxDetail }
+  | {
+      status: 'policy_rejected'
+      detail: TonalliMemoTxDetail
+      verificationStatus: Exclude<TonalliMemoVerificationStatus, 'VERIFIED'>
+    }
+  | { status: 'timed_out' }
+
+export interface TonalliMemoIndexingClient {
+  requestIndex(txid: string, signal?: AbortSignal): Promise<TonalliMemoIndexRequestResult>
+  waitForResult(
+    txid: string,
+    options?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<TonalliMemoIndexingResult>
+}
+
 export type TonalliMemoClientErrorKind = 'network' | 'http' | 'malformed-json' | 'invalid-response'
 
 export class TonalliMemoClientError extends Error {

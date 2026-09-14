@@ -18,7 +18,7 @@ function MemoFeed() {
   const [state, setState] = useState<FeedState>({ status: 'loading', items: [] })
   const [requestId, setRequestId] = useState(0)
 
-  const retry = useCallback(() => {
+  const refresh = useCallback(() => {
     setState((current) => ({ status: 'loading', items: current.items }))
     setRequestId((value) => value + 1)
   }, [])
@@ -59,8 +59,8 @@ function MemoFeed() {
         <div className="quick-actions" aria-label="Acciones del feed Memo">
           <Link className="cta outline" to="/memo/compose">Publicar memo</Link>
           <Link className="cta outline" to="/memo/draft/tm1">Vista previa TM1</Link>
-          <button className="cta outline" type="button" onClick={retry} disabled={state.status === 'loading'}>
-            Reintentar
+          <button className="cta outline" type="button" onClick={refresh} disabled={state.status === 'loading'}>
+            Actualizar feed
           </button>
         </div>
       </header>
@@ -75,8 +75,8 @@ function MemoFeed() {
         <div className="error" role="alert">
           <p className="success-title">No se pudo cargar Tonalli Memo</p>
           <p className="tx-meta">{state.message}</p>
-          <button className="cta outline small" type="button" onClick={retry}>
-            Reintentar
+          <button className="cta outline small" type="button" onClick={refresh}>
+            Actualizar feed
           </button>
         </div>
       )}

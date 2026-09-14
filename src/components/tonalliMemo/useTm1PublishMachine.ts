@@ -17,6 +17,7 @@ import {
   type Tm1VerificationStatus
 } from './types'
 import { ownsNftChildToken } from '../../services/nftService'
+import type { TonalliMemoIndexingClient } from '../../integrations/tonalliMemo/types'
 
 export interface UseTm1PublishMachineOptions {
   initialMessage?: string
@@ -26,6 +27,8 @@ export interface UseTm1PublishMachineOptions {
   maxBytes?: number
   executor: Tm1PublisherExecutor
   recoveryStore?: Tm1PublicationRecoveryStore
+  indexingClient?: TonalliMemoIndexingClient
+  indexingTimeoutMs?: number
   onSuccess?: (txid: string) => void
   onError?: (error: Error) => void
 }
@@ -55,10 +58,13 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     useState<Tm1VerificationStatus>('unverified')
   const [verificationError, setVerificationError] = useState<string | null>(null)
   const [txid, setTxid] = useState<string | null>(null)
+  const [policyStatus, setPolicyStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const abortControllerRef = useRef<AbortController | null>(null)
   const activeExecutorRef = useRef<Tm1PublisherExecutor>(options.executor)
+  const indexingClientRef = useRef(options.indexingClient)
+  const onSuccessRef = useRef(options.onSuccess)
   const onErrorRef = useRef(options.onError)
 
   // Update active executor if option changes
@@ -67,6 +73,14 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
       activeExecutorRef.current = options.executor
     }
   }, [options.executor])
+
+  useEffect(() => {
+    indexingClientRef.current = options.indexingClient
+  }, [options.indexingClient])
+
+  useEffect(() => {
+    onSuccessRef.current = options.onSuccess
+  }, [options.onSuccess])
 
   useEffect(() => {
     onErrorRef.current = options.onError
@@ -141,6 +155,9 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     phase === 'verifying_ownership' ||
     phase === 'requesting_authorization' ||
     phase === 'broadcasting' ||
+    phase === 'indexing_pending' ||
+    phase === 'indexing_delayed' ||
+    phase === 'policy_rejected' ||
     phase === 'success'
 
   const setAttachedNft = useCallback(
@@ -356,17 +373,84 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     setPhase('idle')
   }, [pendingRecord, recoveryStore])
 
+  const completeIndexing = useCallback(async (publishedTxid: string, signal: AbortSignal) => {
+    const indexingClient = indexingClientRef.current
+    if (!indexingClient) {
+      setPhase('success')
+      try {
+        onSuccessRef.current?.(publishedTxid)
+      } catch (uiError) {
+        console.error('Error executing onSuccess callback:', uiError)
+      }
+      return
+    }
+
+    setPhase('indexing_pending')
+    setError(null)
+    setPolicyStatus(null)
+    const timeoutMs = options.indexingTimeoutMs ?? 60_000
+    const deadline = Date.now() + timeoutMs
+    let requestError: Error | null = null
+    try {
+      const requestDeadline = createIndexingDeadlineSignal(timeoutMs, signal)
+      try {
+        await indexingClient.requestIndex(publishedTxid, requestDeadline.signal)
+      } catch (indexRequestError) {
+        if (signal.aborted) return
+        requestError =
+          indexRequestError instanceof Error
+            ? indexRequestError
+            : new Error('No se pudo solicitar la indexación directa.')
+      } finally {
+        requestDeadline.dispose()
+      }
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) {
+        if (requestError !== null) setError(requestError.message)
+        setPhase('indexing_delayed')
+        return
+      }
+      const result = await indexingClient.waitForResult(publishedTxid, {
+        signal,
+        timeoutMs: remainingMs
+      })
+      if (signal.aborted) return
+
+      if (result.status === 'verified') {
+        setPhase('success')
+        try {
+          onSuccessRef.current?.(publishedTxid)
+        } catch (uiError) {
+          console.error('Error executing onSuccess callback:', uiError)
+        }
+        return
+      }
+      if (result.status === 'policy_rejected') {
+        setPolicyStatus(result.verificationStatus)
+        setPhase('policy_rejected')
+        return
+      }
+      if (requestError !== null) {
+        setError(requestError.message)
+      }
+      setPhase('indexing_delayed')
+    } catch (indexingError) {
+      if (signal.aborted) return
+      setError(
+        indexingError instanceof Error
+          ? indexingError.message
+          : 'La indexación todavía no pudo completarse.'
+      )
+      setPhase('indexing_delayed')
+    }
+  }, [options.indexingTimeoutMs])
+
   /**
    * Execute the publication flow across the state machine:
-   * Idle -> Verifying Ownership -> Requesting Authorization -> Broadcasting -> Success / Error.
+   * Idle -> Verifying Ownership -> Requesting Authorization -> Broadcasting -> Indexing -> Success / Policy / Delay.
    */
   const publish = useCallback(async () => {
-    if (
-      !isValid ||
-      phase === 'verifying_ownership' ||
-      phase === 'requesting_authorization' ||
-      phase === 'broadcasting'
-    ) {
+    if (!isValid || (phase !== 'idle' && phase !== 'error')) {
       return
     }
 
@@ -377,6 +461,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
 
     setError(null)
     setTxid(null)
+    setPolicyStatus(null)
 
     try {
       // 1. Verifying Ownership
@@ -407,7 +492,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
           const err = new Error(errorMsg)
           setError(errorMsg)
           setPhase('error')
-          options.onError?.(err)
+          onErrorRef.current?.(err)
           return
         }
       }
@@ -432,14 +517,8 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
         throw new Error('NO_TXID_RETURNED: La difusión no devolvió un identificador de transacción válido.')
       }
 
-      // 4. Success
-      setPhase('success')
       setTxid(result.txid)
-      try {
-        options.onSuccess?.(result.txid)
-      } catch (uiError) {
-        console.error('Error executing onSuccess callback:', uiError)
-      }
+      await completeIndexing(result.txid, signal)
     } catch (err) {
       if (signal.aborted) {
         setPhase('idle')
@@ -457,7 +536,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
           const hasPending = await checkRecovery()
           if (hasPending) {
             setError(errObj.message)
-            options.onError?.(errObj)
+            onErrorRef.current?.(errObj)
             return
           }
         } catch {
@@ -467,9 +546,17 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
 
       setPhase('error')
       setError(errObj.message)
-      options.onError?.(errObj)
+      onErrorRef.current?.(errObj)
     }
-  }, [isValid, phase, alias, ownerAddress, message, attachedNft, wirePayload, options, checkRecovery, recoveryStore])
+  }, [isValid, phase, alias, ownerAddress, attachedNft, wirePayload, checkRecovery, recoveryStore, completeIndexing])
+
+  const retryIndexing = useCallback(async () => {
+    if (txid === null || phase !== 'indexing_delayed') return
+    abortControllerRef.current?.abort()
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+    await completeIndexing(txid, controller.signal)
+  }, [completeIndexing, phase, txid])
 
   /**
    * Reset machine back to idle state.
@@ -480,6 +567,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     setAttachedNftState(null)
     setPhase('idle')
     setTxid(null)
+    setPolicyStatus(null)
     setError(null)
   }, [])
 
@@ -500,6 +588,7 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     verificationStatus,
     verificationError,
     txid,
+    policyStatus,
     error,
     preview,
     previewData: preview,
@@ -524,7 +613,26 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     reconcilePending,
     dismissPending,
     publish,
+    retryIndexing,
     reset,
     abort
+  }
+}
+
+function createIndexingDeadlineSignal(milliseconds: number, parent: AbortSignal) {
+  const controller = new AbortController()
+  const onParentAbort = () => controller.abort()
+  if (parent.aborted) {
+    onParentAbort()
+  } else {
+    parent.addEventListener('abort', onParentAbort, { once: true })
+  }
+  const timeout = setTimeout(() => controller.abort(), Math.max(0, milliseconds))
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timeout)
+      parent.removeEventListener('abort', onParentAbort)
+    }
   }
 }

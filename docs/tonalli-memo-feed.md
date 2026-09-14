@@ -1,6 +1,6 @@
 # Tonalli Memo feed
 
-Tonalli Wallet reads the public Tonalli Memo HTTP API directly from the browser. Hito 9A is read-only: it does not publish memos, construct transactions, sign, broadcast, change wallet identity, introduce TM1, or require backend protocol changes.
+Tonalli Wallet reads the public Tonalli Memo HTTP API directly from the browser. After its existing TM1 publisher broadcasts a transaction, it submits only the resulting TXID for server-side indexing and waits for the server's verification result.
 
 ## API architecture
 
@@ -11,6 +11,9 @@ Only these public endpoints are consumed:
 - `GET /api/v1/health`
 - `GET /api/v1/feed?limit=25`
 - `GET /api/v1/tx/:txid`
+- `POST /api/v1/index-requests`
+
+The POST body is exactly `{ "txid": "<64 lowercase hex characters>" }`. The wallet does not send memo content, identity, status, metadata, cookies, credentials, or an administrative token. Responses use `queued`, `already_queued`, or `already_indexed`; all trust remains on the server.
 
 The feed is expected to contain only `VERIFIED` official Tonalli Memo records. The transaction endpoint may return `VERIFIED`, `UNAUTHORIZED`, `NO_MEMO`, `INVALID_MEMO`, `MULTIPLE_MEMOS`, or `verification: null`.
 
@@ -54,10 +57,16 @@ A cross-origin Tonalli Memo API deployment must configure `CORS_ORIGINS` with th
 
 Tonalli Wallet displays Tonalli Memo registry-policy verification over normalized Chronik transaction data. It does not independently verify eCash consensus or transaction signatures.
 
+The publisher distinguishes these outcomes:
+
+- `broadcasting`: the wallet is signing or transmitting and no on-chain success is claimed yet;
+- `indexing_pending`: broadcast succeeded and the TXID is being checked;
+- `success`: the transaction endpoint returned `VERIFIED`;
+- `policy_rejected`: the transaction exists but returned a durable non-`VERIFIED` policy status;
+- `indexing_delayed`: verification did not complete within 60 seconds or the API was temporarily unavailable.
+
+An indexing retry resubmits and polls the same TXID. It never signs or broadcasts another transaction.
+
 ## Error behavior
 
 The client distinguishes network failures, HTTP failures, malformed JSON, and invalid DTOs. It preserves HTTP status for non-JSON, empty, malformed, and non-2xx responses, but it never exposes raw server response bodies in the UI.
-
-## Limitations
-
-The feed is official and read-only in this milestone. Publication remains a separate future milestone.

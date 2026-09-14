@@ -11,16 +11,20 @@ import {
 } from '../components/tonalliMemo/walletPublisherExecutor'
 import type { Tm1PublisherExecutor } from '../components/tonalliMemo/types'
 import type { Tm1PublicationRecoveryStore } from '../integrations/tonalliMemo/recovery/tm1PublicationRecoveryStore'
+import { tonalliMemoIndexingClient } from '../integrations/tonalliMemo/client'
+import type { TonalliMemoIndexingClient } from '../integrations/tonalliMemo/types'
 import { getChronik } from '../services/ChronikClient'
 
 export interface MemoComposeProps {
   executor?: Tm1PublisherExecutor
   recoveryStore?: Tm1PublicationRecoveryStore
+  indexingClient?: TonalliMemoIndexingClient
 }
 
 export function MemoCompose({
   executor: customExecutor,
-  recoveryStore: customRecoveryStore
+  recoveryStore: customRecoveryStore,
+  indexingClient = tonalliMemoIndexingClient
 }: MemoComposeProps = {}) {
   const { address, alias } = useWallet()
 
@@ -86,6 +90,7 @@ export function MemoCompose({
           initialAlias={alias}
           executor={executor}
           recoveryStore={effectiveRecoveryStore}
+          indexingClient={indexingClient}
         />
       )}
     </div>

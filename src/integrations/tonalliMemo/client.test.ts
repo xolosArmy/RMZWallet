@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import {
   fetchTonalliMemoFeed,
-  fetchTonalliMemoTx
+  fetchTonalliMemoTx,
+  requestTonalliMemoIndex,
+  waitForTonalliMemoIndexing
 } from './client'
 import { buildTonalliMemoApiUrl, buildTonalliMemoTxPath } from './format'
 import { TonalliMemoClientError } from './types'
@@ -32,6 +34,7 @@ function jsonResponse(body: unknown, status = 200) {
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllEnvs()
   vi.restoreAllMocks()
 })
@@ -216,5 +219,115 @@ describe('Tonalli Memo client', () => {
 
   test('validates feed limit', async () => {
     await expect(fetchTonalliMemoFeed(101)).rejects.toMatchObject({ kind: 'invalid-response' })
+  })
+
+  test('requests indexing with only the lowercase TXID and no credentials', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ txid: TXID, status: 'queued' }, 202)
+    )
+
+    await expect(requestTonalliMemoIndex(TXID)).resolves.toEqual({
+      txid: TXID,
+      status: 'queued'
+    })
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/tonalli-memo-api/v1/index-requests',
+      expect.objectContaining({
+        method: 'POST',
+        credentials: 'omit',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ txid: TXID })
+      })
+    )
+    expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty('authorization')
+  })
+
+  test('rejects an uppercase indexing TXID before making a request', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+
+    await expect(requestTonalliMemoIndex(TXID.toUpperCase())).rejects.toMatchObject({
+      kind: 'invalid-response'
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test('rejects an undocumented index-request status', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ txid: TXID, status: 'accepted_content' }, 202)
+    )
+
+    await expect(requestTonalliMemoIndex(TXID)).rejects.toMatchObject({
+      kind: 'invalid-response'
+    })
+  })
+
+  test('recognizes a verified transaction during indexing polling', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ transaction: item, verification: item })
+    )
+
+    await expect(waitForTonalliMemoIndexing(TXID)).resolves.toMatchObject({
+      status: 'verified',
+      detail: { txid: TXID, verification: { status: 'VERIFIED' } }
+    })
+  })
+
+  test('distinguishes a durable feed-policy rejection', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({
+        transaction: item,
+        verification: { ...item, status: 'UNAUTHORIZED' }
+      })
+    )
+
+    await expect(waitForTonalliMemoIndexing(TXID)).resolves.toMatchObject({
+      status: 'policy_rejected',
+      verificationStatus: 'UNAUTHORIZED'
+    })
+  })
+
+  test('retries a missing transaction and later observes verification', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ error: 'not found' }, 404))
+      .mockResolvedValueOnce(jsonResponse({ transaction: item, verification: item }))
+
+    const result = waitForTonalliMemoIndexing(TXID, { timeoutMs: 1_000 })
+    await vi.advanceTimersByTimeAsync(500)
+
+    await expect(result).resolves.toMatchObject({ status: 'verified' })
+  })
+
+  test('preserves on-chain success when bounded polling times out', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      jsonResponse({ error: 'not found' }, 404)
+    )
+
+    const result = waitForTonalliMemoIndexing(TXID, { timeoutMs: 60_000 })
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    await expect(result).resolves.toEqual({ status: 'timed_out' })
+  })
+
+  test('enforces the deadline when a transaction request remains pending', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        const rejectAborted = () => reject(new DOMException('aborted', 'AbortError'))
+        if (signal?.aborted) {
+          rejectAborted()
+          return
+        }
+        signal?.addEventListener('abort', rejectAborted, { once: true })
+      })
+    )
+
+    const result = waitForTonalliMemoIndexing(TXID, { timeoutMs: 60_000 })
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    await expect(result).resolves.toEqual({ status: 'timed_out' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })

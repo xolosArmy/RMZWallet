@@ -100,7 +100,7 @@ describe('Tonalli Memo routes', () => {
     renderAt('/memo', <MemoFeed />)
 
     expect((await screen.findByRole('alert')).textContent).toContain('No se pudo cargar Tonalli Memo')
-    fireEvent.click(screen.getAllByRole('button', { name: 'Reintentar' })[0])
+    fireEvent.click(screen.getAllByRole('button', { name: 'Actualizar feed' })[0])
     expect(await screen.findByText('Tonalli')).toBeTruthy()
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })

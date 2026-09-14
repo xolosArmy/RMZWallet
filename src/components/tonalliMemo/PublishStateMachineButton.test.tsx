@@ -121,6 +121,7 @@ describe('PublishStateMachineButton Component', () => {
     )
 
     expect(screen.getByTestId('publish-success-card')).toBeTruthy()
+    expect(screen.getByText('Tonalli Memo verificado y visible en el feed')).toBeTruthy()
     expect(screen.getByTestId('success-txid').textContent).toBe(testTxid)
 
     const explorerLink = screen.getByTestId('explorer-link') as HTMLAnchorElement
@@ -130,6 +131,61 @@ describe('PublishStateMachineButton Component', () => {
     const resetBtn = screen.getByTestId('publish-reset-button')
     fireEvent.click(resetBtn)
     expect(handleReset).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows that the transaction is on-chain while indexing is pending', () => {
+    const testTxid = 'a'.repeat(64)
+    render(
+      <PublishStateMachineButton
+        phase="indexing_pending"
+        onPublish={vi.fn()}
+        txid={testTxid}
+      />
+    )
+
+    expect(screen.getByTestId('publish-indexing-pending-card').textContent).toContain(
+      'Publicado on-chain'
+    )
+    expect(screen.getByTestId('publish-indexing-pending-card').textContent).toContain(
+      'Indexación pendiente'
+    )
+    expect(screen.getByTestId('published-txid').textContent).toBe(testTxid)
+  })
+
+  it('offers an indexing-only retry after the bounded wait expires', () => {
+    const retryIndexing = vi.fn()
+    render(
+      <PublishStateMachineButton
+        phase="indexing_delayed"
+        onPublish={vi.fn()}
+        onRetryIndexing={retryIndexing}
+        txid={'b'.repeat(64)}
+      />
+    )
+
+    expect(screen.getByTestId('publish-indexing-delayed-card').textContent).toContain(
+      'La publicación no fracasó'
+    )
+    fireEvent.click(screen.getByTestId('retry-indexing-button'))
+    expect(retryIndexing).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows a feed-policy rejection without calling publication again', () => {
+    const publish = vi.fn()
+    render(
+      <PublishStateMachineButton
+        phase="policy_rejected"
+        onPublish={publish}
+        policyStatus="UNAUTHORIZED"
+        txid={'c'.repeat(64)}
+      />
+    )
+
+    const card = screen.getByTestId('publish-policy-rejected-card')
+    expect(card.textContent).toContain('La transacción existe, pero no cumple la política del feed')
+    expect(card.textContent).toContain('UNAUTHORIZED')
+    expect(screen.queryByTestId('publish-retry-button')).toBeNull()
+    expect(publish).not.toHaveBeenCalled()
   })
 
   it('renders error phase with error message and retry button', () => {
