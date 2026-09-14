@@ -389,24 +389,17 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     }
 
     for (const executionId of snapshot.settlingIds) {
-      await this.coordinator.tryExclusive(executionSettlementLockName(executionId), async () => {
-        const record = await this.coordinator.requestExclusive(this.lockName, async () => {
-          return this.loadData().records[executionId]
-        })
-        if (!record || record.state !== 'SETTLING') {
-          return
-        }
-        if (this.settlementRecoveryHandler) {
-          await this.settlementRecoveryHandler(executionId, record.expectedTxid)
-        } else {
-          await this.markSettlementUncertain({
-            executionId,
-            reason:
-              'Abandoned SETTLING execution recovered at startup without network observer. Reconciled to SETTLEMENT_UNCERTAIN.',
-            timestamp: this.clock()
+      if (this.settlementRecoveryHandler) {
+        await this.coordinator.tryExclusive(executionSettlementLockName(executionId), async () => {
+          const record = await this.coordinator.requestExclusive(this.lockName, async () => {
+            return this.loadData().records[executionId]
           })
-        }
-      })
+          if (!record || record.state !== 'SETTLING') {
+            return
+          }
+          await this.settlementRecoveryHandler!(executionId, record.expectedTxid)
+        })
+      }
     }
   }
 

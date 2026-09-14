@@ -470,15 +470,73 @@ function createWalletExecutionComposition(
     (typeof localStorage !== 'undefined' ? localStorage : undefined)
   const trustedSettlementCoordinator = resolveWalletSettlementLockCoordinator()
 
-  // Authoritative settlement ledger constructed inside trusted runtime
-  const authoritativeSettlementLedger: AuthoritativeSettlementLedger | null =
-    canonicalStorage
-      ? new DurableTransactionalExecutionLedger({
-          storage: canonicalStorage,
-          lockCoordinator: trustedSettlementCoordinator,
-          clock: getNow
+  let authoritativeSettlementLedger: AuthoritativeSettlementLedger | null = null
+
+  async function handleSettlementRecovery(
+    executionId: string,
+    expectedTxid?: string
+  ): Promise<void> {
+    if (!authoritativeSettlementLedger) return
+    const record = await authoritativeSettlementLedger.get(executionId)
+    if (!record || record.status !== 'SETTLING') {
+      return
+    }
+
+    let targetTxid = expectedTxid ?? record.expectedTxid
+    if (!targetTxid) {
+      try {
+        const rawTxHex = await getPrivateSignedTransaction(executionId)
+        targetTxid = deriveExpectedTxidFromRawTxHex(rawTxHex)
+      } catch {
+        await authoritativeSettlementLedger.markSettlementUncertain({
+          executionId,
+          reason: 'Abandoned SETTLING record without recoverable expectedTxid.',
+          timestamp: getNow()
         })
-      : null
+        return
+      }
+    }
+
+    let chronik: ChronikBroadcastClient | undefined
+    try {
+      chronik = resolveWalletChronikClient()
+    } catch {
+      chronik = undefined
+    }
+
+    if (chronik) {
+      try {
+        const observed = await chronik.tx(targetTxid)
+        if (observed && observed.txid?.toLowerCase() === targetTxid.toLowerCase()) {
+          await authoritativeSettlementLedger.transitionToSettled({
+            executionId,
+            expectedTxid: targetTxid,
+            settledAt: getNow()
+          })
+          return
+        }
+      } catch {
+        // Not found in mempool or chain
+      }
+    }
+
+    await authoritativeSettlementLedger.markSettlementUncertain({
+      executionId,
+      reason:
+        'Abandoned SETTLING execution recovered at startup without network confirmation. Reconciled to SETTLEMENT_UNCERTAIN without rebroadcast.',
+      timestamp: getNow()
+    })
+  }
+
+  // Authoritative settlement ledger constructed inside trusted runtime
+  authoritativeSettlementLedger = canonicalStorage
+    ? new DurableTransactionalExecutionLedger({
+        storage: canonicalStorage,
+        lockCoordinator: trustedSettlementCoordinator,
+        clock: getNow,
+        settlementRecoveryHandler: handleSettlementRecovery
+      })
+    : null
 
   function getAuthoritativeSettlementLedger(): AuthoritativeSettlementLedger {
     if (!authoritativeSettlementLedger) {
@@ -506,6 +564,13 @@ function createWalletExecutionComposition(
   ledgerReady.catch(() => {
     // Callers of prepareExecution/confirm still await ledgerReady and observe the error.
   })
+
+  const startupReady: Promise<void> = (async () => {
+    await ledgerReady
+    schedulePreparedRecovery()
+    await reconcileAbandonedSettlements().catch(() => {})
+  })()
+  startupReady.catch(() => {})
   const reviewOwnerId = `review_${createId()}`
   const reviewLeaseTtlSeconds = trusted?.reviewLeaseTtlSeconds ?? DEFAULT_REVIEW_LEASE_TTL_SECONDS
   const reviewHeartbeatMs = trusted?.reviewHeartbeatMs ?? 10_000
@@ -1203,7 +1268,7 @@ function createWalletExecutionComposition(
     isPreparing = true
 
     try {
-      await ledgerReady
+      await startupReady
 
       // 2. Parse the incoming value with the canonical HumanApprovalV1 schema only.
       const receipt = parseCanonicalHumanApproval(receiptInput)
@@ -1503,6 +1568,7 @@ function createWalletExecutionComposition(
     }
 
     async function getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined> {
+      await startupReady
       const authRecord = authoritativeSettlementLedger ? await authoritativeSettlementLedger.get(executionId) : undefined
       const record = authRecord ?? (await executionLedger.get(executionId))
       if (!record) return undefined
@@ -1546,7 +1612,7 @@ function createWalletExecutionComposition(
         throw new WalletExecutionError('COMPOSITION_DISPOSED', 'Execution engine is disposed.')
       }
 
-      await ledgerReady
+      await startupReady
 
       const settlementLedger = getAuthoritativeSettlementLedger()
 
@@ -1811,55 +1877,11 @@ function createWalletExecutionComposition(
       if (settlingList.length === 0) return
 
       const coordinator = resolveWalletSettlementLockCoordinator()
-      let chronik: ChronikBroadcastClient | undefined
-      try {
-        chronik = resolveWalletChronikClient()
-      } catch {
-        chronik = undefined
-      }
 
       for (const item of settlingList) {
         const { executionId, expectedTxid } = item
         await coordinator.tryExclusive(executionSettlementLockName(executionId), async () => {
-          const record = await authoritativeSettlementLedger.get(executionId)
-          if (!record || ((record as any).state !== 'SETTLING' && (record as any).status !== 'SETTLING')) {
-            return
-          }
-          let targetTxid = expectedTxid
-          if (!targetTxid) {
-            try {
-              const rawTxHex = await getPrivateSignedTransaction(executionId)
-              targetTxid = deriveExpectedTxidFromRawTxHex(rawTxHex)
-            } catch {
-              await authoritativeSettlementLedger.markSettlementUncertain({
-                executionId,
-                reason: 'Abandoned SETTLING record without recoverable expectedTxid.',
-                timestamp: getNow()
-              })
-              return
-            }
-          }
-          if (chronik) {
-            try {
-              const observed = await chronik.tx(targetTxid)
-              if (observed && observed.txid?.toLowerCase() === targetTxid.toLowerCase()) {
-                await authoritativeSettlementLedger.transitionToSettled({
-                  executionId,
-                  expectedTxid: targetTxid,
-                  settledAt: getNow()
-                })
-                return
-              }
-            } catch {
-              // Not found in mempool or chain
-            }
-          }
-          await authoritativeSettlementLedger.markSettlementUncertain({
-            executionId,
-            reason:
-              'Abandoned SETTLING execution recovered at startup without network confirmation. Reconciled to SETTLEMENT_UNCERTAIN without rebroadcast.',
-            timestamp: getNow()
-          })
+          await handleSettlementRecovery(executionId, expectedTxid)
         })
       }
     }
@@ -1886,11 +1908,6 @@ function createWalletExecutionComposition(
         if (disposed) return undefined
         return activeController ?? undefined
       }
-    })
-
-    void ledgerReady.then(async () => {
-      schedulePreparedRecovery()
-      await reconcileAbandonedSettlements().catch(() => {})
     })
 
     return {

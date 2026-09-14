@@ -586,6 +586,154 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
   })
 
   describe('Test 8: Startup Recovery Reconciles Abandoned SETTLING Record', () => {
+    it('automatically transitions SETTLING to SETTLED upon runtime initialization without calling settle() when observable by Chronik', async () => {
+      const harness = setupTestHarness()
+      const { executionId, expectedTxid } = await harness.signExecution()
+
+      // Transition to SETTLING manually to simulate an interrupted broadcast
+      const ledger = new DurableTransactionalExecutionLedger({
+        storage: harness.ledgerStorage,
+        lockCoordinator: harness.lockCoordinator,
+        clock: () => FIXED_NOW
+      })
+      await ledger.transitionToSettling({
+        executionId,
+        expectedTxid,
+        settlingAt: FIXED_NOW
+      })
+      harness.composition.dispose()
+
+      // Chronik observer sees the transaction
+      const broadcastCalls: Uint8Array[] = []
+      const recoveredChronik: ChronikBroadcastClient = {
+        broadcastTx: async rawTx => {
+          broadcastCalls.push(rawTx)
+          return { txid: expectedTxid }
+        },
+        tx: async txid => ({ txid })
+      }
+      ;(globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+      ] = recoveredChronik
+
+      const rec = createFixtureLedgerRecord()
+      const recoveredComposition = createWalletExecutionComposition(
+        {
+          approvalLedger: {
+            get: async () => rec,
+            getByApprovalId: async () => rec
+          },
+          sessionVerifier: {
+            verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS })
+          },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 100
+        },
+        {
+          privateSettlementStorage: harness.settlementStorage
+        }
+      )
+
+      // Query getExecutionStatus WITHOUT calling publicEngine.settle()
+      const status = await recoveredComposition.publicEngine.getExecutionStatus(executionId)
+      expect(status?.status).toBe('SETTLED')
+      expect(status?.settledAt).toBe(FIXED_NOW + 100)
+
+      // Verify directly in durable storage that state became SETTLED
+      const checkLedger = new DurableTransactionalExecutionLedger({
+        storage: harness.ledgerStorage,
+        lockCoordinator: harness.lockCoordinator,
+        clock: () => FIXED_NOW + 100
+      })
+      const durableRecord = await checkLedger.get(executionId)
+      expect(durableRecord?.status).toBe('SETTLED')
+      expect(durableRecord?.settledAt).toBe(FIXED_NOW + 100)
+
+      // Rebroadcast MUST be 0!
+      expect(broadcastCalls).toHaveLength(0)
+
+      recoveredComposition.dispose()
+    })
+
+    it('automatically transitions SETTLING to SETTLEMENT_UNCERTAIN upon runtime initialization without calling settle() when unobservable by Chronik', async () => {
+      const harness = setupTestHarness()
+      const { executionId, expectedTxid } = await harness.signExecution()
+
+      // Transition to SETTLING manually to simulate an interrupted broadcast
+      const ledger = new DurableTransactionalExecutionLedger({
+        storage: harness.ledgerStorage,
+        lockCoordinator: harness.lockCoordinator,
+        clock: () => FIXED_NOW
+      })
+      await ledger.transitionToSettling({
+        executionId,
+        expectedTxid,
+        settlingAt: FIXED_NOW
+      })
+      harness.composition.dispose()
+
+      // Chronik tx query throws not found
+      const broadcastCalls: Uint8Array[] = []
+      const recoveredChronik: ChronikBroadcastClient = {
+        broadcastTx: async rawTx => {
+          broadcastCalls.push(rawTx)
+          return { txid: expectedTxid }
+        },
+        tx: async () => {
+          throw new Error('Not found')
+        }
+      }
+      ;(globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+      ] = recoveredChronik
+
+      const rec = createFixtureLedgerRecord()
+      const recoveredComposition = createWalletExecutionComposition(
+        {
+          approvalLedger: {
+            get: async () => rec,
+            getByApprovalId: async () => rec
+          },
+          sessionVerifier: {
+            verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS })
+          },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 100
+        },
+        {
+          privateSettlementStorage: harness.settlementStorage
+        }
+      )
+
+      // Query getExecutionStatus WITHOUT calling publicEngine.settle()
+      const status = await recoveredComposition.publicEngine.getExecutionStatus(executionId)
+      expect(status?.status).toBe('SETTLEMENT_UNCERTAIN')
+
+      // Verify directly in durable storage that state became SETTLEMENT_UNCERTAIN
+      const checkLedger = new DurableTransactionalExecutionLedger({
+        storage: harness.ledgerStorage,
+        lockCoordinator: harness.lockCoordinator,
+        clock: () => FIXED_NOW + 100
+      })
+      const durableRecord = await checkLedger.get(executionId)
+      expect(durableRecord?.status).toBe('SETTLEMENT_UNCERTAIN')
+
+      // Outpoints MUST be retained while uncertain
+      const outpoint = canonicalOutpointKey('11'.repeat(32), 0)
+      expect(await checkLedger.getOutpointReservation(outpoint)).toBe(executionId)
+
+      // Zero rebroadcast!
+      expect(broadcastCalls).toHaveLength(0)
+
+      recoveredComposition.dispose()
+    })
+
     it('queries network first and marks SETTLED if observed, with 0 rebroadcast', async () => {
       const harness = setupTestHarness()
       const { executionId, expectedTxid } = await harness.signExecution()
