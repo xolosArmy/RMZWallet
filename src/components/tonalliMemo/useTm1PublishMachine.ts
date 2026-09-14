@@ -388,20 +388,31 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     setPhase('indexing_pending')
     setError(null)
     setPolicyStatus(null)
+    const timeoutMs = options.indexingTimeoutMs ?? 60_000
+    const deadline = Date.now() + timeoutMs
     let requestError: Error | null = null
     try {
+      const requestDeadline = createIndexingDeadlineSignal(timeoutMs, signal)
       try {
-        await indexingClient.requestIndex(publishedTxid, signal)
+        await indexingClient.requestIndex(publishedTxid, requestDeadline.signal)
       } catch (indexRequestError) {
         if (signal.aborted) return
         requestError =
           indexRequestError instanceof Error
             ? indexRequestError
             : new Error('No se pudo solicitar la indexación directa.')
+      } finally {
+        requestDeadline.dispose()
+      }
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) {
+        if (requestError !== null) setError(requestError.message)
+        setPhase('indexing_delayed')
+        return
       }
       const result = await indexingClient.waitForResult(publishedTxid, {
         signal,
-        timeoutMs: options.indexingTimeoutMs ?? 60_000
+        timeoutMs: remainingMs
       })
       if (signal.aborted) return
 
@@ -605,5 +616,23 @@ export function useTm1PublishMachine(options: UseTm1PublishMachineOptions) {
     retryIndexing,
     reset,
     abort
+  }
+}
+
+function createIndexingDeadlineSignal(milliseconds: number, parent: AbortSignal) {
+  const controller = new AbortController()
+  const onParentAbort = () => controller.abort()
+  if (parent.aborted) {
+    onParentAbort()
+  } else {
+    parent.addEventListener('abort', onParentAbort, { once: true })
+  }
+  const timeout = setTimeout(() => controller.abort(), Math.max(0, milliseconds))
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timeout)
+      parent.removeEventListener('abort', onParentAbort)
+    }
   }
 }

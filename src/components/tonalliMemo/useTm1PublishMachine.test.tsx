@@ -790,8 +790,11 @@ describe('useTm1PublishMachine Hook', () => {
       )
       expect(indexingClient.waitForResult).toHaveBeenCalledWith(
         publishedTxid,
-        expect.objectContaining({ timeoutMs: 60_000 })
+        expect.objectContaining({ timeoutMs: expect.any(Number) })
       )
+      const waitTimeoutMs = vi.mocked(indexingClient.waitForResult).mock.calls[0]?.[1]?.timeoutMs
+      expect(waitTimeoutMs).toBeGreaterThan(0)
+      expect(waitTimeoutMs).toBeLessThanOrEqual(60_000)
       expect(result.current.state.phase).toBe('success')
       expect(onSuccess).toHaveBeenCalledWith(publishedTxid)
     })
@@ -856,6 +859,50 @@ describe('useTm1PublishMachine Hook', () => {
       expect(indexingClient.waitForResult).toHaveBeenCalledTimes(1)
       expect(result.current.state.phase).toBe('success')
       expect(result.current.state.error).toBeNull()
+    })
+
+    it('applies the overall indexing deadline to a pending direct request', async () => {
+      vi.useFakeTimers()
+      const executor = createMockExecutor()
+      const indexingClient = createMockIndexingClient([])
+      vi.mocked(indexingClient.requestIndex).mockImplementation((_txid, signal) =>
+        new Promise((_resolve, reject) => {
+          const rejectAborted = () => reject(new DOMException('aborted', 'AbortError'))
+          if (signal?.aborted) {
+            rejectAborted()
+            return
+          }
+          signal?.addEventListener('abort', rejectAborted, { once: true })
+        })
+      )
+      const { result } = renderHook(() =>
+        useTm1PublishMachine({
+          executor,
+          indexingClient,
+          indexingTimeoutMs: 60_000,
+          initialMessage: 'Solicitud directa demorada',
+          initialAlias: 'alice.xec',
+          initialOwnerAddress: 'ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq'
+        })
+      )
+
+      let publication!: Promise<void>
+      await act(async () => {
+        publication = result.current.publish()
+        await Promise.resolve()
+      })
+      expect(indexingClient.requestIndex).toHaveBeenCalledTimes(1)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000)
+        await publication
+      })
+
+      expect(result.current.state.phase).toBe('indexing_delayed')
+      expect(result.current.state.txid).toBe(publishedTxid)
+      expect(indexingClient.waitForResult).not.toHaveBeenCalled()
+      expect(executor.broadcastAndFinalize).toHaveBeenCalledTimes(1)
+      vi.useRealTimers()
     })
 
     it('distinguishes an unauthorized transaction from an on-chain failure', async () => {
