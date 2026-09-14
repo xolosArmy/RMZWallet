@@ -154,8 +154,13 @@ export async function waitForTonalliMemoIndexing(
   const deadline = Date.now() + timeoutMs
   let attempt = 0
   while (true) {
+    const remainingBeforeRequestMs = deadline - Date.now()
+    if (remainingBeforeRequestMs <= 0) {
+      return { status: 'timed_out' }
+    }
+    const requestDeadline = createDeadlineSignal(remainingBeforeRequestMs, options.signal)
     try {
-      const detail = await fetchTonalliMemoTx(txid, options.signal)
+      const detail = await fetchTonalliMemoTx(txid, requestDeadline.signal)
       if (detail.verification?.status === 'VERIFIED') {
         return { status: 'verified', detail }
       }
@@ -167,8 +172,14 @@ export async function waitForTonalliMemoIndexing(
         }
       }
     } catch (error) {
-      if (isAbortError(error)) throw error
+      if (isAbortError(error)) {
+        if (options.signal?.aborted) throw error
+        if (requestDeadline.didTimeout()) return { status: 'timed_out' }
+        throw error
+      }
       if (!isRetryableIndexingError(error)) throw error
+    } finally {
+      requestDeadline.dispose()
     }
 
     const remainingMs = deadline - Date.now()
@@ -194,6 +205,32 @@ function isRetryableIndexingError(error: unknown): boolean {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError'
+}
+
+function createDeadlineSignal(milliseconds: number, parent?: AbortSignal) {
+  const controller = new AbortController()
+  let timedOut = false
+  const onParentAbort = () => controller.abort()
+
+  if (parent?.aborted) {
+    onParentAbort()
+  } else {
+    parent?.addEventListener('abort', onParentAbort, { once: true })
+  }
+
+  const timeout = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, milliseconds)
+
+  return {
+    signal: controller.signal,
+    didTimeout: () => timedOut,
+    dispose: () => {
+      clearTimeout(timeout)
+      parent?.removeEventListener('abort', onParentAbort)
+    }
+  }
 }
 
 async function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {

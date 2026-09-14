@@ -309,4 +309,25 @@ describe('Tonalli Memo client', () => {
 
     await expect(result).resolves.toEqual({ status: 'timed_out' })
   })
+
+  test('enforces the deadline when a transaction request remains pending', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        const rejectAborted = () => reject(new DOMException('aborted', 'AbortError'))
+        if (signal?.aborted) {
+          rejectAborted()
+          return
+        }
+        signal?.addEventListener('abort', rejectAborted, { once: true })
+      })
+    )
+
+    const result = waitForTonalliMemoIndexing(TXID, { timeoutMs: 60_000 })
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    await expect(result).resolves.toEqual({ status: 'timed_out' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
 })
