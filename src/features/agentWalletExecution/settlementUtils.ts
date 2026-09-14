@@ -62,65 +62,21 @@ export function deriveExpectedTxidFromRawTxHex(rawSignedTxHex: string): string {
 }
 
 /**
- * Distinguishes definitive consensus rejections from ambiguous transport/network errors.
- * Transport timeouts, network resets, server 5xx errors, and already-in-mempool MUST return false.
+ * Distinguishes definitive consensus rejections from ambiguous transport/network/mempool errors.
+ *
+ * In Gate C3A, string-based node/mempool rejection texts (e.g. mempool conflict, missing/spent inputs,
+ * policy/script flags, transport timeouts, node disagreement) are NEVER treated as definitive consensus
+ * rejections because Chronik does not provide a structured consensus invariant. All such broadcast failures
+ * default to SETTLEMENT_UNCERTAIN to prevent premature outpoint release.
+ *
+ * SETTLEMENT_REJECTED is reached ONLY if an explicit structured invariant proves permanent non-acceptance.
  */
 export function isDefinitiveConsensusRejection(err: unknown): boolean {
-  if (!err) return false
-  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase()
-
-  // Mempool already known / in mempool is NOT a consensus rejection;
-  // it implies the transaction has already reached the network.
-  if (
-    msg.includes('txn-already-in-mempool') ||
-    msg.includes('already in mempool') ||
-    msg.includes('txn-already-known') ||
-    msg.includes('already known')
-  ) {
-    return false
-  }
-
-  // Network, transport, timeout, or server errors are ambiguous
-  if (
-    msg.includes('timeout') ||
-    msg.includes('timed out') ||
-    msg.includes('aborterror') ||
-    msg.includes('abort') ||
-    msg.includes('econnrefused') ||
-    msg.includes('econnreset') ||
-    msg.includes('fetch failed') ||
-    msg.includes('failed to fetch') ||
-    msg.includes('network error') ||
-    msg.includes('networkerror') ||
-    msg.includes('500') ||
-    msg.includes('502') ||
-    msg.includes('503') ||
-    msg.includes('504')
-  ) {
-    return false
-  }
-
-  // Known definitive consensus rejection patterns from Bitcoin ABC / Chronik
-  return (
-    msg.includes('mandatory-script-verify-flag-failed') ||
-    msg.includes('non-mandatory-script-verify-flag-failed') ||
-    msg.includes('txn-mempool-conflict') ||
-    msg.includes('bad-txns-inputs-missingorspent') ||
-    msg.includes('bad-txns-inputs-spent') ||
-    msg.includes('bad-txns-in-belowout') ||
-    msg.includes('bad-txns-vout-negative') ||
-    msg.includes('bad-txns-vout-toolarge') ||
-    msg.includes('bad-txns-oversize') ||
-    msg.includes('bad-txns-vin-empty') ||
-    msg.includes('bad-txns-vout-empty') ||
-    msg.includes('bad-txns-premature-spend') ||
-    msg.includes('bad-txns-prevout-null') ||
-    msg.includes('bad-txns-fee-outofrange') ||
-    msg.includes('scriptsig-not-pushonly') ||
-    msg.includes('dust') ||
-    msg.includes('tx-size-small') ||
-    msg.includes('absurdly-high-fee') ||
-    msg.includes('consensus-rule-violated') ||
-    msg.includes('definitive-consensus-rejection')
+  if (!err || typeof err !== 'object') return false
+  const candidate = err as Record<string, unknown>
+  return Boolean(
+    candidate.isDefinitiveConsensusRejection === true ||
+    candidate.definitiveConsensusRejection === true
   )
 }
+

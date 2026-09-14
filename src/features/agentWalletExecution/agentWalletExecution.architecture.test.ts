@@ -209,6 +209,7 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(body).not.toMatch(/privateSettlementStorage/)
     expect(body).not.toMatch(/settlementStorage/)
     expect(body).not.toMatch(/rawSignedTxHex/)
+    expect(body).not.toMatch(/chronik/)
     expect(body).toMatch(/NEVER used for raw signed transactions/)
 
     const engineSource = readFileSync(join(__dirname, 'engine.ts'), 'utf-8')
@@ -229,6 +230,7 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(runtimeSource).toMatch(/createFileLocalProductionSignatoryProvider/)
     expect(runtimeSource).not.toMatch(/export function createFileLocalProductionSignatoryProvider/)
     expect(runtimeSource).not.toMatch(/export function createProductionSignatoryProvider/)
+    expect(runtimeSource).not.toMatch(/readonly chronik\?:/)
 
     const mainSource = readFileSync(join(__dirname, '../../main.tsx'), 'utf-8')
     expect(mainSource).toContain('TrustedWalletExecutionProvider')
@@ -240,16 +242,22 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(mainSource).not.toMatch(/getSignatory/)
   })
 
-  it('verifies WalletExecutionLedger never carries signed transaction bytes', () => {
+  it('verifies WalletExecutionLedger never carries signed transaction bytes or settlement mutation authority', () => {
     const typesContent = readFileSync(join(__dirname, 'types.ts'), 'utf-8')
     const ledgerStart = typesContent.indexOf('export interface WalletExecutionLedger')
-    const ledgerEnd = typesContent.indexOf('export interface AgentWalletExecutionEngineConfig')
+    const ledgerEnd = typesContent.indexOf('export interface AuthoritativeSettlementLedger')
     expect(ledgerStart).toBeGreaterThan(-1)
     expect(ledgerEnd).toBeGreaterThan(ledgerStart)
     const ledgerBody = typesContent.slice(ledgerStart, ledgerEnd)
     expect(ledgerBody).not.toMatch(/rawSignedTxHex/)
     expect(ledgerBody).not.toMatch(/\brawTx\b/)
     expect(ledgerBody).not.toMatch(/\btxHex\b/)
+    expect(ledgerBody).not.toMatch(/runWithSettlementLock/)
+    expect(ledgerBody).not.toMatch(/transitionToSettling/)
+    expect(ledgerBody).not.toMatch(/transitionToSettled/)
+    expect(ledgerBody).not.toMatch(/markSettlementUncertain/)
+    expect(ledgerBody).not.toMatch(/markSettlementRejected/)
+    expect(ledgerBody).not.toMatch(/snapshotSettlingRecords/)
     expect(ledgerBody).toContain('transitionToSigned(executionId: string, signedAt: number)')
     expect(ledgerBody).toContain('transitionToSigningIfValid')
 

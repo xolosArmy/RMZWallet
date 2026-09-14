@@ -22,7 +22,8 @@ import {
   DEFAULT_REVIEW_LEASE_TTL_SECONDS,
   DurableTransactionalExecutionLedger,
   WebLocksExecutionCoordinator,
-  executionSettlementLockName
+  executionSettlementLockName,
+  type ExecutionLockCoordinator
 } from '../../features/agentWalletExecution/ledger'
 import {
   assertUniqueUtxoOutpoints,
@@ -43,6 +44,7 @@ import type {
   PublicExecutionStatus,
   SignedExecutionHandle,
   WalletExecutionLedger,
+  AuthoritativeSettlementLedger,
   WalletExecutionReviewSession,
   WalletExecutionReviewSnapshot,
   WalletFeePolicy,
@@ -72,6 +74,12 @@ const TEST_ONLY_CREATE_WALLET_EXECUTION_COMPOSITION = Symbol.for(
 const TEST_ONLY_PRIVATE_SETTLEMENT_STORAGE = Symbol.for(
   'rmzwallet.testOnly.privateSettlementStorage'
 )
+const TEST_ONLY_SETTLEMENT_LOCK_COORDINATOR = Symbol.for(
+  'rmzwallet.testOnly.settlementLockCoordinator'
+)
+const TEST_ONLY_SETTLEMENT_CHRONIK_CLIENT = Symbol.for(
+  'rmzwallet.testOnly.settlementChronikClient'
+)
 
 type ReviewSigningHandoffPhase = 'IDLE' | 'REVIEW_ACTIVE' | 'HANDOFF_TO_SIGNING' | 'SIGNING_DURABLE'
 
@@ -83,6 +91,75 @@ function resolveFileLocalPrivateSettlementStorage(): Storage | undefined {
     }
   }
   return typeof localStorage !== 'undefined' ? localStorage : undefined
+}
+
+const fallbackTestSettlementQueues = new Map<string, Promise<unknown>>()
+
+function getFallbackTestSettlementLockCoordinator(): ExecutionLockCoordinator {
+  return {
+    async requestExclusive<T>(lockName: string, operation: () => Promise<T>): Promise<T> {
+      const prior = fallbackTestSettlementQueues.get(lockName) ?? Promise.resolve()
+      let release!: () => void
+      const current = new Promise<void>(resolve => {
+        release = resolve
+      })
+      fallbackTestSettlementQueues.set(
+        lockName,
+        prior.then(() => current)
+      )
+      try {
+        await prior
+        return await operation()
+      } finally {
+        release()
+      }
+    },
+    async tryExclusive<T>(lockName: string, operation: () => Promise<T>) {
+      const result = await this.requestExclusive(lockName, operation)
+      return { acquired: true as const, result }
+    }
+  }
+}
+
+function resolveWalletSettlementLockCoordinator(): ExecutionLockCoordinator {
+  if (import.meta.env?.VITEST) {
+    const testCoordinator = (globalThis as Record<symbol, unknown>)[
+      TEST_ONLY_SETTLEMENT_LOCK_COORDINATOR
+    ]
+    if (
+      testCoordinator &&
+      typeof (testCoordinator as ExecutionLockCoordinator).requestExclusive === 'function' &&
+      typeof (testCoordinator as ExecutionLockCoordinator).tryExclusive === 'function'
+    ) {
+      return testCoordinator as ExecutionLockCoordinator
+    }
+    if (typeof navigator === 'undefined' || !navigator.locks?.request) {
+      return getFallbackTestSettlementLockCoordinator()
+    }
+  }
+  return new WebLocksExecutionCoordinator()
+}
+
+function resolveWalletChronikClient(): ChronikBroadcastClient {
+  if (import.meta.env?.VITEST) {
+    const testChronik = (globalThis as Record<symbol, unknown>)[
+      TEST_ONLY_SETTLEMENT_CHRONIK_CLIENT
+    ]
+    if (
+      testChronik &&
+      typeof (testChronik as ChronikBroadcastClient).broadcastTx === 'function' &&
+      typeof (testChronik as ChronikBroadcastClient).tx === 'function'
+    ) {
+      return testChronik as ChronikBroadcastClient
+    }
+  }
+  if (typeof getChronik === 'function') {
+    return getChronik() as unknown as ChronikBroadcastClient
+  }
+  throw new WalletExecutionError(
+    'STORAGE_UNAVAILABLE',
+    'Wallet Chronik client is not available for settlement broadcast.'
+  )
 }
 
 function createFileLocalProductionSignatoryProvider(): AgentWalletExecutionEngineConfig['signatoryProvider'] {
@@ -387,14 +464,43 @@ function createWalletExecutionComposition(
     ...(config.feePolicy ?? {})
   }
 
-  // Durable execution ledger by default
+  // One canonical durable execution-state storage dataset
+  const canonicalStorage =
+    config.storage ??
+    (typeof localStorage !== 'undefined' ? localStorage : undefined)
+  const trustedSettlementCoordinator = resolveWalletSettlementLockCoordinator()
+
+  // Authoritative settlement ledger constructed inside trusted runtime
+  const authoritativeSettlementLedger: AuthoritativeSettlementLedger | null =
+    canonicalStorage
+      ? new DurableTransactionalExecutionLedger({
+          storage: canonicalStorage,
+          lockCoordinator: trustedSettlementCoordinator,
+          clock: getNow
+        })
+      : null
+
+  function getAuthoritativeSettlementLedger(): AuthoritativeSettlementLedger {
+    if (!authoritativeSettlementLedger) {
+      throw new WalletExecutionError(
+        'STORAGE_UNAVAILABLE',
+        'No durable storage available. An explicit Storage adapter must be provided in non-browser environments.'
+      )
+    }
+    return authoritativeSettlementLedger
+  }
+
+  // Durable execution ledger facade for C2 operations (or authoritative default)
   const executionLedger: WalletExecutionLedger =
     config.executionLedger ??
-    new DurableTransactionalExecutionLedger({
-      storage: config.storage,
-      lockCoordinator: config.lockCoordinator,
-      clock: getNow
-    })
+    (authoritativeSettlementLedger as unknown as WalletExecutionLedger)
+
+  if (!executionLedger) {
+    throw new WalletExecutionError(
+      'STORAGE_UNAVAILABLE',
+      'No durable storage available. An explicit Storage adapter must be provided in non-browser environments.'
+    )
+  }
 
   const ledgerReady = executionLedger.whenReady()
   ledgerReady.catch(() => {
@@ -427,7 +533,7 @@ function createWalletExecutionComposition(
         'No durable settlement storage available. Raw signed transactions cannot be persisted.'
       )
     }
-    const coordinator = config.lockCoordinator ?? new WebLocksExecutionCoordinator()
+    const coordinator = resolveWalletSettlementLockCoordinator()
     await coordinator.requestExclusive(DEFAULT_SETTLEMENT_STORE_LOCK_NAME, async () => {
       const raw = targetStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
       let store: Record<string, string> = {}
@@ -495,7 +601,7 @@ function createWalletExecutionComposition(
         'No durable settlement storage available. Raw signed transaction cannot be retrieved.'
       )
     }
-    const coordinator = config.lockCoordinator ?? new WebLocksExecutionCoordinator()
+    const coordinator = resolveWalletSettlementLockCoordinator()
     return coordinator.requestExclusive(DEFAULT_SETTLEMENT_STORE_LOCK_NAME, async () => {
       const raw = targetStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
       if (!raw) {
@@ -1397,7 +1503,8 @@ function createWalletExecutionComposition(
     }
 
     async function getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined> {
-      const record = await executionLedger.get(executionId)
+      const authRecord = authoritativeSettlementLedger ? await authoritativeSettlementLedger.get(executionId) : undefined
+      const record = authRecord ?? (await executionLedger.get(executionId))
       if (!record) return undefined
 
       // P0-2: Strip raw signed tx hex from public status
@@ -1411,7 +1518,7 @@ function createWalletExecutionComposition(
         destination: record.destination,
         amountSats: record.amountSats,
         network: record.network,
-        status: record.status ?? (record as any).state,
+        status: (record as any).status ?? (record as any).state,
         planHash: record.planHash,
         uncertainReason: record.uncertainReason,
         reservedAt: record.reservedAt,
@@ -1426,17 +1533,9 @@ function createWalletExecutionComposition(
     }
 
     /**
-     * Settle a SIGNED execution via Chronik broadcast and network verification (Gate C3A).
-     *
-     * State Machine:
-     * SIGNED -> SETTLING -> SETTLED
-     * SETTLING -> SETTLEMENT_UNCERTAIN
-     * SETTLING -> SETTLEMENT_REJECTED (definitive rejection only)
-     *
-     * Fencing & At-Most-Once Broadcast:
-     * Per-execution exclusive lock prevents concurrent broadcasts.
-     * TXID derived locally and committed before broadcast.
-     * Startup recovery queries network before any action; never blindly rebroadcasts.
+     * Authoritative settlement worker.
+     * Transitions SIGNED → SETTLING → broadcast to Chronik → SETTLED.
+     * Reconciles crash-recovery if previously SETTLING.
      *
      * Boundary Rules:
      * NEVER exports raw signed transaction bytes.
@@ -1449,12 +1548,14 @@ function createWalletExecutionComposition(
 
       await ledgerReady
 
-      return executionLedger.runWithSettlementLock(executionId, async () => {
+      const settlementLedger = getAuthoritativeSettlementLedger()
+
+      return settlementLedger.runWithSettlementLock(executionId, async () => {
         if (disposed) {
           throw new WalletExecutionError('COMPOSITION_DISPOSED', 'Execution engine is disposed.')
         }
 
-        const currentStatus = await executionLedger.get(executionId)
+        const currentStatus = await settlementLedger.get(executionId)
         if (!currentStatus) {
           throw new WalletExecutionError(
             'EXECUTION_NOT_FOUND',
@@ -1462,8 +1563,10 @@ function createWalletExecutionComposition(
           )
         }
 
+        const state = (currentStatus as any).state ?? (currentStatus as any).status
+
         // Idempotent return if already settled
-        if (currentStatus.status === 'SETTLED') {
+        if (state === 'SETTLED') {
           return Object.freeze({
             status: 'settled',
             network: currentStatus.network,
@@ -1476,26 +1579,18 @@ function createWalletExecutionComposition(
         }
 
         // Terminal rejected check
-        if (currentStatus.status === 'SETTLEMENT_REJECTED') {
+        if (state === 'SETTLEMENT_REJECTED') {
           throw new WalletExecutionError(
             'SETTLEMENT_REJECTED',
             `Execution "${executionId}" has already been definitively rejected: ${currentStatus.uncertainReason ?? 'settlement rejected'}`
           )
         }
 
-        // Chronik client resolution
-        const chronik =
-          config.chronik ??
-          (typeof getChronik === 'function' ? (getChronik() as unknown as ChronikBroadcastClient) : undefined)
-        if (!chronik) {
-          throw new WalletExecutionError(
-            'STORAGE_UNAVAILABLE',
-            'Chronik client is not available for settlement broadcast.'
-          )
-        }
+        // Chronik client resolution from trusted runtime
+        const chronik = resolveWalletChronikClient()
 
         // Handle recovering SETTLING or SETTLEMENT_UNCERTAIN
-        if (currentStatus.status === 'SETTLING' || currentStatus.status === 'SETTLEMENT_UNCERTAIN') {
+        if (state === 'SETTLING' || state === 'SETTLEMENT_UNCERTAIN') {
           let expectedTxid = currentStatus.expectedTxid
           if (!expectedTxid) {
             const rawTxHex = await getPrivateSignedTransaction(executionId)
@@ -1515,7 +1610,7 @@ function createWalletExecutionComposition(
 
           if (accepted) {
             const settledAt = getNow()
-            await executionLedger.transitionToSettled({
+            await settlementLedger.transitionToSettled({
               executionId,
               expectedTxid,
               settledAt
@@ -1532,7 +1627,7 @@ function createWalletExecutionComposition(
           }
 
           // If previously SETTLEMENT_UNCERTAIN and not accepted, keep uncertain
-          if (currentStatus.status === 'SETTLEMENT_UNCERTAIN') {
+          if (state === 'SETTLEMENT_UNCERTAIN') {
             throw new WalletExecutionError(
               'SETTLEMENT_UNCERTAIN',
               `Execution "${executionId}" settlement outcome is uncertain: ${currentStatus.uncertainReason ?? 'network acceptance could not be confirmed'}`
@@ -1540,7 +1635,7 @@ function createWalletExecutionComposition(
           }
 
           // If was SETTLING (abandoned attempt), mark uncertain
-          await executionLedger.markSettlementUncertain({
+          await settlementLedger.markSettlementUncertain({
             executionId,
             reason: 'Previous settlement attempt interrupted; transaction not observed on network.',
             timestamp: getNow()
@@ -1552,10 +1647,10 @@ function createWalletExecutionComposition(
         }
 
         // Only SIGNED state can initiate a new broadcast
-        if (currentStatus.status !== 'SIGNED') {
+        if (state !== 'SIGNED') {
           throw new WalletExecutionError(
             'INVALID_SETTLEMENT_STATE',
-            `Cannot settle execution "${executionId}" in state "${currentStatus.status}". Execution must be in SIGNED state.`
+            `Cannot settle execution "${executionId}" in state "${state}". Execution must be in SIGNED state.`
           )
         }
 
@@ -1567,7 +1662,7 @@ function createWalletExecutionComposition(
 
         // Bind and persist expectedTxid in durable SETTLING state BEFORE broadcast
         const settlingAt = getNow()
-        await executionLedger.transitionToSettling({
+        await settlementLedger.transitionToSettling({
           executionId,
           expectedTxid,
           settlingAt
@@ -1600,7 +1695,7 @@ function createWalletExecutionComposition(
 
           if (accepted) {
             const settledAt = getNow()
-            await executionLedger.transitionToSettled({
+            await settlementLedger.transitionToSettled({
               executionId,
               expectedTxid,
               settledAt
@@ -1620,10 +1715,11 @@ function createWalletExecutionComposition(
           if (isDefinitiveConsensusRejection(broadcastError)) {
             const timestamp = getNow()
             const reason = broadcastError instanceof Error ? broadcastError.message : String(broadcastError)
-            await executionLedger.markSettlementRejected({
+            await settlementLedger.markSettlementRejected({
               executionId,
               reason: `Definitive consensus rejection: ${reason}`,
-              timestamp
+              timestamp,
+              releaseOutpoints: true
             })
             throw new WalletExecutionError(
               'SETTLEMENT_REJECTED',
@@ -1632,10 +1728,10 @@ function createWalletExecutionComposition(
             )
           }
 
-          // Ambiguous / network drop / 5xx -> SETTLEMENT_UNCERTAIN
+          // Ambiguous / network drop / 5xx / mempool conflict -> SETTLEMENT_UNCERTAIN (retain outpoints)
           const timestamp = getNow()
           const reason = broadcastError instanceof Error ? broadcastError.message : String(broadcastError)
-          await executionLedger.markSettlementUncertain({
+          await settlementLedger.markSettlementUncertain({
             executionId,
             reason: `Settlement broadcast uncertain: ${reason}`,
             timestamp
@@ -1651,7 +1747,7 @@ function createWalletExecutionComposition(
         if (!broadcastTxid || broadcastTxid !== expectedTxid) {
           // FAIL CLOSED
           const timestamp = getNow()
-          await executionLedger.markSettlementUncertain({
+          await settlementLedger.markSettlementUncertain({
             executionId,
             reason: `Chronik returned txid "${broadcastTxid}" does not match locally derived expected txid "${expectedTxid}".`,
             timestamp
@@ -1678,7 +1774,7 @@ function createWalletExecutionComposition(
 
         if (!verifiedAcceptance) {
           const timestamp = getNow()
-          await executionLedger.markSettlementUncertain({
+          await settlementLedger.markSettlementUncertain({
             executionId,
             reason: 'Broadcast succeeded but network acceptance could not be verified via Chronik index.',
             timestamp
@@ -1691,7 +1787,7 @@ function createWalletExecutionComposition(
 
         // Transition to SETTLED
         const settledAt = getNow()
-        await executionLedger.transitionToSettled({
+        await settlementLedger.transitionToSettled({
           executionId,
           expectedTxid,
           settledAt
@@ -1710,19 +1806,23 @@ function createWalletExecutionComposition(
     }
 
     async function reconcileAbandonedSettlements(): Promise<void> {
-      const settlingList = await executionLedger.snapshotSettlingRecords()
+      if (!authoritativeSettlementLedger) return
+      const settlingList = await authoritativeSettlementLedger.snapshotSettlingRecords()
       if (settlingList.length === 0) return
 
-      const coordinator = config.lockCoordinator ?? new WebLocksExecutionCoordinator()
-      const chronik =
-        config.chronik ??
-        (typeof getChronik === 'function' ? (getChronik() as unknown as ChronikBroadcastClient) : undefined)
+      const coordinator = resolveWalletSettlementLockCoordinator()
+      let chronik: ChronikBroadcastClient | undefined
+      try {
+        chronik = resolveWalletChronikClient()
+      } catch {
+        chronik = undefined
+      }
 
       for (const item of settlingList) {
         const { executionId, expectedTxid } = item
         await coordinator.tryExclusive(executionSettlementLockName(executionId), async () => {
-          const record = await executionLedger.get(executionId)
-          if (!record || record.status !== 'SETTLING') {
+          const record = await authoritativeSettlementLedger.get(executionId)
+          if (!record || ((record as any).state !== 'SETTLING' && (record as any).status !== 'SETTLING')) {
             return
           }
           let targetTxid = expectedTxid
@@ -1731,7 +1831,7 @@ function createWalletExecutionComposition(
               const rawTxHex = await getPrivateSignedTransaction(executionId)
               targetTxid = deriveExpectedTxidFromRawTxHex(rawTxHex)
             } catch {
-              await executionLedger.markSettlementUncertain({
+              await authoritativeSettlementLedger.markSettlementUncertain({
                 executionId,
                 reason: 'Abandoned SETTLING record without recoverable expectedTxid.',
                 timestamp: getNow()
@@ -1743,7 +1843,7 @@ function createWalletExecutionComposition(
             try {
               const observed = await chronik.tx(targetTxid)
               if (observed && observed.txid?.toLowerCase() === targetTxid.toLowerCase()) {
-                await executionLedger.transitionToSettled({
+                await authoritativeSettlementLedger.transitionToSettled({
                   executionId,
                   expectedTxid: targetTxid,
                   settledAt: getNow()
@@ -1754,7 +1854,7 @@ function createWalletExecutionComposition(
               // Not found in mempool or chain
             }
           }
-          await executionLedger.markSettlementUncertain({
+          await authoritativeSettlementLedger.markSettlementUncertain({
             executionId,
             reason:
               'Abandoned SETTLING execution recovered at startup without network confirmation. Reconciled to SETTLEMENT_UNCERTAIN without rebroadcast.',
@@ -1830,7 +1930,6 @@ export interface TrustedWalletExecutionProviderProps {
   readonly lockCoordinator?: AgentWalletExecutionEngineConfig['lockCoordinator']
   readonly clock?: AgentWalletExecutionEngineConfig['clock']
   readonly idGenerator?: AgentWalletExecutionEngineConfig['idGenerator']
-  readonly chronik?: ChronikBroadcastClient
   /**
    * Public execution-ledger Storage only. NEVER used for raw signed transactions.
    */
@@ -1856,6 +1955,7 @@ export function resetTrustedExecutionShellForTests(): void {
     }
   }
   shellSlot = null
+  fallbackTestSettlementQueues.clear()
 }
 
 function getOrCreateShell(
@@ -1905,7 +2005,6 @@ export function TrustedWalletExecutionProvider({
   lockCoordinator,
   clock,
   idGenerator,
-  chronik,
   ledgerStorage,
   reviewLeaseTtlSeconds,
   reviewHeartbeatMs
@@ -1918,7 +2017,6 @@ export function TrustedWalletExecutionProvider({
         utxoProvider ||
         signatoryProvider ||
         lockCoordinator ||
-        chronik ||
         ledgerStorage
     )
     if (testsSupplyAdapters) {
@@ -1932,7 +2030,6 @@ export function TrustedWalletExecutionProvider({
     utxoProvider,
     signatoryProvider,
     lockCoordinator,
-    chronik,
     ledgerStorage
   ])
 
@@ -1962,7 +2059,6 @@ export function TrustedWalletExecutionProvider({
         feePolicy,
         storage: resolvedLedgerStorage,
         lockCoordinator,
-        chronik,
         clock,
         idGenerator
       },
