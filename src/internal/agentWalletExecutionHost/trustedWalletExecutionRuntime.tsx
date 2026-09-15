@@ -547,6 +547,48 @@ function resolveWalletChronikClient(): ChronikBroadcastClient {
   )
 }
 
+/**
+ * Safe, total formatter for unknown broadcast rejection payloads.
+ * Must NEVER throw for any JS value (null prototypes, throwing Symbol.toPrimitive/toString/valueOf, hostile proxies).
+ */
+function describeBroadcastRejection(value: unknown): string {
+  try {
+    if (value === undefined) {
+      return 'Broadcast rejected without error payload'
+    }
+
+    if (value === null) {
+      return 'Broadcast rejected with null error payload'
+    }
+
+    if (typeof value === 'string') {
+      return value || 'Empty rejection string'
+    }
+
+    try {
+      if (value instanceof Error) {
+        try {
+          if (typeof value.message === 'string' && value.message.length > 0) {
+            return value.message
+          }
+        } catch {
+          // continue to safe fallbacks
+        }
+      }
+    } catch {
+      // hostile Proxy / prototype behavior
+    }
+
+    try {
+      return String(value)
+    } catch {
+      return 'Unprintable broadcast rejection payload'
+    }
+  } catch {
+    return 'Unprintable broadcast rejection payload'
+  }
+}
+
 function createFileLocalProductionSignatoryProvider(): AgentWalletExecutionEngineConfig['signatoryProvider'] {
   return {
     async getSignatory(address: string) {
@@ -1236,6 +1278,14 @@ function createWalletExecutionComposition(
    * NEVER exposed via any public interface or exported getter.
    */
   async function getPrivateSignedTransaction(executionId: string): Promise<string> {
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforePrivateSignedTransactionRead')
+      ]
+      if (typeof hook === 'function') {
+        await hook(executionId)
+      }
+    }
     const targetStorage =
       trusted?.privateSettlementStorage ?? resolveFileLocalPrivateSettlementStorage()
     if (!targetStorage) {
@@ -2197,11 +2247,19 @@ function createWalletExecutionComposition(
       const settlementLedger = getAuthoritativeSettlementLedger()
 
       return settlementLedger.runWithSettlementLock(executionId, async () => {
-        if (disposed) {
+        const settleGuard: LifecycleGuard = () => !disposed
+        if (disposed || !settleGuard()) {
           throw new WalletExecutionError('COMPOSITION_DISPOSED', 'Execution engine is disposed.')
         }
 
         const currentStatus = await settlementLedger.get(executionId)
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement composition was disposed while reading settlement status.'
+          )
+        }
+
         if (!currentStatus) {
           throw new WalletExecutionError(
             'EXECUTION_NOT_FOUND',
@@ -2234,17 +2292,29 @@ function createWalletExecutionComposition(
 
         // Chronik client resolution from trusted runtime
         const chronik = resolveWalletChronikClient()
-        const settleGuard: LifecycleGuard = () => !disposed
 
         // Handle recovering SETTLING or SETTLEMENT_UNCERTAIN
         if (state === 'SETTLING' || state === 'SETTLEMENT_UNCERTAIN') {
           let expectedTxid = currentStatus.expectedTxid
           if (!expectedTxid) {
             const rawTxHex = await getPrivateSignedTransaction(executionId)
+            if (disposed || !settleGuard()) {
+              throw new WalletExecutionError(
+                'COMPOSITION_DISPOSED',
+                'Settlement composition was disposed while retrieving signed artifact.'
+              )
+            }
             expectedTxid = deriveExpectedTxidFromRawTxHex(rawTxHex)
           }
 
           // Query network acceptance before any further action
+          if (disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement composition was disposed before network observation.'
+            )
+          }
+
           let accepted = false
           try {
             const queryRes = await chronik.tx(expectedTxid)
@@ -2253,6 +2323,13 @@ function createWalletExecutionComposition(
             }
           } catch {
             accepted = false
+          }
+
+          if (disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement composition was disposed after network observation.'
+            )
           }
 
           if (accepted) {
@@ -2265,7 +2342,7 @@ function createWalletExecutionComposition(
               },
               settleGuard
             )
-            if (!committed || disposed) {
+            if (!committed || disposed || !settleGuard()) {
               throw new WalletExecutionError(
                 'COMPOSITION_DISPOSED',
                 'Settlement aborted before durable settled state was committed.'
@@ -2299,7 +2376,7 @@ function createWalletExecutionComposition(
             },
             settleGuard
           )
-          if (!committed || disposed) {
+          if (!committed || disposed || !settleGuard()) {
             throw new WalletExecutionError(
               'COMPOSITION_DISPOSED',
               'Settlement aborted before durable uncertain state was committed.'
@@ -2319,8 +2396,22 @@ function createWalletExecutionComposition(
           )
         }
 
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement composition was disposed before retrieving signed artifact.'
+          )
+        }
+
         // Retrieve raw signed tx from module-private storage
         const rawSignedTxHex = await getPrivateSignedTransaction(executionId)
+
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement composition was disposed after retrieving signed artifact.'
+          )
+        }
 
         // Derive expectedTxid locally from verified signed bytes
         const expectedTxid = deriveExpectedTxidFromRawTxHex(rawSignedTxHex)
@@ -2433,14 +2524,7 @@ function createWalletExecutionComposition(
           // any broadcast exception. Outpoint reservations are retained (never released on broadcast failure).
           cancelSettlementRecoveryRetry(executionId)
           const timestamp = getNow()
-          const reason =
-            broadcastError instanceof Error
-              ? broadcastError.message
-              : typeof broadcastError === 'string'
-                ? broadcastError || 'Empty rejection string'
-                : broadcastError !== undefined && broadcastError !== null
-                  ? String(broadcastError)
-                  : 'Broadcast rejected without error payload'
+          const reason = describeBroadcastRejection(broadcastError)
           const committed = await settlementLedger.markSettlementUncertain(
             {
               executionId,
@@ -2449,7 +2533,7 @@ function createWalletExecutionComposition(
             },
             settleGuard
           )
-          if (!committed || disposed) {
+          if (!committed || disposed || !settleGuard()) {
             throw new WalletExecutionError(
               'COMPOSITION_DISPOSED',
               'Settlement aborted before durable uncertain state was committed.'
@@ -2474,7 +2558,7 @@ function createWalletExecutionComposition(
             },
             settleGuard
           )
-          if (!committed || disposed) {
+          if (!committed || disposed || !settleGuard()) {
             throw new WalletExecutionError(
               'COMPOSITION_DISPOSED',
               'Settlement aborted before durable uncertain state was committed.'
@@ -2529,7 +2613,7 @@ function createWalletExecutionComposition(
             },
             settleGuard
           )
-          if (!committed || disposed) {
+          if (!committed || disposed || !settleGuard()) {
             throw new WalletExecutionError(
               'COMPOSITION_DISPOSED',
               'Settlement aborted before durable uncertain state was committed.'
@@ -2551,7 +2635,7 @@ function createWalletExecutionComposition(
           },
           settleGuard
         )
-        if (!committed || disposed) {
+        if (!committed || disposed || !settleGuard()) {
           throw new WalletExecutionError(
             'COMPOSITION_DISPOSED',
             'Settlement aborted before durable settled state was committed.'
