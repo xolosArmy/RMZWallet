@@ -1579,6 +1579,178 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
         expect(data.records[executionId]?.state).toBe('SETTLING')
         expect(txCalls).toBe(0)
       })
+
+      it('continues retrying beyond the previous 20-attempt window and reconciles to SETTLED when lock is released (observed tx)', async () => {
+        vi.useFakeTimers()
+        try {
+          const harness = setupTestHarness()
+          const { executionId, expectedTxid } = await harness.signExecution()
+          seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
+          harness.composition.dispose()
+
+          const broadcastCalls: Uint8Array[] = []
+          const txCalls: string[] = []
+          const recoveredChronik: ChronikBroadcastClient = {
+            broadcastTx: async rawTx => {
+              broadcastCalls.push(rawTx)
+              return { txid: expectedTxid }
+            },
+            tx: async txid => {
+              txCalls.push(txid)
+              return { txid }
+            }
+          }
+
+          ;(globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+          ] = recoveredChronik
+          ;(globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+          ] = harness.lockCoordinator
+
+          // 1. Tab A holds the settlement lock longer than the previous 20-attempt window
+          let releaseTabALock: () => void = () => {}
+          const tabALockHeld = new Promise<void>(resolve => {
+            releaseTabALock = resolve
+          })
+
+          const tabAHolding = harness.lockCoordinator.requestExclusive(
+            executionSettlementLockName(executionId),
+            async () => {
+              await tabALockHeld
+            }
+          )
+
+          // 2. Tab B starts recovery and repeatedly fails to acquire the lock
+          const rec = createFixtureLedgerRecord()
+          const tabBComposition = createWalletExecutionComposition(
+            {
+              approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+              sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+              utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+              signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+              storage: harness.ledgerStorage,
+              lockCoordinator: harness.lockCoordinator,
+              clock: () => FIXED_NOW + 100
+            },
+            {
+              executionStorage: harness.ledgerStorage,
+              privateSettlementStorage: harness.settlementStorage
+            }
+          )
+
+          // Advance past the previous 20-attempt window (~14.5s for 20 attempts; 25s is ~30 attempts)
+          await vi.advanceTimersByTimeAsync(25_000)
+
+          const midData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+          expect(midData.records[executionId]?.state).toBe('SETTLING')
+          expect(broadcastCalls).toHaveLength(0)
+
+          // 3. After that old retry window has elapsed, Tab A releases/crashes
+          releaseTabALock()
+          await tabAHolding
+
+          // 4. Without any call to publicEngine.settle(), Tab B acquires the lock and reconciles: observed tx -> SETTLED
+          await vi.advanceTimersByTimeAsync(1_000)
+
+          const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+          expect(finalData.records[executionId]?.state).toBe('SETTLED')
+
+          // 5. broadcast count = 0
+          expect(broadcastCalls).toHaveLength(0)
+          expect(txCalls).toContain(expectedTxid)
+
+          tabBComposition.dispose()
+        } finally {
+          vi.useRealTimers()
+        }
+      })
+
+      it('continues retrying beyond the previous 20-attempt window and reconciles to SETTLEMENT_UNCERTAIN when lock is released (unobservable tx)', async () => {
+        vi.useFakeTimers()
+        try {
+          const harness = setupTestHarness()
+          const { executionId, expectedTxid } = await harness.signExecution()
+          seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
+          harness.composition.dispose()
+
+          const broadcastCalls: Uint8Array[] = []
+          const txCalls: string[] = []
+          const recoveredChronik: ChronikBroadcastClient = {
+            broadcastTx: async rawTx => {
+              broadcastCalls.push(rawTx)
+              return { txid: expectedTxid }
+            },
+            tx: async txid => {
+              txCalls.push(txid)
+              throw new Error('Transaction not found in mempool or block')
+            }
+          }
+
+          ;(globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+          ] = recoveredChronik
+          ;(globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+          ] = harness.lockCoordinator
+
+          // 1. Tab A holds the settlement lock longer than the previous 20-attempt window
+          let releaseTabALock: () => void = () => {}
+          const tabALockHeld = new Promise<void>(resolve => {
+            releaseTabALock = resolve
+          })
+
+          const tabAHolding = harness.lockCoordinator.requestExclusive(
+            executionSettlementLockName(executionId),
+            async () => {
+              await tabALockHeld
+            }
+          )
+
+          // 2. Tab B starts recovery and repeatedly fails to acquire the lock
+          const rec = createFixtureLedgerRecord()
+          const tabBComposition = createWalletExecutionComposition(
+            {
+              approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+              sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+              utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+              signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+              storage: harness.ledgerStorage,
+              lockCoordinator: harness.lockCoordinator,
+              clock: () => FIXED_NOW + 100
+            },
+            {
+              executionStorage: harness.ledgerStorage,
+              privateSettlementStorage: harness.settlementStorage
+            }
+          )
+
+          // Advance past the previous 20-attempt window (~14.5s for 20 attempts; 25s is ~30 attempts)
+          await vi.advanceTimersByTimeAsync(25_000)
+
+          const midData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+          expect(midData.records[executionId]?.state).toBe('SETTLING')
+          expect(broadcastCalls).toHaveLength(0)
+
+          // 3. After that old retry window has elapsed, Tab A releases/crashes
+          releaseTabALock()
+          await tabAHolding
+
+          // 4. Without any call to publicEngine.settle(), Tab B acquires the lock and reconciles: unobservable -> SETTLEMENT_UNCERTAIN
+          await vi.advanceTimersByTimeAsync(1_000)
+
+          const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+          expect(finalData.records[executionId]?.state).toBe('SETTLEMENT_UNCERTAIN')
+
+          // 5. broadcast count = 0
+          expect(broadcastCalls).toHaveLength(0)
+          expect(txCalls.length).toBeGreaterThan(0)
+
+          tabBComposition.dispose()
+        } finally {
+          vi.useRealTimers()
+        }
+      })
     })
   })
 })

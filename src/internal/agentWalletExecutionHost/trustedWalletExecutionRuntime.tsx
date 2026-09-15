@@ -825,7 +825,7 @@ function createWalletExecutionComposition(
   ): Promise<void> {
     if (!authoritativeSettlementLedger) return
     const record = await authoritativeSettlementLedger.get(executionId)
-    if (!record || record.status !== 'SETTLING') {
+    if (!record || ((record as any).state ?? record.status) !== 'SETTLING') {
       return
     }
 
@@ -912,22 +912,26 @@ function createWalletExecutionComposition(
 
     cancelSettlementRecoveryRetry(executionId)
 
-    if (attempt > 20) {
-      return
-    }
-
     const baseDelay = 50
-    const delayMs = Math.min(Math.round(baseDelay * Math.pow(1.5, attempt - 1)), 1000)
+    const delayMs =
+      attempt >= 9
+        ? 1000
+        : Math.min(Math.round(baseDelay * Math.pow(1.5, attempt - 1)), 1000)
 
     const timer = setTimeout(async () => {
       if (disposed) return
+      const currentEntry = pendingSettlementRetries.get(executionId)
+      if (currentEntry?.timer !== timer) {
+        return
+      }
+
       try {
         const resolved = await attemptSettlementRecovery(executionId, expectedTxid)
-        if (!resolved && !disposed) {
+        if (!resolved && !disposed && pendingSettlementRetries.get(executionId)?.timer === timer) {
           scheduleSettlementRecoveryRetry(executionId, expectedTxid, attempt + 1)
         }
       } catch {
-        if (!disposed) {
+        if (!disposed && pendingSettlementRetries.get(executionId)?.timer === timer) {
           scheduleSettlementRecoveryRetry(executionId, expectedTxid, attempt + 1)
         }
       }
