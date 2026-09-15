@@ -20,7 +20,10 @@ import { xolosWalletService } from '../../services/XolosWalletService'
 import { WalletExecutionError } from '../../features/agentWalletExecution/errors'
 import {
   DEFAULT_REVIEW_LEASE_TTL_SECONDS,
+  DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
+  DEFAULT_EXECUTION_LOCK_NAME,
   DurableTransactionalExecutionLedger,
+  VALID_EXECUTION_STATE_TRANSITIONS,
   WebLocksExecutionCoordinator,
   executionSettlementLockName,
   type ExecutionLockCoordinator
@@ -44,9 +47,9 @@ import type {
   PublicExecutionStatus,
   SignedExecutionHandle,
   WalletExecutionLedger,
-  AuthoritativeSettlementLedger,
   WalletExecutionReviewSession,
   WalletExecutionReviewSnapshot,
+  WalletExecutionState,
   WalletFeePolicy,
   WalletPreparedExecutionPlan,
   WalletExecutionTrustedOptions,
@@ -80,6 +83,9 @@ const TEST_ONLY_SETTLEMENT_LOCK_COORDINATOR = Symbol.for(
 const TEST_ONLY_SETTLEMENT_CHRONIK_CLIENT = Symbol.for(
   'rmzwallet.testOnly.settlementChronikClient'
 )
+const TEST_ONLY_EXECUTION_STORAGE = Symbol.for(
+  'rmzwallet.testOnly.executionStorage'
+)
 
 type ReviewSigningHandoffPhase = 'IDLE' | 'REVIEW_ACTIVE' | 'HANDOFF_TO_SIGNING' | 'SIGNING_DURABLE'
 
@@ -91,6 +97,288 @@ function resolveFileLocalPrivateSettlementStorage(): Storage | undefined {
     }
   }
   return typeof localStorage !== 'undefined' ? localStorage : undefined
+}
+
+function resolveWalletExecutionStorage(
+  trusted?: WalletExecutionTrustedOptions
+): Storage | undefined {
+  if (import.meta.env?.VITEST) {
+    if (trusted?.executionStorage && typeof (trusted.executionStorage as Storage).setItem === 'function') {
+      return trusted.executionStorage
+    }
+    const override = (globalThis as Record<symbol, unknown>)[TEST_ONLY_EXECUTION_STORAGE]
+    if (override && typeof (override as Storage).setItem === 'function') {
+      return override as Storage
+    }
+  }
+  return typeof localStorage !== 'undefined' ? localStorage : undefined
+}
+
+/**
+ * File-local settlement authority interface.
+ * Strictly NOT exported from this file, barrel, or deep importable surface.
+ */
+interface AuthoritativeSettlementLedger {
+  get(executionId: string): Promise<PublicExecutionStatus | undefined>
+  runWithSettlementLock<T>(executionId: string, operation: () => Promise<T>): Promise<T>
+  transitionToSettling(params: {
+    readonly executionId: string
+    readonly expectedTxid: string
+    readonly settlingAt: number
+  }): Promise<void>
+  transitionToSettled(params: {
+    readonly executionId: string
+    readonly expectedTxid: string
+    readonly settledAt: number
+  }): Promise<void>
+  markSettlementUncertain(params: {
+    readonly executionId: string
+    readonly reason: string
+    readonly timestamp: number
+  }): Promise<void>
+  markSettlementRejected(params: {
+    readonly executionId: string
+    readonly reason: string
+    readonly timestamp: number
+    readonly releaseOutpoints?: boolean
+  }): Promise<void>
+  snapshotSettlingRecords(): Promise<
+    ReadonlyArray<{ readonly executionId: string; readonly expectedTxid?: string }>
+  >
+}
+
+/**
+ * File-local settlement authority implementation.
+ * Operates on the canonical Wallet-owned execution storage under lock.
+ * Strictly unexported.
+ */
+class FileLocalSettlementAuthority implements AuthoritativeSettlementLedger {
+  private readonly storage: Storage
+  private readonly coordinator: ExecutionLockCoordinator
+  private readonly canonicalLedger: DurableTransactionalExecutionLedger
+
+  constructor(options: {
+    storage: Storage
+    lockCoordinator: ExecutionLockCoordinator
+    canonicalLedger: DurableTransactionalExecutionLedger
+  }) {
+    this.storage = options.storage
+    this.coordinator = options.lockCoordinator
+    this.canonicalLedger = options.canonicalLedger
+  }
+
+  async get(executionId: string): Promise<PublicExecutionStatus | undefined> {
+    return this.canonicalLedger.get(executionId)
+  }
+
+  async runWithSettlementLock<T>(executionId: string, operation: () => Promise<T>): Promise<T> {
+    return this.coordinator.requestExclusive(executionSettlementLockName(executionId), operation)
+  }
+
+  private loadData(): {
+    schemaVersion: number
+    generation: number
+    records: Record<string, any>
+    approvalIdIndex: Record<string, string>
+    requestIdIndex: Record<string, string>
+    outpointReservations: Record<string, string>
+  } {
+    const raw = this.storage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)
+    if (!raw) {
+      return {
+        schemaVersion: 3,
+        generation: 0,
+        records: {},
+        approvalIdIndex: {},
+        requestIdIndex: {},
+        outpointReservations: {}
+      }
+    }
+    try {
+      const parsed = JSON.parse(raw)
+      return {
+        schemaVersion: 3,
+        generation: parsed.generation ?? 0,
+        records: parsed.records ?? {},
+        approvalIdIndex: parsed.approvalIdIndex ?? {},
+        requestIdIndex: parsed.requestIdIndex ?? {},
+        outpointReservations: parsed.outpointReservations ?? {}
+      }
+    } catch (err) {
+      throw new WalletExecutionError(
+        'STORAGE_MUTATION_FAILED',
+        `Failed to parse durable execution ledger data: ${err instanceof Error ? err.message : String(err)}`
+      )
+    }
+  }
+
+  private saveData(data: {
+    schemaVersion: number
+    generation: number
+    records: Record<string, any>
+    approvalIdIndex: Record<string, string>
+    requestIdIndex: Record<string, string>
+    outpointReservations: Record<string, string>
+  }): void {
+    data.generation += 1
+    try {
+      this.storage.setItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY, JSON.stringify({ ...data, schemaVersion: 3 }))
+    } catch (err) {
+      throw new WalletExecutionError(
+        'STORAGE_MUTATION_FAILED',
+        `Failed to persist durable execution ledger data: ${err instanceof Error ? err.message : String(err)}`
+      )
+    }
+  }
+
+  private releaseOutpoints(data: any, executionId: string, keys: readonly string[] | undefined): void {
+    if (!keys) return
+    for (const key of keys) {
+      if (data.outpointReservations[key] === executionId) {
+        delete data.outpointReservations[key]
+      }
+    }
+  }
+
+  private assertTransition(currentState: WalletExecutionState, targetState: WalletExecutionState): void {
+    const allowed = VALID_EXECUTION_STATE_TRANSITIONS[currentState]
+    if (!allowed || !allowed.includes(targetState)) {
+      throw new WalletExecutionError(
+        'INVALID_STATE_TRANSITION',
+        `Cannot transition execution record from state "${currentState}" to "${targetState}".`
+      )
+    }
+  }
+
+  async transitionToSettling(params: {
+    readonly executionId: string
+    readonly expectedTxid: string
+    readonly settlingAt: number
+  }): Promise<void> {
+    return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      const data = this.loadData()
+      const existing = data.records[params.executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+      }
+
+      this.assertTransition(existing.state, 'SETTLING')
+
+      data.records[params.executionId] = {
+        ...existing,
+        state: 'SETTLING',
+        expectedTxid: params.expectedTxid.toLowerCase(),
+        settlingAt: params.settlingAt,
+        settlementAttempt: (existing.settlementAttempt ?? 0) + 1
+      }
+
+      this.saveData(data)
+    })
+  }
+
+  async transitionToSettled(params: {
+    readonly executionId: string
+    readonly expectedTxid: string
+    readonly settledAt: number
+  }): Promise<void> {
+    return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      const data = this.loadData()
+      const existing = data.records[params.executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+      }
+
+      this.assertTransition(existing.state, 'SETTLED')
+
+      if (existing.expectedTxid && existing.expectedTxid.toLowerCase() !== params.expectedTxid.toLowerCase()) {
+        throw new WalletExecutionError(
+          'SETTLEMENT_TXID_MISMATCH',
+          `Cannot settle execution "${params.executionId}" with txid "${params.expectedTxid}" (expected "${existing.expectedTxid}").`
+        )
+      }
+
+      data.records[params.executionId] = {
+        ...existing,
+        state: 'SETTLED',
+        expectedTxid: params.expectedTxid.toLowerCase(),
+        settledAt: params.settledAt
+      }
+
+      this.saveData(data)
+    })
+  }
+
+  async markSettlementUncertain(params: {
+    readonly executionId: string
+    readonly reason: string
+    readonly timestamp: number
+  }): Promise<void> {
+    return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      const data = this.loadData()
+      const existing = data.records[params.executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+      }
+
+      this.assertTransition(existing.state, 'SETTLEMENT_UNCERTAIN')
+
+      data.records[params.executionId] = {
+        ...existing,
+        state: 'SETTLEMENT_UNCERTAIN',
+        uncertainReason: params.reason,
+        failedAt: params.timestamp
+      }
+
+      this.saveData(data)
+    })
+  }
+
+  async markSettlementRejected(params: {
+    readonly executionId: string
+    readonly reason: string
+    readonly timestamp: number
+    readonly releaseOutpoints?: boolean
+  }): Promise<void> {
+    return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      const data = this.loadData()
+      const existing = data.records[params.executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+      }
+
+      this.assertTransition(existing.state, 'SETTLEMENT_REJECTED')
+
+      const release = params.releaseOutpoints === true
+      if (release) {
+        this.releaseOutpoints(data, params.executionId, existing.reservedOutpoints)
+      }
+
+      data.records[params.executionId] = {
+        ...existing,
+        state: 'SETTLEMENT_REJECTED',
+        uncertainReason: params.reason,
+        failedAt: params.timestamp,
+        reservedOutpoints: release ? [] : existing.reservedOutpoints
+      }
+
+      this.saveData(data)
+    })
+  }
+
+  async snapshotSettlingRecords(): Promise<
+    ReadonlyArray<{ readonly executionId: string; readonly expectedTxid?: string }>
+  > {
+    return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      const data = this.loadData()
+      const results: Array<{ executionId: string; expectedTxid?: string }> = []
+      for (const record of Object.values(data.records)) {
+        if (record && record.state === 'SETTLING') {
+          results.push({ executionId: record.executionId, expectedTxid: record.expectedTxid })
+        }
+      }
+      return results
+    })
+  }
 }
 
 const fallbackTestSettlementQueues = new Map<string, Promise<unknown>>()
@@ -464,13 +752,72 @@ function createWalletExecutionComposition(
     ...(config.feePolicy ?? {})
   }
 
+  let disposed = false
+  const pendingSettlementRetries = new Map<string, { timer: ReturnType<typeof setTimeout>; attempt: number }>()
+
+  function cancelSettlementRecoveryRetry(executionId: string): void {
+    const existing = pendingSettlementRetries.get(executionId)
+    if (existing) {
+      clearTimeout(existing.timer)
+      pendingSettlementRetries.delete(executionId)
+    }
+  }
+
+  function cancelAllSettlementRecoveryRetries(): void {
+    for (const [_, entry] of pendingSettlementRetries.entries()) {
+      clearTimeout(entry.timer)
+    }
+    pendingSettlementRetries.clear()
+  }
+
   // One canonical durable execution-state storage dataset
-  const canonicalStorage =
-    config.storage ??
-    (typeof localStorage !== 'undefined' ? localStorage : undefined)
+  const canonicalStorage = resolveWalletExecutionStorage(trusted)
   const trustedSettlementCoordinator = resolveWalletSettlementLockCoordinator()
 
-  let authoritativeSettlementLedger: AuthoritativeSettlementLedger | null = null
+  // Canonical Wallet-owned durable execution ledger for C2
+  const canonicalLedger = canonicalStorage
+    ? new DurableTransactionalExecutionLedger({
+        storage: canonicalStorage,
+        lockCoordinator: trustedSettlementCoordinator,
+        clock: getNow
+      })
+    : null
+
+  // File-local authoritative settlement ledger for C3A operating on the single dataset
+  const authoritativeSettlementLedger: AuthoritativeSettlementLedger | null = canonicalStorage
+    ? new FileLocalSettlementAuthority({
+        storage: canonicalStorage,
+        lockCoordinator: trustedSettlementCoordinator,
+        canonicalLedger: canonicalLedger!
+      })
+    : null
+
+  function getAuthoritativeSettlementLedger(): AuthoritativeSettlementLedger {
+    if (!authoritativeSettlementLedger) {
+      throw new WalletExecutionError(
+        'STORAGE_UNAVAILABLE',
+        'No durable settlement storage available. An explicit Storage adapter must be provided in non-browser environments.'
+      )
+    }
+    return authoritativeSettlementLedger
+  }
+
+  // Durable execution ledger facade for C2 operations (or authoritative default).
+  // In production, C2 ALWAYS uses the canonicalLedger.
+  // Historical C2 test double substitution is confined to Vitest when test options are supplied.
+  const executionLedger: WalletExecutionLedger =
+    (import.meta.env?.VITEST && trusted?.testOnlyExecutionLedger)
+      ? trusted.testOnlyExecutionLedger
+      : (import.meta.env?.VITEST && config.executionLedger)
+        ? config.executionLedger
+        : canonicalLedger!
+
+  if (!executionLedger) {
+    throw new WalletExecutionError(
+      'STORAGE_UNAVAILABLE',
+      'No durable storage available. An explicit Storage adapter must be provided in non-browser environments.'
+    )
+  }
 
   async function handleSettlementRecovery(
     executionId: string,
@@ -528,36 +875,80 @@ function createWalletExecutionComposition(
     })
   }
 
-  // Authoritative settlement ledger constructed inside trusted runtime
-  authoritativeSettlementLedger = canonicalStorage
-    ? new DurableTransactionalExecutionLedger({
-        storage: canonicalStorage,
-        lockCoordinator: trustedSettlementCoordinator,
-        clock: getNow,
-        settlementRecoveryHandler: handleSettlementRecovery
-      })
-    : null
+  async function attemptSettlementRecovery(
+    executionId: string,
+    expectedTxid?: string
+  ): Promise<boolean> {
+    if (disposed || !authoritativeSettlementLedger) return true
 
-  function getAuthoritativeSettlementLedger(): AuthoritativeSettlementLedger {
-    if (!authoritativeSettlementLedger) {
-      throw new WalletExecutionError(
-        'STORAGE_UNAVAILABLE',
-        'No durable storage available. An explicit Storage adapter must be provided in non-browser environments.'
-      )
+    const current = await authoritativeSettlementLedger.get(executionId)
+    if (!current || ((current as any).state ?? current.status) !== 'SETTLING') {
+      cancelSettlementRecoveryRetry(executionId)
+      return true
     }
-    return authoritativeSettlementLedger
+
+    const coordinator = resolveWalletSettlementLockCoordinator()
+    const lockResult = await coordinator.tryExclusive(
+      executionSettlementLockName(executionId),
+      async () => {
+        await handleSettlementRecovery(executionId, expectedTxid ?? current.expectedTxid)
+      }
+    )
+
+    if (lockResult.acquired) {
+      cancelSettlementRecoveryRetry(executionId)
+      return true
+    }
+
+    return false
   }
 
-  // Durable execution ledger facade for C2 operations (or authoritative default)
-  const executionLedger: WalletExecutionLedger =
-    config.executionLedger ??
-    (authoritativeSettlementLedger as unknown as WalletExecutionLedger)
+  function scheduleSettlementRecoveryRetry(
+    executionId: string,
+    expectedTxid: string | undefined,
+    attempt: number = 1
+  ): void {
+    if (disposed) return
 
-  if (!executionLedger) {
-    throw new WalletExecutionError(
-      'STORAGE_UNAVAILABLE',
-      'No durable storage available. An explicit Storage adapter must be provided in non-browser environments.'
-    )
+    cancelSettlementRecoveryRetry(executionId)
+
+    if (attempt > 20) {
+      return
+    }
+
+    const baseDelay = 50
+    const delayMs = Math.min(Math.round(baseDelay * Math.pow(1.5, attempt - 1)), 1000)
+
+    const timer = setTimeout(async () => {
+      if (disposed) return
+      try {
+        const resolved = await attemptSettlementRecovery(executionId, expectedTxid)
+        if (!resolved && !disposed) {
+          scheduleSettlementRecoveryRetry(executionId, expectedTxid, attempt + 1)
+        }
+      } catch {
+        if (!disposed) {
+          scheduleSettlementRecoveryRetry(executionId, expectedTxid, attempt + 1)
+        }
+      }
+    }, delayMs)
+
+    pendingSettlementRetries.set(executionId, { timer, attempt })
+  }
+
+  async function reconcileAbandonedSettlements(): Promise<void> {
+    if (disposed || !authoritativeSettlementLedger) return
+    const settlingList = await authoritativeSettlementLedger.snapshotSettlingRecords()
+    if (settlingList.length === 0) return
+
+    for (const item of settlingList) {
+      if (disposed) return
+      const { executionId, expectedTxid } = item
+      const resolved = await attemptSettlementRecovery(executionId, expectedTxid)
+      if (!resolved && !disposed) {
+        scheduleSettlementRecoveryRetry(executionId, expectedTxid, 1)
+      }
+    }
   }
 
   const ledgerReady = executionLedger.whenReady()
@@ -578,7 +969,6 @@ function createWalletExecutionComposition(
   let reviewLockRelease: (() => void) | null = null
   let reviewHeartbeatTimer: ReturnType<typeof setInterval> | null = null
   let recoveryTimer: ReturnType<typeof setTimeout> | null = null
-  let disposed = false
   let handoffPhase: ReviewSigningHandoffPhase = 'IDLE'
   let preSigningAbort: AbortController | null = null
 
@@ -767,6 +1157,7 @@ function createWalletExecutionComposition(
   function disposeComposition(): void {
     if (disposed) return
     disposed = true
+    cancelAllSettlementRecoveryRetries()
     isPreparing = false
     cancelScheduledRecovery()
     sessionPreparedListeners.clear()
@@ -1871,21 +2262,6 @@ function createWalletExecutionComposition(
       })
     }
 
-    async function reconcileAbandonedSettlements(): Promise<void> {
-      if (!authoritativeSettlementLedger) return
-      const settlingList = await authoritativeSettlementLedger.snapshotSettlingRecords()
-      if (settlingList.length === 0) return
-
-      const coordinator = resolveWalletSettlementLockCoordinator()
-
-      for (const item of settlingList) {
-        const { executionId, expectedTxid } = item
-        await coordinator.tryExclusive(executionSettlementLockName(executionId), async () => {
-          await handleSettlementRecovery(executionId, expectedTxid)
-        })
-      }
-    }
-
     const publicEngine: AgentWalletExecutionEngine = Object.freeze({
       prepareExecution,
       getExecutionStatus,
@@ -1924,15 +2300,28 @@ function createWalletExecutionComposition(
   export function createAgentWalletExecutionEngine(
     config: AgentWalletExecutionEngineConfig
   ): AgentWalletExecutionEngine {
-    return createWalletExecutionComposition(config).publicEngine
+    return createWalletExecutionComposition(
+      config,
+      import.meta.env?.VITEST && config.storage
+        ? { executionStorage: config.storage }
+        : undefined
+    ).publicEngine
   }
 
   if (import.meta.env?.VITEST) {
     Object.defineProperty(globalThis, TEST_ONLY_CREATE_WALLET_EXECUTION_COMPOSITION, {
-      value: createWalletExecutionComposition,
+      value: (config: AgentWalletExecutionEngineConfig, trusted?: WalletExecutionTrustedOptions) => {
+        const effectiveTrusted: WalletExecutionTrustedOptions = {
+          ...(config.storage && !trusted?.executionStorage
+            ? { executionStorage: config.storage }
+            : {}),
+          ...trusted
+        }
+        return createWalletExecutionComposition(config, effectiveTrusted)
+      },
       configurable: true,
       enumerable: false,
-      writable: false
+      writable: true
     })
   }
 
@@ -2080,6 +2469,7 @@ export function TrustedWalletExecutionProvider({
         idGenerator
       },
       {
+        executionStorage: import.meta.env?.VITEST ? resolvedLedgerStorage : undefined,
         privateSettlementStorage: resolveFileLocalPrivateSettlementStorage(),
         reviewLeaseTtlSeconds,
         reviewHeartbeatMs

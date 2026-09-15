@@ -143,10 +143,6 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     return operation()
   }
 
-  async runWithSettlementLock<T>(_executionId: string, operation: () => Promise<T>): Promise<T> {
-    return operation()
-  }
-
   private assertTransition(currentState: WalletExecutionState, targetState: WalletExecutionState): void {
     const allowed = VALID_EXECUTION_STATE_TRANSITIONS[currentState]
     if (!allowed.includes(targetState)) {
@@ -458,121 +454,6 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
     })
 
     this.commitUpdate(updated)
-  }
-
-  async transitionToSettling(params: {
-    readonly executionId: string
-    readonly expectedTxid: string
-    readonly settlingAt: number
-  }): Promise<void> {
-    const existing = this.recordsByExecutionId.get(params.executionId)
-    if (!existing) {
-      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
-    }
-
-    this.assertTransition(existing.state, 'SETTLING')
-
-    const updated: InternalWalletExecutionRecord = Object.freeze({
-      ...existing,
-      state: 'SETTLING',
-      expectedTxid: params.expectedTxid.toLowerCase(),
-      settlingAt: params.settlingAt,
-      settlementAttempt: (existing.settlementAttempt ?? 0) + 1
-    })
-
-    this.commitUpdate(updated)
-  }
-
-  async transitionToSettled(params: {
-    readonly executionId: string
-    readonly expectedTxid: string
-    readonly settledAt: number
-  }): Promise<void> {
-    const existing = this.recordsByExecutionId.get(params.executionId)
-    if (!existing) {
-      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
-    }
-
-    this.assertTransition(existing.state, 'SETTLED')
-
-    if (existing.expectedTxid && existing.expectedTxid.toLowerCase() !== params.expectedTxid.toLowerCase()) {
-      throw new WalletExecutionError(
-        'SETTLEMENT_TXID_MISMATCH',
-        `Cannot settle execution "${params.executionId}" with txid "${params.expectedTxid}" (expected "${existing.expectedTxid}").`
-      )
-    }
-
-    const updated: InternalWalletExecutionRecord = Object.freeze({
-      ...existing,
-      state: 'SETTLED',
-      expectedTxid: params.expectedTxid.toLowerCase(),
-      settledAt: params.settledAt
-    })
-
-    this.commitUpdate(updated)
-  }
-
-  async markSettlementUncertain(params: {
-    readonly executionId: string
-    readonly reason: string
-    readonly timestamp: number
-  }): Promise<void> {
-    const existing = this.recordsByExecutionId.get(params.executionId)
-    if (!existing) {
-      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
-    }
-
-    this.assertTransition(existing.state, 'SETTLEMENT_UNCERTAIN')
-
-    const updated: InternalWalletExecutionRecord = Object.freeze({
-      ...existing,
-      state: 'SETTLEMENT_UNCERTAIN',
-      uncertainReason: params.reason,
-      failedAt: params.timestamp
-    })
-
-    this.commitUpdate(updated)
-  }
-
-  async markSettlementRejected(params: {
-    readonly executionId: string
-    readonly reason: string
-    readonly timestamp: number
-    readonly releaseOutpoints?: boolean
-  }): Promise<void> {
-    const existing = this.recordsByExecutionId.get(params.executionId)
-    if (!existing) {
-      throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
-    }
-
-    this.assertTransition(existing.state, 'SETTLEMENT_REJECTED')
-
-    const release = params.releaseOutpoints === true
-    if (release) {
-      this.releaseOwnedOutpoints(params.executionId, existing.reservedOutpoints)
-    }
-
-    const updated: InternalWalletExecutionRecord = Object.freeze({
-      ...existing,
-      state: 'SETTLEMENT_REJECTED',
-      uncertainReason: params.reason,
-      failedAt: params.timestamp,
-      reservedOutpoints: release ? [] : existing.reservedOutpoints
-    })
-
-    this.commitUpdate(updated)
-  }
-
-  async snapshotSettlingRecords(): Promise<
-    ReadonlyArray<{ readonly executionId: string; readonly expectedTxid?: string }>
-  > {
-    const results: Array<{ executionId: string; expectedTxid?: string }> = []
-    for (const record of this.recordsByExecutionId.values()) {
-      if (record.state === 'SETTLING') {
-        results.push({ executionId: record.executionId, expectedTxid: record.expectedTxid })
-      }
-    }
-    return results
   }
 
   async markSigningUncertain(

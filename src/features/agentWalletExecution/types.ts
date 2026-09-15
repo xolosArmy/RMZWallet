@@ -320,41 +320,6 @@ export interface WalletExecutionLedger {
 }
 
 /**
- * Authoritative Wallet Settlement Ledger (Internal / Trusted runtime only).
- * Strictly NOT part of public injectable WalletExecutionLedger interface.
- * Fences and executes settlement lifecycle transitions.
- */
-export interface AuthoritativeSettlementLedger {
-  whenReady(): Promise<void>
-  get(executionId: string): Promise<PublicExecutionStatus | undefined>
-  runWithSettlementLock<T>(executionId: string, operation: () => Promise<T>): Promise<T>
-  transitionToSettling(params: {
-    readonly executionId: string
-    readonly expectedTxid: string
-    readonly settlingAt: number
-  }): Promise<void>
-  transitionToSettled(params: {
-    readonly executionId: string
-    readonly expectedTxid: string
-    readonly settledAt: number
-  }): Promise<void>
-  markSettlementUncertain(params: {
-    readonly executionId: string
-    readonly reason: string
-    readonly timestamp: number
-  }): Promise<void>
-  markSettlementRejected(params: {
-    readonly executionId: string
-    readonly reason: string
-    readonly timestamp: number
-    readonly releaseOutpoints?: boolean
-  }): Promise<void>
-  snapshotSettlingRecords(): Promise<
-    ReadonlyArray<{ readonly executionId: string; readonly expectedTxid?: string }>
-  >
-}
-
-/**
  * Engine configuration for Wallet-owned prepared transaction construction and signing.
  */
 export interface AgentWalletExecutionEngineConfig {
@@ -388,6 +353,8 @@ export interface AgentWalletExecutionEngineConfig {
  * Must not be exported from the public agentWalletExecution barrel.
  */
 export interface WalletExecutionTrustedOptions {
+  readonly executionStorage?: Storage
+  readonly testOnlyExecutionLedger?: WalletExecutionLedger
   readonly privateSettlementStorage?: Storage
   readonly reviewLeaseTtlSeconds?: number
   readonly reviewHeartbeatMs?: number

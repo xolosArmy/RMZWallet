@@ -245,7 +245,7 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
   it('verifies WalletExecutionLedger never carries signed transaction bytes or settlement mutation authority', () => {
     const typesContent = readFileSync(join(__dirname, 'types.ts'), 'utf-8')
     const ledgerStart = typesContent.indexOf('export interface WalletExecutionLedger')
-    const ledgerEnd = typesContent.indexOf('export interface AuthoritativeSettlementLedger')
+    const ledgerEnd = typesContent.indexOf('export interface AgentWalletExecutionEngineConfig')
     expect(ledgerStart).toBeGreaterThan(-1)
     expect(ledgerEnd).toBeGreaterThan(ledgerStart)
     const ledgerBody = typesContent.slice(ledgerStart, ledgerEnd)
@@ -261,13 +261,27 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(ledgerBody).toContain('transitionToSigned(executionId: string, signedAt: number)')
     expect(ledgerBody).toContain('transitionToSigningIfValid')
 
+    expect(typesContent).not.toMatch(/AuthoritativeSettlementLedger/)
+
     const ledgerSource = readFileSync(join(__dirname, 'ledger.ts'), 'utf-8')
     expect(ledgerSource).not.toMatch(/rawSignedTxHex/)
     expect(ledgerSource).not.toMatch(/\brawTx\b/)
     expect(ledgerSource).not.toMatch(/\btxHex\b/)
+    expect(ledgerSource).not.toMatch(/transitionToSettling/)
+    expect(ledgerSource).not.toMatch(/transitionToSettled/)
+    expect(ledgerSource).not.toMatch(/markSettlementUncertain/)
+    expect(ledgerSource).not.toMatch(/markSettlementRejected/)
+    expect(ledgerSource).not.toMatch(/snapshotSettlingRecords/)
+    expect(ledgerSource).not.toMatch(/runWithSettlementLock/)
 
     const testUtilsSource = readFileSync(join(__dirname, 'testUtils.ts'), 'utf-8')
     expect(testUtilsSource).not.toMatch(/rawSignedTxHex/)
+    expect(testUtilsSource).not.toMatch(/transitionToSettling/)
+    expect(testUtilsSource).not.toMatch(/transitionToSettled/)
+    expect(testUtilsSource).not.toMatch(/markSettlementUncertain/)
+    expect(testUtilsSource).not.toMatch(/markSettlementRejected/)
+    expect(testUtilsSource).not.toMatch(/snapshotSettlingRecords/)
+    expect(testUtilsSource).not.toMatch(/runWithSettlementLock/)
   })
 
   it('verifies SignedExecutionHandle remains opaque without raw tx bytes', () => {

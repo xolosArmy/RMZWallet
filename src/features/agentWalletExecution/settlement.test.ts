@@ -38,7 +38,9 @@ import {
 } from './settlementUtils'
 import {
   canonicalOutpointKey,
+  DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
   DurableTransactionalExecutionLedger,
+  executionSettlementLockName,
   WebLocksExecutionCoordinator,
   type ExecutionLockCoordinator
 } from './ledger'
@@ -144,6 +146,24 @@ interface TestHarness {
   }>
 }
 
+function seedSettlingState(
+  storage: Storage,
+  executionId: string,
+  expectedTxid: string,
+  settlingAt: number = FIXED_NOW
+): void {
+  const raw = storage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)
+  const data = JSON.parse(raw!)
+  data.records[executionId] = {
+    ...data.records[executionId],
+    state: 'SETTLING',
+    expectedTxid: expectedTxid.toLowerCase(),
+    settlingAt,
+    settlementAttempt: (data.records[executionId]?.settlementAttempt ?? 0) + 1
+  }
+  storage.setItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY, JSON.stringify(data))
+}
+
 function setupTestHarness(options: {
   chronikOverride?: Partial<ChronikBroadcastClient>
 } = {}): TestHarness {
@@ -230,6 +250,7 @@ function setupTestHarness(options: {
   }
 
   const composition = createWalletExecutionComposition(config, {
+    executionStorage: ledgerStorage,
     privateSettlementStorage: settlementStorage
   })
 
@@ -591,16 +612,7 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
       const { executionId, expectedTxid } = await harness.signExecution()
 
       // Transition to SETTLING manually to simulate an interrupted broadcast
-      const ledger = new DurableTransactionalExecutionLedger({
-        storage: harness.ledgerStorage,
-        lockCoordinator: harness.lockCoordinator,
-        clock: () => FIXED_NOW
-      })
-      await ledger.transitionToSettling({
-        executionId,
-        expectedTxid,
-        settlingAt: FIXED_NOW
-      })
+      seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
       harness.composition.dispose()
 
       // Chronik observer sees the transaction
@@ -663,16 +675,7 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
       const { executionId, expectedTxid } = await harness.signExecution()
 
       // Transition to SETTLING manually to simulate an interrupted broadcast
-      const ledger = new DurableTransactionalExecutionLedger({
-        storage: harness.ledgerStorage,
-        lockCoordinator: harness.lockCoordinator,
-        clock: () => FIXED_NOW
-      })
-      await ledger.transitionToSettling({
-        executionId,
-        expectedTxid,
-        settlingAt: FIXED_NOW
-      })
+      seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
       harness.composition.dispose()
 
       // Chronik tx query throws not found
@@ -739,16 +742,7 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
       const { executionId, expectedTxid } = await harness.signExecution()
 
       // Transition to SETTLING manually to simulate a crash during settlement
-      const ledger = new DurableTransactionalExecutionLedger({
-        storage: harness.ledgerStorage,
-        lockCoordinator: harness.lockCoordinator,
-        clock: () => FIXED_NOW
-      })
-      await ledger.transitionToSettling({
-        executionId,
-        expectedTxid,
-        settlingAt: FIXED_NOW
-      })
+      seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
       harness.composition.dispose()
 
       // Re-instantiate engine on same storage with mock Chronik that sees the tx in mempool
@@ -801,16 +795,7 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
       const { executionId, expectedTxid } = await harness.signExecution()
 
       // Transition to SETTLING to simulate an interrupted broadcast
-      const ledger = new DurableTransactionalExecutionLedger({
-        storage: harness.ledgerStorage,
-        lockCoordinator: harness.lockCoordinator,
-        clock: () => FIXED_NOW
-      })
-      await ledger.transitionToSettling({
-        executionId,
-        expectedTxid,
-        settlingAt: FIXED_NOW
-      })
+      seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
       harness.composition.dispose()
 
       // Chronik tx query throws not found
@@ -1186,6 +1171,414 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
 
       instanceB.dispose()
       harness.composition.dispose()
+    })
+  })
+
+  describe('Gate C3A Pass 3 Remediation Suite', () => {
+    describe('P0-1: Settlement Mutators Must Not Be Publicly Importable', () => {
+      it('proves DurableTransactionalExecutionLedger has NO settlement mutators on prototype or instance', () => {
+        const forbiddenMethods = [
+          'transitionToSettling',
+          'transitionToSettled',
+          'markSettlementUncertain',
+          'markSettlementRejected',
+          'snapshotSettlingRecords',
+          'runWithSettlementLock'
+        ]
+
+        for (const method of forbiddenMethods) {
+          expect((DurableTransactionalExecutionLedger.prototype as any)[method]).toBeUndefined()
+        }
+
+        const ledger = new DurableTransactionalExecutionLedger({
+          storage: new MockStorage(),
+          lockCoordinator: new TestExecutionLockCoordinator(),
+          clock: () => FIXED_NOW
+        })
+
+        for (const method of forbiddenMethods) {
+          expect((ledger as any)[method]).toBeUndefined()
+        }
+      })
+
+      it('proves production deep import cannot obtain a trusted settlement mutation capability', async () => {
+        const ledgerModule = await import('./ledger')
+        const typesModule = await import('./types')
+
+        expect((typesModule as any).AuthoritativeSettlementLedger).toBeUndefined()
+        expect((ledgerModule as any).FileLocalSettlementAuthority).toBeUndefined()
+        expect((ledgerModule as any).AuthoritativeSettlementLedger).toBeUndefined()
+
+        for (const exportName of Object.keys(ledgerModule)) {
+          expect(exportName).not.toMatch(/settle.*mutat/i)
+          expect(exportName).not.toMatch(/authoritative.*settlement/i)
+        }
+      })
+    })
+
+    describe('P0-2: Public config.storage Must Not Back Settlement Authority', () => {
+      it('proves malicious config.storage cannot suppress SETTLING persistence or hijack settlement authority', async () => {
+        const canonicalStorage = new MockStorage()
+        const settlementStorage = new MockStorage()
+        const lockCoordinator = new TestExecutionLockCoordinator()
+
+        let hostileSetItemCalled = false
+        const hostileStorage: Storage = {
+          getItem: vi.fn(() => null),
+          setItem: vi.fn(() => {
+            hostileSetItemCalled = true
+            throw new Error('Hostile storage reject')
+          }),
+          removeItem: vi.fn(),
+          clear: vi.fn(),
+          key: vi.fn(),
+          length: 0
+        }
+
+        const { signatory } = createSyntheticSignatory()
+        const defaultRecord = createFixtureLedgerRecord()
+        const approvalMap = new Map<string, WalletApprovalLedgerRecord>()
+        approvalMap.set(defaultRecord.requestId, defaultRecord)
+
+        const mockChronik: ChronikBroadcastClient = {
+          broadcastTx: async rawTx => {
+            const tx = Tx.fromHex(Buffer.from(rawTx).toString('hex'))
+            return { txid: tx.txid().toLowerCase() }
+          },
+          tx: async txid => ({ txid })
+        }
+
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ] = mockChronik
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ] = lockCoordinator
+
+        const composition = createWalletExecutionComposition(
+          {
+            approvalLedger: {
+              get: async (reqId: string) => approvalMap.get(reqId),
+              getByApprovalId: async (apprId: string) =>
+                Array.from(approvalMap.values()).find(r => r.approvalId === apprId)
+            },
+            sessionVerifier: {
+              verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS })
+            },
+            utxoProvider: {
+              getSpendableUtxos: async () => createFixtureUtxos()
+            },
+            signatoryProvider: {
+              getSignatory: () => signatory
+            },
+            storage: hostileStorage, // HOSTILE STORAGE IN PUBLIC CONFIG
+            lockCoordinator,
+            clock: () => FIXED_NOW,
+            idGenerator: () => 'exec_p0_2_hostile'
+          },
+          {
+            executionStorage: canonicalStorage,
+            privateSettlementStorage: settlementStorage
+          }
+        )
+
+        // Prepare and sign
+        const session = await composition.publicEngine.prepareExecution(defaultRecord.humanApproval!)
+        const controller = composition.walletUIHost.getActiveController()
+        if (!controller) throw new Error('No active controller')
+        const handle = await controller.confirm()
+        expect(handle.status).toBe('SIGNED')
+
+        // Settle must succeed because settlement uses canonicalStorage, not hostileStorage
+        const receipt = await composition.publicEngine.settle(session.executionId)
+        expect(receipt.status).toBe('settled')
+
+        // Check canonicalStorage has SETTLED record
+        const rawCanonical = canonicalStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)
+        expect(rawCanonical).toBeDefined()
+        const parsedCanonical = JSON.parse(rawCanonical!)
+        expect(parsedCanonical.records[session.executionId]?.state).toBe('SETTLED')
+
+        // Hostile storage setItem was NEVER called for settlement
+        expect(hostileSetItemCalled).toBe(false)
+
+        composition.dispose()
+      })
+    })
+
+    describe('P2: C2 and C3A Must Use One Wallet-Owned Durable Dataset', () => {
+      it('proves normal C2 signing and C3 settlement operate over the exact same Wallet-owned execution record', async () => {
+        const harness = setupTestHarness()
+        const { executionId, expectedTxid } = await harness.signExecution()
+
+        // 1. Check raw record immediately after C2 confirm(): it must be SIGNED in harness.ledgerStorage
+        const rawC2 = harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)
+        expect(rawC2).toBeDefined()
+        const parsedC2 = JSON.parse(rawC2!)
+        expect(parsedC2.records[executionId]?.state).toBe('SIGNED')
+
+        // 2. C3A settle() executes over the exact same record
+        const receipt = await harness.composition.publicEngine.settle(executionId)
+        expect(receipt.status).toBe('settled')
+        expect(receipt.txid).toBe(expectedTxid)
+
+        // 3. Check raw record after C3A settle(): same record in same storage is now SETTLED
+        const rawC3 = harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)
+        const parsedC3 = JSON.parse(rawC3!)
+        expect(parsedC3.records[executionId]?.state).toBe('SETTLED')
+        expect(parsedC3.records[executionId]?.settlingAt).toBe(FIXED_NOW)
+        expect(parsedC3.records[executionId]?.settledAt).toBe(FIXED_NOW)
+
+        harness.composition.dispose()
+      })
+
+      it('proves SIGNED produced by C2 is immediately visible to C3A settle() without divergence', async () => {
+        const harness = setupTestHarness()
+        const { executionId } = await harness.signExecution()
+
+        // Status query sees SIGNED
+        const statusBefore = await harness.composition.publicEngine.getExecutionStatus(executionId)
+        expect(statusBefore?.status).toBe('SIGNED')
+
+        // Settle immediately sees SIGNED and transitions to settled
+        const receipt = await harness.composition.publicEngine.settle(executionId)
+        expect(receipt.status).toBe('settled')
+
+        harness.composition.dispose()
+      })
+    })
+
+    describe('P1: Startup Recovery Must Retry Skipped Locks', () => {
+      it('retries skipped startup recovery after another tab releases the settlement lock, performing ZERO rebroadcasts', async () => {
+        const harness = setupTestHarness()
+        const { executionId, expectedTxid } = await harness.signExecution()
+        seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
+        harness.composition.dispose()
+
+        const broadcastCalls: Uint8Array[] = []
+        const txCalls: string[] = []
+        const recoveredChronik: ChronikBroadcastClient = {
+          broadcastTx: async rawTx => {
+            broadcastCalls.push(rawTx)
+            return { txid: expectedTxid }
+          },
+          tx: async txid => {
+            txCalls.push(txid)
+            return { txid } // Chronik observes tx in mempool / block!
+          }
+        }
+
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ] = recoveredChronik
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ] = harness.lockCoordinator
+
+        // Tab A acquires the settlement lock for this executionId and holds it
+        let releaseTabALock: () => void = () => {}
+        const tabALockHeld = new Promise<void>(resolve => {
+          releaseTabALock = resolve
+        })
+
+        const tabAHolding = harness.lockCoordinator.requestExclusive(
+          executionSettlementLockName(executionId),
+          async () => {
+            await tabALockHeld
+          }
+        )
+
+        // Tab B initializes while Tab A holds the lock
+        const rec = createFixtureLedgerRecord()
+        const tabBComposition = createWalletExecutionComposition(
+          {
+            approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+            sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+            utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+            signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+            storage: harness.ledgerStorage,
+            lockCoordinator: harness.lockCoordinator,
+            clock: () => FIXED_NOW + 100
+          },
+          {
+            executionStorage: harness.ledgerStorage,
+            privateSettlementStorage: harness.settlementStorage
+          }
+        )
+
+        // Wait a tick: Tab B's initial attempt fails to acquire the lock because Tab A holds it
+        await new Promise(r => setTimeout(r, 20))
+
+        // Record must STILL be SETTLING (not abandoned or forgotten)
+        const midData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(midData.records[executionId]?.state).toBe('SETTLING')
+        expect(broadcastCalls).toHaveLength(0)
+
+        // Now Tab A releases the settlement lock
+        releaseTabALock()
+        await tabAHolding
+
+        // Wait for Tab B's scheduled retry timer to fire (base 50ms)
+        await vi.waitFor(
+          async () => {
+            const data = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+            expect(data.records[executionId]?.state).toBe('SETTLED')
+          },
+          { timeout: 500, interval: 20 }
+        )
+
+        // ZERO rebroadcasts occurred!
+        expect(broadcastCalls).toHaveLength(0)
+        // Chronik tx query was performed
+        expect(txCalls).toContain(expectedTxid)
+
+        tabBComposition.dispose()
+      })
+
+      it('retries skipped startup recovery and transitions to SETTLEMENT_UNCERTAIN if Chronik cannot observe the tx', async () => {
+        const harness = setupTestHarness()
+        const { executionId, expectedTxid } = await harness.signExecution()
+        seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
+        harness.composition.dispose()
+
+        const broadcastCalls: Uint8Array[] = []
+        const recoveredChronik: ChronikBroadcastClient = {
+          broadcastTx: async rawTx => {
+            broadcastCalls.push(rawTx)
+            return { txid: expectedTxid }
+          },
+          tx: async () => {
+            throw new Error('Not found') // Unobservable
+          }
+        }
+
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ] = recoveredChronik
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ] = harness.lockCoordinator
+
+        let releaseTabALock: () => void = () => {}
+        const tabALockHeld = new Promise<void>(resolve => {
+          releaseTabALock = resolve
+        })
+
+        const tabAHolding = harness.lockCoordinator.requestExclusive(
+          executionSettlementLockName(executionId),
+          async () => {
+            await tabALockHeld
+          }
+        )
+
+        const rec = createFixtureLedgerRecord()
+        const tabBComposition = createWalletExecutionComposition(
+          {
+            approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+            sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+            utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+            signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+            storage: harness.ledgerStorage,
+            lockCoordinator: harness.lockCoordinator,
+            clock: () => FIXED_NOW + 100
+          },
+          {
+            executionStorage: harness.ledgerStorage,
+            privateSettlementStorage: harness.settlementStorage
+          }
+        )
+
+        await new Promise(r => setTimeout(r, 20))
+        releaseTabALock()
+        await tabAHolding
+
+        await vi.waitFor(
+          async () => {
+            const data = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+            expect(data.records[executionId]?.state).toBe('SETTLEMENT_UNCERTAIN')
+          },
+          { timeout: 500, interval: 20 }
+        )
+
+        // ZERO rebroadcasts!
+        expect(broadcastCalls).toHaveLength(0)
+
+        // Outpoints retained during UNCERTAIN
+        const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        const outpoint = canonicalOutpointKey('11'.repeat(32), 0)
+        expect(finalData.outpointReservations[outpoint]).toBe(executionId)
+
+        tabBComposition.dispose()
+      })
+
+      it('cancels pending startup recovery retry timers when composition is disposed', async () => {
+        const harness = setupTestHarness()
+        const { executionId, expectedTxid } = await harness.signExecution()
+        seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
+        harness.composition.dispose()
+
+        let txCalls = 0
+        const recoveredChronik: ChronikBroadcastClient = {
+          broadcastTx: async () => ({ txid: expectedTxid }),
+          tx: async () => {
+            txCalls++
+            return { txid: expectedTxid }
+          }
+        }
+
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ] = recoveredChronik
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ] = harness.lockCoordinator
+
+        let releaseTabALock: () => void = () => {}
+        const tabALockHeld = new Promise<void>(resolve => {
+          releaseTabALock = resolve
+        })
+
+        const tabAHolding = harness.lockCoordinator.requestExclusive(
+          executionSettlementLockName(executionId),
+          async () => {
+            await tabALockHeld
+          }
+        )
+
+        const rec = createFixtureLedgerRecord()
+        const composition = createWalletExecutionComposition(
+          {
+            approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+            sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+            utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+            signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+            storage: harness.ledgerStorage,
+            lockCoordinator: harness.lockCoordinator,
+            clock: () => FIXED_NOW + 100
+          },
+          {
+            executionStorage: harness.ledgerStorage,
+            privateSettlementStorage: harness.settlementStorage
+          }
+        )
+
+        await new Promise(r => setTimeout(r, 20))
+
+        // Dispose composition while retry is pending
+        composition.dispose()
+
+        // Release the lock
+        releaseTabALock()
+        await tabAHolding
+
+        // Wait to verify retry does NOT fire after disposal
+        await new Promise(r => setTimeout(r, 120))
+
+        // State remains SETTLING because retry was cancelled on dispose
+        const data = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(data.records[executionId]?.state).toBe('SETTLING')
+        expect(txCalls).toBe(0)
+      })
     })
   })
 })

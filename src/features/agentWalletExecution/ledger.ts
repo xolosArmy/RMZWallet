@@ -194,7 +194,7 @@ function toPublicStatus(entry: SerializedExecutionStateEntry): PublicExecutionSt
     decisionId: entry.decisionId,
     fromAddress: entry.fromAddress,
     destination: entry.destination,
-    amountSats: BigInt(entry.amountSats),
+    amountSats: entry.amountSats !== undefined ? BigInt(entry.amountSats) : 0n,
     network: entry.network,
     status: entry.state,
     planHash: entry.planHash,
@@ -216,10 +216,6 @@ export interface DurableTransactionalExecutionLedgerOptions {
   readonly lockName?: string
   readonly lockCoordinator?: ExecutionLockCoordinator
   readonly clock?: () => number
-  readonly settlementRecoveryHandler?: (
-    executionId: string,
-    expectedTxid?: string
-  ) => Promise<void>
 }
 
 /**
@@ -231,10 +227,6 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
   private readonly lockName: string
   private readonly coordinator: ExecutionLockCoordinator
   private readonly clock: () => number
-  private readonly settlementRecoveryHandler?: (
-    executionId: string,
-    expectedTxid?: string
-  ) => Promise<void>
   private ready: Promise<void> | null = null
 
   constructor(options?: DurableTransactionalExecutionLedgerOptions) {
@@ -250,7 +242,6 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
     this.lockName = options?.lockName ?? DEFAULT_EXECUTION_LOCK_NAME
     this.coordinator = options?.lockCoordinator ?? new WebLocksExecutionCoordinator()
     this.clock = options?.clock ?? (() => Math.floor(Date.now() / 1000))
-    this.settlementRecoveryHandler = options?.settlementRecoveryHandler
   }
 
   async whenReady(): Promise<void> {
@@ -359,8 +350,7 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
       }
       return {
         signingIds: Object.keys(data.records).filter(id => data.records[id]?.state === 'SIGNING'),
-        preparedIds: Object.keys(data.records).filter(id => data.records[id]?.state === 'PREPARED'),
-        settlingIds: Object.keys(data.records).filter(id => data.records[id]?.state === 'SETTLING')
+        preparedIds: Object.keys(data.records).filter(id => data.records[id]?.state === 'PREPARED')
       }
     })
 
@@ -386,20 +376,6 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
 
     for (const executionId of snapshot.preparedIds) {
       await this.tryRecoverAbandonedPrepared(executionId)
-    }
-
-    for (const executionId of snapshot.settlingIds) {
-      if (this.settlementRecoveryHandler) {
-        await this.coordinator.tryExclusive(executionSettlementLockName(executionId), async () => {
-          const record = await this.coordinator.requestExclusive(this.lockName, async () => {
-            return this.loadData().records[executionId]
-          })
-          if (!record || record.state !== 'SETTLING') {
-            return
-          }
-          await this.settlementRecoveryHandler!(executionId, record.expectedTxid)
-        })
-      }
     }
   }
 
@@ -788,140 +764,6 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
       }
 
       this.saveData(data)
-    })
-  }
-
-  async runWithSettlementLock<T>(executionId: string, operation: () => Promise<T>): Promise<T> {
-    return this.coordinator.requestExclusive(executionSettlementLockName(executionId), operation)
-  }
-
-  async transitionToSettling(params: {
-    readonly executionId: string
-    readonly expectedTxid: string
-    readonly settlingAt: number
-  }): Promise<void> {
-    return this.coordinator.requestExclusive(this.lockName, async () => {
-      const data = this.loadData()
-      const existing = data.records[params.executionId]
-      if (!existing) {
-        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
-      }
-
-      this.assertTransition(existing.state, 'SETTLING')
-
-      data.records[params.executionId] = {
-        ...existing,
-        state: 'SETTLING',
-        expectedTxid: params.expectedTxid.toLowerCase(),
-        settlingAt: params.settlingAt,
-        settlementAttempt: (existing.settlementAttempt ?? 0) + 1
-      }
-
-      this.saveData(data)
-    })
-  }
-
-  async transitionToSettled(params: {
-    readonly executionId: string
-    readonly expectedTxid: string
-    readonly settledAt: number
-  }): Promise<void> {
-    return this.coordinator.requestExclusive(this.lockName, async () => {
-      const data = this.loadData()
-      const existing = data.records[params.executionId]
-      if (!existing) {
-        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
-      }
-
-      this.assertTransition(existing.state, 'SETTLED')
-
-      if (existing.expectedTxid && existing.expectedTxid.toLowerCase() !== params.expectedTxid.toLowerCase()) {
-        throw new WalletExecutionError(
-          'SETTLEMENT_TXID_MISMATCH',
-          `Cannot settle execution "${params.executionId}" with txid "${params.expectedTxid}" (expected "${existing.expectedTxid}").`
-        )
-      }
-
-      data.records[params.executionId] = {
-        ...existing,
-        state: 'SETTLED',
-        expectedTxid: params.expectedTxid.toLowerCase(),
-        settledAt: params.settledAt
-      }
-
-      this.saveData(data)
-    })
-  }
-
-  async markSettlementUncertain(params: {
-    readonly executionId: string
-    readonly reason: string
-    readonly timestamp: number
-  }): Promise<void> {
-    return this.coordinator.requestExclusive(this.lockName, async () => {
-      const data = this.loadData()
-      const existing = data.records[params.executionId]
-      if (!existing) {
-        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
-      }
-
-      this.assertTransition(existing.state, 'SETTLEMENT_UNCERTAIN')
-
-      data.records[params.executionId] = {
-        ...existing,
-        state: 'SETTLEMENT_UNCERTAIN',
-        uncertainReason: params.reason,
-        failedAt: params.timestamp
-      }
-
-      this.saveData(data)
-    })
-  }
-
-  async markSettlementRejected(params: {
-    readonly executionId: string
-    readonly reason: string
-    readonly timestamp: number
-    readonly releaseOutpoints?: boolean
-  }): Promise<void> {
-    return this.coordinator.requestExclusive(this.lockName, async () => {
-      const data = this.loadData()
-      const existing = data.records[params.executionId]
-      if (!existing) {
-        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
-      }
-
-      this.assertTransition(existing.state, 'SETTLEMENT_REJECTED')
-
-      const release = params.releaseOutpoints === true
-      if (release) {
-        this.releaseOutpoints(data, params.executionId, existing.reservedOutpoints)
-      }
-
-      data.records[params.executionId] = {
-        ...existing,
-        state: 'SETTLEMENT_REJECTED',
-        uncertainReason: params.reason,
-        failedAt: params.timestamp,
-        reservedOutpoints: release ? [] : existing.reservedOutpoints
-      }
-
-      this.saveData(data)
-    })
-  }
-
-  async snapshotSettlingRecords(): Promise<
-    ReadonlyArray<{ readonly executionId: string; readonly expectedTxid?: string }>
-  > {
-    return this.coordinator.requestExclusive(this.lockName, async () => {
-      const data = this.loadData()
-      const results: Array<{ executionId: string; expectedTxid?: string }> = []
-      for (const record of Object.values(data.records)) {
-        if (record && record.state === 'SETTLING') {
-          results.push({ executionId: record.executionId, expectedTxid: record.expectedTxid })
-        }
-      }
-      return results
     })
   }
 
