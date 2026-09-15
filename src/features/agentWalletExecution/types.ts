@@ -370,3 +370,13 @@ export interface AgentWalletExecutionEngine {
   getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined>
   settle(executionId: string): Promise<WalletSettlementReceiptV1>
 }
+
+/**
+ * Disposable variant returned ONLY by the explicit createAgentWalletExecutionEngine factory.
+ * Exposes a lifecycle cleanup method to cancel background settlement recovery retries.
+ * Never exposed through the React provider context.
+ */
+export interface DisposableAgentWalletExecutionEngine extends AgentWalletExecutionEngine {
+  dispose(): void
+}
+

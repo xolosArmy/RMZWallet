@@ -161,10 +161,12 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
 
     expect(typeof publicEngine.prepareExecution).toBe('function')
     expect(typeof publicEngine.getExecutionStatus).toBe('function')
+    expect(typeof publicEngine.dispose).toBe('function')
     expect((publicEngine as any).confirm).toBeUndefined()
     expect((publicEngine as any).sign).toBeUndefined()
     expect((publicEngine as any).execute).toBeUndefined()
     expect((publicEngine as any).createLocalConfirmationController).toBeUndefined()
+    publicEngine.dispose()
   })
 
   it('verifies capability.ts does NOT exist in production source', () => {

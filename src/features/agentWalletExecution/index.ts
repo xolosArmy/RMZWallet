@@ -52,8 +52,7 @@ export {
 } from './plan'
 
 export {
-  deriveExpectedTxidFromRawTxHex,
-  isDefinitiveConsensusRejection
+  deriveExpectedTxidFromRawTxHex
 } from './settlementUtils'
 
 export type {
@@ -75,5 +74,7 @@ export type {
   WalletExecutionLedger,
   ExecutionReviewLease,
   AgentWalletExecutionEngineConfig,
-  AgentWalletExecutionEngine
+  AgentWalletExecutionEngine,
+  DisposableAgentWalletExecutionEngine
 } from './types'
+

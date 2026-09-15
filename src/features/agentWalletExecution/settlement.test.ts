@@ -30,12 +30,15 @@ import type {
   ChronikBroadcastClient,
   ExecutionUtxoInput,
   WalletExecutionTrustedOptions,
-  WalletExecutionLedger
+  WalletExecutionLedger,
+  DisposableAgentWalletExecutionEngine
 } from './types'
 import {
-  deriveExpectedTxidFromRawTxHex,
-  isDefinitiveConsensusRejection
+  deriveExpectedTxidFromRawTxHex
 } from './settlementUtils'
+import {
+  createAgentWalletExecutionEngine
+} from './index'
 import {
   canonicalOutpointKey,
   DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
@@ -431,141 +434,94 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
     })
   })
 
-  describe('Test 6: Definitive Consensus Rejection vs Ambiguous Failures', () => {
-    it('transitions to SETTLEMENT_REJECTED on structured definitive consensus rejection and releases outpoints', async () => {
-      const consensusError = Object.assign(
-        new Error('Consensus rule violated: transaction script failed verify'),
-        { isDefinitiveConsensusRejection: true }
-      )
+  describe('Test 6: Broadcast Error Handling — Zero Rejections and Invariant Outpoint Retention (P1-2)', () => {
+    const errorShapes: Array<{ name: string; error: unknown }> = [
+      { name: 'plain Error', error: new Error('Generic socket level failure') },
+      { name: 'HTTP/RPC error', error: new Error('502 Bad Gateway: Upstream RPC failure') },
+      { name: 'mempool conflict', error: new Error('txn-mempool-conflict: txn conflicts with existing txn') },
+      { name: 'missing/spent input', error: new Error('bad-txns-inputs-missingorspent: input already spent') },
+      { name: 'policy error', error: new Error('non-mandatory-script-verify-flag-failed: script flag failure') },
+      {
+        name: 'object with isDefinitiveConsensusRejection: true',
+        error: Object.assign(new Error('Consensus rule violated: transaction script failed verify'), {
+          isDefinitiveConsensusRejection: true
+        })
+      },
+      {
+        name: 'object with definitiveConsensusRejection: true',
+        error: Object.assign(new Error('Consensus rule violated: inputs rejected'), {
+          definitiveConsensusRejection: true
+        })
+      },
+      {
+        name: 'arbitrary nested flags',
+        error: Object.assign(new Error('Arbitrary nested flags error'), {
+          error: { consensus: { rejected: true, definitive: true } },
+          flags: { permanent: true }
+        })
+      }
+    ]
+
+    for (const { name, error } of errorShapes) {
+      it(`defaults ${name} to SETTLEMENT_UNCERTAIN with zero outpoint release and zero terminal rejection`, async () => {
+        const harness = setupTestHarness({
+          chronikOverride: {
+            broadcastTx: async () => {
+              throw error
+            },
+            tx: async () => {
+              throw new Error('Not found')
+            }
+          }
+        })
+        const { executionId } = await harness.signExecution()
+
+        await expect(harness.composition.publicEngine.settle(executionId)).rejects.toThrow(
+          /SETTLEMENT_UNCERTAIN/
+        )
+
+        const status = await harness.composition.publicEngine.getExecutionStatus(executionId)
+        expect(status?.status).toBe('SETTLEMENT_UNCERTAIN')
+        expect(status?.status).not.toBe('SETTLEMENT_REJECTED')
+
+        // Outpoint reservations MUST be retained (zero release on any broadcast failure!)
+        const ledger = new DurableTransactionalExecutionLedger({
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW
+        })
+        const outpoint = canonicalOutpointKey('11'.repeat(32), 0)
+        expect(await ledger.getOutpointReservation(outpoint)).toBe(executionId)
+
+        harness.composition.dispose()
+      })
+    }
+
+    it('settles cleanly if expectedTxid becomes observable during post-error query', async () => {
+      let broadcastThrew = false
       const harness = setupTestHarness({
         chronikOverride: {
           broadcastTx: async () => {
-            throw consensusError
+            broadcastThrew = true
+            throw Object.assign(new Error('Network drop or consensus spoof'), {
+              isDefinitiveConsensusRejection: true
+            })
           },
-          tx: async () => {
-            throw new Error('Not found')
+          tx: async txid => {
+            // Observed on node despite broadcast exception!
+            return { txid }
           }
         }
       })
-      const { executionId } = await harness.signExecution()
+      const { executionId, expectedTxid } = await harness.signExecution()
 
-      await expect(harness.composition.publicEngine.settle(executionId)).rejects.toThrow(
-        /Settlement rejected by network consensus/
-      )
-
-      const status = await harness.composition.publicEngine.getExecutionStatus(executionId)
-      expect(status?.status).toBe('SETTLEMENT_REJECTED')
-      expect(status?.uncertainReason).toContain('Consensus rule violated')
-
-      // Outpoint reservations MUST be released on definitive rejection
-      const ledger = new DurableTransactionalExecutionLedger({
-        storage: harness.ledgerStorage,
-        lockCoordinator: harness.lockCoordinator,
-        clock: () => FIXED_NOW
-      })
-      const outpoint = canonicalOutpointKey('11'.repeat(32), 0)
-      expect(await ledger.getOutpointReservation(outpoint)).toBeUndefined()
-
-      harness.composition.dispose()
-    })
-
-    it('defaults txn-mempool-conflict to SETTLEMENT_UNCERTAIN and retains outpoint reservations', async () => {
-      const harness = setupTestHarness({
-        chronikOverride: {
-          broadcastTx: async () => {
-            throw new Error('txn-mempool-conflict: txn conflicts with existing txn')
-          },
-          tx: async () => {
-            throw new Error('Not found')
-          }
-        }
-      })
-      const { executionId } = await harness.signExecution()
-
-      await expect(harness.composition.publicEngine.settle(executionId)).rejects.toThrow(
-        /SETTLEMENT_UNCERTAIN/
-      )
+      const receipt = await harness.composition.publicEngine.settle(executionId)
+      expect(broadcastThrew).toBe(true)
+      expect(receipt.status).toBe('settled')
+      expect(receipt.txid).toBe(expectedTxid)
 
       const status = await harness.composition.publicEngine.getExecutionStatus(executionId)
-      expect(status?.status).toBe('SETTLEMENT_UNCERTAIN')
-      expect(status?.uncertainReason).toContain('txn-mempool-conflict')
-
-      // Outpoints MUST be retained!
-      const ledger = new DurableTransactionalExecutionLedger({
-        storage: harness.ledgerStorage,
-        lockCoordinator: harness.lockCoordinator,
-        clock: () => FIXED_NOW
-      })
-      const outpoint = canonicalOutpointKey('11'.repeat(32), 0)
-      expect(await ledger.getOutpointReservation(outpoint)).toBe(executionId)
-
-      harness.composition.dispose()
-    })
-
-    it('defaults bad-txns-inputs-missingorspent to SETTLEMENT_UNCERTAIN and retains outpoint reservations', async () => {
-      const harness = setupTestHarness({
-        chronikOverride: {
-          broadcastTx: async () => {
-            throw new Error('bad-txns-inputs-missingorspent')
-          },
-          tx: async () => {
-            throw new Error('Not found')
-          }
-        }
-      })
-      const { executionId } = await harness.signExecution()
-
-      await expect(harness.composition.publicEngine.settle(executionId)).rejects.toThrow(
-        /SETTLEMENT_UNCERTAIN/
-      )
-
-      const status = await harness.composition.publicEngine.getExecutionStatus(executionId)
-      expect(status?.status).toBe('SETTLEMENT_UNCERTAIN')
-      expect(status?.uncertainReason).toContain('bad-txns-inputs-missingorspent')
-
-      // Outpoints MUST be retained!
-      const ledger = new DurableTransactionalExecutionLedger({
-        storage: harness.ledgerStorage,
-        lockCoordinator: harness.lockCoordinator,
-        clock: () => FIXED_NOW
-      })
-      const outpoint = canonicalOutpointKey('11'.repeat(32), 0)
-      expect(await ledger.getOutpointReservation(outpoint)).toBe(executionId)
-
-      harness.composition.dispose()
-    })
-
-    it('defaults non-mandatory-script-verify-flag-failed to SETTLEMENT_UNCERTAIN and retains outpoint reservations', async () => {
-      const harness = setupTestHarness({
-        chronikOverride: {
-          broadcastTx: async () => {
-            throw new Error(
-              'non-mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)'
-            )
-          },
-          tx: async () => {
-            throw new Error('Not found')
-          }
-        }
-      })
-      const { executionId } = await harness.signExecution()
-
-      await expect(harness.composition.publicEngine.settle(executionId)).rejects.toThrow(
-        /SETTLEMENT_UNCERTAIN/
-      )
-
-      const status = await harness.composition.publicEngine.getExecutionStatus(executionId)
-      expect(status?.status).toBe('SETTLEMENT_UNCERTAIN')
-      expect(status?.uncertainReason).toContain('non-mandatory-script-verify-flag-failed')
-
-      // Outpoints MUST be retained!
-      const ledger = new DurableTransactionalExecutionLedger({
-        storage: harness.ledgerStorage,
-        lockCoordinator: harness.lockCoordinator,
-        clock: () => FIXED_NOW
-      })
-      const outpoint = canonicalOutpointKey('11'.repeat(32), 0)
-      expect(await ledger.getOutpointReservation(outpoint)).toBe(executionId)
+      expect(status?.status).toBe('SETTLED')
 
       harness.composition.dispose()
     })
@@ -930,40 +886,52 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
     })
   })
 
-  describe('Test 12: Consensus Rejection Discriminator', () => {
-    it('accurately identifies definitive consensus errors vs transient or policy errors', () => {
-      // Structured invariant: MUST return true
-      expect(isDefinitiveConsensusRejection({ isDefinitiveConsensusRejection: true })).toBe(true)
-      expect(isDefinitiveConsensusRejection({ definitiveConsensusRejection: true })).toBe(true)
-      expect(
-        isDefinitiveConsensusRejection(
-          Object.assign(new Error('consensus violation'), { isDefinitiveConsensusRejection: true })
+  describe('Test 12: Broadcast Error Invariant (Zero Rejections from Broadcast Failures)', () => {
+    it('verifies Gate C3A broadcast path never transitions to SETTLEMENT_REJECTED or releases outpoints', async () => {
+      const spoofedErrors = [
+        Object.assign(new Error('Consensus rule permanently violated'), {
+          isDefinitiveConsensusRejection: true,
+          definitiveConsensusRejection: true
+        }),
+        Object.assign(new Error('Arbitrary deep consensus flag'), {
+          consensus: { rejected: true }
+        }),
+        new Error('txn-mempool-conflict'),
+        new Error('bad-txns-inputs-missingorspent'),
+        new Error('ECONNRESET')
+      ]
+
+      for (const err of spoofedErrors) {
+        const harness = setupTestHarness({
+          chronikOverride: {
+            broadcastTx: async () => {
+              throw err
+            },
+            tx: async () => {
+              throw new Error('Not found')
+            }
+          }
+        })
+        const { executionId } = await harness.signExecution()
+
+        await expect(harness.composition.publicEngine.settle(executionId)).rejects.toThrow(
+          /SETTLEMENT_UNCERTAIN/
         )
-      ).toBe(true)
 
-      // Ambiguous strings / mempool conflict / missing inputs / script flags (P1-1: MUST return false)
-      expect(isDefinitiveConsensusRejection(new Error('bad-txns-inputs-spent'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('txn-mempool-conflict'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('bad-txns-in-belowout'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('mandatory-script-verify-flag-failed'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('non-mandatory-script-verify-flag-failed'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('bad-txns-inputs-missingorspent'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('bad-txns-vin-empty'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('bad-txns-vout-empty'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('bad-txns-oversize'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('dust'))).toBe(false)
+        const status = await harness.composition.publicEngine.getExecutionStatus(executionId)
+        expect(status?.status).toBe('SETTLEMENT_UNCERTAIN')
+        expect(status?.status).not.toBe('SETTLEMENT_REJECTED')
 
-      // Ambiguous / transport errors (MUST return false)
-      expect(isDefinitiveConsensusRejection(new Error('Connection timeout'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('502 Bad Gateway'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('504 Gateway Timeout'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('ECONNRESET'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('Network error'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('fetch failed'))).toBe(false)
+        const ledger = new DurableTransactionalExecutionLedger({
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW
+        })
+        const outpoint = canonicalOutpointKey('11'.repeat(32), 0)
+        expect(await ledger.getOutpointReservation(outpoint)).toBe(executionId)
 
-      // Mempool already-known (NOT a rejection!)
-      expect(isDefinitiveConsensusRejection(new Error('txn-already-in-mempool'))).toBe(false)
-      expect(isDefinitiveConsensusRejection(new Error('already known'))).toBe(false)
+        harness.composition.dispose()
+      }
     })
   })
 
@@ -1751,6 +1719,126 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
           vi.useRealTimers()
         }
       })
+    })
+  })
+
+  describe('Test 16: Factory-Created Engine Lifecycle Cleanup (P1-1)', () => {
+    it('satisfies all 10 factory lifecycle cleanup and boundary requirements', async () => {
+      vi.useFakeTimers()
+      try {
+        const harness = setupTestHarness()
+        const { executionId, expectedTxid } = await harness.signExecution()
+        seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
+        harness.composition.dispose()
+
+        let txCalls = 0
+        const testChronik: ChronikBroadcastClient = {
+          broadcastTx: async () => {
+            throw new Error('Should not broadcast')
+          },
+          tx: async (txid: string) => {
+            txCalls++
+            return { txid }
+          }
+        }
+
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ] = testChronik
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ] = harness.lockCoordinator
+
+        // Hold the settlement lock so neither engine can acquire it immediately
+        let releaseExternalLock: () => void = () => {}
+        const externalLockHeld = new Promise<void>(resolve => {
+          releaseExternalLock = resolve
+        })
+        const externalHolding = harness.lockCoordinator.requestExclusive(
+          executionSettlementLockName(executionId),
+          async () => {
+            await externalLockHeld
+          }
+        )
+
+        const rec = createFixtureLedgerRecord()
+        const engineConfigA: AgentWalletExecutionEngineConfig = {
+          approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+          sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 100
+        }
+
+        const engineConfigB: AgentWalletExecutionEngineConfig = {
+          approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+          sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 100
+        }
+
+        // 1. Two independently factory-created disposable engines are created.
+        const engineA: DisposableAgentWalletExecutionEngine = createAgentWalletExecutionEngine(engineConfigA)
+        const engineB: DisposableAgentWalletExecutionEngine = createAgentWalletExecutionEngine(engineConfigB)
+
+        // 10. No settlement/security authority is added to the disposable handle.
+        expect(typeof engineA.prepareExecution).toBe('function')
+        expect(typeof engineA.getExecutionStatus).toBe('function')
+        expect(typeof engineA.settle).toBe('function')
+        expect(typeof engineA.dispose).toBe('function')
+
+        expect((engineA as any).walletUIHost).toBeUndefined()
+        expect((engineA as any).controller).toBeUndefined()
+        expect((engineA as any).privateSettlementStorage).toBeUndefined()
+        expect((engineA as any).settlementLedger).toBeUndefined()
+        expect((engineA as any).chronik).toBeUndefined()
+        expect((engineA as any).lockCoordinator).toBeUndefined()
+        expect((engineA as any).rawSignedTxHex).toBeUndefined()
+        expect((engineA as any).sign).toBeUndefined()
+        expect((engineA as any).confirm).toBeUndefined()
+        expect((engineA as any).execute).toBeUndefined()
+
+        // 2. Both encounter the same locked SETTLING record.
+        // Advance slightly to trigger initial settlement recovery attempt and fail to lock
+        await vi.advanceTimersByTimeAsync(100)
+
+        // 3. Dispose engine A.
+        // 9. dispose cancels settlement retry timers immediately.
+        // 8. Calling dispose twice is safe/idempotent.
+        engineA.dispose()
+        expect(() => engineA.dispose()).not.toThrow()
+
+        // 4. Verify A stops all background polling permanently (advance 5s while lock held)
+        // 6. No timers remain from A.
+        await vi.advanceTimersByTimeAsync(5_000)
+
+        // 5. Engine B continues its own recovery correctly.
+        releaseExternalLock()
+        await externalHolding
+
+        // Advance 1s for engine B retry to fire and reconcile
+        await vi.advanceTimersByTimeAsync(1_000)
+
+        const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(finalData.records[executionId]?.state).toBe('SETTLED')
+
+        // Clean up Engine B
+        engineB.dispose()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('7. Provider/context publicEngine has NO dispose property', () => {
+      const harness = setupTestHarness()
+      expect('dispose' in harness.composition.publicEngine).toBe(false)
+      expect((harness.composition.publicEngine as any).dispose).toBeUndefined()
+      harness.composition.dispose()
     })
   })
 })

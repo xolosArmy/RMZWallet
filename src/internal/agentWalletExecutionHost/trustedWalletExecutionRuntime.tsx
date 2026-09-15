@@ -37,12 +37,12 @@ import {
   validateOutputInvariants
 } from '../../features/agentWalletExecution/plan'
 import {
-  deriveExpectedTxidFromRawTxHex,
-  isDefinitiveConsensusRejection
+  deriveExpectedTxidFromRawTxHex
 } from '../../features/agentWalletExecution/settlementUtils'
 import type {
   AgentWalletExecutionEngine,
   AgentWalletExecutionEngineConfig,
+  DisposableAgentWalletExecutionEngine,
   ExecutionNetwork,
   PublicExecutionStatus,
   SignedExecutionHandle,
@@ -56,6 +56,7 @@ import type {
   WalletSettlementReceiptV1,
   ChronikBroadcastClient
 } from '../../features/agentWalletExecution/types'
+
 import { getChronik } from '../../services/ChronikClient'
 import type {
   WalletExecutionComposition,
@@ -2155,6 +2156,7 @@ function createWalletExecutionComposition(
           }
 
           if (accepted) {
+            cancelSettlementRecoveryRetry(executionId)
             const settledAt = getNow()
             await settlementLedger.transitionToSettled({
               executionId,
@@ -2172,24 +2174,10 @@ function createWalletExecutionComposition(
             })
           }
 
-          // If not accepted, check if it was a definitive consensus rejection
-          if (isDefinitiveConsensusRejection(broadcastError)) {
-            const timestamp = getNow()
-            const reason = broadcastError instanceof Error ? broadcastError.message : String(broadcastError)
-            await settlementLedger.markSettlementRejected({
-              executionId,
-              reason: `Definitive consensus rejection: ${reason}`,
-              timestamp,
-              releaseOutpoints: true
-            })
-            throw new WalletExecutionError(
-              'SETTLEMENT_REJECTED',
-              `Settlement rejected by network consensus: ${reason}`,
-              broadcastError
-            )
-          }
-
-          // Ambiguous / network drop / 5xx / mempool conflict -> SETTLEMENT_UNCERTAIN (retain outpoints)
+          // Any exception thrown by Chronik broadcastTx() where tx is not observed on network
+          // defaults to SETTLEMENT_UNCERTAIN. Gate C3A does NOT infer permanent invalidity from
+          // any broadcast exception. Outpoint reservations are retained (never released on broadcast failure).
+          cancelSettlementRecoveryRetry(executionId)
           const timestamp = getNow()
           const reason = broadcastError instanceof Error ? broadcastError.message : String(broadcastError)
           await settlementLedger.markSettlementUncertain({
@@ -2298,18 +2286,34 @@ function createWalletExecutionComposition(
   }
 
   /**
-   * Helper that returns the public Agent-facing engine.
-   * Strictly exposes NO confirm, sign, execute, local confirmation controller, or dispose.
+   * Helper that returns the public Agent-facing engine wrapped with an explicit lifecycle dispose method.
+   * Strictly exposes NO confirm, sign, execute, local confirmation controller, private storage,
+   * settlement mutators, Chronik, lock coordinator, raw tx, or signing authority.
    */
   export function createAgentWalletExecutionEngine(
     config: AgentWalletExecutionEngineConfig
-  ): AgentWalletExecutionEngine {
-    return createWalletExecutionComposition(
+  ): DisposableAgentWalletExecutionEngine {
+    const composition = createWalletExecutionComposition(
       config,
       import.meta.env?.VITEST && config.storage
         ? { executionStorage: config.storage }
         : undefined
-    ).publicEngine
+    )
+
+    const disposableEngine: DisposableAgentWalletExecutionEngine = {
+      prepareExecution: receipt =>
+        composition.publicEngine.prepareExecution(receipt),
+
+      getExecutionStatus: executionId =>
+        composition.publicEngine.getExecutionStatus(executionId),
+
+      settle: executionId =>
+        composition.publicEngine.settle(executionId),
+
+      dispose: () => composition.dispose()
+    }
+
+    return Object.freeze(disposableEngine)
   }
 
   if (import.meta.env?.VITEST) {

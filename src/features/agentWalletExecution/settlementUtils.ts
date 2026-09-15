@@ -2,7 +2,7 @@
  * @file settlementUtils.ts
  *
  * Settlement utilities for Gate C3A (RMZWallet Settlement Engine).
- * Pure functions for canonical TXID computation and consensus rejection discrimination.
+ * Pure functions for canonical TXID computation.
  *
  * Boundary Rules:
  * - NEVER exports private keys, signatories, or raw-tx accessors.
@@ -61,22 +61,4 @@ export function deriveExpectedTxidFromRawTxHex(rawSignedTxHex: string): string {
   return expectedTxid
 }
 
-/**
- * Distinguishes definitive consensus rejections from ambiguous transport/network/mempool errors.
- *
- * In Gate C3A, string-based node/mempool rejection texts (e.g. mempool conflict, missing/spent inputs,
- * policy/script flags, transport timeouts, node disagreement) are NEVER treated as definitive consensus
- * rejections because Chronik does not provide a structured consensus invariant. All such broadcast failures
- * default to SETTLEMENT_UNCERTAIN to prevent premature outpoint release.
- *
- * SETTLEMENT_REJECTED is reached ONLY if an explicit structured invariant proves permanent non-acceptance.
- */
-export function isDefinitiveConsensusRejection(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false
-  const candidate = err as Record<string, unknown>
-  return Boolean(
-    candidate.isDefinitiveConsensusRejection === true ||
-    candidate.definitiveConsensusRejection === true
-  )
-}
 
