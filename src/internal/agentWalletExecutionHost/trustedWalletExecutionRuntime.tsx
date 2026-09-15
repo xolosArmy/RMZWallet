@@ -169,6 +169,14 @@ class FileLocalSettlementAuthority implements AuthoritativeSettlementLedger {
   }
 
   async get(executionId: string): Promise<PublicExecutionStatus | undefined> {
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforeAuthoritativeLedgerGet')
+      ]
+      if (typeof hook === 'function') {
+        await hook(executionId)
+      }
+    }
     return this.canonicalLedger.get(executionId)
   }
 
@@ -754,6 +762,14 @@ function createWalletExecutionComposition(
   }
 
   let disposed = false
+  let lifecycleGeneration = 0
+
+  function isLifecycleActive(generation?: number): boolean {
+    if (disposed) return false
+    if (generation !== undefined && generation !== lifecycleGeneration) return false
+    return true
+  }
+
   const pendingSettlementRetries = new Map<string, { timer: ReturnType<typeof setTimeout>; attempt: number }>()
 
   function cancelSettlementRecoveryRetry(executionId: string): void {
@@ -822,10 +838,15 @@ function createWalletExecutionComposition(
 
   async function handleSettlementRecovery(
     executionId: string,
-    expectedTxid?: string
+    expectedTxid?: string,
+    calledGeneration?: number
   ): Promise<void> {
-    if (!authoritativeSettlementLedger) return
+    const generation = calledGeneration ?? lifecycleGeneration
+    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
+
     const record = await authoritativeSettlementLedger.get(executionId)
+    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
+
     if (!record || ((record as any).state ?? record.status) !== 'SETTLING') {
       return
     }
@@ -834,8 +855,10 @@ function createWalletExecutionComposition(
     if (!targetTxid) {
       try {
         const rawTxHex = await getPrivateSignedTransaction(executionId)
+        if (!isLifecycleActive(generation)) return
         targetTxid = deriveExpectedTxidFromRawTxHex(rawTxHex)
       } catch {
+        if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
         await authoritativeSettlementLedger.markSettlementUncertain({
           executionId,
           reason: 'Abandoned SETTLING record without recoverable expectedTxid.',
@@ -844,6 +867,8 @@ function createWalletExecutionComposition(
         return
       }
     }
+
+    if (!isLifecycleActive(generation)) return
 
     let chronik: ChronikBroadcastClient | undefined
     try {
@@ -854,7 +879,17 @@ function createWalletExecutionComposition(
 
     if (chronik) {
       try {
+        if (import.meta.env?.VITEST) {
+          const hook = (globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.beforeSettlementRecoveryObservation')
+          ]
+          if (typeof hook === 'function') {
+            await hook(executionId, targetTxid)
+          }
+        }
+        if (!isLifecycleActive(generation)) return
         const observed = await chronik.tx(targetTxid)
+        if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
         if (observed && observed.txid?.toLowerCase() === targetTxid.toLowerCase()) {
           await authoritativeSettlementLedger.transitionToSettled({
             executionId,
@@ -868,6 +903,8 @@ function createWalletExecutionComposition(
       }
     }
 
+    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
+
     await authoritativeSettlementLedger.markSettlementUncertain({
       executionId,
       reason:
@@ -878,23 +915,54 @@ function createWalletExecutionComposition(
 
   async function attemptSettlementRecovery(
     executionId: string,
-    expectedTxid?: string
+    expectedTxid?: string,
+    calledGeneration?: number
   ): Promise<boolean> {
-    if (disposed || !authoritativeSettlementLedger) return true
+    const generation = calledGeneration ?? lifecycleGeneration
+    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return true
 
     const current = await authoritativeSettlementLedger.get(executionId)
+    // 1. Re-check disposed immediately AFTER: await authoritativeSettlementLedger.get(executionId)
+    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return true
+
     if (!current || ((current as any).state ?? current.status) !== 'SETTLING') {
       cancelSettlementRecoveryRetry(executionId)
       return true
     }
 
+    // 2. Re-check disposed BEFORE attempting/acquiring the settlement lock
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforeSettlementLockAcquire')
+      ]
+      if (typeof hook === 'function') {
+        await hook(executionId)
+      }
+    }
+    if (!isLifecycleActive(generation)) return true
+
     const coordinator = resolveWalletSettlementLockCoordinator()
     const lockResult = await coordinator.tryExclusive(
       executionSettlementLockName(executionId),
       async () => {
-        await handleSettlementRecovery(executionId, expectedTxid ?? current.expectedTxid)
+        // 3. Re-check disposed INSIDE the acquired settlement-lock callback BEFORE:
+        //    - handleSettlementRecovery()
+        //    - Chronik query
+        //    - any durable settlement mutation
+        if (import.meta.env?.VITEST) {
+          const hook = (globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.afterLockAcquisitionBeforeRecovery')
+          ]
+          if (typeof hook === 'function') {
+            await hook(executionId)
+          }
+        }
+        if (!isLifecycleActive(generation)) return
+        await handleSettlementRecovery(executionId, expectedTxid ?? current.expectedTxid, generation)
       }
     )
+
+    if (!isLifecycleActive(generation)) return true
 
     if (lockResult.acquired) {
       cancelSettlementRecoveryRetry(executionId)
@@ -910,6 +978,7 @@ function createWalletExecutionComposition(
     attempt: number = 1
   ): void {
     if (disposed) return
+    const generation = lifecycleGeneration
 
     cancelSettlementRecoveryRetry(executionId)
 
@@ -920,19 +989,19 @@ function createWalletExecutionComposition(
         : Math.min(Math.round(baseDelay * Math.pow(1.5, attempt - 1)), 1000)
 
     const timer = setTimeout(async () => {
-      if (disposed) return
+      if (!isLifecycleActive(generation)) return
       const currentEntry = pendingSettlementRetries.get(executionId)
       if (currentEntry?.timer !== timer) {
         return
       }
 
       try {
-        const resolved = await attemptSettlementRecovery(executionId, expectedTxid)
-        if (!resolved && !disposed && pendingSettlementRetries.get(executionId)?.timer === timer) {
+        const resolved = await attemptSettlementRecovery(executionId, expectedTxid, generation)
+        if (!resolved && isLifecycleActive(generation) && pendingSettlementRetries.get(executionId)?.timer === timer) {
           scheduleSettlementRecoveryRetry(executionId, expectedTxid, attempt + 1)
         }
       } catch {
-        if (!disposed && pendingSettlementRetries.get(executionId)?.timer === timer) {
+        if (isLifecycleActive(generation) && pendingSettlementRetries.get(executionId)?.timer === timer) {
           scheduleSettlementRecoveryRetry(executionId, expectedTxid, attempt + 1)
         }
       }
@@ -942,15 +1011,16 @@ function createWalletExecutionComposition(
   }
 
   async function reconcileAbandonedSettlements(): Promise<void> {
-    if (disposed || !authoritativeSettlementLedger) return
+    const generation = lifecycleGeneration
+    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
     const settlingList = await authoritativeSettlementLedger.snapshotSettlingRecords()
-    if (settlingList.length === 0) return
+    if (!isLifecycleActive(generation) || settlingList.length === 0) return
 
     for (const item of settlingList) {
-      if (disposed) return
+      if (!isLifecycleActive(generation)) return
       const { executionId, expectedTxid } = item
-      const resolved = await attemptSettlementRecovery(executionId, expectedTxid)
-      if (!resolved && !disposed) {
+      const resolved = await attemptSettlementRecovery(executionId, expectedTxid, generation)
+      if (!resolved && isLifecycleActive(generation)) {
         scheduleSettlementRecoveryRetry(executionId, expectedTxid, 1)
       }
     }
@@ -963,6 +1033,7 @@ function createWalletExecutionComposition(
 
   const startupReady: Promise<void> = (async () => {
     await ledgerReady
+    if (disposed) return
     schedulePreparedRecovery()
     await reconcileAbandonedSettlements().catch(() => {})
   })()
@@ -1162,6 +1233,7 @@ function createWalletExecutionComposition(
   function disposeComposition(): void {
     if (disposed) return
     disposed = true
+    lifecycleGeneration += 1
     cancelAllSettlementRecoveryRetries()
     isPreparing = false
     cancelScheduledRecovery()
