@@ -366,6 +366,14 @@ class FileLocalSettlementAuthority implements AuthoritativeSettlementLedger {
       }
 
       if (guard && !guard()) return false
+      if (import.meta.env?.VITEST) {
+        const simFail = (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.simulateTransitionToSettledStorageFailure')
+        ]
+        if (typeof simFail === 'function') {
+          await simFail(params.executionId)
+        }
+      }
       this.saveData(data)
       return true
     })
@@ -962,6 +970,7 @@ function createWalletExecutionComposition(
       chronik = undefined
     }
 
+    let observedExact = false
     if (chronik) {
       try {
         if (import.meta.env?.VITEST) {
@@ -974,23 +983,28 @@ function createWalletExecutionComposition(
         }
         if (!recoveryGuard()) return
         const observed = await chronik.tx(targetTxid)
-        if (!recoveryGuard() || !authoritativeSettlementLedger) return
-        if (observed && observed.txid?.toLowerCase() === targetTxid.toLowerCase()) {
-          const committed = await authoritativeSettlementLedger.transitionToSettled(
-            {
-              executionId,
-              expectedTxid: targetTxid,
-              settledAt: getNow()
-            },
-            recoveryGuard
-          )
-          if (!committed) return
-          return
-        }
+        observedExact =
+          observed?.txid?.toLowerCase() === targetTxid.toLowerCase()
       } catch {
-        // Not found in mempool or chain
+        observedExact = false
       }
     }
+
+    if (observedExact) {
+      if (!recoveryGuard() || !authoritativeSettlementLedger) return
+      const committed = await authoritativeSettlementLedger.transitionToSettled(
+        {
+          executionId,
+          expectedTxid: targetTxid,
+          settledAt: getNow()
+        },
+        recoveryGuard
+      )
+      if (!committed) return
+      return
+    }
+
+    // ONLY observation failure/unavailability reaches uncertain logic.
 
     if (!recoveryGuard() || !authoritativeSettlementLedger) return
 
@@ -1112,7 +1126,12 @@ function createWalletExecutionComposition(
     for (const item of settlingList) {
       if (!isLifecycleActive(generation)) return
       const { executionId, expectedTxid } = item
-      const resolved = await attemptSettlementRecovery(executionId, expectedTxid, generation)
+      let resolved = false
+      try {
+        resolved = await attemptSettlementRecovery(executionId, expectedTxid, generation)
+      } catch {
+        resolved = false
+      }
       if (!resolved && isLifecycleActive(generation)) {
         scheduleSettlementRecoveryRetry(executionId, expectedTxid, 1)
       }
@@ -2335,17 +2354,34 @@ function createWalletExecutionComposition(
         // Broadcast to Chronik
         const rawTxBytes = fromHex(rawSignedTxHex)
         let broadcastTxid: string | undefined
-        let broadcastError: unknown = null
+        let broadcastThrew = false
+        let broadcastError: unknown
 
         try {
           const res = await chronik.broadcastTx(rawTxBytes)
           broadcastTxid = res?.txid?.toLowerCase()
         } catch (err) {
+          broadcastThrew = true
           broadcastError = err
         }
 
+        // P1-2: Immediately after broadcastTx settles — success OR rejection — recheck lifecycle before any further network call or durable mutation.
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement composition was disposed after broadcast dispatch.'
+          )
+        }
+
         // If broadcast threw, check whether the network actually accepted it or if it was rejected
-        if (broadcastError) {
+        if (broadcastThrew) {
+          if (disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement composition was disposed after broadcast dispatch.'
+            )
+          }
+
           // Check network acceptance (e.g. timeout on broadcast response, or already in mempool)
           let accepted = false
           try {
@@ -2355,6 +2391,13 @@ function createWalletExecutionComposition(
             }
           } catch {
             accepted = false
+          }
+
+          if (disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement composition was disposed after broadcast dispatch.'
+            )
           }
 
           if (accepted) {
@@ -2390,7 +2433,14 @@ function createWalletExecutionComposition(
           // any broadcast exception. Outpoint reservations are retained (never released on broadcast failure).
           cancelSettlementRecoveryRetry(executionId)
           const timestamp = getNow()
-          const reason = broadcastError instanceof Error ? broadcastError.message : String(broadcastError)
+          const reason =
+            broadcastError instanceof Error
+              ? broadcastError.message
+              : typeof broadcastError === 'string'
+                ? broadcastError || 'Empty rejection string'
+                : broadcastError !== undefined && broadcastError !== null
+                  ? String(broadcastError)
+                  : 'Broadcast rejected without error payload'
           const committed = await settlementLedger.markSettlementUncertain(
             {
               executionId,
@@ -2439,6 +2489,12 @@ function createWalletExecutionComposition(
         // Verify network acceptance via Chronik query
         let verifiedAcceptance = false
         for (let attempt = 0; attempt < 3; attempt++) {
+          if (disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement composition was disposed during network verification.'
+            )
+          }
           try {
             const queryRes = await chronik.tx(expectedTxid)
             if (queryRes && queryRes.txid?.toLowerCase() === expectedTxid.toLowerCase()) {
@@ -2446,8 +2502,21 @@ function createWalletExecutionComposition(
               break
             }
           } catch {
+            if (disposed || !settleGuard()) {
+              throw new WalletExecutionError(
+                'COMPOSITION_DISPOSED',
+                'Settlement composition was disposed during network verification.'
+              )
+            }
             await new Promise(resolve => setTimeout(resolve, 50))
           }
+        }
+
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement composition was disposed during network verification.'
+          )
         }
 
         if (!verifiedAcceptance) {

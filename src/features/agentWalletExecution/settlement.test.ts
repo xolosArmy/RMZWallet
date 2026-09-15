@@ -3097,4 +3097,482 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
       }
     })
   })
+
+  describe('Gate C3A Pass 4.4: Broadcast Throw Tracking, Disposal After Broadcast Await, and Observed Tx Persistence Decoupling', () => {
+    // ============================================================
+    // P1-1: TRACK BROADCAST THROW SEPARATELY FROM ERROR PAYLOAD
+    // ============================================================
+    const falsyRejectionValues: Array<{ name: string; value: unknown }> = [
+      { name: 'undefined', value: undefined },
+      { name: 'null', value: null },
+      { name: '0', value: 0 },
+      { name: 'false', value: false },
+      { name: 'empty string', value: '' },
+      { name: 'Error instance', value: new Error('network connection dropped') }
+    ]
+
+    for (const { name, value } of falsyRejectionValues) {
+      it(`P1-1: broadcastTx rejecting with ${name} -> observed exact txid reconciles to SETTLED`, async () => {
+        const harness = setupTestHarness()
+        try {
+          const { executionId, expectedTxid } = await harness.signExecution()
+
+          let broadcastCalled = false
+          let txCalled = false
+          const testChronik: ChronikBroadcastClient = {
+            broadcastTx: async () => {
+              broadcastCalled = true
+              return Promise.reject(value)
+            },
+            tx: async () => {
+              txCalled = true
+              return { txid: expectedTxid }
+            }
+          }
+
+          ;(globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+          ] = testChronik
+          ;(globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+          ] = harness.lockCoordinator
+          ;(globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.privateSettlementStorage')
+          ] = harness.settlementStorage
+
+          const receipt = await harness.composition.publicEngine.settle(executionId)
+          expect(receipt.status).toBe('settled')
+          expect(receipt.txid).toBe(expectedTxid)
+          expect(broadcastCalled).toBe(true)
+          expect(txCalled).toBe(true)
+
+          const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+          expect(finalData.records[executionId]?.state).toBe('SETTLED')
+        } finally {
+          harness.composition.dispose()
+          delete (globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+          ]
+          delete (globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+          ]
+          delete (globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.privateSettlementStorage')
+          ]
+        }
+      })
+
+      it(`P1-1: broadcastTx rejecting with ${name} -> unobservable txid reconciles to SETTLEMENT_UNCERTAIN (never SETTLEMENT_TXID_MISMATCH)`, async () => {
+        const harness = setupTestHarness()
+        try {
+          const { executionId } = await harness.signExecution()
+
+          let broadcastCalled = false
+          let txCalled = false
+          const testChronik: ChronikBroadcastClient = {
+            broadcastTx: async () => {
+              broadcastCalled = true
+              return Promise.reject(value)
+            },
+            tx: async () => {
+              txCalled = true
+              throw new Error('Not found')
+            }
+          }
+
+          ;(globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+          ] = testChronik
+          ;(globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+          ] = harness.lockCoordinator
+          ;(globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.privateSettlementStorage')
+          ] = harness.settlementStorage
+
+          let errorCaught: unknown
+          try {
+            await harness.composition.publicEngine.settle(executionId)
+          } catch (err) {
+            errorCaught = err
+          }
+
+          expect(errorCaught).toBeDefined()
+          expect(errorCaught).toMatchObject({
+            code: 'SETTLEMENT_UNCERTAIN'
+          })
+          expect((errorCaught as { code: string }).code).not.toBe('SETTLEMENT_TXID_MISMATCH')
+          expect(broadcastCalled).toBe(true)
+          expect(txCalled).toBe(true)
+
+          const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+          expect(finalData.records[executionId]?.state).toBe('SETTLEMENT_UNCERTAIN')
+        } finally {
+          harness.composition.dispose()
+          delete (globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+          ]
+          delete (globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+          ]
+          delete (globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.privateSettlementStorage')
+          ]
+        }
+      })
+    }
+
+    // ============================================================
+    // P1-2: DISPOSAL AFTER BROADCAST AWAIT MUST STOP CONTINUATION
+    // ============================================================
+    it('P1-2: disposal while broadcastTx is in flight (broadcastTx resolves successfully) -> stops continuation, zero chronik.tx calls, remains SETTLING, Engine B reconciles without rebroadcast', async () => {
+      try {
+        const harness = setupTestHarness()
+        const { executionId, expectedTxid } = await harness.signExecution()
+
+        let resolveBroadcast!: (val: { txid: string }) => void
+        const broadcastPromise = new Promise<{ txid: string }>(r => {
+          resolveBroadcast = r
+        })
+        let broadcastCalledResolve!: () => void
+        const broadcastCalledPromise = new Promise<void>(r => {
+          broadcastCalledResolve = r
+        })
+
+        let broadcastCalls = 0
+        let txCalls = 0
+        const testChronik: ChronikBroadcastClient = {
+          broadcastTx: async () => {
+            broadcastCalls++
+            broadcastCalledResolve()
+            return broadcastPromise
+          },
+          tx: async (txid: string) => {
+            txCalls++
+            return { txid }
+          }
+        }
+
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ] = testChronik
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ] = harness.lockCoordinator
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.privateSettlementStorage')
+        ] = harness.settlementStorage
+
+        const rec = createFixtureLedgerRecord()
+        const engineConfigA: AgentWalletExecutionEngineConfig = {
+          approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+          sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 100
+        }
+
+        const engineA: DisposableAgentWalletExecutionEngine = createAgentWalletExecutionEngine(engineConfigA)
+
+        // 1. SIGNED -> durable SETTLING committed. Settle is called.
+        const settlePromise = engineA.settle(executionId)
+
+        // 2. Wait until broadcastTx is paused in flight
+        await broadcastCalledPromise
+        expect(broadcastCalls).toBe(1)
+        const midData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(midData.records[executionId]?.state).toBe('SETTLING')
+
+        // 3. dispose engine A
+        engineA.dispose()
+
+        // 4. Resolve broadcastTx successfully
+        resolveBroadcast({ txid: expectedTxid })
+
+        // 5. Assert engine A:
+        //    - rejects COMPOSITION_DISPOSED
+        //    - makes zero chronik.tx calls after disposal
+        //    - performs zero post-disposal durable mutations (leaves state SETTLING)
+        await expect(settlePromise).rejects.toMatchObject({
+          code: 'COMPOSITION_DISPOSED'
+        })
+
+        expect(txCalls).toBe(0)
+        const dataAfterA = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(dataAfterA.records[executionId]?.state).toBe('SETTLING')
+
+        // 6. Engine B later reconciles safely from expectedTxid
+        // 7. No second broadcast
+        const engineConfigB: AgentWalletExecutionEngineConfig = {
+          approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+          sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 200
+        }
+        const engineB: DisposableAgentWalletExecutionEngine = createAgentWalletExecutionEngine(engineConfigB)
+
+        const receiptB = await engineB.settle(executionId)
+        expect(receiptB.status).toBe('settled')
+        expect(receiptB.txid).toBe(expectedTxid)
+        expect(broadcastCalls).toBe(1) // Still exactly 1 broadcast call, zero rebroadcast!
+        expect(txCalls).toBeGreaterThanOrEqual(1)
+
+        const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(finalData.records[executionId]?.state).toBe('SETTLED')
+
+        engineB.dispose()
+      } finally {
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.privateSettlementStorage')
+        ]
+      }
+    })
+
+    it('P1-2: disposal while broadcastTx is in flight (broadcastTx rejects) -> stops continuation, zero chronik.tx calls, remains SETTLING, Engine B reconciles without rebroadcast', async () => {
+      try {
+        const harness = setupTestHarness()
+        const { executionId, expectedTxid } = await harness.signExecution()
+
+        let rejectBroadcast!: (err: unknown) => void
+        const broadcastPromise = new Promise<{ txid: string }>((_, r) => {
+          rejectBroadcast = r
+        })
+        let broadcastCalledResolve!: () => void
+        const broadcastCalledPromise = new Promise<void>(r => {
+          broadcastCalledResolve = r
+        })
+
+        let broadcastCalls = 0
+        let txCalls = 0
+        const testChronik: ChronikBroadcastClient = {
+          broadcastTx: async () => {
+            broadcastCalls++
+            broadcastCalledResolve()
+            return broadcastPromise
+          },
+          tx: async (txid: string) => {
+            txCalls++
+            return { txid }
+          }
+        }
+
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ] = testChronik
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ] = harness.lockCoordinator
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.privateSettlementStorage')
+        ] = harness.settlementStorage
+
+        const rec = createFixtureLedgerRecord()
+        const engineConfigA: AgentWalletExecutionEngineConfig = {
+          approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+          sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 100
+        }
+
+        const engineA: DisposableAgentWalletExecutionEngine = createAgentWalletExecutionEngine(engineConfigA)
+
+        // 1. SIGNED -> durable SETTLING committed. Settle is called.
+        const settlePromise = engineA.settle(executionId)
+
+        // 2. Wait until broadcastTx is paused in flight
+        await broadcastCalledPromise
+        expect(broadcastCalls).toBe(1)
+        const midData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(midData.records[executionId]?.state).toBe('SETTLING')
+
+        // 3. dispose engine A
+        engineA.dispose()
+
+        // 4. Reject broadcastTx
+        rejectBroadcast(new Error('Network transport aborted'))
+
+        // 5. Assert engine A:
+        //    - rejects COMPOSITION_DISPOSED
+        //    - makes zero chronik.tx calls after disposal
+        //    - performs zero post-disposal durable mutations (leaves state SETTLING)
+        await expect(settlePromise).rejects.toMatchObject({
+          code: 'COMPOSITION_DISPOSED'
+        })
+
+        expect(txCalls).toBe(0)
+        const dataAfterA = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(dataAfterA.records[executionId]?.state).toBe('SETTLING')
+
+        // 6. Engine B later reconciles safely from expectedTxid
+        // 7. No second broadcast
+        const engineConfigB: AgentWalletExecutionEngineConfig = {
+          approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+          sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 200
+        }
+        const engineB: DisposableAgentWalletExecutionEngine = createAgentWalletExecutionEngine(engineConfigB)
+
+        const receiptB = await engineB.settle(executionId)
+        expect(receiptB.status).toBe('settled')
+        expect(receiptB.txid).toBe(expectedTxid)
+        expect(broadcastCalls).toBe(1) // Still exactly 1 broadcast call, zero rebroadcast!
+        expect(txCalls).toBeGreaterThanOrEqual(1)
+
+        const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(finalData.records[executionId]?.state).toBe('SETTLED')
+
+        engineB.dispose()
+      } finally {
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.privateSettlementStorage')
+        ]
+      }
+    })
+
+    // ============================================================
+    // P1-3: OBSERVED TX + SETTLED PERSISTENCE FAILURE MUST STAY SETTLING
+    // ============================================================
+    it('P1-3: observed tx + transitionToSettled persistence failure leaves state SETTLING (never markSettlementUncertain), reconciles on retry', async () => {
+      vi.useFakeTimers()
+      try {
+        // 1. Seed SETTLING + expectedTxid
+        const harness = setupTestHarness()
+        const { executionId, expectedTxid } = await harness.signExecution()
+        seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
+        harness.composition.dispose()
+
+        let broadcastCalls = 0
+        let txCalls = 0
+        const testChronik: ChronikBroadcastClient = {
+          broadcastTx: async () => {
+            broadcastCalls++
+            return { txid: expectedTxid }
+          },
+          // 2. Chronik tx(expectedTxid) returns exact observed tx
+          tx: async (_txid: string) => {
+            txCalls++
+            return { txid: expectedTxid }
+          }
+        }
+
+        let markSettlementUncertainInvoked = false
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.beforeMarkSettlementUncertainLockRequest')
+        ] = async () => {
+          markSettlementUncertainInvoked = true
+        }
+
+        // 3. Force transitionToSettled persistence to fail
+        let shouldFailSettledPersistence = true
+        let settledPersistenceAttempts = 0
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.simulateTransitionToSettledStorageFailure')
+        ] = async () => {
+          settledPersistenceAttempts++
+          if (shouldFailSettledPersistence) {
+            throw new Error('Simulated persistent storage / disk failure')
+          }
+        }
+
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ] = testChronik
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ] = harness.lockCoordinator
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.privateSettlementStorage')
+        ] = harness.settlementStorage
+
+        const rec = createFixtureLedgerRecord()
+        const composition = createWalletExecutionComposition(
+          {
+            approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+            sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+            utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+            signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+            storage: harness.ledgerStorage,
+            lockCoordinator: harness.lockCoordinator,
+            clock: () => FIXED_NOW + 100
+          },
+          {
+            executionStorage: harness.ledgerStorage,
+            privateSettlementStorage: harness.settlementStorage
+          }
+        )
+
+        // Allow startup recovery to run its initial attempt
+        await vi.advanceTimersByTimeAsync(0)
+        await Promise.resolve()
+        await Promise.resolve()
+
+        // 4. Assert:
+        //    - state remains SETTLING
+        //    - markSettlementUncertain is NOT invoked
+        //    - no broadcast
+        expect(settledPersistenceAttempts).toBeGreaterThanOrEqual(1)
+        expect(markSettlementUncertainInvoked).toBe(false)
+        expect(broadcastCalls).toBe(0)
+
+        const dataAfterFail = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(dataAfterFail.records[executionId]?.state).toBe('SETTLING')
+
+        // 5. On later retry with persistence healthy: observed tx -> durable SETTLED
+        shouldFailSettledPersistence = false
+
+        // Advance 1s for retry timer to trigger and execute
+        await vi.advanceTimersByTimeAsync(1_000)
+        await Promise.resolve()
+        await Promise.resolve()
+
+        const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(finalData.records[executionId]?.state).toBe('SETTLED')
+        expect(markSettlementUncertainInvoked).toBe(false)
+        expect(broadcastCalls).toBe(0)
+
+        composition.dispose()
+      } finally {
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.beforeMarkSettlementUncertainLockRequest')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.simulateTransitionToSettledStorageFailure')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.privateSettlementStorage')
+        ]
+        vi.useRealTimers()
+      }
+    })
+  })
 })
