@@ -42,6 +42,7 @@ import {
 import {
   canonicalOutpointKey,
   DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
+  DEFAULT_EXECUTION_LOCK_NAME,
   DurableTransactionalExecutionLedger,
   executionSettlementLockName,
   WebLocksExecutionCoordinator,
@@ -2300,6 +2301,274 @@ describe('Gate C3A — RMZWallet Settlement Engine', () => {
       } finally {
         delete (globalThis as Record<symbol, unknown>)[
           Symbol.for('rmzwallet.testOnly.beforeSettlementRecoveryObservation')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ]
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  describe('Gate C3A Pass 4.2: Fencing Durable Settlement Mutation Inside Execution-Lock Callback', () => {
+    it('Test A: observed tx - blocks mutation when dispose occurs while waiting for DEFAULT_EXECUTION_LOCK_NAME', async () => {
+      vi.useFakeTimers()
+      try {
+        const harness = setupTestHarness()
+        const { executionId, expectedTxid } = await harness.signExecution()
+        seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
+        harness.composition.dispose()
+
+        let txCalls = 0
+        let broadcastCalls = 0
+        const testChronik: ChronikBroadcastClient = {
+          broadcastTx: async () => {
+            broadcastCalls++
+            return { txid: expectedTxid }
+          },
+          tx: async (txid: string) => {
+            txCalls++
+            return { txid }
+          }
+        }
+
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ] = testChronik
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ] = harness.lockCoordinator
+
+        let releaseExecutionLock!: () => void
+        const releasePromise = new Promise<void>(r => {
+          releaseExecutionLock = r
+        })
+        let lockAcquiredResolve!: () => void
+        const lockAcquiredPromise = new Promise<void>(r => {
+          lockAcquiredResolve = r
+        })
+        let transitionInvokedResolve!: () => void
+        const transitionInvokedPromise = new Promise<void>(r => {
+          transitionInvokedResolve = r
+        })
+
+        let hookRan = false
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.beforeTransitionToSettledLockRequest')
+        ] = async (targetExecutionId: string) => {
+          if (targetExecutionId === executionId && !hookRan) {
+            hookRan = true
+            // 2. Pause FileLocalSettlementAuthority after transitionToSettled() has been
+            // invoked but BEFORE the DEFAULT_EXECUTION_LOCK_NAME callback executes.
+            // Hold DEFAULT_EXECUTION_LOCK_NAME externally so transitionToSettled queues behind it.
+            void harness.lockCoordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+              lockAcquiredResolve()
+              await releasePromise
+            })
+            await lockAcquiredPromise
+            transitionInvokedResolve()
+          }
+        }
+
+        const rec = createFixtureLedgerRecord()
+        const engineConfigA: AgentWalletExecutionEngineConfig = {
+          approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+          sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 100
+        }
+
+        const engineA: DisposableAgentWalletExecutionEngine = createAgentWalletExecutionEngine(engineConfigA)
+
+        // 1. Recovery observes exact expectedTxid and invokes transitionToSettled()
+        await transitionInvokedPromise
+        expect(txCalls).toBe(1)
+
+        // 3. Call dispose() while transitionToSettled is waiting for DEFAULT_EXECUTION_LOCK_NAME
+        engineA.dispose()
+        // verify dispose is idempotent
+        expect(() => engineA.dispose()).not.toThrow()
+
+        // 4. Release the execution lock
+        releaseExecutionLock()
+
+        // Allow microtasks and callbacks to execute
+        await vi.advanceTimersByTimeAsync(5_000)
+
+        // 5. Assert:
+        // - no SETTLED write from disposed engine
+        // - durable state remains SETTLING
+        // - no retry from disposed engine
+        // - zero broadcast
+        const dataAfterA = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(dataAfterA.records[executionId]?.state).toBe('SETTLING')
+        expect(broadcastCalls).toBe(0)
+
+        // Remove hook for Engine B
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.beforeTransitionToSettledLockRequest')
+        ]
+
+        // 6. Live Engine B subsequently reconciles to SETTLED
+        const engineConfigB: AgentWalletExecutionEngineConfig = {
+          approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+          sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 200
+        }
+        const engineB: DisposableAgentWalletExecutionEngine = createAgentWalletExecutionEngine(engineConfigB)
+
+        await vi.advanceTimersByTimeAsync(500)
+
+        const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(finalData.records[executionId]?.state).toBe('SETTLED')
+        expect(finalData.records[executionId]?.expectedTxid).toBe(expectedTxid.toLowerCase())
+        expect(broadcastCalls).toBe(0)
+
+        engineB.dispose()
+      } finally {
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.beforeTransitionToSettledLockRequest')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ]
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ]
+        vi.useRealTimers()
+      }
+    })
+
+    it('Test B: uncertain tx - blocks mutation when dispose occurs while waiting for DEFAULT_EXECUTION_LOCK_NAME', async () => {
+      vi.useFakeTimers()
+      try {
+        const harness = setupTestHarness()
+        const { executionId, expectedTxid } = await harness.signExecution()
+        seedSettlingState(harness.ledgerStorage, executionId, expectedTxid, FIXED_NOW)
+        harness.composition.dispose()
+
+        let broadcastCalls = 0
+        let chronikTxCalled = false
+        const testChronik: ChronikBroadcastClient = {
+          broadcastTx: async () => {
+            broadcastCalls++
+            return { txid: expectedTxid }
+          },
+          tx: async () => {
+            chronikTxCalled = true
+            throw new Error('Transaction not found on chain or mempool')
+          }
+        }
+
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementChronikClient')
+        ] = testChronik
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.settlementLockCoordinator')
+        ] = harness.lockCoordinator
+
+        let releaseExecutionLock!: () => void
+        const releasePromise = new Promise<void>(r => {
+          releaseExecutionLock = r
+        })
+        let lockAcquiredResolve!: () => void
+        const lockAcquiredPromise = new Promise<void>(r => {
+          lockAcquiredResolve = r
+        })
+        let mutationInvokedResolve!: () => void
+        const mutationInvokedPromise = new Promise<void>(r => {
+          mutationInvokedResolve = r
+        })
+
+        let hookRan = false
+        ;(globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.beforeMarkSettlementUncertainLockRequest')
+        ] = async (targetExecutionId: string) => {
+          if (targetExecutionId === executionId && !hookRan) {
+            hookRan = true
+            // 2. Pause before markSettlementUncertain() mutation callback executes.
+            // Hold DEFAULT_EXECUTION_LOCK_NAME externally so markSettlementUncertain queues behind it.
+            void harness.lockCoordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+              lockAcquiredResolve()
+              await releasePromise
+            })
+            await lockAcquiredPromise
+            mutationInvokedResolve()
+          }
+        }
+
+        const rec = createFixtureLedgerRecord()
+        const engineConfigA: AgentWalletExecutionEngineConfig = {
+          approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+          sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 100
+        }
+
+        const engineA: DisposableAgentWalletExecutionEngine = createAgentWalletExecutionEngine(engineConfigA)
+
+        // 1. Recovery decides SETTLEMENT_UNCERTAIN and calls markSettlementUncertain()
+        await mutationInvokedPromise
+        expect(chronikTxCalled).toBe(true)
+
+        // 3. dispose()
+        engineA.dispose()
+        expect(() => engineA.dispose()).not.toThrow()
+
+        // 4. Release execution lock
+        releaseExecutionLock()
+
+        // Allow microtasks to execute
+        await vi.advanceTimersByTimeAsync(5_000)
+
+        // 5. Assert:
+        // - no SETTLEMENT_UNCERTAIN write from disposed engine
+        // - state remains SETTLING
+        // - zero broadcast
+        const dataAfterA = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(dataAfterA.records[executionId]?.state).toBe('SETTLING')
+        expect(broadcastCalls).toBe(0)
+
+        // Remove hook for Engine B
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.beforeMarkSettlementUncertainLockRequest')
+        ]
+
+        // 6. Live Engine B reconciles normally
+        const engineConfigB: AgentWalletExecutionEngineConfig = {
+          approvalLedger: { get: async () => rec, getByApprovalId: async () => rec },
+          sessionVerifier: { verifyActiveSession: async () => ({ authenticated: true, activeAddress: FROM_ADDRESS }) },
+          utxoProvider: { getSpendableUtxos: async () => createFixtureUtxos() },
+          signatoryProvider: { getSignatory: () => createSyntheticSignatory().signatory },
+          storage: harness.ledgerStorage,
+          lockCoordinator: harness.lockCoordinator,
+          clock: () => FIXED_NOW + 200
+        }
+        const engineB: DisposableAgentWalletExecutionEngine = createAgentWalletExecutionEngine(engineConfigB)
+
+        await vi.advanceTimersByTimeAsync(500)
+
+        const finalData = JSON.parse(harness.ledgerStorage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)!)
+        expect(finalData.records[executionId]?.state).toBe('SETTLEMENT_UNCERTAIN')
+        expect(broadcastCalls).toBe(0)
+
+        engineB.dispose()
+      } finally {
+        delete (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.beforeMarkSettlementUncertainLockRequest')
         ]
         delete (globalThis as Record<symbol, unknown>)[
           Symbol.for('rmzwallet.testOnly.settlementChronikClient')

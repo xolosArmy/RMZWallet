@@ -117,32 +117,52 @@ function resolveWalletExecutionStorage(
 
 /**
  * File-local settlement authority interface.
+/**
+ * Composition-local lifecycle guard predicate.
+ * Strictly unexported.
+ */
+type LifecycleGuard = () => boolean
+
+/**
+ * File-local settlement authority interface.
  * Strictly NOT exported from this file, barrel, or deep importable surface.
  */
 interface AuthoritativeSettlementLedger {
   get(executionId: string): Promise<PublicExecutionStatus | undefined>
   runWithSettlementLock<T>(executionId: string, operation: () => Promise<T>): Promise<T>
-  transitionToSettling(params: {
-    readonly executionId: string
-    readonly expectedTxid: string
-    readonly settlingAt: number
-  }): Promise<void>
-  transitionToSettled(params: {
-    readonly executionId: string
-    readonly expectedTxid: string
-    readonly settledAt: number
-  }): Promise<void>
-  markSettlementUncertain(params: {
-    readonly executionId: string
-    readonly reason: string
-    readonly timestamp: number
-  }): Promise<void>
-  markSettlementRejected(params: {
-    readonly executionId: string
-    readonly reason: string
-    readonly timestamp: number
-    readonly releaseOutpoints?: boolean
-  }): Promise<void>
+  transitionToSettling(
+    params: {
+      readonly executionId: string
+      readonly expectedTxid: string
+      readonly settlingAt: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<void>
+  transitionToSettled(
+    params: {
+      readonly executionId: string
+      readonly expectedTxid: string
+      readonly settledAt: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<void>
+  markSettlementUncertain(
+    params: {
+      readonly executionId: string
+      readonly reason: string
+      readonly timestamp: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<void>
+  markSettlementRejected(
+    params: {
+      readonly executionId: string
+      readonly reason: string
+      readonly timestamp: number
+      readonly releaseOutpoints?: boolean
+    },
+    guard?: LifecycleGuard
+  ): Promise<void>
   snapshotSettlingRecords(): Promise<
     ReadonlyArray<{ readonly executionId: string; readonly expectedTxid?: string }>
   >
@@ -259,13 +279,20 @@ class FileLocalSettlementAuthority implements AuthoritativeSettlementLedger {
     }
   }
 
-  async transitionToSettling(params: {
-    readonly executionId: string
-    readonly expectedTxid: string
-    readonly settlingAt: number
-  }): Promise<void> {
+  async transitionToSettling(
+    params: {
+      readonly executionId: string
+      readonly expectedTxid: string
+      readonly settlingAt: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<void> {
     return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      if (guard && !guard()) return
+
       const data = this.loadData()
+      if (guard && !guard()) return
+
       const existing = data.records[params.executionId]
       if (!existing) {
         throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
@@ -281,17 +308,33 @@ class FileLocalSettlementAuthority implements AuthoritativeSettlementLedger {
         settlementAttempt: (existing.settlementAttempt ?? 0) + 1
       }
 
+      if (guard && !guard()) return
       this.saveData(data)
     })
   }
 
-  async transitionToSettled(params: {
-    readonly executionId: string
-    readonly expectedTxid: string
-    readonly settledAt: number
-  }): Promise<void> {
+  async transitionToSettled(
+    params: {
+      readonly executionId: string
+      readonly expectedTxid: string
+      readonly settledAt: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<void> {
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforeTransitionToSettledLockRequest')
+      ]
+      if (typeof hook === 'function') {
+        await hook(params.executionId)
+      }
+    }
     return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      if (guard && !guard()) return
+
       const data = this.loadData()
+      if (guard && !guard()) return
+
       const existing = data.records[params.executionId]
       if (!existing) {
         throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
@@ -313,17 +356,33 @@ class FileLocalSettlementAuthority implements AuthoritativeSettlementLedger {
         settledAt: params.settledAt
       }
 
+      if (guard && !guard()) return
       this.saveData(data)
     })
   }
 
-  async markSettlementUncertain(params: {
-    readonly executionId: string
-    readonly reason: string
-    readonly timestamp: number
-  }): Promise<void> {
+  async markSettlementUncertain(
+    params: {
+      readonly executionId: string
+      readonly reason: string
+      readonly timestamp: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<void> {
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforeMarkSettlementUncertainLockRequest')
+      ]
+      if (typeof hook === 'function') {
+        await hook(params.executionId)
+      }
+    }
     return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      if (guard && !guard()) return
+
       const data = this.loadData()
+      if (guard && !guard()) return
+
       const existing = data.records[params.executionId]
       if (!existing) {
         throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
@@ -338,18 +397,26 @@ class FileLocalSettlementAuthority implements AuthoritativeSettlementLedger {
         failedAt: params.timestamp
       }
 
+      if (guard && !guard()) return
       this.saveData(data)
     })
   }
 
-  async markSettlementRejected(params: {
-    readonly executionId: string
-    readonly reason: string
-    readonly timestamp: number
-    readonly releaseOutpoints?: boolean
-  }): Promise<void> {
+  async markSettlementRejected(
+    params: {
+      readonly executionId: string
+      readonly reason: string
+      readonly timestamp: number
+      readonly releaseOutpoints?: boolean
+    },
+    guard?: LifecycleGuard
+  ): Promise<void> {
     return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      if (guard && !guard()) return
+
       const data = this.loadData()
+      if (guard && !guard()) return
+
       const existing = data.records[params.executionId]
       if (!existing) {
         throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
@@ -370,6 +437,7 @@ class FileLocalSettlementAuthority implements AuthoritativeSettlementLedger {
         reservedOutpoints: release ? [] : existing.reservedOutpoints
       }
 
+      if (guard && !guard()) return
       this.saveData(data)
     })
   }
@@ -842,10 +910,11 @@ function createWalletExecutionComposition(
     calledGeneration?: number
   ): Promise<void> {
     const generation = calledGeneration ?? lifecycleGeneration
-    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
+    const recoveryGuard: LifecycleGuard = () => isLifecycleActive(generation)
+    if (!recoveryGuard() || !authoritativeSettlementLedger) return
 
     const record = await authoritativeSettlementLedger.get(executionId)
-    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
+    if (!recoveryGuard() || !authoritativeSettlementLedger) return
 
     if (!record || ((record as any).state ?? record.status) !== 'SETTLING') {
       return
@@ -855,20 +924,23 @@ function createWalletExecutionComposition(
     if (!targetTxid) {
       try {
         const rawTxHex = await getPrivateSignedTransaction(executionId)
-        if (!isLifecycleActive(generation)) return
+        if (!recoveryGuard()) return
         targetTxid = deriveExpectedTxidFromRawTxHex(rawTxHex)
       } catch {
-        if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
-        await authoritativeSettlementLedger.markSettlementUncertain({
-          executionId,
-          reason: 'Abandoned SETTLING record without recoverable expectedTxid.',
-          timestamp: getNow()
-        })
+        if (!recoveryGuard() || !authoritativeSettlementLedger) return
+        await authoritativeSettlementLedger.markSettlementUncertain(
+          {
+            executionId,
+            reason: 'Abandoned SETTLING record without recoverable expectedTxid.',
+            timestamp: getNow()
+          },
+          recoveryGuard
+        )
         return
       }
     }
 
-    if (!isLifecycleActive(generation)) return
+    if (!recoveryGuard()) return
 
     let chronik: ChronikBroadcastClient | undefined
     try {
@@ -887,15 +959,18 @@ function createWalletExecutionComposition(
             await hook(executionId, targetTxid)
           }
         }
-        if (!isLifecycleActive(generation)) return
+        if (!recoveryGuard()) return
         const observed = await chronik.tx(targetTxid)
-        if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
+        if (!recoveryGuard() || !authoritativeSettlementLedger) return
         if (observed && observed.txid?.toLowerCase() === targetTxid.toLowerCase()) {
-          await authoritativeSettlementLedger.transitionToSettled({
-            executionId,
-            expectedTxid: targetTxid,
-            settledAt: getNow()
-          })
+          await authoritativeSettlementLedger.transitionToSettled(
+            {
+              executionId,
+              expectedTxid: targetTxid,
+              settledAt: getNow()
+            },
+            recoveryGuard
+          )
           return
         }
       } catch {
@@ -903,14 +978,17 @@ function createWalletExecutionComposition(
       }
     }
 
-    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
+    if (!recoveryGuard() || !authoritativeSettlementLedger) return
 
-    await authoritativeSettlementLedger.markSettlementUncertain({
-      executionId,
-      reason:
-        'Abandoned SETTLING execution recovered at startup without network confirmation. Reconciled to SETTLEMENT_UNCERTAIN without rebroadcast.',
-      timestamp: getNow()
-    })
+    await authoritativeSettlementLedger.markSettlementUncertain(
+      {
+        executionId,
+        reason:
+          'Abandoned SETTLING execution recovered at startup without network confirmation. Reconciled to SETTLEMENT_UNCERTAIN without rebroadcast.',
+        timestamp: getNow()
+      },
+      recoveryGuard
+    )
   }
 
   async function attemptSettlementRecovery(
@@ -2122,6 +2200,7 @@ function createWalletExecutionComposition(
 
         // Chronik client resolution from trusted runtime
         const chronik = resolveWalletChronikClient()
+        const settleGuard: LifecycleGuard = () => !disposed
 
         // Handle recovering SETTLING or SETTLEMENT_UNCERTAIN
         if (state === 'SETTLING' || state === 'SETTLEMENT_UNCERTAIN') {
@@ -2144,11 +2223,14 @@ function createWalletExecutionComposition(
 
           if (accepted) {
             const settledAt = getNow()
-            await settlementLedger.transitionToSettled({
-              executionId,
-              expectedTxid,
-              settledAt
-            })
+            await settlementLedger.transitionToSettled(
+              {
+                executionId,
+                expectedTxid,
+                settledAt
+              },
+              settleGuard
+            )
             return Object.freeze({
               status: 'settled',
               network: currentStatus.network,
@@ -2169,11 +2251,14 @@ function createWalletExecutionComposition(
           }
 
           // If was SETTLING (abandoned attempt), mark uncertain
-          await settlementLedger.markSettlementUncertain({
-            executionId,
-            reason: 'Previous settlement attempt interrupted; transaction not observed on network.',
-            timestamp: getNow()
-          })
+          await settlementLedger.markSettlementUncertain(
+            {
+              executionId,
+              reason: 'Previous settlement attempt interrupted; transaction not observed on network.',
+              timestamp: getNow()
+            },
+            settleGuard
+          )
           throw new WalletExecutionError(
             'SETTLEMENT_UNCERTAIN',
             `Execution "${executionId}" settlement interrupted. Reconciled to SETTLEMENT_UNCERTAIN.`
@@ -2196,11 +2281,14 @@ function createWalletExecutionComposition(
 
         // Bind and persist expectedTxid in durable SETTLING state BEFORE broadcast
         const settlingAt = getNow()
-        await settlementLedger.transitionToSettling({
-          executionId,
-          expectedTxid,
-          settlingAt
-        })
+        await settlementLedger.transitionToSettling(
+          {
+            executionId,
+            expectedTxid,
+            settlingAt
+          },
+          settleGuard
+        )
 
         // Broadcast to Chronik
         const rawTxBytes = fromHex(rawSignedTxHex)
@@ -2230,11 +2318,14 @@ function createWalletExecutionComposition(
           if (accepted) {
             cancelSettlementRecoveryRetry(executionId)
             const settledAt = getNow()
-            await settlementLedger.transitionToSettled({
-              executionId,
-              expectedTxid,
-              settledAt
-            })
+            await settlementLedger.transitionToSettled(
+              {
+                executionId,
+                expectedTxid,
+                settledAt
+              },
+              settleGuard
+            )
             return Object.freeze({
               status: 'settled',
               network: currentStatus.network,
@@ -2252,11 +2343,14 @@ function createWalletExecutionComposition(
           cancelSettlementRecoveryRetry(executionId)
           const timestamp = getNow()
           const reason = broadcastError instanceof Error ? broadcastError.message : String(broadcastError)
-          await settlementLedger.markSettlementUncertain({
-            executionId,
-            reason: `Settlement broadcast uncertain: ${reason}`,
-            timestamp
-          })
+          await settlementLedger.markSettlementUncertain(
+            {
+              executionId,
+              reason: `Settlement broadcast uncertain: ${reason}`,
+              timestamp
+            },
+            settleGuard
+          )
           throw new WalletExecutionError(
             'SETTLEMENT_UNCERTAIN',
             `Settlement broadcast outcome uncertain: ${reason}`,
@@ -2268,11 +2362,14 @@ function createWalletExecutionComposition(
         if (!broadcastTxid || broadcastTxid !== expectedTxid) {
           // FAIL CLOSED
           const timestamp = getNow()
-          await settlementLedger.markSettlementUncertain({
-            executionId,
-            reason: `Chronik returned txid "${broadcastTxid}" does not match locally derived expected txid "${expectedTxid}".`,
-            timestamp
-          })
+          await settlementLedger.markSettlementUncertain(
+            {
+              executionId,
+              reason: `Chronik returned txid "${broadcastTxid}" does not match locally derived expected txid "${expectedTxid}".`,
+              timestamp
+            },
+            settleGuard
+          )
           throw new WalletExecutionError(
             'SETTLEMENT_TXID_MISMATCH',
             `Chronik returned txid "${broadcastTxid}" does not match locally derived expected txid "${expectedTxid}".`
@@ -2295,11 +2392,14 @@ function createWalletExecutionComposition(
 
         if (!verifiedAcceptance) {
           const timestamp = getNow()
-          await settlementLedger.markSettlementUncertain({
-            executionId,
-            reason: 'Broadcast succeeded but network acceptance could not be verified via Chronik index.',
-            timestamp
-          })
+          await settlementLedger.markSettlementUncertain(
+            {
+              executionId,
+              reason: 'Broadcast succeeded but network acceptance could not be verified via Chronik index.',
+              timestamp
+            },
+            settleGuard
+          )
           throw new WalletExecutionError(
             'SETTLEMENT_UNCERTAIN',
             'Broadcast succeeded but network acceptance could not be verified via Chronik index.'
@@ -2308,11 +2408,14 @@ function createWalletExecutionComposition(
 
         // Transition to SETTLED
         const settledAt = getNow()
-        await settlementLedger.transitionToSettled({
-          executionId,
-          expectedTxid,
-          settledAt
-        })
+        await settlementLedger.transitionToSettled(
+          {
+            executionId,
+            expectedTxid,
+            settledAt
+          },
+          settleGuard
+        )
 
         return Object.freeze({
           status: 'settled',
