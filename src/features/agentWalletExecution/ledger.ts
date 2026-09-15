@@ -48,6 +48,7 @@ export const DEFAULT_EXECUTION_LEDGER_STORAGE_KEY = 'rmzwallet_agent_execution_l
 export const DEFAULT_EXECUTION_LOCK_NAME = 'rmzwallet:agent-execution:lock:v2'
 export const EXECUTION_SIGNING_LOCK_PREFIX = 'rmzwallet:agent-signing:'
 export const EXECUTION_REVIEW_LOCK_PREFIX = 'rmzwallet:agent-review:'
+export const EXECUTION_SETTLEMENT_LOCK_PREFIX = 'rmzwallet:agent-settlement:'
 export const DEFAULT_REVIEW_LEASE_TTL_SECONDS = 30
 
 export function executionSigningLockName(executionId: string): string {
@@ -56,6 +57,10 @@ export function executionSigningLockName(executionId: string): string {
 
 export function executionReviewLockName(executionId: string): string {
   return `${EXECUTION_REVIEW_LOCK_PREFIX}${executionId}`
+}
+
+export function executionSettlementLockName(executionId: string): string {
+  return `${EXECUTION_SETTLEMENT_LOCK_PREFIX}${executionId}`
 }
 
 export function canonicalOutpointKey(txid: string, outIdx: number): string {
@@ -69,7 +74,11 @@ export const VALID_EXECUTION_STATE_TRANSITIONS: Readonly<
   EXECUTION_RESERVED: ['PREPARED', 'REJECTED', 'FAILED', 'EXPIRED'],
   PREPARED: ['SIGNING', 'REJECTED', 'FAILED', 'EXPIRED'],
   SIGNING: ['SIGNED', 'SIGNING_UNCERTAIN'],
-  SIGNED: [],
+  SIGNED: ['SETTLING'],
+  SETTLING: ['SETTLED', 'SETTLEMENT_UNCERTAIN', 'SETTLEMENT_REJECTED'],
+  SETTLEMENT_UNCERTAIN: ['SETTLED', 'SETTLEMENT_REJECTED'],
+  SETTLED: [],
+  SETTLEMENT_REJECTED: [],
   REJECTED: [],
   FAILED: [],
   SIGNING_UNCERTAIN: [],
@@ -145,6 +154,10 @@ interface SerializedExecutionStateEntry {
   readonly preparedAt?: number
   readonly signingAt?: number
   readonly signedAt?: number
+  readonly settlingAt?: number
+  readonly settledAt?: number
+  readonly expectedTxid?: string
+  readonly settlementAttempt?: number
   readonly failedAt?: number
   readonly reservedOutpoints?: readonly string[]
   readonly reviewOwnerId?: string
@@ -181,7 +194,7 @@ function toPublicStatus(entry: SerializedExecutionStateEntry): PublicExecutionSt
     decisionId: entry.decisionId,
     fromAddress: entry.fromAddress,
     destination: entry.destination,
-    amountSats: BigInt(entry.amountSats),
+    amountSats: entry.amountSats !== undefined ? BigInt(entry.amountSats) : 0n,
     network: entry.network,
     status: entry.state,
     planHash: entry.planHash,
@@ -190,6 +203,9 @@ function toPublicStatus(entry: SerializedExecutionStateEntry): PublicExecutionSt
     preparedAt: entry.preparedAt,
     signingAt: entry.signingAt,
     signedAt: entry.signedAt,
+    settlingAt: entry.settlingAt,
+    settledAt: entry.settledAt,
+    expectedTxid: entry.expectedTxid,
     failedAt: entry.failedAt
   })
 }
@@ -305,6 +321,7 @@ export class DurableTransactionalExecutionLedger implements WalletExecutionLedge
    * SIGNING: only abandoned signers (review/signing lock available) become SIGNING_UNCERTAIN.
    * PREPARED: only expired leases whose review lock can be acquired become EXPIRED and release outpoints.
    * EXECUTION_RESERVED: never entered PREPARED/SIGNING; terminalize to FAILED and release outpoints.
+   * SETTLING: query expectedTxid; if observed -> SETTLED; if ambiguous -> SETTLEMENT_UNCERTAIN. Never blindly rebroadcast.
    */
   private async reconcileInterruptedExecutions(): Promise<void> {
     const snapshot = await this.coordinator.requestExclusive(this.lockName, async () => {

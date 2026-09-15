@@ -11,6 +11,7 @@ import {
   canonicalOutpointKey,
   DEFAULT_EXECUTION_LOCK_NAME,
   EXECUTION_REVIEW_LOCK_PREFIX,
+  EXECUTION_SETTLEMENT_LOCK_PREFIX,
   EXECUTION_SIGNING_LOCK_PREFIX,
   VALID_EXECUTION_STATE_TRANSITIONS
 } from './ledger'
@@ -22,6 +23,7 @@ const testLockOrderAls = new AsyncLocalStorage<readonly number[]>()
 export function testLockRank(lockName: string): number {
   if (lockName.startsWith(EXECUTION_REVIEW_LOCK_PREFIX)) return 10
   if (lockName.startsWith(EXECUTION_SIGNING_LOCK_PREFIX)) return 20
+  if (lockName.startsWith(EXECUTION_SETTLEMENT_LOCK_PREFIX)) return 25
   if (lockName === DEFAULT_EXECUTION_LOCK_NAME) return 30
   if (lockName === DEFAULT_SETTLEMENT_STORE_LOCK_NAME) return 40
   return 100
@@ -35,7 +37,7 @@ function assertTestLockOrder(lockName: string): void {
   if (rank < maxHeld) {
     throw new WalletExecutionError(
       'LOCK_ORDER_VIOLATION',
-      `Forbidden lock order: holding rank ${maxHeld} then acquiring "${lockName}" (rank ${rank}). Canonical order is review → signing → global ledger → settlement.`
+      `Forbidden lock order: holding rank ${maxHeld} then acquiring "${lockName}" (rank ${rank}). Canonical order is review → signing → settlement → global ledger → settlementStore.`
     )
   }
 }
@@ -561,6 +563,9 @@ export class InMemoryWalletExecutionLedger implements WalletExecutionLedger {
       preparedAt: record.preparedAt,
       signingAt: record.signingAt,
       signedAt: record.signedAt,
+      settlingAt: record.settlingAt,
+      settledAt: record.settledAt,
+      expectedTxid: record.expectedTxid,
       failedAt: record.failedAt
     })
   }

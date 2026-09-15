@@ -161,10 +161,12 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
 
     expect(typeof publicEngine.prepareExecution).toBe('function')
     expect(typeof publicEngine.getExecutionStatus).toBe('function')
+    expect(typeof publicEngine.dispose).toBe('function')
     expect((publicEngine as any).confirm).toBeUndefined()
     expect((publicEngine as any).sign).toBeUndefined()
     expect((publicEngine as any).execute).toBeUndefined()
     expect((publicEngine as any).createLocalConfirmationController).toBeUndefined()
+    publicEngine.dispose()
   })
 
   it('verifies capability.ts does NOT exist in production source', () => {
@@ -209,6 +211,7 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(body).not.toMatch(/privateSettlementStorage/)
     expect(body).not.toMatch(/settlementStorage/)
     expect(body).not.toMatch(/rawSignedTxHex/)
+    expect(body).not.toMatch(/chronik/)
     expect(body).toMatch(/NEVER used for raw signed transactions/)
 
     const engineSource = readFileSync(join(__dirname, 'engine.ts'), 'utf-8')
@@ -229,6 +232,7 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(runtimeSource).toMatch(/createFileLocalProductionSignatoryProvider/)
     expect(runtimeSource).not.toMatch(/export function createFileLocalProductionSignatoryProvider/)
     expect(runtimeSource).not.toMatch(/export function createProductionSignatoryProvider/)
+    expect(runtimeSource).not.toMatch(/readonly chronik\?:/)
 
     const mainSource = readFileSync(join(__dirname, '../../main.tsx'), 'utf-8')
     expect(mainSource).toContain('TrustedWalletExecutionProvider')
@@ -240,7 +244,7 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(mainSource).not.toMatch(/getSignatory/)
   })
 
-  it('verifies WalletExecutionLedger never carries signed transaction bytes', () => {
+  it('verifies WalletExecutionLedger never carries signed transaction bytes or settlement mutation authority', () => {
     const typesContent = readFileSync(join(__dirname, 'types.ts'), 'utf-8')
     const ledgerStart = typesContent.indexOf('export interface WalletExecutionLedger')
     const ledgerEnd = typesContent.indexOf('export interface AgentWalletExecutionEngineConfig')
@@ -250,16 +254,36 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     expect(ledgerBody).not.toMatch(/rawSignedTxHex/)
     expect(ledgerBody).not.toMatch(/\brawTx\b/)
     expect(ledgerBody).not.toMatch(/\btxHex\b/)
+    expect(ledgerBody).not.toMatch(/runWithSettlementLock/)
+    expect(ledgerBody).not.toMatch(/transitionToSettling/)
+    expect(ledgerBody).not.toMatch(/transitionToSettled/)
+    expect(ledgerBody).not.toMatch(/markSettlementUncertain/)
+    expect(ledgerBody).not.toMatch(/markSettlementRejected/)
+    expect(ledgerBody).not.toMatch(/snapshotSettlingRecords/)
     expect(ledgerBody).toContain('transitionToSigned(executionId: string, signedAt: number)')
     expect(ledgerBody).toContain('transitionToSigningIfValid')
+
+    expect(typesContent).not.toMatch(/AuthoritativeSettlementLedger/)
 
     const ledgerSource = readFileSync(join(__dirname, 'ledger.ts'), 'utf-8')
     expect(ledgerSource).not.toMatch(/rawSignedTxHex/)
     expect(ledgerSource).not.toMatch(/\brawTx\b/)
     expect(ledgerSource).not.toMatch(/\btxHex\b/)
+    expect(ledgerSource).not.toMatch(/transitionToSettling/)
+    expect(ledgerSource).not.toMatch(/transitionToSettled/)
+    expect(ledgerSource).not.toMatch(/markSettlementUncertain/)
+    expect(ledgerSource).not.toMatch(/markSettlementRejected/)
+    expect(ledgerSource).not.toMatch(/snapshotSettlingRecords/)
+    expect(ledgerSource).not.toMatch(/runWithSettlementLock/)
 
     const testUtilsSource = readFileSync(join(__dirname, 'testUtils.ts'), 'utf-8')
     expect(testUtilsSource).not.toMatch(/rawSignedTxHex/)
+    expect(testUtilsSource).not.toMatch(/transitionToSettling/)
+    expect(testUtilsSource).not.toMatch(/transitionToSettled/)
+    expect(testUtilsSource).not.toMatch(/markSettlementUncertain/)
+    expect(testUtilsSource).not.toMatch(/markSettlementRejected/)
+    expect(testUtilsSource).not.toMatch(/snapshotSettlingRecords/)
+    expect(testUtilsSource).not.toMatch(/runWithSettlementLock/)
   })
 
   it('verifies SignedExecutionHandle remains opaque without raw tx bytes', () => {
@@ -311,10 +335,13 @@ describe('agentWalletExecution Architecture & Security Boundaries', () => {
     }
   })
 
-  it('verifies terminal state is SIGNED / READY_FOR_SETTLEMENT and NEVER SETTLED', () => {
+  it('verifies Gate C3A settlement states exist and terminal state is SETTLED / SETTLEMENT_REJECTED', () => {
     const typesContent = readFileSync(join(__dirname, 'types.ts'), 'utf-8')
 
-    expect(typesContent).not.toMatch(/\|\s*'SETTLED'/)
+    expect(typesContent).toContain("'SETTLING'")
+    expect(typesContent).toContain("'SETTLED'")
+    expect(typesContent).toContain("'SETTLEMENT_UNCERTAIN'")
+    expect(typesContent).toContain("'SETTLEMENT_REJECTED'")
     expect(typesContent).toContain("'SIGNED'")
     expect(typesContent).toContain("'SIGNING_UNCERTAIN'")
   })

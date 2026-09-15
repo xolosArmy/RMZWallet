@@ -20,8 +20,13 @@ import { xolosWalletService } from '../../services/XolosWalletService'
 import { WalletExecutionError } from '../../features/agentWalletExecution/errors'
 import {
   DEFAULT_REVIEW_LEASE_TTL_SECONDS,
+  DEFAULT_EXECUTION_LEDGER_STORAGE_KEY,
+  DEFAULT_EXECUTION_LOCK_NAME,
   DurableTransactionalExecutionLedger,
-  WebLocksExecutionCoordinator
+  VALID_EXECUTION_STATE_TRANSITIONS,
+  WebLocksExecutionCoordinator,
+  executionSettlementLockName,
+  type ExecutionLockCoordinator
 } from '../../features/agentWalletExecution/ledger'
 import {
   assertUniqueUtxoOutpoints,
@@ -31,19 +36,28 @@ import {
   snapshotOwnedUtxos,
   validateOutputInvariants
 } from '../../features/agentWalletExecution/plan'
+import {
+  deriveExpectedTxidFromRawTxHex
+} from '../../features/agentWalletExecution/settlementUtils'
 import type {
   AgentWalletExecutionEngine,
   AgentWalletExecutionEngineConfig,
+  DisposableAgentWalletExecutionEngine,
   ExecutionNetwork,
   PublicExecutionStatus,
   SignedExecutionHandle,
   WalletExecutionLedger,
   WalletExecutionReviewSession,
   WalletExecutionReviewSnapshot,
+  WalletExecutionState,
   WalletFeePolicy,
   WalletPreparedExecutionPlan,
-  WalletExecutionTrustedOptions
+  WalletExecutionTrustedOptions,
+  WalletSettlementReceiptV1,
+  ChronikBroadcastClient
 } from '../../features/agentWalletExecution/types'
+
+import { getChronik } from '../../services/ChronikClient'
 import type {
   WalletExecutionComposition,
   WalletExecutionUIHost,
@@ -64,6 +78,15 @@ const TEST_ONLY_CREATE_WALLET_EXECUTION_COMPOSITION = Symbol.for(
 const TEST_ONLY_PRIVATE_SETTLEMENT_STORAGE = Symbol.for(
   'rmzwallet.testOnly.privateSettlementStorage'
 )
+const TEST_ONLY_SETTLEMENT_LOCK_COORDINATOR = Symbol.for(
+  'rmzwallet.testOnly.settlementLockCoordinator'
+)
+const TEST_ONLY_SETTLEMENT_CHRONIK_CLIENT = Symbol.for(
+  'rmzwallet.testOnly.settlementChronikClient'
+)
+const TEST_ONLY_EXECUTION_STORAGE = Symbol.for(
+  'rmzwallet.testOnly.executionStorage'
+)
 
 type ReviewSigningHandoffPhase = 'IDLE' | 'REVIEW_ACTIVE' | 'HANDOFF_TO_SIGNING' | 'SIGNING_DURABLE'
 
@@ -75,6 +98,495 @@ function resolveFileLocalPrivateSettlementStorage(): Storage | undefined {
     }
   }
   return typeof localStorage !== 'undefined' ? localStorage : undefined
+}
+
+function resolveWalletExecutionStorage(
+  trusted?: WalletExecutionTrustedOptions
+): Storage | undefined {
+  if (import.meta.env?.VITEST) {
+    if (trusted?.executionStorage && typeof (trusted.executionStorage as Storage).setItem === 'function') {
+      return trusted.executionStorage
+    }
+    const override = (globalThis as Record<symbol, unknown>)[TEST_ONLY_EXECUTION_STORAGE]
+    if (override && typeof (override as Storage).setItem === 'function') {
+      return override as Storage
+    }
+  }
+  return typeof localStorage !== 'undefined' ? localStorage : undefined
+}
+
+/**
+ * File-local settlement authority interface.
+/**
+ * Composition-local lifecycle guard predicate.
+ * Strictly unexported.
+ */
+type LifecycleGuard = () => boolean
+
+/**
+ * File-local settlement authority interface.
+ * Strictly NOT exported from this file, barrel, or deep importable surface.
+ */
+interface AuthoritativeSettlementLedger {
+  get(executionId: string): Promise<PublicExecutionStatus | undefined>
+  runWithSettlementLock<T>(executionId: string, operation: () => Promise<T>): Promise<T>
+  transitionToSettling(
+    params: {
+      readonly executionId: string
+      readonly expectedTxid: string
+      readonly settlingAt: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<boolean>
+  transitionToSettled(
+    params: {
+      readonly executionId: string
+      readonly expectedTxid: string
+      readonly settledAt: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<boolean>
+  markSettlementUncertain(
+    params: {
+      readonly executionId: string
+      readonly reason: string
+      readonly timestamp: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<boolean>
+  markSettlementRejected(
+    params: {
+      readonly executionId: string
+      readonly reason: string
+      readonly timestamp: number
+      readonly releaseOutpoints?: boolean
+    },
+    guard?: LifecycleGuard
+  ): Promise<boolean>
+  snapshotSettlingRecords(): Promise<
+    ReadonlyArray<{ readonly executionId: string; readonly expectedTxid?: string }>
+  >
+}
+
+/**
+ * File-local settlement authority implementation.
+ * Operates on the canonical Wallet-owned execution storage under lock.
+ * Strictly unexported.
+ */
+class FileLocalSettlementAuthority implements AuthoritativeSettlementLedger {
+  private readonly storage: Storage
+  private readonly coordinator: ExecutionLockCoordinator
+  private readonly canonicalLedger: DurableTransactionalExecutionLedger
+
+  constructor(options: {
+    storage: Storage
+    lockCoordinator: ExecutionLockCoordinator
+    canonicalLedger: DurableTransactionalExecutionLedger
+  }) {
+    this.storage = options.storage
+    this.coordinator = options.lockCoordinator
+    this.canonicalLedger = options.canonicalLedger
+  }
+
+  async get(executionId: string): Promise<PublicExecutionStatus | undefined> {
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforeAuthoritativeLedgerGet')
+      ]
+      if (typeof hook === 'function') {
+        await hook(executionId)
+      }
+    }
+    return this.canonicalLedger.get(executionId)
+  }
+
+  async runWithSettlementLock<T>(executionId: string, operation: () => Promise<T>): Promise<T> {
+    return this.coordinator.requestExclusive(executionSettlementLockName(executionId), operation)
+  }
+
+  private loadData(): {
+    schemaVersion: number
+    generation: number
+    records: Record<string, any>
+    approvalIdIndex: Record<string, string>
+    requestIdIndex: Record<string, string>
+    outpointReservations: Record<string, string>
+  } {
+    const raw = this.storage.getItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY)
+    if (!raw) {
+      return {
+        schemaVersion: 3,
+        generation: 0,
+        records: {},
+        approvalIdIndex: {},
+        requestIdIndex: {},
+        outpointReservations: {}
+      }
+    }
+    try {
+      const parsed = JSON.parse(raw)
+      return {
+        schemaVersion: 3,
+        generation: parsed.generation ?? 0,
+        records: parsed.records ?? {},
+        approvalIdIndex: parsed.approvalIdIndex ?? {},
+        requestIdIndex: parsed.requestIdIndex ?? {},
+        outpointReservations: parsed.outpointReservations ?? {}
+      }
+    } catch (err) {
+      throw new WalletExecutionError(
+        'STORAGE_MUTATION_FAILED',
+        `Failed to parse durable execution ledger data: ${err instanceof Error ? err.message : String(err)}`
+      )
+    }
+  }
+
+  private saveData(data: {
+    schemaVersion: number
+    generation: number
+    records: Record<string, any>
+    approvalIdIndex: Record<string, string>
+    requestIdIndex: Record<string, string>
+    outpointReservations: Record<string, string>
+  }): void {
+    data.generation += 1
+    try {
+      this.storage.setItem(DEFAULT_EXECUTION_LEDGER_STORAGE_KEY, JSON.stringify({ ...data, schemaVersion: 3 }))
+    } catch (err) {
+      throw new WalletExecutionError(
+        'STORAGE_MUTATION_FAILED',
+        `Failed to persist durable execution ledger data: ${err instanceof Error ? err.message : String(err)}`
+      )
+    }
+  }
+
+  private releaseOutpoints(data: any, executionId: string, keys: readonly string[] | undefined): void {
+    if (!keys) return
+    for (const key of keys) {
+      if (data.outpointReservations[key] === executionId) {
+        delete data.outpointReservations[key]
+      }
+    }
+  }
+
+  private assertTransition(currentState: WalletExecutionState, targetState: WalletExecutionState): void {
+    const allowed = VALID_EXECUTION_STATE_TRANSITIONS[currentState]
+    if (!allowed || !allowed.includes(targetState)) {
+      throw new WalletExecutionError(
+        'INVALID_STATE_TRANSITION',
+        `Cannot transition execution record from state "${currentState}" to "${targetState}".`
+      )
+    }
+  }
+
+  async transitionToSettling(
+    params: {
+      readonly executionId: string
+      readonly expectedTxid: string
+      readonly settlingAt: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<boolean> {
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforeTransitionToSettlingLockRequest')
+      ]
+      if (typeof hook === 'function') {
+        await hook(params.executionId)
+      }
+    }
+    return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      if (guard && !guard()) return false
+
+      const data = this.loadData()
+      if (guard && !guard()) return false
+
+      const existing = data.records[params.executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+      }
+
+      this.assertTransition(existing.state, 'SETTLING')
+
+      data.records[params.executionId] = {
+        ...existing,
+        state: 'SETTLING',
+        expectedTxid: params.expectedTxid.toLowerCase(),
+        settlingAt: params.settlingAt,
+        settlementAttempt: (existing.settlementAttempt ?? 0) + 1
+      }
+
+      if (guard && !guard()) return false
+      this.saveData(data)
+      return true
+    })
+  }
+
+  async transitionToSettled(
+    params: {
+      readonly executionId: string
+      readonly expectedTxid: string
+      readonly settledAt: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<boolean> {
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforeTransitionToSettledLockRequest')
+      ]
+      if (typeof hook === 'function') {
+        await hook(params.executionId)
+      }
+    }
+    return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      if (guard && !guard()) return false
+
+      const data = this.loadData()
+      if (guard && !guard()) return false
+
+      const existing = data.records[params.executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+      }
+
+      this.assertTransition(existing.state, 'SETTLED')
+
+      if (existing.expectedTxid && existing.expectedTxid.toLowerCase() !== params.expectedTxid.toLowerCase()) {
+        throw new WalletExecutionError(
+          'SETTLEMENT_TXID_MISMATCH',
+          `Cannot settle execution "${params.executionId}" with txid "${params.expectedTxid}" (expected "${existing.expectedTxid}").`
+        )
+      }
+
+      data.records[params.executionId] = {
+        ...existing,
+        state: 'SETTLED',
+        expectedTxid: params.expectedTxid.toLowerCase(),
+        settledAt: params.settledAt
+      }
+
+      if (guard && !guard()) return false
+      if (import.meta.env?.VITEST) {
+        const simFail = (globalThis as Record<symbol, unknown>)[
+          Symbol.for('rmzwallet.testOnly.simulateTransitionToSettledStorageFailure')
+        ]
+        if (typeof simFail === 'function') {
+          await simFail(params.executionId)
+        }
+      }
+      this.saveData(data)
+      return true
+    })
+  }
+
+  async markSettlementUncertain(
+    params: {
+      readonly executionId: string
+      readonly reason: string
+      readonly timestamp: number
+    },
+    guard?: LifecycleGuard
+  ): Promise<boolean> {
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforeMarkSettlementUncertainLockRequest')
+      ]
+      if (typeof hook === 'function') {
+        await hook(params.executionId)
+      }
+    }
+    return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      if (guard && !guard()) return false
+
+      const data = this.loadData()
+      if (guard && !guard()) return false
+
+      const existing = data.records[params.executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+      }
+
+      this.assertTransition(existing.state, 'SETTLEMENT_UNCERTAIN')
+
+      data.records[params.executionId] = {
+        ...existing,
+        state: 'SETTLEMENT_UNCERTAIN',
+        uncertainReason: params.reason,
+        failedAt: params.timestamp
+      }
+
+      if (guard && !guard()) return false
+      this.saveData(data)
+      return true
+    })
+  }
+
+  async markSettlementRejected(
+    params: {
+      readonly executionId: string
+      readonly reason: string
+      readonly timestamp: number
+      readonly releaseOutpoints?: boolean
+    },
+    guard?: LifecycleGuard
+  ): Promise<boolean> {
+    return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      if (guard && !guard()) return false
+
+      const data = this.loadData()
+      if (guard && !guard()) return false
+
+      const existing = data.records[params.executionId]
+      if (!existing) {
+        throw new WalletExecutionError('APPROVAL_NOT_FOUND', `Execution record "${params.executionId}" not found.`)
+      }
+
+      this.assertTransition(existing.state, 'SETTLEMENT_REJECTED')
+
+      const release = params.releaseOutpoints === true
+      if (release) {
+        this.releaseOutpoints(data, params.executionId, existing.reservedOutpoints)
+      }
+
+      data.records[params.executionId] = {
+        ...existing,
+        state: 'SETTLEMENT_REJECTED',
+        uncertainReason: params.reason,
+        failedAt: params.timestamp,
+        reservedOutpoints: release ? [] : existing.reservedOutpoints
+      }
+
+      if (guard && !guard()) return false
+      this.saveData(data)
+      return true
+    })
+  }
+
+  async snapshotSettlingRecords(): Promise<
+    ReadonlyArray<{ readonly executionId: string; readonly expectedTxid?: string }>
+  > {
+    return this.coordinator.requestExclusive(DEFAULT_EXECUTION_LOCK_NAME, async () => {
+      const data = this.loadData()
+      const results: Array<{ executionId: string; expectedTxid?: string }> = []
+      for (const record of Object.values(data.records)) {
+        if (record && record.state === 'SETTLING') {
+          results.push({ executionId: record.executionId, expectedTxid: record.expectedTxid })
+        }
+      }
+      return results
+    })
+  }
+}
+
+const fallbackTestSettlementQueues = new Map<string, Promise<unknown>>()
+
+function getFallbackTestSettlementLockCoordinator(): ExecutionLockCoordinator {
+  return {
+    async requestExclusive<T>(lockName: string, operation: () => Promise<T>): Promise<T> {
+      const prior = fallbackTestSettlementQueues.get(lockName) ?? Promise.resolve()
+      let release!: () => void
+      const current = new Promise<void>(resolve => {
+        release = resolve
+      })
+      fallbackTestSettlementQueues.set(
+        lockName,
+        prior.then(() => current)
+      )
+      try {
+        await prior
+        return await operation()
+      } finally {
+        release()
+      }
+    },
+    async tryExclusive<T>(lockName: string, operation: () => Promise<T>) {
+      const result = await this.requestExclusive(lockName, operation)
+      return { acquired: true as const, result }
+    }
+  }
+}
+
+function resolveWalletSettlementLockCoordinator(): ExecutionLockCoordinator {
+  if (import.meta.env?.VITEST) {
+    const testCoordinator = (globalThis as Record<symbol, unknown>)[
+      TEST_ONLY_SETTLEMENT_LOCK_COORDINATOR
+    ]
+    if (
+      testCoordinator &&
+      typeof (testCoordinator as ExecutionLockCoordinator).requestExclusive === 'function' &&
+      typeof (testCoordinator as ExecutionLockCoordinator).tryExclusive === 'function'
+    ) {
+      return testCoordinator as ExecutionLockCoordinator
+    }
+    if (typeof navigator === 'undefined' || !navigator.locks?.request) {
+      return getFallbackTestSettlementLockCoordinator()
+    }
+  }
+  return new WebLocksExecutionCoordinator()
+}
+
+function resolveWalletChronikClient(): ChronikBroadcastClient {
+  if (import.meta.env?.VITEST) {
+    const testChronik = (globalThis as Record<symbol, unknown>)[
+      TEST_ONLY_SETTLEMENT_CHRONIK_CLIENT
+    ]
+    if (
+      testChronik &&
+      typeof (testChronik as ChronikBroadcastClient).broadcastTx === 'function' &&
+      typeof (testChronik as ChronikBroadcastClient).tx === 'function'
+    ) {
+      return testChronik as ChronikBroadcastClient
+    }
+  }
+  if (typeof getChronik === 'function') {
+    return getChronik() as unknown as ChronikBroadcastClient
+  }
+  throw new WalletExecutionError(
+    'STORAGE_UNAVAILABLE',
+    'Wallet Chronik client is not available for settlement broadcast.'
+  )
+}
+
+/**
+ * Safe, total formatter for unknown broadcast rejection payloads.
+ * Must NEVER throw for any JS value (null prototypes, throwing Symbol.toPrimitive/toString/valueOf, hostile proxies).
+ */
+function describeBroadcastRejection(value: unknown): string {
+  try {
+    if (value === undefined) {
+      return 'Broadcast rejected without error payload'
+    }
+
+    if (value === null) {
+      return 'Broadcast rejected with null error payload'
+    }
+
+    if (typeof value === 'string') {
+      return value || 'Empty rejection string'
+    }
+
+    try {
+      if (value instanceof Error) {
+        try {
+          if (typeof value.message === 'string' && value.message.length > 0) {
+            return value.message
+          }
+        } catch {
+          // continue to safe fallbacks
+        }
+      }
+    } catch {
+      // hostile Proxy / prototype behavior
+    }
+
+    try {
+      return String(value)
+    } catch {
+      return 'Unprintable broadcast rejection payload'
+    }
+  } catch {
+    return 'Unprintable broadcast rejection payload'
+  }
 }
 
 function createFileLocalProductionSignatoryProvider(): AgentWalletExecutionEngineConfig['signatoryProvider'] {
@@ -379,19 +891,307 @@ function createWalletExecutionComposition(
     ...(config.feePolicy ?? {})
   }
 
-  // Durable execution ledger by default
+  let disposed = false
+  let lifecycleGeneration = 0
+
+  function isLifecycleActive(generation?: number): boolean {
+    if (disposed) return false
+    if (generation !== undefined && generation !== lifecycleGeneration) return false
+    return true
+  }
+
+  const pendingSettlementRetries = new Map<string, { timer: ReturnType<typeof setTimeout>; attempt: number }>()
+
+  function cancelSettlementRecoveryRetry(executionId: string): void {
+    const existing = pendingSettlementRetries.get(executionId)
+    if (existing) {
+      clearTimeout(existing.timer)
+      pendingSettlementRetries.delete(executionId)
+    }
+  }
+
+  function cancelAllSettlementRecoveryRetries(): void {
+    for (const [_, entry] of pendingSettlementRetries.entries()) {
+      clearTimeout(entry.timer)
+    }
+    pendingSettlementRetries.clear()
+  }
+
+  // One canonical durable execution-state storage dataset
+  const canonicalStorage = resolveWalletExecutionStorage(trusted)
+  const trustedSettlementCoordinator = resolveWalletSettlementLockCoordinator()
+
+  // Canonical Wallet-owned durable execution ledger for C2
+  const canonicalLedger = canonicalStorage
+    ? new DurableTransactionalExecutionLedger({
+        storage: canonicalStorage,
+        lockCoordinator: trustedSettlementCoordinator,
+        clock: getNow
+      })
+    : null
+
+  // File-local authoritative settlement ledger for C3A operating on the single dataset
+  const authoritativeSettlementLedger: AuthoritativeSettlementLedger | null = canonicalStorage
+    ? new FileLocalSettlementAuthority({
+        storage: canonicalStorage,
+        lockCoordinator: trustedSettlementCoordinator,
+        canonicalLedger: canonicalLedger!
+      })
+    : null
+
+  function getAuthoritativeSettlementLedger(): AuthoritativeSettlementLedger {
+    if (!authoritativeSettlementLedger) {
+      throw new WalletExecutionError(
+        'STORAGE_UNAVAILABLE',
+        'No durable settlement storage available. An explicit Storage adapter must be provided in non-browser environments.'
+      )
+    }
+    return authoritativeSettlementLedger
+  }
+
+  // Durable execution ledger facade for C2 operations (or authoritative default).
+  // In production, C2 ALWAYS uses the canonicalLedger.
+  // Historical C2 test double substitution is confined to Vitest when test options are supplied.
   const executionLedger: WalletExecutionLedger =
-    config.executionLedger ??
-    new DurableTransactionalExecutionLedger({
-      storage: config.storage,
-      lockCoordinator: config.lockCoordinator,
-      clock: getNow
-    })
+    (import.meta.env?.VITEST && trusted?.testOnlyExecutionLedger)
+      ? trusted.testOnlyExecutionLedger
+      : (import.meta.env?.VITEST && config.executionLedger)
+        ? config.executionLedger
+        : canonicalLedger!
+
+  if (!executionLedger) {
+    throw new WalletExecutionError(
+      'STORAGE_UNAVAILABLE',
+      'No durable storage available. An explicit Storage adapter must be provided in non-browser environments.'
+    )
+  }
+
+  async function handleSettlementRecovery(
+    executionId: string,
+    expectedTxid?: string,
+    calledGeneration?: number
+  ): Promise<void> {
+    const generation = calledGeneration ?? lifecycleGeneration
+    const recoveryGuard: LifecycleGuard = () => isLifecycleActive(generation)
+    if (!recoveryGuard() || !authoritativeSettlementLedger) return
+
+    const record = await authoritativeSettlementLedger.get(executionId)
+    if (!recoveryGuard() || !authoritativeSettlementLedger) return
+
+    if (!record || ((record as any).state ?? record.status) !== 'SETTLING') {
+      return
+    }
+
+    let targetTxid = expectedTxid ?? record.expectedTxid
+    if (!targetTxid) {
+      try {
+        const rawTxHex = await getPrivateSignedTransaction(executionId)
+        if (!recoveryGuard()) return
+        targetTxid = deriveExpectedTxidFromRawTxHex(rawTxHex)
+      } catch {
+        if (!recoveryGuard() || !authoritativeSettlementLedger) return
+        const committed = await authoritativeSettlementLedger.markSettlementUncertain(
+          {
+            executionId,
+            reason: 'Abandoned SETTLING record without recoverable expectedTxid.',
+            timestamp: getNow()
+          },
+          recoveryGuard
+        )
+        if (!committed) return
+        return
+      }
+    }
+
+    if (!recoveryGuard()) return
+
+    let chronik: ChronikBroadcastClient | undefined
+    try {
+      chronik = resolveWalletChronikClient()
+    } catch {
+      chronik = undefined
+    }
+
+    let observedExact = false
+    if (chronik) {
+      try {
+        if (import.meta.env?.VITEST) {
+          const hook = (globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.beforeSettlementRecoveryObservation')
+          ]
+          if (typeof hook === 'function') {
+            await hook(executionId, targetTxid)
+          }
+        }
+        if (!recoveryGuard()) return
+        const observed = await chronik.tx(targetTxid)
+        observedExact =
+          observed?.txid?.toLowerCase() === targetTxid.toLowerCase()
+      } catch {
+        observedExact = false
+      }
+    }
+
+    if (observedExact) {
+      if (!recoveryGuard() || !authoritativeSettlementLedger) return
+      const committed = await authoritativeSettlementLedger.transitionToSettled(
+        {
+          executionId,
+          expectedTxid: targetTxid,
+          settledAt: getNow()
+        },
+        recoveryGuard
+      )
+      if (!committed) return
+      return
+    }
+
+    // ONLY observation failure/unavailability reaches uncertain logic.
+
+    if (!recoveryGuard() || !authoritativeSettlementLedger) return
+
+    const committed = await authoritativeSettlementLedger.markSettlementUncertain(
+      {
+        executionId,
+        reason:
+          'Abandoned SETTLING execution recovered at startup without network confirmation. Reconciled to SETTLEMENT_UNCERTAIN without rebroadcast.',
+        timestamp: getNow()
+      },
+      recoveryGuard
+    )
+    if (!committed) return
+  }
+
+  async function attemptSettlementRecovery(
+    executionId: string,
+    expectedTxid?: string,
+    calledGeneration?: number
+  ): Promise<boolean> {
+    const generation = calledGeneration ?? lifecycleGeneration
+    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return true
+
+    const current = await authoritativeSettlementLedger.get(executionId)
+    // 1. Re-check disposed immediately AFTER: await authoritativeSettlementLedger.get(executionId)
+    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return true
+
+    if (!current || ((current as any).state ?? current.status) !== 'SETTLING') {
+      cancelSettlementRecoveryRetry(executionId)
+      return true
+    }
+
+    // 2. Re-check disposed BEFORE attempting/acquiring the settlement lock
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforeSettlementLockAcquire')
+      ]
+      if (typeof hook === 'function') {
+        await hook(executionId)
+      }
+    }
+    if (!isLifecycleActive(generation)) return true
+
+    const coordinator = resolveWalletSettlementLockCoordinator()
+    const lockResult = await coordinator.tryExclusive(
+      executionSettlementLockName(executionId),
+      async () => {
+        // 3. Re-check disposed INSIDE the acquired settlement-lock callback BEFORE:
+        //    - handleSettlementRecovery()
+        //    - Chronik query
+        //    - any durable settlement mutation
+        if (import.meta.env?.VITEST) {
+          const hook = (globalThis as Record<symbol, unknown>)[
+            Symbol.for('rmzwallet.testOnly.afterLockAcquisitionBeforeRecovery')
+          ]
+          if (typeof hook === 'function') {
+            await hook(executionId)
+          }
+        }
+        if (!isLifecycleActive(generation)) return
+        await handleSettlementRecovery(executionId, expectedTxid ?? current.expectedTxid, generation)
+      }
+    )
+
+    if (!isLifecycleActive(generation)) return true
+
+    if (lockResult.acquired) {
+      cancelSettlementRecoveryRetry(executionId)
+      return true
+    }
+
+    return false
+  }
+
+  function scheduleSettlementRecoveryRetry(
+    executionId: string,
+    expectedTxid: string | undefined,
+    attempt: number = 1
+  ): void {
+    if (disposed) return
+    const generation = lifecycleGeneration
+
+    cancelSettlementRecoveryRetry(executionId)
+
+    const baseDelay = 50
+    const delayMs =
+      attempt >= 9
+        ? 1000
+        : Math.min(Math.round(baseDelay * Math.pow(1.5, attempt - 1)), 1000)
+
+    const timer = setTimeout(async () => {
+      if (!isLifecycleActive(generation)) return
+      const currentEntry = pendingSettlementRetries.get(executionId)
+      if (currentEntry?.timer !== timer) {
+        return
+      }
+
+      try {
+        const resolved = await attemptSettlementRecovery(executionId, expectedTxid, generation)
+        if (!resolved && isLifecycleActive(generation) && pendingSettlementRetries.get(executionId)?.timer === timer) {
+          scheduleSettlementRecoveryRetry(executionId, expectedTxid, attempt + 1)
+        }
+      } catch {
+        if (isLifecycleActive(generation) && pendingSettlementRetries.get(executionId)?.timer === timer) {
+          scheduleSettlementRecoveryRetry(executionId, expectedTxid, attempt + 1)
+        }
+      }
+    }, delayMs)
+
+    pendingSettlementRetries.set(executionId, { timer, attempt })
+  }
+
+  async function reconcileAbandonedSettlements(): Promise<void> {
+    const generation = lifecycleGeneration
+    if (!isLifecycleActive(generation) || !authoritativeSettlementLedger) return
+    const settlingList = await authoritativeSettlementLedger.snapshotSettlingRecords()
+    if (!isLifecycleActive(generation) || settlingList.length === 0) return
+
+    for (const item of settlingList) {
+      if (!isLifecycleActive(generation)) return
+      const { executionId, expectedTxid } = item
+      let resolved = false
+      try {
+        resolved = await attemptSettlementRecovery(executionId, expectedTxid, generation)
+      } catch {
+        resolved = false
+      }
+      if (!resolved && isLifecycleActive(generation)) {
+        scheduleSettlementRecoveryRetry(executionId, expectedTxid, 1)
+      }
+    }
+  }
 
   const ledgerReady = executionLedger.whenReady()
   ledgerReady.catch(() => {
     // Callers of prepareExecution/confirm still await ledgerReady and observe the error.
   })
+
+  const startupReady: Promise<void> = (async () => {
+    await ledgerReady
+    if (disposed) return
+    schedulePreparedRecovery()
+    await reconcileAbandonedSettlements().catch(() => {})
+  })()
+  startupReady.catch(() => {})
   const reviewOwnerId = `review_${createId()}`
   const reviewLeaseTtlSeconds = trusted?.reviewLeaseTtlSeconds ?? DEFAULT_REVIEW_LEASE_TTL_SECONDS
   const reviewHeartbeatMs = trusted?.reviewHeartbeatMs ?? 10_000
@@ -399,7 +1199,6 @@ function createWalletExecutionComposition(
   let reviewLockRelease: (() => void) | null = null
   let reviewHeartbeatTimer: ReturnType<typeof setInterval> | null = null
   let recoveryTimer: ReturnType<typeof setTimeout> | null = null
-  let disposed = false
   let handoffPhase: ReviewSigningHandoffPhase = 'IDLE'
   let preSigningAbort: AbortController | null = null
 
@@ -419,7 +1218,7 @@ function createWalletExecutionComposition(
         'No durable settlement storage available. Raw signed transactions cannot be persisted.'
       )
     }
-    const coordinator = config.lockCoordinator ?? new WebLocksExecutionCoordinator()
+    const coordinator = resolveWalletSettlementLockCoordinator()
     await coordinator.requestExclusive(DEFAULT_SETTLEMENT_STORE_LOCK_NAME, async () => {
       const raw = targetStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
       let store: Record<string, string> = {}
@@ -470,6 +1269,57 @@ function createWalletExecutionComposition(
           'Settlement persistence confirmation failed: stored artifact does not match verified bytes.'
         )
       }
+    })
+  }
+
+  /**
+   * Module-private raw signed transaction reader.
+   * Scoped strictly to this composition closure.
+   * NEVER exposed via any public interface or exported getter.
+   */
+  async function getPrivateSignedTransaction(executionId: string): Promise<string> {
+    if (import.meta.env?.VITEST) {
+      const hook = (globalThis as Record<symbol, unknown>)[
+        Symbol.for('rmzwallet.testOnly.beforePrivateSignedTransactionRead')
+      ]
+      if (typeof hook === 'function') {
+        await hook(executionId)
+      }
+    }
+    const targetStorage =
+      trusted?.privateSettlementStorage ?? resolveFileLocalPrivateSettlementStorage()
+    if (!targetStorage) {
+      throw new WalletExecutionError(
+        'STORAGE_UNAVAILABLE',
+        'No durable settlement storage available. Raw signed transaction cannot be retrieved.'
+      )
+    }
+    const coordinator = resolveWalletSettlementLockCoordinator()
+    return coordinator.requestExclusive(DEFAULT_SETTLEMENT_STORE_LOCK_NAME, async () => {
+      const raw = targetStorage.getItem(DEFAULT_INTERNAL_SETTLEMENT_STORAGE_KEY)
+      if (!raw) {
+        throw new WalletExecutionError(
+          'SETTLEMENT_ARTIFACT_NOT_FOUND',
+          `No settlement artifact store found for execution "${executionId}".`
+        )
+      }
+      let parsed: Record<string, string>
+      try {
+        parsed = JSON.parse(raw) as Record<string, string>
+      } catch (err) {
+        throw new WalletExecutionError(
+          'STORAGE_MUTATION_FAILED',
+          `Failed to parse settlement store payload: ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+      const rawTxHex = parsed[executionId]
+      if (!rawTxHex) {
+        throw new WalletExecutionError(
+          'SETTLEMENT_ARTIFACT_NOT_FOUND',
+          `Raw signed transaction artifact not found for execution "${executionId}".`
+        )
+      }
+      return rawTxHex
     })
   }
 
@@ -545,6 +1395,8 @@ function createWalletExecutionComposition(
   function disposeComposition(): void {
     if (disposed) return
     disposed = true
+    lifecycleGeneration += 1
+    cancelAllSettlementRecoveryRetries()
     isPreparing = false
     cancelScheduledRecovery()
     sessionPreparedListeners.clear()
@@ -1046,7 +1898,7 @@ function createWalletExecutionComposition(
     isPreparing = true
 
     try {
-      await ledgerReady
+      await startupReady
 
       // 2. Parse the incoming value with the canonical HumanApprovalV1 schema only.
       const receipt = parseCanonicalHumanApproval(receiptInput)
@@ -1346,7 +2198,9 @@ function createWalletExecutionComposition(
     }
 
     async function getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined> {
-      const record = await executionLedger.get(executionId)
+      await startupReady
+      const authRecord = authoritativeSettlementLedger ? await authoritativeSettlementLedger.get(executionId) : undefined
+      const record = authRecord ?? (await executionLedger.get(executionId))
       if (!record) return undefined
 
       // P0-2: Strip raw signed tx hex from public status
@@ -1360,20 +2214,450 @@ function createWalletExecutionComposition(
         destination: record.destination,
         amountSats: record.amountSats,
         network: record.network,
-        status: record.status ?? (record as any).state,
+        status: (record as any).status ?? (record as any).state,
         planHash: record.planHash,
         uncertainReason: record.uncertainReason,
         reservedAt: record.reservedAt,
         preparedAt: record.preparedAt,
         signingAt: record.signingAt,
         signedAt: record.signedAt,
+        settlingAt: record.settlingAt,
+        settledAt: record.settledAt,
+        expectedTxid: record.expectedTxid,
         failedAt: record.failedAt
+      })
+    }
+
+    /**
+     * Authoritative settlement worker.
+     * Transitions SIGNED → SETTLING → broadcast to Chronik → SETTLED.
+     * Reconciles crash-recovery if previously SETTLING.
+     *
+     * Boundary Rules:
+     * NEVER exports raw signed transaction bytes.
+     * Produces only an immutable WalletSettlementReceiptV1.
+     */
+    async function settleExecution(executionId: string): Promise<WalletSettlementReceiptV1> {
+      if (disposed) {
+        throw new WalletExecutionError('COMPOSITION_DISPOSED', 'Execution engine is disposed.')
+      }
+
+      await startupReady
+
+      const settlementLedger = getAuthoritativeSettlementLedger()
+
+      return settlementLedger.runWithSettlementLock(executionId, async () => {
+        const settleGuard: LifecycleGuard = () => !disposed
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError('COMPOSITION_DISPOSED', 'Execution engine is disposed.')
+        }
+
+        const currentStatus = await settlementLedger.get(executionId)
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement composition was disposed while reading settlement status.'
+          )
+        }
+
+        if (!currentStatus) {
+          throw new WalletExecutionError(
+            'EXECUTION_NOT_FOUND',
+            `Execution record "${executionId}" not found.`
+          )
+        }
+
+        const state = (currentStatus as any).state ?? (currentStatus as any).status
+
+        // Idempotent return if already settled
+        if (state === 'SETTLED') {
+          return Object.freeze({
+            status: 'settled',
+            network: currentStatus.network,
+            executionId: currentStatus.executionId,
+            approvalId: currentStatus.approvalId,
+            requestId: currentStatus.requestId,
+            txid: currentStatus.expectedTxid!,
+            settledAt: currentStatus.settledAt ?? currentStatus.signedAt ?? getNow()
+          })
+        }
+
+        // Terminal rejected check
+        if (state === 'SETTLEMENT_REJECTED') {
+          throw new WalletExecutionError(
+            'SETTLEMENT_REJECTED',
+            `Execution "${executionId}" has already been definitively rejected: ${currentStatus.uncertainReason ?? 'settlement rejected'}`
+          )
+        }
+
+        // Chronik client resolution from trusted runtime
+        const chronik = resolveWalletChronikClient()
+
+        // Handle recovering SETTLING or SETTLEMENT_UNCERTAIN
+        if (state === 'SETTLING' || state === 'SETTLEMENT_UNCERTAIN') {
+          let expectedTxid = currentStatus.expectedTxid
+          if (!expectedTxid) {
+            const rawTxHex = await getPrivateSignedTransaction(executionId)
+            if (disposed || !settleGuard()) {
+              throw new WalletExecutionError(
+                'COMPOSITION_DISPOSED',
+                'Settlement composition was disposed while retrieving signed artifact.'
+              )
+            }
+            expectedTxid = deriveExpectedTxidFromRawTxHex(rawTxHex)
+          }
+
+          // Query network acceptance before any further action
+          if (disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement composition was disposed before network observation.'
+            )
+          }
+
+          let accepted = false
+          try {
+            const queryRes = await chronik.tx(expectedTxid)
+            if (queryRes && queryRes.txid?.toLowerCase() === expectedTxid.toLowerCase()) {
+              accepted = true
+            }
+          } catch {
+            accepted = false
+          }
+
+          if (disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement composition was disposed after network observation.'
+            )
+          }
+
+          if (accepted) {
+            const settledAt = getNow()
+            const committed = await settlementLedger.transitionToSettled(
+              {
+                executionId,
+                expectedTxid,
+                settledAt
+              },
+              settleGuard
+            )
+            if (!committed || disposed || !settleGuard()) {
+              throw new WalletExecutionError(
+                'COMPOSITION_DISPOSED',
+                'Settlement aborted before durable settled state was committed.'
+              )
+            }
+            return Object.freeze({
+              status: 'settled',
+              network: currentStatus.network,
+              executionId: currentStatus.executionId,
+              approvalId: currentStatus.approvalId,
+              requestId: currentStatus.requestId,
+              txid: expectedTxid,
+              settledAt
+            })
+          }
+
+          // If previously SETTLEMENT_UNCERTAIN and not accepted, keep uncertain
+          if (state === 'SETTLEMENT_UNCERTAIN') {
+            throw new WalletExecutionError(
+              'SETTLEMENT_UNCERTAIN',
+              `Execution "${executionId}" settlement outcome is uncertain: ${currentStatus.uncertainReason ?? 'network acceptance could not be confirmed'}`
+            )
+          }
+
+          // If was SETTLING (abandoned attempt), mark uncertain
+          const committed = await settlementLedger.markSettlementUncertain(
+            {
+              executionId,
+              reason: 'Previous settlement attempt interrupted; transaction not observed on network.',
+              timestamp: getNow()
+            },
+            settleGuard
+          )
+          if (!committed || disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement aborted before durable uncertain state was committed.'
+            )
+          }
+          throw new WalletExecutionError(
+            'SETTLEMENT_UNCERTAIN',
+            `Execution "${executionId}" settlement interrupted. Reconciled to SETTLEMENT_UNCERTAIN.`
+          )
+        }
+
+        // Only SIGNED state can initiate a new broadcast
+        if (state !== 'SIGNED') {
+          throw new WalletExecutionError(
+            'INVALID_SETTLEMENT_STATE',
+            `Cannot settle execution "${executionId}" in state "${state}". Execution must be in SIGNED state.`
+          )
+        }
+
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement composition was disposed before retrieving signed artifact.'
+          )
+        }
+
+        // Retrieve raw signed tx from module-private storage
+        const rawSignedTxHex = await getPrivateSignedTransaction(executionId)
+
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement composition was disposed after retrieving signed artifact.'
+          )
+        }
+
+        // Derive expectedTxid locally from verified signed bytes
+        const expectedTxid = deriveExpectedTxidFromRawTxHex(rawSignedTxHex)
+
+        // Bind and persist expectedTxid in durable SETTLING state BEFORE broadcast
+        const settlingAt = getNow()
+        const settlingCommitted = await settlementLedger.transitionToSettling(
+          {
+            executionId,
+            expectedTxid,
+            settlingAt
+          },
+          settleGuard
+        )
+
+        if (!settlingCommitted || disposed) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement aborted before durable ownership was committed.'
+          )
+        }
+
+        // CRITICAL INVARIANT: chronik.broadcastTx() MUST be unreachable unless settlingCommitted === true.
+        if (settlingCommitted !== true) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement aborted before durable ownership was committed.'
+          )
+        }
+
+        // Broadcast to Chronik
+        const rawTxBytes = fromHex(rawSignedTxHex)
+        let broadcastTxid: string | undefined
+        let broadcastThrew = false
+        let broadcastError: unknown
+
+        try {
+          const res = await chronik.broadcastTx(rawTxBytes)
+          broadcastTxid = res?.txid?.toLowerCase()
+        } catch (err) {
+          broadcastThrew = true
+          broadcastError = err
+        }
+
+        // P1-2: Immediately after broadcastTx settles — success OR rejection — recheck lifecycle before any further network call or durable mutation.
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement composition was disposed after broadcast dispatch.'
+          )
+        }
+
+        // If broadcast threw, check whether the network actually accepted it or if it was rejected
+        if (broadcastThrew) {
+          if (disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement composition was disposed after broadcast dispatch.'
+            )
+          }
+
+          // Check network acceptance (e.g. timeout on broadcast response, or already in mempool)
+          let accepted = false
+          try {
+            const queryRes = await chronik.tx(expectedTxid)
+            if (queryRes && queryRes.txid?.toLowerCase() === expectedTxid.toLowerCase()) {
+              accepted = true
+            }
+          } catch {
+            accepted = false
+          }
+
+          if (disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement composition was disposed after broadcast dispatch.'
+            )
+          }
+
+          if (accepted) {
+            cancelSettlementRecoveryRetry(executionId)
+            const settledAt = getNow()
+            const committed = await settlementLedger.transitionToSettled(
+              {
+                executionId,
+                expectedTxid,
+                settledAt
+              },
+              settleGuard
+            )
+            if (!committed || disposed) {
+              throw new WalletExecutionError(
+                'COMPOSITION_DISPOSED',
+                'Settlement aborted before durable settled state was committed.'
+              )
+            }
+            return Object.freeze({
+              status: 'settled',
+              network: currentStatus.network,
+              executionId: currentStatus.executionId,
+              approvalId: currentStatus.approvalId,
+              requestId: currentStatus.requestId,
+              txid: expectedTxid,
+              settledAt
+            })
+          }
+
+          // Any exception thrown by Chronik broadcastTx() where tx is not observed on network
+          // defaults to SETTLEMENT_UNCERTAIN. Gate C3A does NOT infer permanent invalidity from
+          // any broadcast exception. Outpoint reservations are retained (never released on broadcast failure).
+          cancelSettlementRecoveryRetry(executionId)
+          const timestamp = getNow()
+          const reason = describeBroadcastRejection(broadcastError)
+          const committed = await settlementLedger.markSettlementUncertain(
+            {
+              executionId,
+              reason: `Settlement broadcast uncertain: ${reason}`,
+              timestamp
+            },
+            settleGuard
+          )
+          if (!committed || disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement aborted before durable uncertain state was committed.'
+            )
+          }
+          throw new WalletExecutionError(
+            'SETTLEMENT_UNCERTAIN',
+            `Settlement broadcast outcome uncertain: ${reason}`,
+            broadcastError
+          )
+        }
+
+        // Broadcast returned normally: verify returnedTxid === expectedTxid
+        if (!broadcastTxid || broadcastTxid !== expectedTxid) {
+          // FAIL CLOSED
+          const timestamp = getNow()
+          const committed = await settlementLedger.markSettlementUncertain(
+            {
+              executionId,
+              reason: `Chronik returned txid "${broadcastTxid}" does not match locally derived expected txid "${expectedTxid}".`,
+              timestamp
+            },
+            settleGuard
+          )
+          if (!committed || disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement aborted before durable uncertain state was committed.'
+            )
+          }
+          throw new WalletExecutionError(
+            'SETTLEMENT_TXID_MISMATCH',
+            `Chronik returned txid "${broadcastTxid}" does not match locally derived expected txid "${expectedTxid}".`
+          )
+        }
+
+        // Verify network acceptance via Chronik query
+        let verifiedAcceptance = false
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement composition was disposed during network verification.'
+            )
+          }
+          try {
+            const queryRes = await chronik.tx(expectedTxid)
+            if (queryRes && queryRes.txid?.toLowerCase() === expectedTxid.toLowerCase()) {
+              verifiedAcceptance = true
+              break
+            }
+          } catch {
+            if (disposed || !settleGuard()) {
+              throw new WalletExecutionError(
+                'COMPOSITION_DISPOSED',
+                'Settlement composition was disposed during network verification.'
+              )
+            }
+            await new Promise(resolve => setTimeout(resolve, 50))
+          }
+        }
+
+        if (disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement composition was disposed during network verification.'
+          )
+        }
+
+        if (!verifiedAcceptance) {
+          const timestamp = getNow()
+          const committed = await settlementLedger.markSettlementUncertain(
+            {
+              executionId,
+              reason: 'Broadcast succeeded but network acceptance could not be verified via Chronik index.',
+              timestamp
+            },
+            settleGuard
+          )
+          if (!committed || disposed || !settleGuard()) {
+            throw new WalletExecutionError(
+              'COMPOSITION_DISPOSED',
+              'Settlement aborted before durable uncertain state was committed.'
+            )
+          }
+          throw new WalletExecutionError(
+            'SETTLEMENT_UNCERTAIN',
+            'Broadcast succeeded but network acceptance could not be verified via Chronik index.'
+          )
+        }
+
+        // Transition to SETTLED
+        const settledAt = getNow()
+        const committed = await settlementLedger.transitionToSettled(
+          {
+            executionId,
+            expectedTxid,
+            settledAt
+          },
+          settleGuard
+        )
+        if (!committed || disposed || !settleGuard()) {
+          throw new WalletExecutionError(
+            'COMPOSITION_DISPOSED',
+            'Settlement aborted before durable settled state was committed.'
+          )
+        }
+
+        return Object.freeze({
+          status: 'settled',
+          network: currentStatus.network,
+          executionId: currentStatus.executionId,
+          approvalId: currentStatus.approvalId,
+          requestId: currentStatus.requestId,
+          txid: expectedTxid,
+          settledAt
+        })
       })
     }
 
     const publicEngine: AgentWalletExecutionEngine = Object.freeze({
       prepareExecution,
-      getExecutionStatus
+      getExecutionStatus,
+      settle: settleExecution
     })
 
     const walletUIHost: WalletExecutionUIHost = Object.freeze({
@@ -1394,10 +2678,6 @@ function createWalletExecutionComposition(
       }
     })
 
-    void ledgerReady.then(() => {
-      schedulePreparedRecovery()
-    })
-
     return {
       publicEngine,
       walletUIHost,
@@ -1406,21 +2686,50 @@ function createWalletExecutionComposition(
   }
 
   /**
-   * Helper that returns the public Agent-facing engine.
-   * Strictly exposes NO confirm, sign, execute, local confirmation controller, or dispose.
+   * Helper that returns the public Agent-facing engine wrapped with an explicit lifecycle dispose method.
+   * Strictly exposes NO confirm, sign, execute, local confirmation controller, private storage,
+   * settlement mutators, Chronik, lock coordinator, raw tx, or signing authority.
    */
   export function createAgentWalletExecutionEngine(
     config: AgentWalletExecutionEngineConfig
-  ): AgentWalletExecutionEngine {
-    return createWalletExecutionComposition(config).publicEngine
+  ): DisposableAgentWalletExecutionEngine {
+    const composition = createWalletExecutionComposition(
+      config,
+      import.meta.env?.VITEST && config.storage
+        ? { executionStorage: config.storage }
+        : undefined
+    )
+
+    const disposableEngine: DisposableAgentWalletExecutionEngine = {
+      prepareExecution: receipt =>
+        composition.publicEngine.prepareExecution(receipt),
+
+      getExecutionStatus: executionId =>
+        composition.publicEngine.getExecutionStatus(executionId),
+
+      settle: executionId =>
+        composition.publicEngine.settle(executionId),
+
+      dispose: () => composition.dispose()
+    }
+
+    return Object.freeze(disposableEngine)
   }
 
   if (import.meta.env?.VITEST) {
     Object.defineProperty(globalThis, TEST_ONLY_CREATE_WALLET_EXECUTION_COMPOSITION, {
-      value: createWalletExecutionComposition,
+      value: (config: AgentWalletExecutionEngineConfig, trusted?: WalletExecutionTrustedOptions) => {
+        const effectiveTrusted: WalletExecutionTrustedOptions = {
+          ...(config.storage && !trusted?.executionStorage
+            ? { executionStorage: config.storage }
+            : {}),
+          ...trusted
+        }
+        return createWalletExecutionComposition(config, effectiveTrusted)
+      },
       configurable: true,
       enumerable: false,
-      writable: false
+      writable: true
     })
   }
 
@@ -1460,6 +2769,7 @@ export function resetTrustedExecutionShellForTests(): void {
     }
   }
   shellSlot = null
+  fallbackTestSettlementQueues.clear()
 }
 
 function getOrCreateShell(
@@ -1567,6 +2877,7 @@ export function TrustedWalletExecutionProvider({
         idGenerator
       },
       {
+        executionStorage: import.meta.env?.VITEST ? resolvedLedgerStorage : undefined,
         privateSettlementStorage: resolveFileLocalPrivateSettlementStorage(),
         reviewLeaseTtlSeconds,
         reviewHeartbeatMs

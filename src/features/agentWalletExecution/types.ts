@@ -96,6 +96,10 @@ export type WalletExecutionState =
   | 'PREPARED'
   | 'SIGNING'
   | 'SIGNED'
+  | 'SETTLING'
+  | 'SETTLED'
+  | 'SETTLEMENT_UNCERTAIN'
+  | 'SETTLEMENT_REJECTED'
   | 'SIGNING_UNCERTAIN'
   | 'REJECTED'
   | 'EXPIRED'
@@ -122,7 +126,32 @@ export interface PublicExecutionStatus {
   readonly preparedAt?: number
   readonly signingAt?: number
   readonly signedAt?: number
+  readonly settlingAt?: number
+  readonly settledAt?: number
+  readonly expectedTxid?: string
   readonly failedAt?: number
+}
+
+/**
+ * Public, non-authority settlement receipt containing safe, immutable metadata (Gate C3A).
+ * Raw signed transaction bytes, private keys, and internal storage details are strictly omitted.
+ */
+export interface WalletSettlementReceiptV1 {
+  readonly status: 'settled'
+  readonly network: ExecutionNetwork
+  readonly executionId: string
+  readonly approvalId: string
+  readonly requestId?: string
+  readonly txid: string
+  readonly settledAt: number
+}
+
+/**
+ * Minimal Chronik client interface required for settlement broadcast and verification.
+ */
+export interface ChronikBroadcastClient {
+  broadcastTx(rawTx: Uint8Array): Promise<{ txid?: string } | { txid: string }>
+  tx(txid: string): Promise<{ txid: string; [key: string]: unknown }>
 }
 
 /**
@@ -148,6 +177,10 @@ export interface InternalWalletExecutionRecord {
   readonly preparedAt?: number
   readonly signingAt?: number
   readonly signedAt?: number
+  readonly settlingAt?: number
+  readonly settledAt?: number
+  readonly expectedTxid?: string
+  readonly settlementAttempt?: number
   readonly failedAt?: number
   readonly reservedOutpoints?: readonly string[]
   readonly reviewOwnerId?: string
@@ -320,6 +353,8 @@ export interface AgentWalletExecutionEngineConfig {
  * Must not be exported from the public agentWalletExecution barrel.
  */
 export interface WalletExecutionTrustedOptions {
+  readonly executionStorage?: Storage
+  readonly testOnlyExecutionLedger?: WalletExecutionLedger
   readonly privateSettlementStorage?: Storage
   readonly reviewLeaseTtlSeconds?: number
   readonly reviewHeartbeatMs?: number
@@ -333,4 +368,15 @@ export interface WalletExecutionTrustedOptions {
 export interface AgentWalletExecutionEngine {
   prepareExecution(receipt: HumanApprovalV1): Promise<WalletExecutionReviewSession>
   getExecutionStatus(executionId: string): Promise<PublicExecutionStatus | undefined>
+  settle(executionId: string): Promise<WalletSettlementReceiptV1>
 }
+
+/**
+ * Disposable variant returned ONLY by the explicit createAgentWalletExecutionEngine factory.
+ * Exposes a lifecycle cleanup method to cancel background settlement recovery retries.
+ * Never exposed through the React provider context.
+ */
+export interface DisposableAgentWalletExecutionEngine extends AgentWalletExecutionEngine {
+  dispose(): void
+}
+

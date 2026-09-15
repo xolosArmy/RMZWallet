@@ -401,4 +401,39 @@ describe('TrustedWalletExecutionProvider production shell (Gate C2)', () => {
     expect(JSON.parse(raw!)['exec_prod_c2']).toBeDefined()
     expect((await approvalLedger.get(REQUEST.requestId))?.status).toBe('approved')
   })
+
+  it('exposes publicEngine without dispose method to React context consumers', async () => {
+    const ledgerStorage = new MockStorage()
+    const lockCoordinator = new TestExecutionLockCoordinator()
+    const approvalLedger = new InMemoryWalletApprovalLedger()
+
+    let engine: AgentWalletExecutionEngine | null = null
+
+    render(
+      <TrustedWalletExecutionProvider
+        approvalLedger={approvalLedger}
+        sessionVerifier={createMockSessionVerifier(FROM_ADDRESS)}
+        utxoProvider={{
+          async getSpendableUtxos() {
+            return []
+          }
+        }}
+        signatoryProvider={{
+          async getSignatory() {
+            return createSignatory()
+          }
+        }}
+        ledgerStorage={ledgerStorage}
+        lockCoordinator={lockCoordinator}
+        clock={() => CLOCK_NOW}
+        idGenerator={() => 'prod_c2'}
+      >
+        <CaptureEngine onReady={value => { engine = value }} />
+      </TrustedWalletExecutionProvider>
+    )
+
+    await waitFor(() => expect(engine).not.toBeNull())
+    expect('dispose' in engine!).toBe(false)
+    expect((engine as any)!.dispose).toBeUndefined()
+  })
 })
