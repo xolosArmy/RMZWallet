@@ -47,4 +47,10 @@ describe('wallet capability policy', () => {
     expect(isCapabilityAllowed(WALLET_LIFECYCLE.UNINITIALIZED, WALLET_CAPABILITY.VIEW_BALANCE)).toBe(false)
     expect(isCapabilityAllowed(WALLET_LIFECYCLE.UNINITIALIZED, WALLET_CAPABILITY.SEND_XEC)).toBe(false)
   })
+
+  test('TM_COMM stays unauthorized for every current lifecycle until M1 defines policy', () => {
+    expect(isCapabilityAllowed(WALLET_LIFECYCLE.UNINITIALIZED, WALLET_CAPABILITY.TM_COMM)).toBe(false)
+    expect(isCapabilityAllowed(WALLET_LIFECYCLE.QUICK_START_UNBACKED, WALLET_CAPABILITY.TM_COMM)).toBe(false)
+    expect(isCapabilityAllowed(WALLET_LIFECYCLE.BACKUP_VERIFIED, WALLET_CAPABILITY.TM_COMM)).toBe(false)
+  })
 })

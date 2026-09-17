@@ -743,7 +743,32 @@ export class XolosWalletService {
     }
   }
 
+  private async activateMnemonicLocalIdentity(
+    mnemonic: string,
+    profileId: DerivationProfileId
+  ): Promise<void> {
+    this.buildWallet(profileId)
+    const wallet = this.wallet as MinimalXecWallet
+    await wallet.walletInfoPromise
+    this.decryptedMnemonic = mnemonic
+    this.activeAccountState = deriveAccountPublicState(mnemonic, profileId)
+    this.bindMinimalWalletToCanonicalProfile(mnemonic)
+    this.isReady = true
+    this.scanCache = null
+    this.scanPromise = null
+    this.scanPromiseGapLimit = null
+    this.ensureHdAddressCache(this.getEffectiveGapLimit())
+  }
+
   async createQuickStartWallet(): Promise<{ address: string; profileId: DerivationProfileId }> {
+    if (await hasQuickStartMnemonic()) {
+      const recovered = await this.activateQuickStartFromDevice()
+      if (!recovered) {
+        throw new Error('QUICK_START_RECOVERY_FAILED')
+      }
+      return recovered
+    }
+
     await assertQuickStartStorageAvailable()
     const mnemonic = await this.createNewWallet()
     const profileId = this.activeProfileId
@@ -784,7 +809,12 @@ export class XolosWalletService {
       if (!isDerivationProfileId(profileId)) {
         throw new Error('QUICK_START_DERIVATION_PROFILE_REQUIRED')
       }
-      await this.activateMnemonic(normalizedMnemonic, profileId)
+      await this.activateMnemonicLocalIdentity(normalizedMnemonic, profileId)
+      try {
+        await (this.wallet as MinimalXecWallet).initialize()
+      } catch {
+        // Chronik/network failure must not destroy a recoverable local identity.
+      }
       const address = this.getAddress()
       if (!address) {
         throw new Error('QUICK_START_WALLET_IDENTITY_MISSING')

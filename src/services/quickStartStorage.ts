@@ -9,6 +9,7 @@ const DB_VERSION = 1
 const STORE_NAME = 'wallet'
 const KEY_RECORD = 'device-key'
 const SEED_RECORD = 'seed-ciphertext'
+const PROBE_KEY_RECORD = 'device-key-probe'
 export const QUICK_START_RECORD_VERSION = 1 as const
 
 export class QuickStartUnavailableError extends Error {
@@ -172,6 +173,15 @@ function parseSeedRecord(raw: unknown): QuickStartSeedRecord | null {
 }
 
 async function persistNonExtractableDeviceKey(): Promise<CryptoKey> {
+  const existingSeed = await readRecord<unknown>(SEED_RECORD)
+  if (existingSeed) {
+    throw new Error('QUICK_START_RECORD_EXISTS')
+  }
+  const existingKey = await readRecord<{ id: string; key: CryptoKey }>(KEY_RECORD)
+  if (existingKey?.key) {
+    assertNonExtractableAesGcmKey(existingKey.key)
+    return existingKey.key
+  }
   assertAvailable()
   const key = await crypto.subtle.generateKey(
     { name: 'AES-GCM', length: 256 },
@@ -194,13 +204,52 @@ async function getOrCreateDeviceKey(): Promise<CryptoKey> {
     assertNonExtractableAesGcmKey(stored.key)
     return stored.key
   }
+  const existingSeed = await readRecord<unknown>(SEED_RECORD)
+  if (existingSeed) {
+    throw new Error('QUICK_START_DEVICE_KEY_MISSING')
+  }
   return persistNonExtractableDeviceKey()
+}
+
+async function deleteRecord(id: string): Promise<void> {
+  const db = await openDb()
+  try {
+    const transaction = db.transaction(STORE_NAME, 'readwrite')
+    transaction.objectStore(STORE_NAME).delete(id)
+    await transactionDone(transaction)
+  } finally {
+    db.close()
+  }
 }
 
 export async function assertQuickStartStorageAvailable(): Promise<void> {
   assertAvailable()
-  const probe = await persistNonExtractableDeviceKey()
-  assertNonExtractableAesGcmKey(probe)
+  const existingSeed = await readRecord<unknown>(SEED_RECORD)
+  if (existingSeed) {
+    return
+  }
+  const existingKey = await readRecord<{ id: string; key: CryptoKey }>(KEY_RECORD)
+  if (existingKey?.key) {
+    assertNonExtractableAesGcmKey(existingKey.key)
+    return
+  }
+
+  const probeKey = await crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  )
+  assertNonExtractableAesGcmKey(probeKey)
+  await writeRecords([{ id: PROBE_KEY_RECORD, key: probeKey }])
+  try {
+    const stored = await readRecord<{ id: string; key: CryptoKey }>(PROBE_KEY_RECORD)
+    if (!stored?.key) {
+      throw new QuickStartUnavailableError('QUICK_START_DEVICE_KEY_NOT_PERSISTED')
+    }
+    assertNonExtractableAesGcmKey(stored.key)
+  } finally {
+    await deleteRecord(PROBE_KEY_RECORD)
+  }
 }
 
 export async function storeQuickStartMnemonic(
@@ -214,6 +263,11 @@ export async function storeQuickStartMnemonic(
   if (!normalized) throw new Error('QUICK_START_MNEMONIC_REQUIRED')
   if (!isDerivationProfileId(metadata.derivationProfileId)) {
     throw new Error('QUICK_START_DERIVATION_PROFILE_REQUIRED')
+  }
+
+  const existing = parseSeedRecord(await readRecord<unknown>(SEED_RECORD))
+  if (existing) {
+    throw new Error('QUICK_START_RECORD_EXISTS')
   }
 
   const key = await getOrCreateDeviceKey()

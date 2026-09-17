@@ -1,28 +1,8 @@
-import { useEffect, useRef } from 'react'
-import { useWallet } from '../context/useWallet'
-
+/**
+ * Quick Start recovery is owned by WalletProvider bootstrap.
+ * This component remains mounted so App composition stays stable; it must not
+ * start a second activation race.
+ */
 export default function QuickStartHydrator() {
-  const { initialized, backupVerified, activateQuickStartFromDevice } = useWallet()
-  const attempted = useRef(false)
-
-  useEffect(() => {
-    if (initialized || backupVerified || attempted.current) return
-    attempted.current = true
-    let cancelled = false
-
-    void (async () => {
-      try {
-        const restored = await activateQuickStartFromDevice()
-        if (cancelled || !restored) return
-      } catch {
-        // Fail closed: the user can still unlock or recreate. Never log secrets.
-      }
-    })()
-
-    return () => {
-      cancelled = true
-    }
-  }, [activateQuickStartFromDevice, backupVerified, initialized])
-
   return null
 }

@@ -67,6 +67,28 @@ describe('Tonalli onboarding routes', () => {
     expect(html).toContain('href="/onboarding"')
   })
 
+  test('/onboarding/create stays blocked while Quick Start hydration is pending or failed', () => {
+    const pending = renderToStaticMarkup(
+      <MemoryRouter>
+        <WalletContext.Provider value={walletContextFixture({ quickStartBootstrap: 'pending' })}>
+          <CreateWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+    expect(pending).toContain('Preparando')
+    expect(pending).toContain('disabled')
+
+    const failed = renderToStaticMarkup(
+      <MemoryRouter>
+        <WalletContext.Provider value={walletContextFixture({ quickStartBootstrap: 'failed' })}>
+          <CreateWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+    expect(failed).toContain('no se pudo recuperar')
+    expect(failed).toContain('disabled')
+  })
+
   test('/onboarding/create-backed preserves the PIN create form', () => {
     const html = renderRoute(<CreateBackedWallet />)
 

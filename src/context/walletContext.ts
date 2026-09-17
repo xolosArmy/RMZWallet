@@ -15,6 +15,8 @@ import type { FirmaSendPreview } from '../services/firmaAlphaSend'
 import type { WalletCapability } from '../domain/walletCapabilities'
 import type { WalletLifecycle } from '../domain/walletLifecycle'
 
+export type QuickStartBootstrapStatus = 'pending' | 'absent' | 'recovered' | 'failed'
+
 export interface WalletContextValue {
   address: string | null
   alias?: string | null
@@ -24,6 +26,7 @@ export interface WalletContextValue {
   initialized: boolean
   backupVerified: boolean
   lifecycle: WalletLifecycle
+  quickStartBootstrap: QuickStartBootstrapStatus
   hasCapability: (capability: WalletCapability) => boolean
   setAlias?: (alias: string | null) => void
   startQuickStartWallet: () => Promise<{ address: string }>

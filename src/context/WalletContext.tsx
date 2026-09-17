@@ -9,7 +9,7 @@ import { parseTokenAmount } from '../utils/tokenFormat'
 import { FIRMA_ALPHA } from '../config/firmaAlpha'
 import type { FirmaSendPreview } from '../services/firmaAlphaSend'
 import type { DerivationProfileId } from '../services/derivationProfiles'
-import { WalletContext } from './walletContext'
+import { WalletContext, type QuickStartBootstrapStatus } from './walletContext'
 import { WALLET_REFRESH_EVENT, type WalletRefreshDetail } from '../utils/walletRefresh'
 import { discoverAliasForAddress } from '../services/aliasDiscovery'
 import { WALLET_CAPABILITY, assertCapability, isCapabilityAllowed } from '../domain/walletCapabilities'
@@ -160,6 +160,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
   const [initialized, setInitialized] = useState<boolean>(false)
+  const [quickStartBootstrap, setQuickStartBootstrap] = useState<QuickStartBootstrapStatus>('pending')
   const [backupVerified, setBackupVerifiedState] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false
     return localStorage.getItem(BACKUP_KEY) === 'true'
@@ -246,11 +247,19 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(BACKUP_KEY, backupVerified ? 'true' : 'false')
   }, [backupVerified])
 
-  const syncAddressAndBalance = useCallback(async () => {
+  const syncAddressAndBalance = useCallback(async (options?: { optionalBalance?: boolean }) => {
     const addr = xolosWalletService.getAddress()
     setAddress(addr)
-    const balances = await xolosWalletService.getBalances()
-    setBalance(balances)
+    try {
+      const balances = await xolosWalletService.getBalances()
+      setBalance(balances)
+    } catch (err) {
+      if (options?.optionalBalance) {
+        setError((err as Error).message || 'No se pudo actualizar el saldo.')
+        return
+      }
+      throw err
+    }
   }, [])
 
   const lifecycle = resolveWalletLifecycle({ initialized, backupVerified })
@@ -339,14 +348,26 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   }, [syncAddressAndBalance])
 
   const startQuickStartWallet = useCallback(async (): Promise<{ address: string }> => {
+    if (quickStartBootstrap === 'pending') {
+      throw new Error('QUICK_START_BOOTSTRAP_PENDING')
+    }
+    if (quickStartBootstrap === 'failed') {
+      throw new Error('QUICK_START_RECOVERY_FAILED')
+    }
+    if (initialized) {
+      const current = xolosWalletService.getAddress() ?? address
+      if (current) return { address: current }
+    }
     setLoading(true)
     setError(null)
     try {
       const created = await xolosWalletService.createQuickStartWallet()
-      await syncAddressAndBalance()
+      setAddress(created.address)
       setInitialized(true)
       setBackupVerifiedState(false)
+      setQuickStartBootstrap('recovered')
       localStorage.setItem(BACKUP_KEY, 'false')
+      await syncAddressAndBalance({ optionalBalance: true })
       return { address: created.address }
     } catch (err) {
       const message = err instanceof QuickStartUnavailableError
@@ -357,22 +378,60 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     } finally {
       setLoading(false)
     }
-  }, [syncAddressAndBalance])
+  }, [address, initialized, quickStartBootstrap, syncAddressAndBalance])
 
   const activateQuickStartFromDevice = useCallback(async (): Promise<{ address: string } | null> => {
     try {
       const restored = await xolosWalletService.activateQuickStartFromDevice()
       if (!restored) return null
-      await syncAddressAndBalance()
+      setAddress(restored.address)
       setInitialized(true)
       setBackupVerifiedState(false)
+      setQuickStartBootstrap('recovered')
       localStorage.setItem(BACKUP_KEY, 'false')
+      await syncAddressAndBalance({ optionalBalance: true })
       return { address: restored.address }
     } catch (err) {
-      console.warn('[QuickStart] secure local recovery unavailable')
+      setQuickStartBootstrap('failed')
       throw err
     }
   }, [syncAddressAndBalance])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (initialized || backupVerified) {
+      setQuickStartBootstrap((current) => (
+        current === 'pending'
+          ? (initialized ? 'recovered' : 'absent')
+          : current
+      ))
+      return
+    }
+    if (quickStartBootstrap !== 'pending') return
+
+    let cancelled = false
+    void (async () => {
+      try {
+        const hasRecord = typeof xolosWalletService.hasQuickStartRecord === 'function'
+          ? await xolosWalletService.hasQuickStartRecord()
+          : false
+        if (cancelled) return
+        if (!hasRecord) {
+          setQuickStartBootstrap('absent')
+          return
+        }
+        const restored = await activateQuickStartFromDevice()
+        if (cancelled) return
+        setQuickStartBootstrap(restored ? 'recovered' : 'failed')
+      } catch {
+        if (!cancelled) setQuickStartBootstrap('failed')
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [activateQuickStartFromDevice, backupVerified, initialized, quickStartBootstrap])
 
   const completeProgressiveBackup = useCallback(async (password: string) => {
     try {
@@ -686,6 +745,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       initialized,
       backupVerified,
       lifecycle,
+      quickStartBootstrap,
       hasCapability,
       startQuickStartWallet,
       activateQuickStartFromDevice,
@@ -719,6 +779,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       initialized,
       backupVerified,
       lifecycle,
+      quickStartBootstrap,
       hasCapability,
       startQuickStartWallet,
       activateQuickStartFromDevice,

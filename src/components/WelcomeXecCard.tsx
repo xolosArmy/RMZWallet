@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
 import { useWallet } from '../context/useWallet'
 import {
-  isWelcomeFaucetConfigured
+  isWelcomeFaucetConfigured,
+  isWelcomeQuickStartCompatible
 } from '../services/welcomeFaucet'
 import type { WelcomeClaimResponse, WelcomeFaucetConfig } from '../services/welcomeFaucet'
 import {
@@ -76,7 +77,7 @@ export default function WelcomeXecCard() {
   }
 
   if (!allowed || !configured || !address) return null
-  if (config && !config.enabled && claim?.status === 'available') {
+  if (config && !isWelcomeQuickStartCompatible(config)) {
     return null
   }
 
