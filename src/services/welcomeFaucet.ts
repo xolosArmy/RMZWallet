@@ -28,8 +28,17 @@ export type WelcomeFaucetConfig = Readonly<{
   enabled: boolean
   oneTimePerAddress: boolean
   dryRun: boolean
+  turnstileRequired?: boolean
+  quickStartCompatible?: boolean
   starterPack: WelcomeStarterPack
 }>
+
+export function isWelcomeQuickStartCompatible(config: WelcomeFaucetConfig): boolean {
+  if (config.quickStartCompatible === false) return false
+  if (config.turnstileRequired === true) return false
+  if (!config.enabled) return false
+  return true
+}
 
 const configuredBaseUrl = String(import.meta.env.VITE_TONALLI_FAUCET_URL ?? '').trim().replace(/\/$/, '')
 

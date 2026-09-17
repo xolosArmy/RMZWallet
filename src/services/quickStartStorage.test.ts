@@ -4,6 +4,7 @@ import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { ECASH_STANDARD_PROFILE_ID } from './derivationProfiles'
 import {
+  assertQuickStartStorageAvailable,
   clearQuickStartMnemonic,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
@@ -86,6 +87,35 @@ describe('Quick Start encrypted storage', () => {
     })
     db.close()
     await expect(loadQuickStartMnemonic()).rejects.toThrow('QUICK_START_DEVICE_KEY_MISSING')
+    await expect(assertQuickStartStorageAvailable()).resolves.toBeUndefined()
+    await expect(loadQuickStartMnemonic()).rejects.toThrow('QUICK_START_DEVICE_KEY_MISSING')
+    await expect(storeQuickStartMnemonic(MNEMONIC, {
+      derivationProfileId: ECASH_STANDARD_PROFILE_ID
+    })).rejects.toThrow('QUICK_START_RECORD_EXISTS')
+  })
+
+  test('existing Quick Start + second availability check keeps the same key able to decrypt', async () => {
+    await storeQuickStartMnemonic(MNEMONIC, { derivationProfileId: ECASH_STANDARD_PROFILE_ID })
+    await assertQuickStartStorageAvailable()
+    await assertQuickStartStorageAvailable()
+    expect(await loadQuickStartMnemonic()).toBe(MNEMONIC)
+    const records = await allStoreRecords()
+    expect(records.some((record) => (
+      record && typeof record === 'object' && 'id' in record && (record as { id?: string }).id === 'device-key-probe'
+    ))).toBe(false)
+  })
+
+  test('existing Quick Start record is never overwritten by a second store', async () => {
+    await storeQuickStartMnemonic(MNEMONIC, {
+      derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+      address: 'ecash:qoriginal'
+    })
+    await expect(storeQuickStartMnemonic(
+      'legal winner thank year wave sausage worth useful legal winner thank yellow',
+      { derivationProfileId: ECASH_STANDARD_PROFILE_ID, address: 'ecash:qother' }
+    )).rejects.toThrow('QUICK_START_RECORD_EXISTS')
+    expect(await loadQuickStartMnemonic()).toBe(MNEMONIC)
+    expect((await loadQuickStartMetadata())?.address).toBe('ecash:qoriginal')
   })
 
   test('corrupt ciphertext fails closed', async () => {

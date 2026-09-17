@@ -1,5 +1,5 @@
 import type { FormEvent, ReactNode } from 'react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
@@ -12,9 +12,7 @@ import {
 import type { DerivationProfileId } from '../services/derivationProfiles'
 import type { DerivationDiscovery } from '../services/dualDerivationDiscovery'
 import { QuickStartUnavailableError } from '../services/quickStartStorage'
-import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
-import type { WalletCapability } from '../domain/walletCapabilities'
-import { consumeTonalliIntent, readTonalliIntent } from '../services/tonalliIntent'
+import { readTonalliIntent } from '../services/tonalliIntent'
 import { setPendingBackupPassword } from '../services/backupSession'
 
 const formatSatsAsXec = (sats: bigint) =>
@@ -181,28 +179,45 @@ function DerivationProfileChoice({
   )
 }
 
-function resumeAfterQuickStart(
-  navigate: ReturnType<typeof useNavigate>,
-  hasCapability: (capability: WalletCapability) => boolean
-) {
-  if (hasCapability(WALLET_CAPABILITY.RESUME_SAFE_INTENT) && readTonalliIntent()) {
-    consumeTonalliIntent()
-  }
+function resumeAfterQuickStart(navigate: ReturnType<typeof useNavigate>) {
+  void readTonalliIntent()
   navigate('/', { replace: true })
 }
 
 export function CreateWallet() {
   const navigate = useNavigate()
-  const { startQuickStartWallet, loading, error, hasCapability } = useWallet()
+  const {
+    startQuickStartWallet,
+    loading,
+    error,
+    initialized,
+    quickStartBootstrap
+  } = useWallet()
   const [localError, setLocalError] = useState<string | null>(null)
   const [needsPinFallback, setNeedsPinFallback] = useState(false)
+
+  const bootstrapPending = quickStartBootstrap === 'pending'
+  const recoveryFailed = quickStartBootstrap === 'failed'
+  const createBlocked = bootstrapPending || recoveryFailed || initialized
+
+  useEffect(() => {
+    if (initialized) resumeAfterQuickStart(navigate)
+  }, [initialized, navigate])
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault()
     setLocalError(null)
+    if (createBlocked && !initialized) {
+      setLocalError(
+        recoveryFailed
+          ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se creará otra wallet.'
+          : 'Espera a que Tonalli termine de preparar este dispositivo.'
+      )
+      return
+    }
     try {
       await startQuickStartWallet()
-      resumeAfterQuickStart(navigate, hasCapability)
+      resumeAfterQuickStart(navigate)
     } catch (err) {
       if (err instanceof QuickStartUnavailableError) {
         setNeedsPinFallback(true)
@@ -224,9 +239,20 @@ export function CreateWallet() {
             Generamos tu wallet en este dispositivo. Puedes empezar a usarla ahora y protegerla cuando quieras.
           </p>
           <p className="warning">Tonalli Wallet no custodia ni puede recuperar tu frase de recuperación.</p>
+          {bootstrapPending && <p className="muted">Preparando este dispositivo…</p>}
+          {recoveryFailed && (
+            <div className="error" role="alert">
+              Hay una Tonalli guardada aquí que no se pudo recuperar. No se creará otra wallet.
+            </div>
+          )}
           <div className="actions">
-            <button className="cta primary" type="submit" disabled={loading} data-testid="create-tonalli">
-              {loading ? 'Creando...' : 'Crear mi Tonalli'}
+            <button
+              className="cta primary"
+              type="submit"
+              disabled={loading || createBlocked}
+              data-testid="create-tonalli"
+            >
+              {loading ? 'Creando...' : bootstrapPending ? 'Preparando...' : 'Crear mi Tonalli'}
             </button>
           </div>
           {needsPinFallback && (

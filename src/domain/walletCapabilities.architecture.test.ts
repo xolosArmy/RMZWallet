@@ -44,6 +44,14 @@ describe('Quick Start capability architecture', () => {
   it('declares TM_COMM as a reserved future capability without implementing internals', () => {
     expect(capabilitiesSource).toContain("TM_COMM: 'TM_COMM'")
     expect(capabilitiesSource).toContain('QUICK_START_RESERVED_FUTURE_CAPABILITIES')
+    expect(capabilitiesSource).toMatch(/if \(capability === WALLET_CAPABILITY\.TM_COMM\) return false/)
+    const fullWalletBlock = capabilitiesSource.slice(
+      capabilitiesSource.indexOf('export const FULL_WALLET_CAPABILITIES'),
+      capabilitiesSource.indexOf('const QUICK_START_ALLOWED')
+    )
+    expect(fullWalletBlock).not.toContain('WALLET_CAPABILITY.TM_COMM')
+    expect(isCapabilityAllowed(WALLET_LIFECYCLE.UNINITIALIZED, WALLET_CAPABILITY.TM_COMM)).toBe(false)
     expect(isCapabilityAllowed(WALLET_LIFECYCLE.QUICK_START_UNBACKED, WALLET_CAPABILITY.TM_COMM)).toBe(false)
+    expect(isCapabilityAllowed(WALLET_LIFECYCLE.BACKUP_VERIFIED, WALLET_CAPABILITY.TM_COMM)).toBe(false)
   })
 })

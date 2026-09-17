@@ -58,11 +58,37 @@ describe('Quick Start seed and frozen-boundary architecture', () => {
     }
   })
 
-  it('rehydrates through activateQuickStartFromDevice instead of legacy restoreWallet', () => {
+  it('rehydrates through WalletProvider bootstrap instead of a racing hydrator or restoreWallet', () => {
     const hydrator = readFileSync(join(root, 'components/QuickStartHydrator.tsx'), 'utf8')
-    expect(hydrator).toContain('activateQuickStartFromDevice')
+    const context = readFileSync(join(root, 'context/WalletContext.tsx'), 'utf8')
+    const onboarding = readFileSync(join(root, 'routes/Onboarding.tsx'), 'utf8')
+    expect(hydrator).not.toContain('activateQuickStartFromDevice')
     expect(hydrator).not.toContain('restoreWallet')
     expect(hydrator).not.toContain('loadQuickStartMnemonic')
+    expect(context).toContain('hasQuickStartRecord')
+    expect(context).toContain('QUICK_START_BOOTSTRAP_PENDING')
+    expect(onboarding).not.toContain('consumeTonalliIntent')
+    expect(onboarding).toContain('readTonalliIntent')
+
+    const storage = readFileSync(join(root, 'services/quickStartStorage.ts'), 'utf8')
+    const availabilityFn = storage.slice(
+      storage.indexOf('export async function assertQuickStartStorageAvailable'),
+      storage.indexOf('export async function storeQuickStartMnemonic')
+    )
+    expect(availabilityFn).toContain('PROBE_KEY_RECORD')
+    expect(availabilityFn).not.toContain('persistNonExtractableDeviceKey')
+    expect(availabilityFn).toContain('deleteRecord(PROBE_KEY_RECORD)')
+    expect(availabilityFn).not.toMatch(/writeRecords\(\[\{ id: KEY_RECORD/)
+
+    const walletService = readFileSync(join(root, 'services/XolosWalletService.ts'), 'utf8')
+    const createQuickStart = walletService.slice(
+      walletService.indexOf('async createQuickStartWallet()'),
+      walletService.indexOf('async activateQuickStartWallet(')
+    )
+    expect(createQuickStart.indexOf('hasQuickStartMnemonic()')).toBeGreaterThanOrEqual(0)
+    expect(createQuickStart.indexOf('hasQuickStartMnemonic()'))
+      .toBeLessThan(createQuickStart.indexOf('createNewWallet()'))
+    expect(createQuickStart).toContain('QUICK_START_RECOVERY_FAILED')
   })
 
   it('does not import TM-COMM internals anywhere on this branch', () => {

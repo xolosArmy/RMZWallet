@@ -71,8 +71,7 @@ export const FULL_WALLET_CAPABILITIES = Object.freeze([
   WALLET_CAPABILITY.X402,
   WALLET_CAPABILITY.EXTERNAL_SIGNING,
   WALLET_CAPABILITY.AGENT_WALLET_EXECUTION,
-  WALLET_CAPABILITY.ARBITRARY_BROADCAST,
-  WALLET_CAPABILITY.TM_COMM
+  WALLET_CAPABILITY.ARBITRARY_BROADCAST
 ] as const satisfies readonly WalletCapability[])
 
 const QUICK_START_ALLOWED = new Set<WalletCapability>(QUICK_START_ALLOWED_CAPABILITIES)
@@ -85,6 +84,7 @@ export function capabilitiesForLifecycle(lifecycle: WalletLifecycle): readonly W
 }
 
 export function isCapabilityAllowed(lifecycle: WalletLifecycle, capability: WalletCapability): boolean {
+  if (capability === WALLET_CAPABILITY.TM_COMM) return false
   if (lifecycle === WALLET_LIFECYCLE.BACKUP_VERIFIED) return FULL_ALLOWED.has(capability)
   if (lifecycle === WALLET_LIFECYCLE.QUICK_START_UNBACKED) return QUICK_START_ALLOWED.has(capability)
   return false
