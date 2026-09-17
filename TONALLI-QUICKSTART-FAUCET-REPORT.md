@@ -46,7 +46,7 @@ git log --oneline origin/main..HEAD
 | HEAD de primitives (antes de este gate) | `39c078643a6d8df2cfc91654c453caca8b0f0521` |
 | HEAD de implementación | `b67fd2feb163f0e1b5716be5f142f11786480715` |
 | HEAD de documentación SHA table | `fdbee3351dad0bef4e88ffff25bf892060816ac6` |
-| HEAD de rama al publicar este reporte canónico | el tip de `feat/tonalli-quickstart-onboarding` (este archivo). Confirmar con `git rev-parse HEAD`. |
+| HEAD de rama al publicar este reporte canónico | `b2c0d89557ec021fe9696250fb27d67cbf1afe12` |
 | PR | **#99** |
 | URL | https://github.com/xolosArmy/RMZWallet/pull/99 |
 | Base del PR | `main` |
