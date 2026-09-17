@@ -13,7 +13,7 @@ Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No m
 | **BASE SHA** | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
 | BASE worktree | `/tmp/rmzwallet-tm-comm-a0-base` |
 | Mensaje BASE | `[Gate C3A] RMZWallet Settlement Engine: Durable Ownership, Local TXID Derivation, and Broadcast Boundary (#96)` |
-| **HEAD SHA** (verificación lint/tests) | `4e6d1ce2269c194c9a81d8bd092b99df940a55a0` |
+| **HEAD SHA** | `dbe77d2aea2d893023501b042785e658b9bec91e` |
 | Staging API | http://127.0.0.1:4178/v1/tm-comm/health |
 | Staging UI | http://127.0.0.1:5174/tm-comm-staging |
 | Merge | **No** |
@@ -118,7 +118,7 @@ Mismo archivo de test: mensaje aceptado sobrevive close/reopen de SQLite + HTTP;
 
 ---
 
-## Resultados de tests (HEAD `4e6d1ce`)
+## Resultados de tests (HEAD `dbe77d2`)
 
 | Comando | Exit | Clasificación |
 | --- | --- | --- |
@@ -127,6 +127,7 @@ Mismo archivo de test: mensaje aceptado sobrevive close/reopen de SQLite + HTTP;
 | TM-COMM focalizado (`vitest run src/features/privateMessaging server/tmComm src/routes/TmCommStaging.test.tsx`) | 0 | **PASS** 5 files / 22 tests |
 | Architecture/boundary (`privateMessaging.architecture.test.ts`) | 0 | **PASS** 8/8 |
 | `npm test` suite vigente | 0 | **PASS** 149 files / 2670 vitest + 10 node:test |
+| `npm run test:tm1-regtest-e2e` | 20 | **ENVIRONMENTAL FAILURE** (preexistente en BASE y HEAD; requiere chronik local en :3000) |
 | `npm run lint` BASE | 1 | **FAIL preexistente en BASE** (328/0) |
 | `npm run lint` HEAD | 1 | **FAIL preexistente en HEAD** (328/0; NEW=0) |
 
@@ -157,7 +158,7 @@ Tokens staging en `.tmp/`; cookie sin `Secure` en HTTP local; sin rate-limit; XS
 
 ## Apéndice A — `npm run lint` HEAD (FAIL preexistente)
 
-SHA `4e6d1ce2269c194c9a81d8bd092b99df940a55a0`. Exit 1. 328 errors / 0 warnings.
+SHA `dbe77d2aea2d893023501b042785e658b9bec91e`. Exit 1. 328 errors / 0 warnings.
 
 
 ````text
