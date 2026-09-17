@@ -14,10 +14,10 @@ This report is the canonical evidence for the Quick Start / Welcome XEC restruct
 |---|---|---|
 | RMZWallet `origin/main` (BASE) | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` | `[Gate C3A] Settlement Engine #96` |
 | RMZWallet branch (pre-edit HEAD) | `39c078643a6d8df2cfc91654c453caca8b0f0521` | existing Quick Start primitives |
-| RMZWallet branch (post-edit HEAD) | *recorded after commit in the closing table* | this gate |
+| RMZWallet branch (post-edit HEAD) | `b67fd2feb163f0e1b5716be5f142f11786480715` | this gate |
 | tonalli-faucet `origin/main` (BASE) | `f1964d220d23b214141e722ea5781adee32c0fc9` | faucet main |
 | tonalli-faucet branch (pre-edit HEAD) | `94235140fac0f22430929a5d2f1fb6bbc71554a3` | existing Welcome Claim |
-| tonalli-faucet branch (post-edit HEAD) | *recorded after commit in the closing table* | this gate |
+| tonalli-faucet branch (post-edit HEAD) | `c26b70e06bf69568a7b2b5430917a79a3a9fb48c` | this gate |
 
 Working copies:
 
@@ -282,6 +282,20 @@ Live Firefox clean-profile click-through against a local Vite + dry-run faucet w
 | Merge | both | **not performed** |
 
 ---
+
+## Closing identities
+
+| Item | Value |
+|---|---|
+| RMZWallet BASE | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
+| RMZWallet HEAD | `b67fd2feb163f0e1b5716be5f142f11786480715` |
+| tonalli-faucet BASE | `f1964d220d23b214141e722ea5781adee32c0fc9` |
+| tonalli-faucet HEAD | `c26b70e06bf69568a7b2b5430917a79a3a9fb48c` |
+| RMZWallet tests | 2674 vitest + 10 slp, all pass |
+| tonalli-faucet tests | 40 pass |
+| Codex review | requested on both PRs after open |
+| Merge | not performed |
+| GO / NO-GO | **GO — Quick Start ready for TM-COMM M1 / Xolos Ramírez integration** (live clean-profile residual) |
 
 ## PRs
 
