@@ -46,7 +46,7 @@ git log --oneline origin/main..HEAD
 | HEAD de primitives (antes de este gate) | `39c078643a6d8df2cfc91654c453caca8b0f0521` |
 | HEAD de implementación | `b67fd2feb163f0e1b5716be5f142f11786480715` |
 | HEAD de documentación SHA table | `fdbee3351dad0bef4e88ffff25bf892060816ac6` |
-| HEAD de rama al publicar este reporte canónico | `b2c0d89557ec021fe9696250fb27d67cbf1afe12` |
+| HEAD de rama al publicar este reporte canónico | `ff9c1403ac55ab470b3084f9baf2dd706394d0ce` |
 | PR | **#99** |
 | URL | https://github.com/xolosArmy/RMZWallet/pull/99 |
 | Base del PR | `main` |
@@ -78,6 +78,8 @@ No se crearon ramas paralelas equivalentes. No hubo force-push.
 ### RMZWallet `origin/main..HEAD`
 
 ```
+ff9c1403ac55ab470b3084f9baf2dd706394d0ce  docs(onboarding): pin canonical report to published SHA
+b2c0d89557ec021fe9696250fb27d67cbf1afe12  docs(onboarding): publish canonical TONALLI-QUICKSTART-FAUCET-REPORT.md
 fdbee3351dad0bef4e88ffff25bf892060816ac6  docs(onboarding): record exact Quick Start and Welcome Claim SHAs
 b67fd2feb163f0e1b5716be5f142f11786480715  feat(onboarding): complete Tonalli Quick Start lifecycle and Welcome XEC UX
 39c078643a6d8df2cfc91654c453caca8b0f0521  feat(onboarding): restore encrypted quick start wallet after reload
@@ -85,7 +87,7 @@ c7ae51f5456ef0ca844d5180bbf855e805002334  feat(onboarding): add embedded welcome
 32d3819392afc8d13f1ec3933f363e41215d52e6  feat(onboarding): add encrypted passwordless quick start storage
 ```
 
-Más el commit que publica este reporte canónico (ver `git log -1` en el tip).
+El tip de la rama es `git rev-parse HEAD`. Al publicar este pin, el tip es `ff9c1403ac55ab470b3084f9baf2dd706394d0ce`.
 
 ### tonalli-faucet `origin/main..HEAD`
 
