@@ -12,6 +12,10 @@ import type { DerivationProfileId } from '../services/derivationProfiles'
 import { WalletContext } from './walletContext'
 import { WALLET_REFRESH_EVENT, type WalletRefreshDetail } from '../utils/walletRefresh'
 import { discoverAliasForAddress } from '../services/aliasDiscovery'
+import { WALLET_CAPABILITY, assertCapability, isCapabilityAllowed } from '../domain/walletCapabilities'
+import type { WalletCapability } from '../domain/walletCapabilities'
+import { resolveWalletLifecycle } from '../domain/walletLifecycle'
+import { QuickStartUnavailableError } from '../services/quickStartStorage'
 
 const BACKUP_KEY = 'xoloswallet_backup_verified'
 
@@ -249,8 +253,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setBalance(balances)
   }, [])
 
+  const lifecycle = resolveWalletLifecycle({ initialized, backupVerified })
+
+  const hasCapability = useCallback(
+    (capability: WalletCapability) => isCapabilityAllowed(lifecycle, capability),
+    [lifecycle]
+  )
+
   const refreshBalances = useCallback(async () => {
     if (!initialized) return
+    assertCapability(lifecycle, WALLET_CAPABILITY.REFRESH_BALANCE)
     try {
       setLoading(true)
       await syncAddressAndBalance()
@@ -260,7 +272,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     } finally {
       setLoading(false)
     }
-  }, [initialized, syncAddressAndBalance])
+  }, [initialized, lifecycle, syncAddressAndBalance])
 
   const rescanWallet = useCallback(
     async (options?: WalletRescanOptions) => {
@@ -326,6 +338,55 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
   }, [syncAddressAndBalance])
 
+  const startQuickStartWallet = useCallback(async (): Promise<{ address: string }> => {
+    setLoading(true)
+    setError(null)
+    try {
+      const created = await xolosWalletService.createQuickStartWallet()
+      await syncAddressAndBalance()
+      setInitialized(true)
+      setBackupVerifiedState(false)
+      localStorage.setItem(BACKUP_KEY, 'false')
+      return { address: created.address }
+    } catch (err) {
+      const message = err instanceof QuickStartUnavailableError
+        ? 'Este navegador no puede guardar una Tonalli temporal de forma segura. Usa un PIN local.'
+        : (err as Error).message || 'No se pudo crear la billetera.'
+      setError(message)
+      throw err instanceof QuickStartUnavailableError ? err : new Error(message)
+    } finally {
+      setLoading(false)
+    }
+  }, [syncAddressAndBalance])
+
+  const activateQuickStartFromDevice = useCallback(async (): Promise<{ address: string } | null> => {
+    try {
+      const restored = await xolosWalletService.activateQuickStartFromDevice()
+      if (!restored) return null
+      await syncAddressAndBalance()
+      setInitialized(true)
+      setBackupVerifiedState(false)
+      localStorage.setItem(BACKUP_KEY, 'false')
+      return { address: restored.address }
+    } catch (err) {
+      console.warn('[QuickStart] secure local recovery unavailable')
+      throw err
+    }
+  }, [syncAddressAndBalance])
+
+  const completeProgressiveBackup = useCallback(async (password: string) => {
+    try {
+      await xolosWalletService.persistVerifiedBackup(password)
+      setBackupVerifiedState(true)
+      localStorage.setItem(BACKUP_KEY, 'true')
+      await xolosWalletService.discardQuickStartRecord()
+    } catch (e) {
+      console.error(e)
+      setError('No pudimos cifrar y verificar el respaldo en este dispositivo.')
+      throw e
+    }
+  }, [])
+
   const restoreWallet = useCallback(async (
     mnemonic: string,
     selectedProfileId?: DerivationProfileId
@@ -357,8 +418,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         const result = await xolosWalletService.loadFromStorage(password, selectedProfileId)
         if (result.status === 'choice-required') return result
         await syncAddressAndBalance()
+        const verified = localStorage.getItem(BACKUP_KEY) === 'true'
         setInitialized(true)
-        setBackupVerifiedState(localStorage.getItem(BACKUP_KEY) === 'true')
+        setBackupVerifiedState(verified)
+        if (verified && typeof xolosWalletService.discardQuickStartRecord === 'function') {
+          await xolosWalletService.discardQuickStartRecord()
+        }
         return result
       } catch (err) {
         const message = (err as Error).message || 'No se pudo cargar la billetera guardada.'
@@ -405,6 +470,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no está lista: termina el onboarding y el respaldo de la seed.')
       }
+      assertCapability(lifecycle, WALLET_CAPABILITY.SEND_RMZ)
       setLoading(true)
       setError(null)
       try {
@@ -421,7 +487,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setLoading(false)
       }
     },
-    [backupVerified, initialized, syncAddressAndBalance, balance]
+    [backupVerified, initialized, lifecycle, syncAddressAndBalance, balance]
   )
 
   const prepareFirmaSend = useCallback(
@@ -429,6 +495,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no está lista: termina el onboarding y el respaldo de la seed.')
       }
+      assertCapability(lifecycle, WALLET_CAPABILITY.SEND_FIRMA)
       setLoading(true)
       setError(null)
       try {
@@ -442,7 +509,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setLoading(false)
       }
     },
-    [backupVerified, initialized]
+    [backupVerified, initialized, lifecycle]
   )
 
   const sendFirma = useCallback(
@@ -450,6 +517,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no está lista: termina el onboarding y el respaldo de la seed.')
       }
+      assertCapability(lifecycle, WALLET_CAPABILITY.SEND_FIRMA)
       setLoading(true)
       setError(null)
       try {
@@ -464,7 +532,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setLoading(false)
       }
     },
-    [backupVerified, initialized, syncAddressAndBalance]
+    [backupVerified, initialized, lifecycle, syncAddressAndBalance]
   )
 
   const estimateXecSend = useCallback(
@@ -472,6 +540,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!initialized) {
         throw new Error('La billetera no está lista.')
       }
+      assertCapability(lifecycle, WALLET_CAPABILITY.SEND_XEC)
       if (!amountInSats || amountInSats <= 0) {
         throw new Error('El monto debe ser mayor a cero.')
       }
@@ -498,7 +567,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         totalCostSats: plan.totalCostSats
       }
     },
-    [initialized]
+    [initialized, lifecycle]
   )
 
   const sendXEC = useCallback(
@@ -506,6 +575,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no está lista: termina el onboarding y el respaldo de la seed.')
       }
+      assertCapability(lifecycle, WALLET_CAPABILITY.SEND_XEC)
       setLoading(true)
       setError(null)
       try {
@@ -520,7 +590,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setLoading(false)
       }
     },
-    [backupVerified, initialized, syncAddressAndBalance]
+    [backupVerified, initialized, lifecycle, syncAddressAndBalance]
   )
 
 
@@ -529,9 +599,10 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!initialized) {
         throw new Error('La billetera no esta lista.')
       }
+      assertCapability(lifecycle, WALLET_CAPABILITY.ALIAS_SPEND_OPERATIONS)
       return xolosWalletService.estimateAliasRegistration(registration)
     },
-    [initialized]
+    [initialized, lifecycle]
   )
 
   const reserveAliasRegistrationUtxos = useCallback(
@@ -539,9 +610,10 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no esta lista: termina el onboarding y el respaldo de la seed.')
       }
+      assertCapability(lifecycle, WALLET_CAPABILITY.ALIAS_SPEND_OPERATIONS)
       return xolosWalletService.reserveAliasRegistrationUtxos(registration)
     },
-    [backupVerified, initialized]
+    [backupVerified, initialized, lifecycle]
   )
 
   const buildAliasRegistrationRawTx = useCallback(
@@ -549,6 +621,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no esta lista: termina el onboarding y el respaldo de la seed.')
       }
+      assertCapability(lifecycle, WALLET_CAPABILITY.ALIAS_SPEND_OPERATIONS)
       setLoading(true)
       setError(null)
       try {
@@ -561,7 +634,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setLoading(false)
       }
     },
-    [backupVerified, initialized]
+    [backupVerified, initialized, lifecycle]
   )
 
   const registerAliasOnChain = useCallback(
@@ -569,6 +642,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!initialized || !backupVerified) {
         throw new Error('La billetera no esta lista: termina el onboarding y el respaldo de la seed.')
       }
+      assertCapability(lifecycle, WALLET_CAPABILITY.ALIAS_SPEND_OPERATIONS)
       setLoading(true)
       setError(null)
       try {
@@ -597,7 +671,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setLoading(false)
       }
     },
-    [backupVerified, initialized, syncAddressAndBalance, updateAlias]
+    [backupVerified, initialized, lifecycle, syncAddressAndBalance, updateAlias]
   )
 
   const getMnemonic = useCallback(() => xolosWalletService.getMnemonic(), [])
@@ -611,6 +685,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       error,
       initialized,
       backupVerified,
+      lifecycle,
+      hasCapability,
+      startQuickStartWallet,
+      activateQuickStartFromDevice,
+      completeProgressiveBackup,
       createNewWallet,
       restoreWallet,
       loadExistingWallet,
@@ -639,6 +718,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       error,
       initialized,
       backupVerified,
+      lifecycle,
+      hasCapability,
+      startQuickStartWallet,
+      activateQuickStartFromDevice,
+      completeProgressiveBackup,
       createNewWallet,
       restoreWallet,
       loadExistingWallet,

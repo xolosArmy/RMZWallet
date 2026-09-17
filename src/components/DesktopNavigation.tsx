@@ -1,20 +1,22 @@
 import { Link, useLocation } from 'react-router-dom'
 import { useWallet } from '../context/useWallet'
+import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
 import {
   isWalletNavigationActive,
   shouldShowWalletNavigation,
-  walletNavigationItems
+  walletNavigationItemsForCapabilities
 } from './walletNavigation'
 
 function DesktopNavigation() {
   const { pathname } = useLocation()
-  const { initialized } = useWallet()
+  const { initialized, hasCapability } = useWallet()
 
   if (!shouldShowWalletNavigation(initialized, pathname)) return null
+  const items = walletNavigationItemsForCapabilities(hasCapability?.(WALLET_CAPABILITY.SEND_XEC) ?? true)
 
   return (
     <nav className="desktop-navigation" aria-label="Navegación principal de escritorio">
-      {walletNavigationItems.map((item) => {
+      {items.map((item) => {
         const active = isWalletNavigationActive(item.id, pathname)
         return (
           <Link

@@ -1,9 +1,8 @@
 import { useEffect, useRef } from 'react'
 import { useWallet } from '../context/useWallet'
-import { loadQuickStartMnemonic } from '../services/quickStartStorage'
 
 export default function QuickStartHydrator() {
-  const { initialized, backupVerified, restoreWallet } = useWallet()
+  const { initialized, backupVerified, activateQuickStartFromDevice } = useWallet()
   const attempted = useRef(false)
 
   useEffect(() => {
@@ -13,21 +12,17 @@ export default function QuickStartHydrator() {
 
     void (async () => {
       try {
-        const mnemonic = await loadQuickStartMnemonic()
-        if (!mnemonic || cancelled) return
-        const result = await restoreWallet(mnemonic)
-        if (result.status === 'choice-required') {
-          console.warn('[QuickStart] unexpected derivation choice required during local recovery')
-        }
-      } catch (error) {
-        console.warn('[QuickStart] secure local recovery unavailable', error)
+        const restored = await activateQuickStartFromDevice()
+        if (cancelled || !restored) return
+      } catch {
+        // Fail closed: the user can still unlock or recreate. Never log secrets.
       }
     })()
 
     return () => {
       cancelled = true
     }
-  }, [backupVerified, initialized, restoreWallet])
+  }, [activateQuickStartFromDevice, backupVerified, initialized])
 
   return null
 }

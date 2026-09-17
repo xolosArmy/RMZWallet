@@ -9,7 +9,9 @@ import RegisterAlias from './routes/RegisterAlias'
 import More from './routes/More'
 import Receive from './routes/Receive'
 import Settings from './routes/Settings'
-import Onboarding, { CreateWallet, ImportWallet, ReadOnlyWallet, UnlockWallet } from './routes/Onboarding'
+import Onboarding, { CreateBackedWallet, CreateWallet, ExistingWallet, ImportWallet, ReadOnlyWallet, UnlockWallet } from './routes/Onboarding'
+import QuickStartHydrator from './components/QuickStartHydrator'
+import TonalliIntentCapture from './components/TonalliIntentCapture'
 import BackupSeed from './routes/BackupSeed'
 import { ScanQR } from './routes/ScanQR'
 import RevealSeed from './routes/RevealSeed'
@@ -52,6 +54,8 @@ function App() {
   return (
     <div className="app-shell">
       <div className="app-glow" aria-hidden />
+      <QuickStartHydrator />
+      <TonalliIntentCapture />
       <AppNavigationLayout>
         <Routes>
           <Route path="/" element={<Dashboard />} />
@@ -81,6 +85,8 @@ function App() {
           <Route path="/multisig/:vaultId/sign" element={<SignProposal />} />
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/onboarding/create" element={<CreateWallet />} />
+          <Route path="/onboarding/create-backed" element={<CreateBackedWallet />} />
+          <Route path="/onboarding/existing" element={<ExistingWallet />} />
           <Route path="/onboarding/unlock" element={<UnlockWallet />} />
           <Route path="/onboarding/import" element={<ImportWallet />} />
           <Route path="/onboarding/read-only" element={<ReadOnlyWallet />} />

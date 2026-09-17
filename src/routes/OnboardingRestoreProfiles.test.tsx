@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { WalletContext } from '../context/walletContext'
 import type { WalletContextValue } from '../context/walletContext'
+import { walletContextFixture } from '../test/walletContextFixture'
 import {
   ECASH_STANDARD_899_PROFILE_ID,
   ECASH_STANDARD_PROFILE_ID,
@@ -45,31 +46,10 @@ function walletValue(
   restoreWallet: WalletContextValue['restoreWallet'],
   loadExistingWallet: WalletContextValue['loadExistingWallet'] = vi.fn()
 ): WalletContextValue {
-  return {
-    address: null,
-    balance: null,
-    loading: false,
-    error: null,
-    initialized: false,
-    backupVerified: false,
-    createNewWallet: vi.fn(),
+  return walletContextFixture({
     restoreWallet,
-    loadExistingWallet,
-    encryptAndStore: vi.fn(),
-    refreshBalances: vi.fn(),
-    rescanWallet: vi.fn(),
-    sendRMZ: vi.fn(),
-    prepareFirmaSend: vi.fn(),
-    sendFirma: vi.fn(),
-    sendXEC: vi.fn(),
-    estimateAliasRegistration: vi.fn(),
-    reserveAliasRegistrationUtxos: vi.fn(),
-    buildAliasRegistrationRawTx: vi.fn(),
-    registerAliasOnChain: vi.fn(),
-    estimateXecSend: vi.fn(),
-    getMnemonic: vi.fn(),
-    unlockEncryptedWallet: vi.fn()
-  }
+    loadExistingWallet
+  })
 }
 
 describe('dual-profile restore resolution UI', () => {

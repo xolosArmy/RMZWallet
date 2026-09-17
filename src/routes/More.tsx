@@ -1,5 +1,7 @@
 import { Link } from 'react-router-dom'
 import TopBar from '../components/TopBar'
+import { useWallet } from '../context/useWallet'
+import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
 import { X402_DRY_RUN_ENABLED } from '../integrations/x402/x402DryRunFeature'
 import { TM_COMM_STAGING_ENABLED } from '../config/tmCommStaging'
 import { X402_STAGING_TEST_ENABLED } from '../integrations/x402/x402StagingFeature'
@@ -64,9 +66,18 @@ const developmentItems: MoreItem[] = [
 ]
 
 function More() {
-  const visibleSections = developmentItems.length
-    ? [...sections, { id: 'desarrollo', title: 'Desarrollo', items: developmentItems }]
-    : sections
+  const { hasCapability } = useWallet()
+  const canUseAdvanced = hasCapability?.(WALLET_CAPABILITY.AGORA_TRADING) ?? true
+  const filteredSections = (canUseAdvanced
+    ? sections
+    : sections.map((section) => ({
+        ...section,
+        items: section.items.filter((item) => item.to === '/settings' || item.to === '/receive')
+      })).filter((section) => section.items.length > 0)
+  )
+  const visibleSections = canUseAdvanced && developmentItems.length
+    ? [...filteredSections, { id: 'desarrollo', title: 'Desarrollo', items: developmentItems }]
+    : filteredSections
 
   return (
     <div className="page">

@@ -40,17 +40,55 @@ function endpoint(path: string): string {
   return `${configuredBaseUrl}/v1/faucet${path}`
 }
 
+function asClaimStatus(value: unknown): WelcomeClaimStatus | null {
+  if (
+    value === 'available'
+    || value === 'completed'
+    || value === 'already_claimed'
+    || value === 'pending_review'
+    || value === 'retryable'
+    || value === 'rate_limited'
+    || value === 'error'
+  ) {
+    return value
+  }
+  return null
+}
+
 async function parseResponse(response: Response): Promise<WelcomeClaimResponse> {
-  let body: WelcomeClaimResponse
+  let body: Partial<WelcomeClaimResponse> = {}
   try {
-    body = await response.json() as WelcomeClaimResponse
+    body = await response.json() as Partial<WelcomeClaimResponse>
   } catch {
+    if (response.status === 429) {
+      return { ok: false, status: 'rate_limited', error: 'WELCOME_FAUCET_RATE_LIMITED' }
+    }
     throw new Error('WELCOME_FAUCET_INVALID_RESPONSE')
   }
-  if (!response.ok && response.status !== 202) {
+
+  const status = asClaimStatus(body.status) ?? (
+    response.status === 429
+      ? 'rate_limited'
+      : response.status === 202
+        ? 'pending_review'
+        : !response.ok
+          ? 'error'
+          : null
+  )
+  if (!status) {
     throw new Error(body.error || 'WELCOME_FAUCET_UNAVAILABLE')
   }
-  return body
+
+  return {
+    ok: body.ok === true && (status === 'completed' || status === 'already_claimed' || status === 'available'),
+    status,
+    address: body.address,
+    starterPack: body.starterPack,
+    txid: body.txid,
+    dryRun: body.dryRun,
+    message: body.message,
+    error: body.error
+  }
 }
 
 export function isWelcomeFaucetConfigured(): boolean {
