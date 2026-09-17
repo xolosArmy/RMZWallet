@@ -1,60 +1,68 @@
 # TM-COMM A0 — Architecture & Staging Readiness
 
-Evidencia A0. Scope estrictamente TM-COMM. **No se remedió el lint global histórico de RMZWallet.**
-
-**No merge. No producción. No clientes reales. No OpenAI. No fondos reales.**
-
-Fecha de verificación lint diferencial y suites: 2026-09-17.
+Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No merge.
 
 ---
 
 ## Identidad
 
-| Campo | Valor |
+| Campo | SHA / valor |
 | --- | --- |
 | Repositorio | `xolosArmy/RMZWallet` |
 | Rama | `feat/tm-comm-a0-architecture-staging` |
-| **BASE SHA** (origen de la rama = `origin/main` canónico) | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
+| **BASE SHA** | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
+| BASE worktree | `/tmp/rmzwallet-tm-comm-a0-base` |
 | Mensaje BASE | `[Gate C3A] RMZWallet Settlement Engine: Durable Ownership, Local TXID Derivation, and Broadcast Boundary (#96)` |
-| SHA implementación A0 | `006ac8f0f1bc6d7dedfe95ece54c9ebb94e0171f` |
-| **HEAD SHA** al momento de lint diferencial / typecheck / build / tests | `8070f991d556e7c5369906652a77c2a848bb9a97` |
-| Mensaje HEAD | `docs(tm-comm): record A0 architecture and staging evidence` |
-| PR / merge | **No se abrió PR. No se hizo merge.** |
+| **HEAD SHA** (verificación lint/tests) | `4e6d1ce2269c194c9a81d8bd092b99df940a55a0` |
+| Staging API | http://127.0.0.1:4178/v1/tm-comm/health |
+| Staging UI | http://127.0.0.1:5174/tm-comm-staging |
+| Merge | **No** |
 
-Anclaje:
+---
+
+## Baseline vs A0 Regression Analysis
+
+Comando idéntico en ambos árboles:
 
 ```bash
-git fetch origin main
-git rev-parse origin/main
-# ab0024a97ac62f9ba3725b92c553805cb348c7fb
-git checkout -B feat/tm-comm-a0-architecture-staging origin/main
+npm run lint
+# eslint .
 ```
 
-Lint BASE se ejecutó en worktree desacoplado en exactamente `ab0024a97ac62f9ba3725b92c553805cb348c7fb`, no sobre un SHA supuesto.
+Normalización: únicamente el prefijo de raíz
 
----
+- BASE: `/tmp/rmzwallet-tm-comm-a0-base/`
+- HEAD: `/home/xolosarmy/ecashschool/RMZWallet/`
 
-## Veredicto
+Finding = `(path relativo, línea, columna, regla ESLint, mensaje)`.
 
-**GO para iniciar M0.**
+| Métrica | Valor |
+| --- | --- |
+| **BASE findings** | **328** |
+| **HEAD findings** | **328** |
+| **NEW findings introduced by A0** | **0** |
+| **BASE findings removed incidentally by A0** | **0** |
+| Exit BASE | 1 |
+| Exit HEAD | 1 |
+| Warnings BASE | 0 |
+| Warnings HEAD | 0 |
+| Findings en archivos TM-COMM | 0 |
+| Findings en archivos tocados por A0 | 0 |
 
-A0 no introduce ningún error nuevo de lint. `npm run lint` es **BASELINE FAILURE / PRE-EXISTING** en BASE y en HEAD: **328 errores en ambos**. Cero errores en archivos TM-COMM. Cero errores en archivos modificados por A0.
+Criterio de aprobación del lint diferencial: `NEW findings introduced by A0 = 0`. **Cumple.**
 
-No se declara PASS el lint global.
+Clasificación de `npm run lint`:
 
----
+- **FAIL preexistente en BASE** (328 errors / 0 warnings)
+- **FAIL preexistente en HEAD** (mismo conjunto; no es PASS)
+- **FAIL nuevo en HEAD:** ninguno
+- **Fallo ambiental:** ninguno
 
-## Staging URL
+La suite global de lint ya estaba rota en BASE. No se convirtió artificialmente en PASS. No bloquea A0 porque A0 introduce **cero** regresiones.
 
-| Superficie | URL | Resultado |
-| --- | --- | --- |
-| API | http://127.0.0.1:4178/v1/tm-comm/health | `{"ok":true,"environment":"staging","protocol":"tm-comm","version":1,"financialAuthority":false,"memoPublication":false}` |
-| UI | http://127.0.0.1:5174/tm-comm-staging | HTTP 200 |
-| API vía proxy Vite | http://127.0.0.1:5174/tm-comm-api/v1/tm-comm/health | mismo JSON |
+Los 328 findings son BASELINE FAILURE / PRE-EXISTING en Tonalli Memo, Agent Wallet Execution, Trusted Wallet Runtime, MemoCompose y aliasDiscovery. **No se modificaron.**
 
-Procesos: `npm run tm-comm:staging` y `VITE_TM_COMM_STAGING=true npx vite --host 127.0.0.1 --port 5174 --strictPort`.
-
-DB y secrets independientes: `.tmp/tm-comm-staging/` (gitignored). Reservas ficticias `rsv_staging_client_a` y `rsv_staging_client_b`.
+Logs completos: Apéndice A (HEAD) y Apéndice B (BASE).
 
 ---
 
@@ -63,16 +71,10 @@ DB y secrets independientes: `.tmp/tm-comm-staging/` (gitignored). Reservas fict
 ```text
 M  .env.example
 A  TM-COMM-A0-architecture-staging-readiness.md
-A  docs/tm-comm/README.md
-A  docs/tm-comm/a0-ai-agent-boundary.md
-A  docs/tm-comm/a0-architecture.md
-A  docs/tm-comm/a0-email-fallback.md
-A  docs/tm-comm/a0-staging.md
-A  docs/tm-comm/a0-threat-model.md
-A  docs/tm-comm/a0-tonalli-memo-boundary.md
+A  docs/tm-comm/*
 M  package.json
 A  scripts/tm-comm-staging-up.ts
-A  server/tmComm/* (store, HTTP, auth, schema, tests)
+A  server/tmComm/*
 M  src/App.tsx
 M  src/components/walletNavigation.ts
 A  src/config/tmCommStaging.ts
@@ -84,191 +86,78 @@ A  src/routes/tmCommStagingClient.ts
 M  vite.config.ts
 ```
 
-Agent Wallet, settlement, broadcast, signing productivo y Tonalli Memo **no se modificaron** para limpiar lint.
-
 ---
 
 ## Modelo de datos
 
-| Entidad | Rol |
-| --- | --- |
-| `Principal` | Identidad de servidor tras challenge. Una address conocida no es autoridad. |
-| `ReservationBinding` | Principal ↔ reserva ficticia. Solo con token de enrolamiento de Xolos Ramírez. |
-| `Conversation` | Un hilo por reserva (cliente bindeado + operador). |
-| `Message` | Mensaje privado durable. |
-| `MessageReceipt` | `delivered` / `read` por principal. |
-| `AuditEvent` | allow/deny sin cuerpos ni secretos. |
+`Principal`, `ReservationBinding`, `Conversation`, `Message`, `MessageReceipt`, `AuditEvent`.
 
-`Message` mínimo: `id` (servidor), `clientMessageId` (idempotente), `conversationId`, `senderPrincipalId`, `senderKind`, `body`, `serverCreatedAt` (servidor), `replyToId` opcional, `status` ∈ {`accepted`,`delivered`,`read`}.
+`Message`: `id` servidor, `clientMessageId` idempotente, `conversationId`, `senderPrincipalId`, `senderKind`, `body`, `serverCreatedAt` servidor, `replyToId` opcional, `status` ∈ {accepted, delivered, read}.
 
-Registro canónico: SQLite (`node:sqlite`, WAL). `localStorage` no es fuente de verdad.
+Canónico: SQLite. No `localStorage`.
 
 ---
 
 ## Auth challenge
 
-Protocolo `TM-COMM-AUTH-V1`. **No** es `/connect/sign-message`.
+`TM-COMM-AUTH-V1`. No es `/connect/sign-message`.
 
-1. Servidor emite nonce de un solo uso, expiración, audience/origin, session context.
-2. Tonalli firma el string canónico con `signMessage`. Las claves no salen de Tonalli.
-3. Servidor verifica address, pubkey, firma, nonce no usado, expiración, origin/audience, session context.
-4. Cookie HttpOnly `SameSite=Strict`. La sesión **no** abre reservas.
-5. Binding exige token de enrolamiento. `reservationId`/`customerId`/`conversationId`/`walletAddress` del navegador son claims.
+Nonce de un solo uso, expiración, audience/origin, session context. Tonalli firma con `signMessage`; keys no salen de la wallet. Servidor verifica address, pubkey, firma, nonce, expiración, origin y context. Cookie HttpOnly `SameSite=Strict`. Address conocida ≠ acceso a reserva. Binding solo con token de enrolamiento de Xolos Ramírez.
 
 ---
 
 ## Prueba A/B de aislamiento
 
-`server/tmComm/tmComm.http.test.ts` → `client A cannot read, list, send as, or touch metadata of client B`.
-
-A no puede: listar conversación de B; leer mensajes de B; enviar como B; escribir en B; obtener adjuntos/metadata de B; escapar ACL cambiando ids en URL/body.
-
-Denegaciones 403 + audit: `CONVERSATION_FORBIDDEN`, `SENDER_IMPERSONATION`, `ATTACHMENT_UNAVAILABLE`, `RESERVATION_CLAIM_MISMATCH`.
-
-Una address autenticada sin token tiene `bindings: []` y `conversations: []`.
+`server/tmComm/tmComm.http.test.ts`: A no lista/lee/escribe/impersona/adjunta B; ids en URL/body no escapan el ACL. 403 + audit deny.
 
 ---
 
 ## Persistencia después de reload
 
-Mismo test file → `accepted messages survive store reopen and support receipts plus idempotency`.
-
-Mensaje aceptado → close store + HTTP → reopen SQLite → GET con la misma cookie → el mensaje permanece con el mismo id de servidor. `clientMessageId` es idempotente. Receipts `delivered`/`read` soportados.
+Mismo archivo de test: mensaje aceptado sobrevive close/reopen de SQLite + HTTP; historial vía GET con cookie; `clientMessageId` idempotente.
 
 ---
 
-## Resultados de tests (HEAD `8070f99`)
+## Resultados de tests (HEAD `4e6d1ce`)
 
-| Comando | Exit | Resultado | Clasificación |
-| --- | --- | --- | --- |
-| `npm run typecheck` | 0 | `tsc -b && tsc -p tsconfig.tm1-regtest-e2e.json` limpio | PASS |
-| `npm run build` | 0 | Vite 7.3.0, 1419 modules, 39–45s. Warnings de eval/chunk/browserslist (preexistentes de deps) | PASS con warnings de build |
-| `npx vitest run src/features/privateMessaging server/tmComm src/routes/TmCommStaging.test.tsx` | 0 | **5 files / 22 tests pass** (incluye architecture boundaries) | PASS |
-| Architecture boundaries | 0 | `privateMessaging.architecture.test.ts` **8/8** | PASS |
-| `npm test` (suite vigente) | 0 | pretest Node 24.19.0; vitest **149 files / 2670 pass**; tsx slpNft **10/10 pass** | PASS |
-| `npm run lint` BASE | 1 | **328 errors, 0 warnings** | **BASELINE FAILURE / PRE-EXISTING** |
-| `npm run lint` HEAD | 1 | **328 errors, 0 warnings** | **BASELINE FAILURE / PRE-EXISTING** (idéntico conteo; 0 regresiones A0) |
-
-Tests TM-COMM 22:
-
-- `privateMessaging.domain.test.ts` (4)
-- `privateMessaging.architecture.test.ts` (8) — frontera: no signing/keys/settlement/broadcast/`sendXec`/`sendETokens`/Memo/`agentWalletExecution`
-- `tmComm.auth.test.ts` (3)
-- `tmComm.http.test.ts` (5) — health, no-authority-from-address, nonce, A/B, durabilidad
-- `TmCommStaging.test.tsx` (2)
-
-Stderr en suite vigente (tests que **pasan**; no omitidos):
-
-```text
-stderr | src/routes/RegisterAlias.test.tsx ... QuotaExceededError: storage is full
-stderr | src/services/XolosWalletService.x402Activation.test.ts
-WebAssembly initialization failed (using fallbacks): Cannot find module './browser-shims/ecash_lib_wasm_browser'
-```
-
----
-
-## Tabla lint BASE vs HEAD
-
-Comando idéntico en ambos: `npm run lint` (`eslint .`).
-
-| Métrica | BASE `ab0024a97ac62f9ba3725b92c553805cb348c7fb` | HEAD `8070f991d556e7c5369906652a77c2a848bb9a97` |
+| Comando | Exit | Clasificación |
 | --- | --- | --- |
-| Exit code | 1 | 1 |
-| Problems | 328 errors, 0 warnings | 328 errors, 0 warnings |
-| Fixable | 2 | 2 |
-| Errores en archivos TM-COMM | 0 | 0 |
-| Errores en archivos tocados por A0 (`App.tsx`, `More.tsx`, `walletNavigation.ts`, `vite.config.ts`, `package.json`, `.env.example`) | 0 | 0 |
-| Errores nuevos introducidos por A0 | — | **0** |
-| Errores presentes ya en BASE | 328 | 328 (los mismos fingerprints `file:line:col:rule`) |
-| Errores fuera de scope | 328 | 328 |
-| Clasificación | BASELINE FAILURE / PRE-EXISTING | BASELINE FAILURE / PRE-EXISTING |
+| `npm run typecheck` | 0 | **PASS** |
+| `npm run build` | 0 | **PASS** (warnings de deps: eval, chunks >500kB, browserslist stale — no FAIL nuevo) |
+| TM-COMM focalizado (`vitest run src/features/privateMessaging server/tmComm src/routes/TmCommStaging.test.tsx`) | 0 | **PASS** 5 files / 22 tests |
+| Architecture/boundary (`privateMessaging.architecture.test.ts`) | 0 | **PASS** 8/8 |
+| `npm test` suite vigente | 0 | **PASS** 149 files / 2670 vitest + 10 node:test |
+| `npm run lint` BASE | 1 | **FAIL preexistente en BASE** (328/0) |
+| `npm run lint` HEAD | 1 | **FAIL preexistente en HEAD** (328/0; NEW=0) |
 
-Fingerprints únicos `file:line:col:rule`: 327 en ambos (una línea de `react-hooks/refs` se reporta más de una vez; el total ESLint es 328).  
-ONLY_HEAD = 0. ONLY_BASE = 0.
-
-La diferencia binaria de logs es solo padding de columnas stylish de ESLint (worktree vs repo). No hay reglas, archivos ni líneas nuevas.
-
-**Regresión A0 de lint: ninguna.** No se corrigió código TM-COMM en esta pasada porque no había errores nuevos que corregir.
+Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAlias; WASM fallback en x402Activation.
 
 ---
 
-## Fallos preexistentes (BASELINE FAILURE / PRE-EXISTING)
+## Staging URL
 
-Todos los 328 viven fuera de TM-COMM: Tonalli Memo, Agent Wallet Execution, Trusted Wallet Runtime, MemoCompose, aliasDiscovery. **No se tocaron.**
-
-| Archivo | Errores | Clasificación | Scope |
-| --- | --- | --- | --- |
-| `src/integrations/tonalliMemo/tm1RegtestE2eHarness.test.ts` | 139 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/features/agentWalletExecution/agentWalletExecution.architecture.test.ts` | 57 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/features/agentWalletExecution/settlement.test.ts` | 30 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/features/agentWalletExecution/agentWalletExecution.test.ts` | 29 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/internal/agentWalletExecutionHost/trustedWalletExecutionRuntime.tsx` | 22 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/components/tonalliMemo/useTm1PublishMachine.test.tsx` | 17 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/components/tonalliMemo/useTm1PublishMachine.ts` | 9 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/context/WalletContext.aliasPersistence.test.tsx` | 4 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/services/aliasDiscovery.ts` | 4 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/components/tonalliMemo/TonalliMemoComposer.tsx` | 3 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/internal/agentWalletExecutionHost/TrustedWalletExecutionProvider.test.tsx` | 2 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/components/tonalliMemo/walletPublisherRecoveryStore.ts` | 2 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/features/agentWalletExecution/types.ts` | 2 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/services/aliasDiscovery.test.ts` | 2 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/components/tonalliMemo/walletPublisherRecoveryStore.test.ts` | 1 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/features/agentWalletExecution/errors.ts` | 1 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/integrations/tonalliMemo/tm1RegtestE2eHarness.ts` | 1 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/internal/agentWalletExecutionHost/TrustedWalletExecutionProvider.tsx` | 1 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/routes/MemoCompose.test.tsx` | 1 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| `src/routes/MemoCompose.tsx` | 1 | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-| **Total** | **328** | BASELINE FAILURE / PRE-EXISTING | fuera de scope |
-
-Reglas dominantes (HEAD = BASE): `@typescript-eslint/no-explicit-any`, `react-hooks/refs`, `@typescript-eslint/no-unused-vars`, `prefer-const`, `react-refresh/only-export-components`, `no-empty`, `react-hooks/globals`.
-
-Salida completa de HEAD en el Apéndice A. No se declara PASS.
-
----
-
-## Cualquier regresión A0
-
-| Área | ¿Regresión A0? |
-| --- | --- |
-| Lint (errores nuevos) | **No** (0) |
-| Lint en archivos TM-COMM | **No** (0) |
-| Lint en archivos tocados por A0 | **No** (0) |
-| Typecheck | No |
-| Build | No (exit 0) |
-| Tests TM-COMM / architecture | No (22/22) |
-| Suite vigente | No (2680 pass) |
-| Agent Wallet / Memo / settlement / broadcast / signing | No modificados |
+- API: http://127.0.0.1:4178/v1/tm-comm/health → `{"ok":true,"environment":"staging","protocol":"tm-comm","version":1,"financialAuthority":false,"memoPublication":false}`
+- UI: http://127.0.0.1:5174/tm-comm-staging → 200
 
 ---
 
 ## Riesgos residuales
 
-- Tokens de enrolamiento staging en `.tmp/` (secretos de máquina).
-- Cookie HttpOnly en HTTP local sin `Secure`.
-- Challenge plaintext; no debe incluir contenido de reserva.
-- Sin rate-limit en A0.
-- XSS en origen staging podría pedir firma de un challenge fresco a Tonalli desbloqueada.
-- Operador es fixture, no identidad hardware.
-- Email (M1) e IA no implementados; no habilitar send/email sin repetir aislamiento.
-- Lint global 328 permanece como deuda **fuera de A0**.
+Tokens staging en `.tmp/`; cookie sin `Secure` en HTTP local; sin rate-limit; XSS en origen staging; operador fixture; email/IA no implementados; 328 lint históricos fuera de A0.
 
 ---
 
 ## GO / NO-GO para M0
 
-**GO para M0** si se permanece en esta rama, con datos ficticios, sin merge, sin OpenAI, sin email real, sin Memo, sin fondos reales.
+**GO para M0** en esta rama, datos ficticios, sin merge, sin OpenAI, sin email real, sin Memo, sin fondos reales.
 
-**NO-GO** para merge, producción, clientes reales, o para tratar `npm run lint` global como PASS.
-
-Condiciones: M0 sobre este ACL y SQLite. No `localStorage` canónico. No `/connect/sign-message`. No Agent Wallet. No limpiar lint histórico de Memo/Agent Wallet como parte de TM-COMM.
+**NO-GO** para merge, producción, o declarar PASS el lint global.
 
 ---
 
-## Apéndice A — `npm run lint` HEAD (BASELINE FAILURE / PRE-EXISTING)
+## Apéndice A — `npm run lint` HEAD (FAIL preexistente)
 
-Comando: `npm run lint`  
-SHA: `8070f991d556e7c5369906652a77c2a848bb9a97`  
-Exit 1. 328 errors. Idéntico conteo que BASE `ab0024a97ac62f9ba3725b92c553805cb348c7fb`.
+SHA `4e6d1ce2269c194c9a81d8bd092b99df940a55a0`. Exit 1. 328 errors / 0 warnings.
 
 
 ````text
@@ -737,9 +626,9 @@ React refs are values that are not needed for rendering. Refs should only be acc
   2 errors and 0 warnings potentially fixable with the `--fix` option.
 ````
 
-## Apéndice B — `npm run lint` BASE (worktree `ab0024a`)
+## Apéndice B — `npm run lint` BASE (FAIL preexistente)
 
-Mismo comando. Paths del worktree `/tmp/rmzwallet-tm-comm-a0-base/`. Conteo 328. Clasificación: BASELINE FAILURE / PRE-EXISTING.
+Worktree `/tmp/rmzwallet-tm-comm-a0-base` SHA `ab0024a97ac62f9ba3725b92c553805cb348c7fb`. Exit 1. 328 errors / 0 warnings.
 
 ````text
 
