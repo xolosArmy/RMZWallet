@@ -28,6 +28,15 @@ import { getChronik } from './ChronikClient'
 import { extractAliasFromOutputScript } from './aliasDiscovery'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 import type { DecryptPasswordResult } from './crypto'
+import {
+  QuickStartUnavailableError,
+  assertQuickStartStorageAvailable,
+  clearQuickStartMnemonic,
+  hasQuickStartMnemonic,
+  loadQuickStartMetadata,
+  loadQuickStartMnemonic,
+  storeQuickStartMnemonic
+} from './quickStartStorage'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
 import type {
   MinimalXecWallet,
@@ -733,6 +742,96 @@ export class XolosWalletService {
       this.releaseWalletActivation()
     }
   }
+
+  async createQuickStartWallet(): Promise<{ address: string; profileId: DerivationProfileId }> {
+    await assertQuickStartStorageAvailable()
+    const mnemonic = await this.createNewWallet()
+    const profileId = this.activeProfileId
+    const address = this.getAddress()
+    if (!mnemonic || !address) {
+      throw new Error('QUICK_START_WALLET_IDENTITY_MISSING')
+    }
+    try {
+      await storeQuickStartMnemonic(mnemonic, {
+        derivationProfileId: profileId,
+        address
+      })
+    } catch (error) {
+      this.decryptedMnemonic = null
+      this.wallet = null
+      this.isReady = false
+      this.activeAccountState = null
+      if (error instanceof QuickStartUnavailableError) throw error
+      throw new QuickStartUnavailableError(
+        error instanceof Error ? error.message : 'QUICK_START_SECURE_STORAGE_UNAVAILABLE'
+      )
+    }
+    return { address, profileId }
+  }
+
+  async activateQuickStartWallet(
+    mnemonic: string,
+    profileId: DerivationProfileId
+  ): Promise<{ address: string; profileId: DerivationProfileId }> {
+    if (!this.tryAcquireWalletActivation()) {
+      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
+    }
+    try {
+      const normalizedMnemonic = mnemonic.trim()
+      if (!normalizedMnemonic) {
+        throw new Error('QUICK_START_MNEMONIC_REQUIRED')
+      }
+      if (!isDerivationProfileId(profileId)) {
+        throw new Error('QUICK_START_DERIVATION_PROFILE_REQUIRED')
+      }
+      await this.activateMnemonic(normalizedMnemonic, profileId)
+      const address = this.getAddress()
+      if (!address) {
+        throw new Error('QUICK_START_WALLET_IDENTITY_MISSING')
+      }
+      return { address, profileId }
+    } finally {
+      this.releaseWalletActivation()
+    }
+  }
+
+  async activateQuickStartFromDevice(): Promise<{ address: string; profileId: DerivationProfileId } | null> {
+    const metadata = await loadQuickStartMetadata()
+    if (!metadata) return null
+    const mnemonic = await loadQuickStartMnemonic()
+    if (!mnemonic) return null
+    return this.activateQuickStartWallet(mnemonic, metadata.derivationProfileId)
+  }
+
+  async hasQuickStartRecord(): Promise<boolean> {
+    return hasQuickStartMnemonic()
+  }
+
+  async verifyStoredMnemonic(password: string, expectedMnemonic: string): Promise<boolean> {
+    const stored = typeof window === 'undefined'
+      ? this.encryptedMnemonic
+      : localStorage.getItem(STORAGE_KEY_MNEMONIC)
+    if (!stored) return false
+    const { plainText } = await decryptWithPassword(stored, password)
+    return plainText.trim() === expectedMnemonic.trim()
+  }
+
+  async persistVerifiedBackup(password: string): Promise<void> {
+    const mnemonic = this.getMnemonic()
+    if (!mnemonic) {
+      throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
+    }
+    await this.encryptAndStoreMnemonic(password)
+    const verified = await this.verifyStoredMnemonic(password, mnemonic)
+    if (!verified) {
+      throw new Error('QUICK_START_BACKUP_VERIFY_FAILED')
+    }
+  }
+
+  async discardQuickStartRecord(): Promise<void> {
+    await clearQuickStartMnemonic()
+  }
+
 
   async detectDerivationProfiles(mnemonic: string): Promise<DerivationDiscovery> {
     if (!mnemonic || mnemonic.trim().split(' ').length < 12) {
