@@ -108,6 +108,37 @@ d890b2e51adaec6cd138def691bd3387f6d78feb  feat(faucet): route starter pack throu
 
 ---
 
+## Arquitectura (sigue vigente tras el pass)
+
+Una sola Wallet (`XolosWalletService` + `WalletContext`). Quick Start no crea una wallet paralela.
+
+```text
+startup
+  ↓
+check existing Quick Start
+  ↓
+if exists → recover it
+if absent → permit "Crear mi Tonalli"
+```
+
+`QuickStartHydrator` es un no-op de composición. El bootstrap lo posee `WalletProvider` (`quickStartBootstrap: pending | absent | recovered | failed`). No se permite crear otra wallet mientras esa decisión está pendiente.
+
+Lifecycle: `UNINITIALIZED → QUICK_START_UNBACKED → BACKUP_VERIFIED` vía `resolveWalletLifecycle({ initialized, backupVerified })`.
+
+`QUICK_START_UNBACKED` permite VIEW_BALANCE, RECEIVE_XEC, WELCOME_XEC_CLAIM, BACKUP_WALLET, REFRESH_BALANCE, RESUME_SAFE_INTENT. Bloquea send/NFT/Agora/WalletConnect/x402/Agent/broadcast.
+
+`TM_COMM` está bloqueado en **los tres** lifecycles actuales. Backup verificado no autoriza mensajería.
+
+Seed Quick Start: IndexedDB `tonalli-quickstart-v1`, AES-GCM, CryptoKey no extractable. Probe de disponibilidad usa `device-key-probe` y lo borra. Nunca plaintext, URL, history.state, localStorage, sessionStorage, logs o red.
+
+Backup crash-safe: cifrar PIN store → verificar decrypt → `BACKUP_VERIFIED` → entonces borrar ciphertext Quick Start.
+
+Welcome XEC: one-time por address, `POST /v1/faucet/starter-pack`, dry-run por defecto. Quick Start requiere `TURNSTILE_ENABLED=false`.
+
+No se acopló TM-COMM A0. No se cambiaron semánticamente C2/C3A/broadcast/Agent Wallet/x402/WalletConnect/Agora/Memo.
+
+---
+
 ## Fresh Independent Review Findings
 
 Review-start SHAs (referencia únicamente): RMZWallet `9e5aed17448d4cece6759f32ca7a18c436ff2865`, tonalli-faucet `c26b70e06bf69568a7b2b5430917a79a3a9fb48c`. Los HEAD actuales se resolvieron otra vez antes de editar.
