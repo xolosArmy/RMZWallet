@@ -542,19 +542,13 @@ export class XolosWalletService {
     profileId: DerivationProfileId,
     persistProfile = false
   ): Promise<void> {
-    this.buildWallet(profileId)
-    const wallet = this.wallet as MinimalXecWallet
-    await wallet.walletInfoPromise
-    this.decryptedMnemonic = mnemonic
-    this.activeAccountState = deriveAccountPublicState(mnemonic, profileId)
-    this.bindMinimalWalletToCanonicalProfile(mnemonic)
-    await wallet.initialize()
-    this.isReady = true
-    this.scanCache = null
-    this.scanPromise = null
-    this.scanPromiseGapLimit = null
-    this.ensureHdAddressCache(this.getEffectiveGapLimit())
+    await this.activateMnemonicLocalIdentity(mnemonic, profileId)
     if (persistProfile) this.persistActiveProfile()
+    const wallet = this.wallet as MinimalXecWallet | null
+    if (!wallet) return
+    void wallet.initialize().catch(() => {
+      // Chronik/network failure must not block a recoverable local identity.
+    })
   }
 
   private ensureReady() {

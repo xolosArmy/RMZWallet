@@ -89,6 +89,14 @@ describe('Quick Start seed and frozen-boundary architecture', () => {
     expect(createQuickStart.indexOf('hasQuickStartMnemonic()'))
       .toBeLessThan(createQuickStart.indexOf('createNewWallet()'))
     expect(createQuickStart).toContain('QUICK_START_RECOVERY_FAILED')
+
+    const activateMnemonic = walletService.slice(
+      walletService.indexOf('private async activateMnemonic('),
+      walletService.indexOf('private ensureReady(')
+    )
+    expect(activateMnemonic).toContain('activateMnemonicLocalIdentity')
+    expect(activateMnemonic).toContain('void wallet.initialize()')
+    expect(context).toMatch(/loadFromStorage[\s\S]*optionalBalance: true/)
   })
 
   it('does not import TM-COMM internals anywhere on this branch', () => {

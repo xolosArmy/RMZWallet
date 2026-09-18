@@ -476,13 +476,15 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       try {
         const result = await xolosWalletService.loadFromStorage(password, selectedProfileId)
         if (result.status === 'choice-required') return result
-        await syncAddressAndBalance()
+        const current = xolosWalletService.getAddress()
+        setAddress(current)
         const verified = localStorage.getItem(BACKUP_KEY) === 'true'
         setInitialized(true)
         setBackupVerifiedState(verified)
         if (verified && typeof xolosWalletService.discardQuickStartRecord === 'function') {
           await xolosWalletService.discardQuickStartRecord()
         }
+        void syncAddressAndBalance({ optionalBalance: true })
         return result
       } catch (err) {
         const message = (err as Error).message || 'No se pudo cargar la billetera guardada.'

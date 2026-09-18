@@ -32,6 +32,11 @@ const serviceMocks = vi.hoisted(() => ({
   persistVerifiedBackup: vi.fn(async () => undefined),
   discardQuickStartRecord: vi.fn(async () => undefined),
   hasQuickStartRecord: vi.fn(async () => false),
+  loadFromStorage: vi.fn(async () => ({
+    status: 'loaded' as const,
+    selectedProfileId: 'ecash-standard-1899',
+    notice: 'loaded'
+  })),
   sendXEC: vi.fn(),
   sendRMZ: vi.fn(),
   sendFirma: vi.fn(),
@@ -78,6 +83,12 @@ describe('WalletContext Quick Start lifecycle', () => {
     serviceMocks.hasQuickStartRecord.mockResolvedValue(false)
     serviceMocks.createQuickStartWallet.mockClear()
     serviceMocks.activateQuickStartFromDevice.mockClear()
+    serviceMocks.loadFromStorage.mockReset()
+    serviceMocks.loadFromStorage.mockResolvedValue({
+      status: 'loaded',
+      selectedProfileId: 'ecash-standard-1899',
+      notice: 'loaded'
+    })
     serviceMocks.getBalances.mockReset()
     serviceMocks.getBalances.mockResolvedValue({
       xec: 0n,
@@ -226,5 +237,32 @@ describe('WalletContext Quick Start lifecycle', () => {
     expect(wallet!.initialized).toBe(false)
     await expect(wallet!.startQuickStartWallet()).rejects.toThrow('QUICK_START_RECOVERY_FAILED')
     expect(serviceMocks.createQuickStartWallet).not.toHaveBeenCalled()
+  })
+
+  it('unlocks a backed-up Quick Start even when Chronik/balance never resolves', async () => {
+    localStorage.setItem('xoloswallet_backup_verified', 'true')
+    serviceMocks.getAddress.mockReturnValue('ecash:qbacked')
+    serviceMocks.loadFromStorage.mockResolvedValue({
+      status: 'loaded',
+      selectedProfileId: 'ecash-standard-1899',
+      notice: 'loaded'
+    })
+    serviceMocks.getBalances.mockImplementation(() => new Promise(() => {}))
+
+    let wallet: ReturnType<typeof useWallet> | null = null
+    render(
+      <WalletProvider>
+        <Harness onReady={(value) => { wallet = value }} />
+      </WalletProvider>
+    )
+
+    const result = await wallet!.loadExistingWallet('123456')
+    expect(result.status).toBe('loaded')
+    await waitFor(() => {
+      expect(wallet!.initialized).toBe(true)
+      expect(wallet!.address).toBe('ecash:qbacked')
+      expect(wallet!.backupVerified).toBe(true)
+      expect(wallet!.lifecycle).toBe(WALLET_LIFECYCLE.BACKUP_VERIFIED)
+    })
   })
 })
