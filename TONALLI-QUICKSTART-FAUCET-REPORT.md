@@ -26,11 +26,11 @@ Do not treat this report commit as the implementation HEAD. Implementation HEAD 
 
 | Campo | Valor |
 |---|---|
-| Fecha | 2026-09-17 |
-| Gate | Tonalli Quick Start — fresh remediation pass on PR #99 / PR #3 |
+| Fecha | 2026-09-18 |
+| Gate | Tonalli Quick Start — release candidate freeze + exact-head audit |
 | Estado | cerrado en ramas de feature; **sin merge** |
-| Decisión | **NO-GO — remediation/review pending** |
-| Justificación | P0 overwrite/race, P1 intent, P1 `TM_COMM`, P1 Turnstile y el unlock PIN post-backup están corregidos. Suite RMZWallet verde. Aceptación perfil limpio (create → Welcome dry-run → reload → receive → backup → unlock, Chronik-down, intent) PASS. El review exact-head de Codex sigue bloqueado por cuota; no se llama al gate completo. |
+| Decisión | **GO — ready for merge review** |
+| Justificación | Audit independiente P0=0 / P1=0. Suites RMZWallet y faucet verdes. Faucet `npm test` 3/3 en proceso limpio. Clean-profile dry-run PASS. Sin findings de seguridad nuevos. **No merge** hasta el review exact-head de Codex (cuota agotada). |
 
 ---
 
@@ -67,14 +67,15 @@ Checkout de trabajo: `/home/xolosarmy/ecashschool/RMZWallet-quickstart`. El chec
 | Rama | `feat/welcome-xec-one-time-claim` |
 | BASE `origin/main` | `f1964d220d23b214141e722ea5781adee32c0fc9` |
 | HEAD al inicio de esta revisión (referencia, no asumir) | `c26b70e06bf69568a7b2b5430917a79a3a9fb48c` |
-| HEAD de implementación (este pass) | `4e32338a6aee3411c1d23d0b3257ca18300af841` |
+| HEAD Turnstile Quick Start | `4e32338a6aee3411c1d23d0b3257ca18300af841` |
+| HEAD de implementación / PR tip (freeze) | `aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71` |
 | PR | **#3** OPEN, no mergeado |
 | URL | https://github.com/xolosArmy/tonalli-faucet/pull/3 |
 | Base del PR | `main` (`f1964d220d23b214141e722ea5781adee32c0fc9`) |
 
 Checkout de trabajo: `/home/xolosarmy/ecashschool/tonalli-faucet`.
 
-HEADs de implementación: #99 `2050b35e80bda11ed85373284717b08425b77b14`, #3 `4e32338a6aee3411c1d23d0b3257ca18300af841`. El tip de la rama RMZWallet incluye commits de reporte posteriores; el HEAD de código de este pass es el SHA de implementación.
+HEADs de implementación de este freeze: RMZWallet `2050b35e80bda11ed85373284717b08425b77b14`, tonalli-faucet `aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71`. El tip de PR #99 puede incluir commits documentales posteriores.
 
 ---
 
@@ -99,6 +100,8 @@ c7ae51f5456ef0ca844d5180bbf855e805002334  feat(onboarding): add embedded welcome
 ### tonalli-faucet `origin/main..HEAD`
 
 ```
+aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71  fix(faucet): upgrade better-sqlite3 for Node 24 test isolate teardown
+5ee830e6c2b84024999db12e6c26803fea560c8a  test(faucet): do not close SQLite during Node 24 isolate teardown
 4e32338a6aee3411c1d23d0b3257ca18300af841  fix(faucet): fail closed when Welcome Quick Start meets Turnstile
 c26b70e06bf69568a7b2b5430917a79a3a9fb48c  feat(faucet): make Welcome Claim the sole starter-pack authority
 94235140fac0f22430929a5d2f1fb6bbc71554a3  test(faucet): cover one-time welcome claim races and ambiguous broadcast
@@ -347,26 +350,104 @@ Respuesta `chatgpt-codex-connector[bot]` 2026-09-17T22:55:00Z / 22:55:01Z:
 
 ## Residual risks
 
-1. `@codex review` exact-head bloqueado por cuota.
-2. Preview Vercel SSO-gated; aceptación contra preview de producción no ejecutada.
-3. `npm run lint` global sigue en 328 errores históricos.
+1. `@codex review` exact-head bloqueado por cuota — **no merge** hasta que exista.
+2. Preview Vercel SSO-gated; freeze-audit acceptance was local dry-run.
+3. `npm run lint` global sigue en 328 errores históricos (BASE=HEAD, 0 hits Quick Start).
 4. Device-local IndexedDB se destruye si el usuario borra datos del sitio antes del backup.
 5. Turnstile no está integrado; Quick Start Welcome exige `TURNSTILE_ENABLED=false`.
-6. Native abort intermitente de `better-sqlite3` en `faucet.test.ts` bajo `node --test`.
-7. `wallet.initialize()` de Chronik sigue en background tras unlock; no bloquea la identidad local.
+6. `wallet.initialize()` de Chronik sigue en background tras unlock; no bloquea la identidad local.
+
+---
+
+## Release Candidate Freeze Audit
+
+Freeze date: 2026-09-18. Functional Quick Start/Welcome product code was not redesigned. Faucet received only test-runner stability fixes found by this audit.
+
+### Exact HEADs
+
+| Repo | Role | SHA |
+|---|---|---|
+| RMZWallet | implementation | `2050b35e80bda11ed85373284717b08425b77b14` |
+| RMZWallet | PR tip before this report commit | `23e38bb0d810ee5cc6e0d12f80490d632cef7029` |
+| RMZWallet | authoritative tip | `git rev-parse HEAD` |
+| tonalli-faucet | implementation / PR tip | `aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71` |
+| tonalli-faucet | Turnstile contract | `4e32338a6aee3411c1d23d0b3257ca18300af841` |
+
+PR metadata on #99 and #3 was updated to these identities. Codex was **not** re-pinged.
+
+### Independent findings
+
+Product audit of RMZWallet `2050b35` and faucet Welcome/Turnstile `4e32338` (code, not the previous report):
+
+- Quick Start overwrite: `storeQuickStartMnemonic` / `persistNonExtractableDeviceKey` fail closed; availability probe uses `PROBE_KEY_RECORD` then deletes it.
+- Chronik independence: local identity via `activateMnemonicLocalIdentity`; initialize is background; loadExistingWallet does not wait on balance.
+- Bootstrap: hydrator is a no-op; `WalletProvider` owns `pending|absent|recovered|failed`; create blocked while pending/failed.
+- Seed: AES-GCM non-extractable key; no mnemonic in URL/storage/network.
+- Backup: encrypt → verify → `BACKUP_VERIFIED` → then discard QS.
+- `TM_COMM=false` in `isCapabilityAllowed` for all three lifecycles; not in `FULL_WALLET_CAPABILITIES`.
+- Intent: Onboarding `readTonalliIntent` only; `consumeTonalliIntent` remains for a future consumer.
+- Faucet: `INSERT OR IGNORE` + `failed_retryable` retry only; ambiguous RPC → `needs_review`; no second `POST /starter-pack`; Turnstile-on → 503; CORP cross-origin; RPC secrets sanitized.
+
+```text
+Fresh independent audit: P0=0 P1=0 P2=1
+```
+
+The P2 was the faucet `node --test` SIGABRT (`Statement::~Statement` → `RemoveEnvironmentCleanupHook` with `env == nullptr`) on Node 24.19.0 + better-sqlite3 11.10.0. It is **not** environmental: reproduced on consecutive clean processes, including `faucet.test.ts` alone (exit 134 with tests already green). Root cause: native statement destructors during isolate teardown. Fix in-repo: drop `db.close()` in `after()` and upgrade to better-sqlite3 **12.9.0**. After the fix, remaining product P2 = 0.
+
+### Faucet test-run stability (committed `aeb5b2a`)
+
+| Run | Command | Result |
+|---|---|---|
+| 1 | `npm test` clean process | 41/41 PASS, exit 0 |
+| 2 | `npm test` clean process | 41/41 PASS, exit 0 |
+| 3 | `npm test` clean process | 41/41 PASS, exit 0 |
+
+Before the sqlite upgrade, a 3-run series was 41 / abort / 41. Isolation=none is invalid (shared `fetch` mocks). Concurrency=1 still aborted 11.10.0.
+
+`npm run typecheck` PASS. `npm run build` PASS.
+
+### RMZWallet validation (`2050b35` product / docs tip)
+
+| Check | Result |
+|---|---|
+| `npx tsc -b` | PASS |
+| `npx tsc -p tsconfig.tm1-regtest-e2e.json` | PASS |
+| `npm test` | 2686 vitest + 10 slp PASS |
+| `npm run lint` HEAD | `✖ 328 problems (328 errors, 0 warnings)` |
+| lint BASE `ab0024a` | `✖ 328 problems (328 errors, 0 warnings)` |
+| Quick Start lint hits | 0 |
+
+Classification: **FAIL preexistente en BASE**, not a new HEAD finding.
+
+### Clean-profile acceptance (2026-09-18T01:28:03Z)
+
+Local dry-run only (`TURNSTILE_ENABLED=false`, `FAUCET_DRY_RUN=true`). No real funds. Vercel preview still SSO-gated.
+
+| Flow | Result |
+|---|---|
+| Create → Welcome dry-run → reload same address → Receive → backup → reload → unlock PIN | PASS `ecash:qpkpm5743u75ackmudl22uakkv0ejur8fuyyzkzvsh` |
+| Chronik unavailable → same identity → create blocked | PASS `ecash:qzs5nhphp9dpeupvzdzh69elpphd7qu7fvhusxejlt` |
+| conversation intent → Dashboard → reload still pending | PASS |
+
+### Codex status
+
+Do not spam. Last attempts:
+
+- 2026-09-17T22:54:53Z PR #99 and #3 → usage limit 22:55:00Z
+- 2026-09-18T01:07:48Z PR #99 → usage limit 01:07:55Z
+
+No exact-head Codex findings exist. This independent audit **does not substitute** Codex.
+
+### Final residuals
+
+Codex quota; Vercel SSO; historical ESLint 328; IndexedDB wipe before backup; Turnstile not integrated; Chronik initialize remains background-only.
 
 ---
 
 ## GO / NO-GO
 
-**NO-GO — remediation/review pending.**
+**GO — ready for merge review.**
 
-P0 overwrite/race: corregido.
-P1 intent: corregido.
-P1 `TM_COMM`: bloqueado en todos los lifecycles actuales.
-P1 Turnstile: contrato coherente (`TURNSTILE_ENABLED=false`).
-Tests nuevos + suite RMZWallet: verdes.
-Aceptación perfil limpio: create / welcome dry-run / reload same address / receive / backup / unlock / Chronik-down / intent PASS.
-Codex exact-head: pendiente por cuota.
+Independent audit remaining product: P0=0 P1=0. RMZWallet suites PASS. Faucet suites PASS. Faucet `npm test` 3/3. Clean-profile acceptance PASS. No new security findings.
 
-**Do not merge. Do not deploy production. Do not use real funds.**
+**Do not merge. Do not deploy production. Do not use real funds until Codex exact-head review completes.**
