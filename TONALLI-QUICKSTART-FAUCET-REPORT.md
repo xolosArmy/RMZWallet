@@ -30,7 +30,7 @@ Do not treat this report commit as the implementation HEAD. Implementation HEAD 
 | Gate | Tonalli Quick Start — fresh remediation pass on PR #99 / PR #3 |
 | Estado | cerrado en ramas de feature; **sin merge** |
 | Decisión | **NO-GO — remediation/review pending** |
-| Justificación | P0 overwrite/race, P1 intent, P1 `TM_COMM` y P1 Turnstile están corregidos y cubiertos por tests. La suite RMZWallet está verde. El review exact-head de Codex volvió a fallar por cuota (`chatgpt-codex-connector` 2026-09-17T22:55:00Z). El unlock PIN posterior al backup, en perfil limpio, no completó en 120s porque `activateMnemonic()` espera `wallet.initialize()` de Chronik. Ese residual y el review externo pendiente impiden llamar al gate completo. |
+| Justificación | P0 overwrite/race, P1 intent, P1 `TM_COMM`, P1 Turnstile y el unlock PIN post-backup están corregidos. Suite RMZWallet verde. Aceptación perfil limpio (create → Welcome dry-run → reload → receive → backup → unlock, Chronik-down, intent) PASS. El review exact-head de Codex sigue bloqueado por cuota; no se llama al gate completo. |
 
 ---
 
@@ -51,7 +51,7 @@ git log --oneline origin/main..HEAD
 | Rama | `feat/tonalli-quickstart-onboarding` |
 | BASE `origin/main` | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
 | HEAD al inicio de esta revisión (referencia, no asumir) | `9e5aed17448d4cece6759f32ca7a18c436ff2865` |
-| HEAD de implementación (este pass) | `cb2ad8b721bf07163ea9ef9c7a26ce9f895de0f1` |
+| HEAD de implementación (este pass) | `2050b35e80bda11ed85373284717b08425b77b14` |
 | HEAD de reporte | el commit de este archivo; **no** es el HEAD de implementación |
 | Tip autoritativo | `git rev-parse HEAD` |
 | PR | **#99** OPEN, no mergeado |
@@ -74,7 +74,7 @@ Checkout de trabajo: `/home/xolosarmy/ecashschool/RMZWallet-quickstart`. El chec
 
 Checkout de trabajo: `/home/xolosarmy/ecashschool/tonalli-faucet`.
 
-HEADs actuales de los PRs al push de implementación: #99 `cb2ad8b721bf07163ea9ef9c7a26ce9f895de0f1`, #3 `4e32338a6aee3411c1d23d0b3257ca18300af841`.
+HEADs de implementación: #99 `2050b35e80bda11ed85373284717b08425b77b14`, #3 `4e32338a6aee3411c1d23d0b3257ca18300af841`. El tip de la rama RMZWallet incluye commits de reporte posteriores; el HEAD de código de este pass es el SHA de implementación.
 
 ---
 
@@ -83,6 +83,7 @@ HEADs actuales de los PRs al push de implementación: #99 `cb2ad8b721bf07163ea9e
 ### RMZWallet `origin/main..HEAD` (implementación, antes del commit de este reporte)
 
 ```
+2050b35e80bda11ed85373284717b08425b77b14  fix(onboarding): unlock backed-up Quick Start without waiting on Chronik
 cb2ad8b721bf07163ea9ef9c7a26ce9f895de0f1  fix(onboarding): never overwrite an existing Quick Start wallet
 9e5aed17448d4cece6759f32ca7a18c436ff2865  docs(onboarding): point canonical report HEAD at git rev-parse
 7ef524a2e837323316a7d1db120428700b59e6f4  docs(onboarding): include canonical report commits in the SHA log
@@ -174,7 +175,7 @@ NEVER generate a replacement wallet implicitly
 - corrupt/missing device key → fail closed, no automatic recreate (`quickStartStorage.test.ts`)
 - architecture: probe no escribe `KEY_RECORD`; `createQuickStartWallet` comprueba `hasQuickStartMnemonic()` antes de `createNewWallet()`
 
-**evidence.** Vitest 2685 + slpNftTxBuilder 10 PASS. Aceptación perfil limpio: Chronik abortado → misma address `ecash:qrvzsu2ra9fvjkqdya9ukaamue6fkvzeqsjvq3zckr`, botón Crear disabled, no segunda wallet.
+**evidence.** Vitest 2686 + slpNftTxBuilder 10 PASS. Aceptación perfil limpio: Chronik abortado → misma address, botón Crear disabled, no segunda wallet. Unlock PIN post-backup ya no espera `wallet.initialize()`.
 
 **status.** Corregido. No GO: falta review exact-head de Codex.
 
@@ -261,12 +262,12 @@ Node observado: `v24.19.0` (`>=24.18.0 <25`).
 ```bash
 npx tsc -b                         # PASS
 npx tsc -p tsconfig.tm1-regtest-e2e.json  # PASS
-npm test                           # PASS  2685 vitest / 153 files + 10 slpNftTxBuilder
+npm test                           # PASS  2686 vitest / 153 files + 10 slpNftTxBuilder
 npx tsx --test src/services/slpNftTxBuilder.test.ts  # PASS 10 (incluido en npm test)
 npm run lint                       # FAIL preexistente en BASE
 ```
 
-`npm test` HEAD: **2685** tests vitest + **10** slp. BASE histórico de este gate era 2674+10; el incremento son tests nuevos de remediación, no recorte de suite.
+`npm test` HEAD: **2686** tests vitest + **10** slp. BASE histórico de este gate era 2674+10; el incremento son tests nuevos de remediación, no recorte de suite.
 
 ### Lint diferencial
 
@@ -275,7 +276,7 @@ Clasificación: **FAIL preexistente en BASE**. No es FAIL nuevo en HEAD.
 | Checkout | SHA | Resultado |
 |---|---|---|
 | BASE `/tmp/rmzwallet-tm-comm-a0-base` | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` | `✖ 328 problems (328 errors, 0 warnings)` |
-| HEAD worktree | `cb2ad8b721bf07163ea9ef9c7a26ce9f895de0f1` | `✖ 328 problems (328 errors, 0 warnings)` |
+| HEAD worktree | `2050b35e80bda11ed85373284717b08425b77b14` | `✖ 328 problems (328 errors, 0 warnings)` (conteo del pass previo; archivos Quick Start: 0 hits) |
 
 Hits ESLint en archivos Quick Start tocados por este pass: **0**. No se remediò deuda de Tonalli Memo / Agent Wallet / settlement / broadcast / signing / aliasDiscovery / MemoCompose.
 
@@ -307,16 +308,16 @@ Preview Vercel del PR #99 sigue SSO-gated (`302` a `vercel.com/sso-api`). Se us�
 | Paso | Resultado |
 |---|---|
 | open Tonalli → Crear mi Tonalli | PASS |
-| wallet activa | PASS address `ecash:qzjgk6wx7qlt9j0vyyk8gtlts9nwwtlvpqn92qasyc` (corrida 22:58Z) |
-| Welcome XEC dry-run `[ Recibir XEC ]` | PASS `Simulación completada. Referencia lista en tu saldo.` |
+| wallet activa | PASS |
+| Welcome XEC dry-run `[ Recibir XEC ]` | PASS `Simulación completada.` |
 | reload | PASS **misma address** |
 | Recibir | PASS QR + misma address |
-| Protege tu Tonalli → backup | PASS; dashboard pasa a `BACKUP_VERIFIED` (`Enviar` visible, copy “Tu patrimonio digital…”) |
-| reload / unlock PIN | **NO completó en 120s** — `loadFromStorage` → `activateMnemonic()` espera `wallet.initialize()` de Chronik. Residual del path PIN existente, no del hydrator Quick Start. Misma sesión ya mostró wallet respaldada. |
+| Protege tu Tonalli → backup | PASS; dashboard pasa a `BACKUP_VERIFIED` |
+| reload / unlock PIN | PASS misma address `ecash:qrrg57kgq5hr0qzrstwwtqxcpav5gt55ycxukz3uh9` (corrida 2026-09-18T01:06:26Z) |
 
 ### Flujo 2 — Chronik no disponible no crea segunda wallet
 
-PASS. Address `ecash:qrvzsu2ra9fvjkqdya9ukaamue6fkvzeqsjvq3zckr` sobrevivió reload con Chronik abortado. `/onboarding/create` mostró el botón **disabled**. Tras el intento, la address original permaneció. El error de balance se mostró como `Error connecting to known Chronik instances` sin borrar la identidad.
+PASS. Address `ecash:qzl9tml7a2svwnyfzcvqx98u7ppx6dvazgl6d9wu8j` sobrevivió reload con Chronik abortado. `/onboarding/create` mostró el botón **disabled**. Tras el intento, la address original permaneció. El error de balance se mostró como `Error connecting to known Chronik instances` sin borrar la identidad.
 
 ### Flujo 3 — Conversation intent persiste
 
@@ -347,12 +348,12 @@ Respuesta `chatgpt-codex-connector[bot]` 2026-09-17T22:55:00Z / 22:55:01Z:
 ## Residual risks
 
 1. `@codex review` exact-head bloqueado por cuota.
-2. Unlock PIN tras backup + reload depende de Chronik `wallet.initialize()` (`activateMnemonic`). Quick Start recovery ya no; el path PIN sí. Fuera de los P0/P1 listados de este pass.
-3. Preview Vercel SSO-gated; aceptación contra preview de producción no ejecutada.
-4. `npm run lint` global sigue en 328 errores históricos.
-5. Device-local IndexedDB se destruye si el usuario borra datos del sitio antes del backup.
-6. Turnstile no está integrado; Quick Start Welcome exige `TURNSTILE_ENABLED=false`.
-7. Native abort intermitente de `better-sqlite3` en `faucet.test.ts` bajo `node --test`.
+2. Preview Vercel SSO-gated; aceptación contra preview de producción no ejecutada.
+3. `npm run lint` global sigue en 328 errores históricos.
+4. Device-local IndexedDB se destruye si el usuario borra datos del sitio antes del backup.
+5. Turnstile no está integrado; Quick Start Welcome exige `TURNSTILE_ENABLED=false`.
+6. Native abort intermitente de `better-sqlite3` en `faucet.test.ts` bajo `node --test`.
+7. `wallet.initialize()` de Chronik sigue en background tras unlock; no bloquea la identidad local.
 
 ---
 
@@ -365,7 +366,7 @@ P1 intent: corregido.
 P1 `TM_COMM`: bloqueado en todos los lifecycles actuales.
 P1 Turnstile: contrato coherente (`TURNSTILE_ENABLED=false`).
 Tests nuevos + suite RMZWallet: verdes.
-Aceptación perfil limpio: create / welcome dry-run / reload same address / receive / backup / Chronik-down / intent PASS; unlock PIN post-reload no completó.
+Aceptación perfil limpio: create / welcome dry-run / reload same address / receive / backup / unlock / Chronik-down / intent PASS.
 Codex exact-head: pendiente por cuota.
 
 **Do not merge. Do not deploy production. Do not use real funds.**
