@@ -34,13 +34,15 @@ vi.mock('../components/TopBar', () => ({ default: () => <div>Top bar</div> }))
 vi.mock('../context/useWallet', () => ({
   useWallet: () => ({
     initialized: true,
+    backupVerified: true,
     address: 'ecash:qptestaddress',
     alias: 'satoshixec.xec',
     balance: { rmzFormatted: '1', xecFormatted: '2', xec: 2n },
     refreshBalances: vi.fn(),
     rescanWallet: vi.fn(),
     loading: false,
-    error: null
+    error: null,
+    hasCapability: () => true
   })
 }))
 

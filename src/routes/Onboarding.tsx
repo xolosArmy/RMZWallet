@@ -269,13 +269,28 @@ export function CreateWallet() {
 
 export function CreateBackedWallet() {
   const navigate = useNavigate()
-  const { createNewWallet, loading, error } = useWallet()
+  const { createNewWallet, loading, error, initialized, quickStartBootstrap } = useWallet()
   const [passwordNew, setPasswordNew] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
+
+  const bootstrapPending = quickStartBootstrap === 'pending'
+  const recoveryFailed = quickStartBootstrap === 'failed'
+  const existingQuickStart = quickStartBootstrap === 'recovered'
+  const createBlocked = bootstrapPending || recoveryFailed || existingQuickStart || initialized
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault()
     setLocalError(null)
+    if (createBlocked) {
+      setLocalError(
+        recoveryFailed
+          ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se creará otra wallet.'
+          : bootstrapPending
+            ? 'Espera a que Tonalli termine de preparar este dispositivo.'
+            : 'Ya hay una Tonalli en este dispositivo. No se creará otra wallet.'
+      )
+      return
+    }
     const validationError = validateLocalPassword(passwordNew, 'Usa al menos 6 caracteres para el password/PIN local.')
     if (validationError) {
       setLocalError(validationError)
@@ -300,6 +315,17 @@ export function CreateBackedWallet() {
           <h1 id="create-backed-wallet-title" className="section-title">Crear con PIN y respaldo inmediato</h1>
           <p className="muted">La frase de recuperación se genera localmente y nunca sale de tu dispositivo.</p>
           <p className="warning">Tonalli Wallet no custodia ni puede recuperar tu frase de recuperación.</p>
+          {bootstrapPending && <p className="muted">Preparando este dispositivo…</p>}
+          {recoveryFailed && (
+            <div className="error" role="alert">
+              Hay una Tonalli guardada aquí que no se pudo recuperar. No se creará otra wallet.
+            </div>
+          )}
+          {(initialized || existingQuickStart) && !recoveryFailed && (
+            <div className="error" role="alert">
+              Ya hay una Tonalli en este dispositivo. No se creará otra wallet.
+            </div>
+          )}
           <label htmlFor="new-password">Password/PIN local</label>
           <input
             id="new-password"
@@ -310,8 +336,13 @@ export function CreateBackedWallet() {
             onChange={(e) => setPasswordNew(e.target.value)}
           />
           <div className="actions">
-            <button className="cta primary" type="submit" disabled={loading}>
-              Generar wallet
+            <button
+              className="cta primary"
+              type="submit"
+              disabled={loading || createBlocked}
+              data-testid="create-backed-tonalli"
+            >
+              {loading ? 'Creando...' : bootstrapPending ? 'Preparando...' : 'Generar wallet'}
             </button>
           </div>
           <RouteError message={localError || error} />
