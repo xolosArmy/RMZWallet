@@ -13,6 +13,7 @@
 export const TM_COMM_AUTH_PROTOCOL = 'TM-COMM-AUTH-V1' as const
 export const TM_COMM_AUTH_PURPOSE = 'tm-comm-private-messaging-session' as const
 export const TM_COMM_AUTH_CHAIN = 'ecash' as const
+export const TM_COMM_EXPECTED_SESSION_CONTEXT = 'tm-comm-a0-staging:v1' as const
 
 export type TmCommAuthChallengeInput = Readonly<{
   challengeId: string
@@ -106,6 +107,7 @@ export type TmCommAuthChallengePayload = Readonly<{
 
 export type TmCommAuthChallengeValidationOptions = Readonly<{
   expectedOrigin: string
+  expectedSessionContext?: string
   now?: number
 }>
 
@@ -117,6 +119,15 @@ export function verifyAndReconstructAuthChallenge(
     throw new Error('Challenge payload must be a non-null object.')
   }
   const raw = payload as Record<string, unknown>
+
+  const expectedSessionContext =
+    options.expectedSessionContext ?? TM_COMM_EXPECTED_SESSION_CONTEXT
+  if (
+    typeof expectedSessionContext !== 'string' ||
+    !REQUIRED_CHALLENGE_LINE.test(expectedSessionContext)
+  ) {
+    throw new Error('expectedSessionContext must be a valid non-empty canonical token.')
+  }
 
   if (raw.protocol !== TM_COMM_AUTH_PROTOCOL) {
     throw new Error(`Invalid protocol: expected ${TM_COMM_AUTH_PROTOCOL}, got ${String(raw.protocol)}.`)
@@ -135,6 +146,11 @@ export function verifyAndReconstructAuthChallenge(
   }
   if (typeof raw.sessionContext !== 'string' || !REQUIRED_CHALLENGE_LINE.test(raw.sessionContext)) {
     throw new Error('sessionContext must be a valid non-empty canonical token.')
+  }
+  if (raw.sessionContext !== expectedSessionContext) {
+    throw new Error(
+      `sessionContext mismatch: expected ${expectedSessionContext}, got ${String(raw.sessionContext)}.`
+    )
   }
   if (typeof raw.audience !== 'string' || raw.audience !== options.expectedOrigin) {
     throw new Error(`audience mismatch: expected ${options.expectedOrigin}, got ${String(raw.audience)}.`)

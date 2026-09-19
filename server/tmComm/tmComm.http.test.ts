@@ -729,4 +729,343 @@ describe('TM-COMM A0 HTTP API', () => {
     const msgs4 = checkAfterReadAgain.json.messages as Array<{ id: string; status: string }>
     expect(msgs4[0].status).toBe('read')
   })
+
+  test('P2-6: replyToId included in idempotency identity with replay vs conflict semantics', async () => {
+    const started = await startStaging()
+    const senderWallet = createTmCommEphemeralWallet()
+    const senderSession = await authenticate(started, senderWallet)
+
+    // Bind primary conversation
+    const bind1 = await request(started, '/v1/tm-comm/bindings', {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({ enrollmentToken: started.enrollments[0].enrollmentToken })
+    })
+    expect(bind1.status).toBe(201)
+    const conv1Id = (bind1.json.conversation as { id: string }).id
+
+    // Bind secondary conversation with second enrollment token
+    const otherWallet = createTmCommEphemeralWallet()
+    const otherSession = await authenticate(started, otherWallet)
+    const bind2 = await request(started, '/v1/tm-comm/bindings', {
+      method: 'POST',
+      token: otherSession.token,
+      body: JSON.stringify({ enrollmentToken: started.enrollments[1].enrollmentToken })
+    })
+    expect(bind2.status).toBe(201)
+    const conv2Id = (bind2.json.conversation as { id: string }).id
+
+    // Post message in conv2 to use as cross-conversation reply target
+    const msgConv2Res = await request(started, `/v1/tm-comm/conversations/${conv2Id}/messages`, {
+      method: 'POST',
+      token: otherSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'msg-conv2-initial',
+        body: 'Message in conv 2'
+      })
+    })
+    expect(msgConv2Res.status).toBe(201)
+    const msgInOtherConvId = (msgConv2Res.json as { id: string }).id
+
+    // Create root messages in conv1
+    const root1Res = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'root-msg-001',
+        body: 'Root message 1'
+      })
+    })
+    expect(root1Res.status).toBe(201)
+    const root1Id = (root1Res.json as { id: string }).id
+
+    const root2Res = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'root-msg-002',
+        body: 'Root message 2'
+      })
+    })
+    expect(root2Res.status).toBe(201)
+    const root2Id = (root2Res.json as { id: string }).id
+
+    // 1. Same clientMessageId, same body, same replyToId -> idempotent replay
+    const reply1 = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'reply-replay-msg',
+        body: 'Replying to root 1',
+        replyToId: root1Id
+      })
+    })
+    expect(reply1.status).toBe(201)
+    const reply1Id = (reply1.json as { id: string; replyToId: string }).id
+    expect((reply1.json as { replyToId: string }).replyToId).toBe(root1Id)
+
+    const reply1Replay = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'reply-replay-msg',
+        body: 'Replying to root 1',
+        replyToId: root1Id
+      })
+    })
+    expect(reply1Replay.status).toBe(201)
+    expect((reply1Replay.json as { id: string }).id).toBe(reply1Id)
+
+    // 2. Same clientMessageId, same body, null vs null normalized -> replay
+    const nullMsg = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'null-replay-msg',
+        body: 'Explicit null reply target',
+        replyToId: null
+      })
+    })
+    expect(nullMsg.status).toBe(201)
+    const nullMsgId = (nullMsg.json as { id: string; replyToId: string | null }).id
+    expect((nullMsg.json as { replyToId: string | null }).replyToId).toBeNull()
+
+    // Omitted replyToId replay
+    const nullReplayOmitted = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'null-replay-msg',
+        body: 'Explicit null reply target'
+      })
+    })
+    expect(nullReplayOmitted.status).toBe(201)
+    expect((nullReplayOmitted.json as { id: string }).id).toBe(nullMsgId)
+
+    // Explicit null replay again
+    const nullReplayExplicit = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'null-replay-msg',
+        body: 'Explicit null reply target',
+        replyToId: null
+      })
+    })
+    expect(nullReplayExplicit.status).toBe(201)
+    expect((nullReplayExplicit.json as { id: string }).id).toBe(nullMsgId)
+
+    // 3. Same ID, same body, replyToId A vs replyToId B -> IDEMPOTENCY_CONFLICT (409)
+    const switchTarget = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'switch-target-msg',
+        body: 'Switching reply targets',
+        replyToId: root1Id
+      })
+    })
+    expect(switchTarget.status).toBe(201)
+    const switchTargetId = (switchTarget.json as { id: string }).id
+
+    const switchConflict = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'switch-target-msg',
+        body: 'Switching reply targets',
+        replyToId: root2Id
+      })
+    })
+    expect(switchConflict.status).toBe(409)
+    expect(switchConflict.json).toMatchObject({
+      error: {
+        code: 'CONFLICT',
+        reasonCode: 'IDEMPOTENCY_CONFLICT'
+      }
+    })
+
+    // 4. Same ID, same body, before without reply and after with reply -> conflict (409)
+    const noneThenReply = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'none-then-reply-msg',
+        body: 'Before no reply, after with reply'
+      })
+    })
+    expect(noneThenReply.status).toBe(201)
+
+    const noneThenReplyConflict = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'none-then-reply-msg',
+        body: 'Before no reply, after with reply',
+        replyToId: root1Id
+      })
+    })
+    expect(noneThenReplyConflict.status).toBe(409)
+    expect(noneThenReplyConflict.json).toMatchObject({
+      error: {
+        code: 'CONFLICT',
+        reasonCode: 'IDEMPOTENCY_CONFLICT'
+      }
+    })
+
+    // 5. Same ID, same body, before with reply and after without reply -> conflict (409)
+    const replyThenNone = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'reply-then-none-msg',
+        body: 'Before with reply, after without reply',
+        replyToId: root1Id
+      })
+    })
+    expect(replyThenNone.status).toBe(201)
+
+    const replyThenNoneConflict = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'reply-then-none-msg',
+        body: 'Before with reply, after without reply',
+        replyToId: null
+      })
+    })
+    expect(replyThenNoneConflict.status).toBe(409)
+    expect(replyThenNoneConflict.json).toMatchObject({
+      error: {
+        code: 'CONFLICT',
+        reasonCode: 'IDEMPOTENCY_CONFLICT'
+      }
+    })
+
+    // 6. Same ID, same body, second reply target non-existent -> conflict (409), not silent success
+    const nonExistentConflict = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'none-then-reply-msg',
+        body: 'Before no reply, after with reply',
+        replyToId: 'msg-does-not-exist-99999'
+      })
+    })
+    expect(nonExistentConflict.status).toBe(409)
+    expect(nonExistentConflict.json).toMatchObject({
+      error: {
+        code: 'CONFLICT',
+        reasonCode: 'IDEMPOTENCY_CONFLICT'
+      }
+    })
+
+    // 7. Same ID, same body, second reply target from another conversation -> conflict (409), not silent success
+    const otherConvConflict = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'none-then-reply-msg',
+        body: 'Before no reply, after with reply',
+        replyToId: msgInOtherConvId
+      })
+    })
+    expect(otherConvConflict.status).toBe(409)
+    expect(otherConvConflict.json).toMatchObject({
+      error: {
+        code: 'CONFLICT',
+        reasonCode: 'IDEMPOTENCY_CONFLICT'
+      }
+    })
+
+    // 8. Same ID with different body produces conflict (409)
+    const bodyConflict = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'switch-target-msg',
+        body: 'Completely different body text',
+        replyToId: root1Id
+      })
+    })
+    expect(bodyConflict.status).toBe(409)
+    expect(bodyConflict.json).toMatchObject({
+      error: {
+        code: 'CONFLICT',
+        reasonCode: 'IDEMPOTENCY_CONFLICT'
+      }
+    })
+
+    // 9. Original persisted messages remain completely immutable after conflicts
+    const conv1Msgs = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      token: senderSession.token
+    })
+    const list = conv1Msgs.json.messages as Array<{
+      id: string
+      clientMessageId: string
+      body: string
+      replyToId: string | null
+    }>
+    const originalSwitch = list.find((m) => m.clientMessageId === 'switch-target-msg')
+    expect(originalSwitch).toBeDefined()
+    expect(originalSwitch?.id).toBe(switchTargetId)
+    expect(originalSwitch?.body).toBe('Switching reply targets')
+    expect(originalSwitch?.replyToId).toBe(root1Id)
+
+    const originalNoneThenReply = list.find((m) => m.clientMessageId === 'none-then-reply-msg')
+    expect(originalNoneThenReply?.replyToId).toBeNull()
+
+    const originalReplyThenNone = list.find((m) => m.clientMessageId === 'reply-then-none-msg')
+    expect(originalReplyThenNone?.replyToId).toBe(root1Id)
+
+    // 10. Concurrent equivalent requests remain idempotent
+    const concurrentPayload = {
+      clientMessageId: 'concurrent-race-msg',
+      body: 'Concurrent idempotent test',
+      replyToId: root1Id
+    }
+    const concurrentResults = await Promise.all([
+      request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+        method: 'POST',
+        token: senderSession.token,
+        body: JSON.stringify(concurrentPayload)
+      }),
+      request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+        method: 'POST',
+        token: senderSession.token,
+        body: JSON.stringify(concurrentPayload)
+      }),
+      request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+        method: 'POST',
+        token: senderSession.token,
+        body: JSON.stringify(concurrentPayload)
+      })
+    ])
+
+    for (const res of concurrentResults) {
+      expect(res.status).toBe(201)
+    }
+    const firstConcurrentId = (concurrentResults[0].json as { id: string }).id
+    for (const res of concurrentResults) {
+      expect((res.json as { id: string }).id).toBe(firstConcurrentId)
+    }
+
+    // 11. Empty string "" is rejected and not silently accepted as null
+    const emptyStringReply = await request(started, `/v1/tm-comm/conversations/${conv1Id}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'empty-reply-msg',
+        body: 'Empty string reply target',
+        replyToId: ''
+      })
+    })
+    expect(emptyStringReply.status).toBe(400)
+    expect(emptyStringReply.json).toMatchObject({
+      error: {
+        code: 'INVALID_INPUT',
+        reasonCode: 'REPLY_TARGET_INVALID'
+      }
+    })
+  })
 })

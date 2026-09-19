@@ -36,6 +36,17 @@ export type TmCommAuthenticatedPrincipal = TmCommPrincipal
 
 const CLIENT_MESSAGE_ID = /^[A-Za-z0-9._:-]{8,128}$/
 
+function normalizeReplyToId(value: unknown): string | null {
+  if (value === undefined || value === null) {
+    return null
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed.length === 0 ? '' : trimmed
+  }
+  return null
+}
+
 export class TmCommService {
   private readonly store: TmCommStore
   private readonly config: TmCommRuntimeConfig
@@ -445,49 +456,62 @@ export class TmCommService {
       throw tmCommInvalidInput('MESSAGE_BODY_INVALID', 'Message body is empty or too long.')
     }
 
-    const existing = this.store.findMessageByClientId(conversationId, input.clientMessageId)
-    if (existing !== null) {
-      if (existing.senderPrincipalId !== principal.id || existing.body !== body) {
-        throw new TmCommError(
-          TM_COMM_ERROR_CODES.CONFLICT,
-          409,
-          'clientMessageId already exists with different content.',
-          'IDEMPOTENCY_CONFLICT'
-        )
-      }
-      return existing
-    }
+    const normalizedIncomingReplyToId = normalizeReplyToId(input.replyToId)
 
-    if (input.replyToId) {
-      const replyTo = this.store.findMessageById(input.replyToId)
-      if (replyTo === null || replyTo.conversationId !== conversationId) {
-        throw tmCommInvalidInput('REPLY_TARGET_INVALID', 'replyToId is not in this conversation.')
+    return this.store.withTransaction(() => {
+      const existing = this.store.findMessageByClientId(conversationId, input.clientMessageId)
+      if (existing !== null) {
+        if (
+          existing.senderPrincipalId !== principal.id ||
+          existing.body !== body ||
+          existing.replyToId !== normalizedIncomingReplyToId
+        ) {
+          throw new TmCommError(
+            TM_COMM_ERROR_CODES.CONFLICT,
+            409,
+            'clientMessageId already exists with different content.',
+            'IDEMPOTENCY_CONFLICT'
+          )
+        }
+        return existing
       }
-    }
 
-    const now = this.now()
-    const message: TmCommMessage = {
-      id: createTmCommId('message'),
-      clientMessageId: input.clientMessageId,
-      conversationId,
-      senderPrincipalId: principal.id,
-      senderKind: principal.kind,
-      body,
-      serverCreatedAt: now,
-      replyToId: input.replyToId ?? null,
-      status: 'accepted'
-    }
-    this.store.insertMessage(message)
-    this.audit({
-      at: now,
-      actorPrincipalId: principal.id,
-      action: 'message.send',
-      resourceType: 'message',
-      resourceId: message.id,
-      outcome: 'allow',
-      reasonCode: 'MESSAGE_ACCEPTED'
+      let validatedReplyToId: string | null = null
+      if (normalizedIncomingReplyToId !== null) {
+        if (normalizedIncomingReplyToId.length === 0) {
+          throw tmCommInvalidInput('REPLY_TARGET_INVALID', 'replyToId cannot be an empty string.')
+        }
+        const replyTo = this.store.findMessageById(normalizedIncomingReplyToId)
+        if (replyTo === null || replyTo.conversationId !== conversationId) {
+          throw tmCommInvalidInput('REPLY_TARGET_INVALID', 'replyToId is not in this conversation.')
+        }
+        validatedReplyToId = normalizedIncomingReplyToId
+      }
+
+      const now = this.now()
+      const message: TmCommMessage = {
+        id: createTmCommId('message'),
+        clientMessageId: input.clientMessageId,
+        conversationId,
+        senderPrincipalId: principal.id,
+        senderKind: principal.kind,
+        body,
+        serverCreatedAt: now,
+        replyToId: validatedReplyToId,
+        status: 'accepted'
+      }
+      this.store.insertMessage(message)
+      this.audit({
+        at: now,
+        actorPrincipalId: principal.id,
+        action: 'message.send',
+        resourceType: 'message',
+        resourceId: message.id,
+        outcome: 'allow',
+        reasonCode: 'MESSAGE_ACCEPTED'
+      })
+      return this.store.findMessageById(message.id) ?? message
     })
-    return this.store.findMessageById(message.id) ?? message
   }
 
   listReceipts(principal: TmCommPrincipal, messageId: string): TmCommMessageReceipt[] {

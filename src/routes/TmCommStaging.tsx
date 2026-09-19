@@ -3,6 +3,7 @@ import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import {
   verifyAndReconstructAuthChallenge,
+  TM_COMM_EXPECTED_SESSION_CONTEXT,
   type TmCommAuthChallengePayload
 } from '../features/privateMessaging/authChallenge'
 import { xolosWalletService } from '../services/XolosWalletService'
@@ -162,7 +163,8 @@ function TmCommStaging() {
       let verified: { canonicalMessage: string; challengeId: string }
       try {
         verified = verifyAndReconstructAuthChallenge(challenge.data, {
-          expectedOrigin: clientOrigin
+          expectedOrigin: clientOrigin,
+          expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT
         })
       } catch (validationError) {
         append(

@@ -1,7 +1,8 @@
 import { isAbsolute, resolve } from 'node:path'
+import { TM_COMM_EXPECTED_SESSION_CONTEXT } from '../../src/features/privateMessaging/authChallenge'
 
 export const TM_COMM_COOKIE_NAME = 'tm_comm_a0_session'
-export const TM_COMM_SESSION_CONTEXT = 'tm-comm-a0-staging:v1'
+export const TM_COMM_SESSION_CONTEXT = TM_COMM_EXPECTED_SESSION_CONTEXT
 export const TM_COMM_DEFAULT_HOST = '127.0.0.1'
 export const TM_COMM_DEFAULT_PORT = 4178
 export const TM_COMM_DEFAULT_ORIGIN = 'http://127.0.0.1:5174'

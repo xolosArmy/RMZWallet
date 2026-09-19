@@ -141,7 +141,17 @@ describe('P2-1: Local challenge validation before signing in staging UI', () => 
     ['altered origin', () => ({ ...makeValidChallenge(), origin: 'http://evil.com' })],
     ['altered nonce', () => ({ ...makeValidChallenge(), nonce: 'bad nonce with spaces' })],
     ['expired timestamp', () => ({ ...makeValidChallenge(), expiresAt: Date.now() - 1000 })],
-    ['manipulated canonicalMessage', () => ({ ...makeValidChallenge(), canonicalMessage: 'tampered text' })]
+    ['manipulated canonicalMessage', () => ({ ...makeValidChallenge(), canonicalMessage: 'tampered text' })],
+    ['different valid sessionContext', () => ({ ...makeValidChallenge(), sessionContext: 'tm-comm-production:v1' })],
+    ['same prefix with different version', () => ({ ...makeValidChallenge(), sessionContext: 'tm-comm-a0-staging:v2' })],
+    ['empty sessionContext', () => ({ ...makeValidChallenge(), sessionContext: '' })],
+    ['omitted sessionContext', () => {
+      const copy = { ...makeValidChallenge() } as Record<string, unknown>
+      delete copy.sessionContext
+      return copy
+    }],
+    ['whitespace added to sessionContext', () => ({ ...makeValidChallenge(), sessionContext: ' tm-comm-a0-staging:v1' })],
+    ['canonicalMessage consistent with wrong context', () => createTmCommAuthChallengeView({ ...makeValidChallenge(), sessionContext: 'tm-comm-a0-staging:v2' })]
   ])('rejects %s without invoking signMessage', async (_description, createBadChallenge) => {
     const badChallenge = createBadChallenge()
     mockTmCommRequest.mockImplementation((path: string) => {

@@ -42,6 +42,7 @@ export {
   TM_COMM_AUTH_PROTOCOL,
   TM_COMM_AUTH_PURPOSE,
   TM_COMM_AUTH_CHAIN,
+  TM_COMM_EXPECTED_SESSION_CONTEXT,
   buildTmCommAuthChallengeMessage,
   createTmCommAuthChallengeView,
   verifyAndReconstructAuthChallenge,

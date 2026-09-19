@@ -150,7 +150,7 @@ async function handleRequest(
         const message = service.sendMessage(principal, conversationId, {
           clientMessageId: readString(body, 'clientMessageId'),
           body: readString(body, 'body'),
-          replyToId: optionalString(body, 'replyToId'),
+          replyToId: optionalNullableString(body, 'replyToId'),
           claimedSenderPrincipalId: optionalString(body, 'senderPrincipalId'),
           claimedConversationId: optionalString(body, 'conversationId'),
           claimedReservationId: optionalString(body, 'reservationId'),
@@ -365,3 +365,22 @@ function optionalString(body: Record<string, unknown>, key: string): string | un
   }
   return value
 }
+
+function optionalNullableString(
+  body: Record<string, unknown>,
+  key: string
+): string | null | undefined {
+  const value = body[key]
+  if (value === undefined) return undefined
+  if (value === null) return null
+  if (typeof value !== 'string') {
+    throw new TmCommError(
+      TM_COMM_ERROR_CODES.INVALID_INPUT,
+      400,
+      `${key} must be a string or null.`,
+      'FIELD_INVALID'
+    )
+  }
+  return value
+}
+

@@ -14,6 +14,7 @@ import {
   TM_COMM_MEMO_PUBLICATION_PIPELINE,
   TM_COMM_MESSAGE_STATUSES,
   TM_COMM_PROTOCOL_ID,
+  TM_COMM_EXPECTED_SESSION_CONTEXT,
   agentAuthenticationGrantsWalletCapability,
   assertPrivateConversationNotAutoPublished,
   buildTmCommAuthChallengeMessage,
@@ -214,6 +215,123 @@ describe('TM-COMM closed domain', () => {
           expectedOrigin: 'http://127.0.0.1:5174'
         })
       ).toThrow(/Challenge payload must be a non-null object/)
+    })
+
+    describe('P2-5 sessionContext pinning', () => {
+      test('permits exact expected session context (tm-comm-a0-staging:v1)', () => {
+        const result = verifyAndReconstructAuthChallenge(validView, {
+          expectedOrigin: 'http://127.0.0.1:5174',
+          expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT,
+          now: 1_900_000_000_000
+        })
+        expect(result.canonicalMessage).toBe(validView.canonicalMessage)
+      })
+
+      test('rejects another syntactically valid TM-COMM context', () => {
+        expect(() =>
+          verifyAndReconstructAuthChallenge(
+            { ...validView, sessionContext: 'tm-comm-production:v1' },
+            {
+              expectedOrigin: 'http://127.0.0.1:5174',
+              expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT,
+              now: 1_900_000_000_000
+            }
+          )
+        ).toThrow(/sessionContext mismatch: expected tm-comm-a0-staging:v1, got tm-comm-production:v1/)
+      })
+
+      test('rejects same prefix with different version', () => {
+        expect(() =>
+          verifyAndReconstructAuthChallenge(
+            { ...validView, sessionContext: 'tm-comm-a0-staging:v2' },
+            {
+              expectedOrigin: 'http://127.0.0.1:5174',
+              expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT,
+              now: 1_900_000_000_000
+            }
+          )
+        ).toThrow(/sessionContext mismatch: expected tm-comm-a0-staging:v1, got tm-comm-a0-staging:v2/)
+      })
+
+      test('rejects empty sessionContext', () => {
+        expect(() =>
+          verifyAndReconstructAuthChallenge(
+            { ...validView, sessionContext: '' },
+            {
+              expectedOrigin: 'http://127.0.0.1:5174',
+              expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT,
+              now: 1_900_000_000_000
+            }
+          )
+        ).toThrow(/sessionContext must be a valid non-empty canonical token/)
+      })
+
+      test('rejects omitted sessionContext', () => {
+        const withoutContext = { ...validView } as Record<string, unknown>
+        delete withoutContext.sessionContext
+        expect(() =>
+          verifyAndReconstructAuthChallenge(
+            withoutContext,
+            {
+              expectedOrigin: 'http://127.0.0.1:5174',
+              expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT,
+              now: 1_900_000_000_000
+            }
+          )
+        ).toThrow(/sessionContext must be a valid non-empty canonical token/)
+      })
+
+      test('rejects leading or trailing whitespace added to sessionContext', () => {
+        expect(() =>
+          verifyAndReconstructAuthChallenge(
+            { ...validView, sessionContext: ' tm-comm-a0-staging:v1' },
+            {
+              expectedOrigin: 'http://127.0.0.1:5174',
+              expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT,
+              now: 1_900_000_000_000
+            }
+          )
+        ).toThrow(/sessionContext must be a valid non-empty canonical token/)
+
+        expect(() =>
+          verifyAndReconstructAuthChallenge(
+            { ...validView, sessionContext: 'tm-comm-a0-staging:v1 ' },
+            {
+              expectedOrigin: 'http://127.0.0.1:5174',
+              expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT,
+              now: 1_900_000_000_000
+            }
+          )
+        ).toThrow(/sessionContext must be a valid non-empty canonical token/)
+      })
+
+      test('rejects canonicalMessage that is perfectly consistent with incorrect context', () => {
+        const wrongContextView = createTmCommAuthChallengeView({
+          challengeId: 'chlg_test_123',
+          nonce: 'nonce_secret_abc',
+          expiresAt: 2_000_000_000_000,
+          audience: 'http://127.0.0.1:5174',
+          origin: 'http://127.0.0.1:5174',
+          sessionContext: 'tm-comm-a0-staging:v2'
+        })
+
+        expect(() =>
+          verifyAndReconstructAuthChallenge(wrongContextView, {
+            expectedOrigin: 'http://127.0.0.1:5174',
+            expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT,
+            now: 1_900_000_000_000
+          })
+        ).toThrow(/sessionContext mismatch/)
+      })
+
+      test('rejects empty or invalid expectedSessionContext in options', () => {
+        expect(() =>
+          verifyAndReconstructAuthChallenge(validView, {
+            expectedOrigin: 'http://127.0.0.1:5174',
+            expectedSessionContext: '   '
+          })
+        ).toThrow(/expectedSessionContext must be a valid non-empty canonical token/)
+      })
     })
   })
 })
