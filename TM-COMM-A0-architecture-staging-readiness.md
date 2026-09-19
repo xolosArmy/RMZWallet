@@ -13,18 +13,63 @@ Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No m
 | **BASE SHA** | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
 | BASE worktree | `/tmp/rmzwallet-tm-comm-a0-base` |
 | Mensaje BASE | `[Gate C3A] RMZWallet Settlement Engine: Durable Ownership, Local TXID Derivation, and Broadcast Boundary (#96)` |
-| **OLD REVIEWED HEAD** | `0aef01d195bc4bbe15d564ab6187e65356365d17` |
-| **REMEDIATION CODE SHA** | `09e3d946e346cb58a3ef2e176cc8e12e7327e035` |
-| **NEW FINAL HEAD** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 remediation pass closure) |
+| **PASS 1 REVIEWED HEAD** | `0aef01d195bc4bbe15d564ab6187e65356365d17` |
+| **PASS 1 REMEDIATION SHA** | `09e3d946e346cb58a3ef2e176cc8e12e7327e035` |
+| **PASS 2 REVIEWED HEAD** | `a63aeacc6a407517805c4c2c31a351511281600c` |
+| **PASS 2 REMEDIATION SHA** | `ee5d2ad07e48e0b94c76eebf9d568e6dbe1cf7dd` |
+| **NEW FINAL HEAD** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 remediation pass 2 closure) |
 | Staging API | http://127.0.0.1:4178/v1/tm-comm/health |
 | Staging UI | http://127.0.0.1:5174/tm-comm-staging |
+| Estado | **READY FOR FRESH CODEX REVIEW** |
 | Merge | **No** |
+
+> [!NOTE]
+> **Aclaración de Genealogía y Corrección de SHA**: Se documenta explícitamente que la referencia previa `a63aeacef335ca7f42dcae2e83b8b64e6224168e` correspondió a una referencia errónea en notas. El commit HEAD remoto canónico de PR #98 efectivamente revisado por Codex para el Pass 2 fue `a63aeacc6a407517805c4c2c31a351511281600c`.
 
 ---
 
-## Fresh Codex Review Remediation Pass (P2 Findings)
+## Remediation Pass 2 (Codex Findings P2-5 & P2-6)
 
-El fresh Codex review ejecutado sobre el exact HEAD `0aef01d195bc4bbe15d564ab6187e65356365d17` identificó 4 findings P2. Los cuatro han sido formalmente remediados en `09e3d946e346cb58a3ef2e176cc8e12e7327e035` conservando todas las invariantes de arquitectura de TM-COMM A0 y sin introducir regresiones ni modificar código histórico de RMZWallet:
+El fresh Codex review ejecutado sobre el exact HEAD `a63aeacc6a407517805c4c2c31a351511281600c` identificó 2 findings P2 adicionales. Ambos han sido formalmente remediados en `ee5d2ad07e48e0b94c76eebf9d568e6dbe1cf7dd` conservando todas las remediaciones P2 previas y las invariantes de arquitectura de TM-COMM A0:
+
+### P2-5: Pin the expected session context before signing (`PRRC_kwDOQYWUus7xmxqu` / Thread `PRRT_kwDOQYWUus6kAPHV`)
+- **Causa raíz**: En la validación del challenge de autenticación (`verifyAndReconstructAuthChallenge`), se verificaba la presencia sintáctica de `sessionContext` y su coincidencia con `canonicalMessage`, pero el valor provenía exclusivamente del payload untrusted enviado por el servidor. Esto permitía que un servidor malicioso o desalineado indujera a la wallet a firmar para un contexto de sesión arbitrario que la wallet no esperaba.
+- **Remediación**:
+  - Se definió y exportó la constante canónica `TM_COMM_EXPECTED_SESSION_CONTEXT = 'tm-comm-a0-staging:v1'` en `src/features/privateMessaging/authChallenge.ts` y re-exportó en `src/features/privateMessaging/index.ts`.
+  - Se reutilizó dicha constante en `server/tmComm/tmCommConfig.ts` (`TM_COMM_SESSION_CONTEXT = TM_COMM_EXPECTED_SESSION_CONTEXT`) para garantizar consistencia entre cliente y servidor sin duplicación frágil de strings.
+  - Se extendió `TmCommAuthChallengeValidationOptions` con `expectedSessionContext?: string` (por defecto `TM_COMM_EXPECTED_SESSION_CONTEXT`).
+  - En `verifyAndReconstructAuthChallenge`, se exige de forma fail-closed que `payload.sessionContext === expectedSessionContext`. Ante cualquier discrepancia, cadena vacía, versión distinta o whitespace, se arroja un error inmediato.
+  - En la UI de staging (`src/routes/TmCommStaging.tsx`), se pasa explícitamente `expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT`. Ante cualquier error de validación, se aborta y jamás se invoca `xolosWalletService.signMessage`.
+- **Archivos modificados**:
+  - `src/features/privateMessaging/authChallenge.ts`
+  - `src/features/privateMessaging/index.ts`
+  - `server/tmComm/tmCommConfig.ts`
+  - `src/routes/TmCommStaging.tsx`
+- **Tests agregados/actualizados**:
+  - `src/features/privateMessaging/privateMessaging.domain.test.ts` (8 nuevos tests unitarios en la suite `P2-5 sessionContext pinning` verificando: exact match permitido; contexto foráneo rechazado; prefijo con versión distinta rechazado; contexto vacío rechazado; contexto omitido rechazado; whitespace rechazado; canonicalMessage consistente con contexto alterado rechazado; opciones con expectedSessionContext inválido rechazadas).
+  - `src/routes/TmCommStaging.test.tsx` (6 nuevos casos en la suite paramétrica de challenge inválido confirmando que un challenge con context erróneo, version mismatch, context vacío, context omitido o whitespace resulta en fail-closed con 0 llamadas a `signMessage`).
+
+### P2-6: Include replyToId in idempotency identity with replay vs conflict semantics (`PRRC_kwDOQYWUus7xmxqx` / Thread `PRRT_kwDOQYWUus6kAPHX`)
+- **Causa raíz**: El endpoint `sendMessage` en `server/tmComm/tmCommService.ts` evaluaba la idempotencia de mensajes comparando únicamente `existing.senderPrincipalId !== principal.id` y `existing.body !== body`. El campo semántico `replyToId` quedaba fuera de la tupla de identidad. Por ende, un reintento con el mismo `clientMessageId` pero con un `replyToId` distinto (o mutando de null a reply o viceversa) devolvía el mensaje original silenciosamente en lugar de señalar un conflicto, o aceptaba un replay inconsistente.
+- **Remediación**:
+  - Se integró `replyToId` a la identidad idempotente: `(conversationId, senderPrincipalId, clientMessageId, body, normalizedReplyToId)`.
+  - Normalización formal: se implementó `normalizeReplyToId` en `server/tmComm/tmCommService.ts`. Define explícitamente que `undefined` y `null` se normalizan a `null`. Strings no vacíos se normalizan tras `trim()`. Strings vacíos `""` se preservan como `""` para ser rechazados explícitamente como target inválido y no ser admitidos silenciosamente como null.
+  - En `server/tmComm/tmCommHttp.ts`, se implementó `optionalNullableString` para preservar valores `undefined` y `null` válidos, arrojando 400 `FIELD_INVALID` ante tipos no-string.
+  - Orden estricto de validación: si existe un registro previo con el mismo `clientMessageId`, se verifica primero la coincidencia de identidad (`sender`, `body`, y `existing.replyToId === normalizedIncomingReplyToId`). Si alguno difiere, se arroja de inmediato HTTP 409 `IDEMPOTENCY_CONFLICT` (`CONFLICT`), antes de evaluar si el nuevo `replyToId` existe o pertenece a otra conversación.
+  - Si el replay es verdaderamente idéntico (mismo body y mismo replyToId), devuelve el mensaje existente con HTTP 201/200 de forma idempotente.
+  - Si el mensaje es nuevo (`existing === null`), se ejecuta la validación normal de `replyToId`: rechazo 400 `REPLY_TARGET_INVALID` ante target inexistente, target de otra conversación o string vacío.
+  - Concurrencia y atomicidad: se envolvió la deduplicación y creación del mensaje dentro de `this.store.withTransaction()` (`BEGIN IMMEDIATE` en SQLite), garantizando serialización atómica ante peticiones concurrentes y previniendo colisiones de unicidad no controladas.
+- **Archivos modificados**:
+  - `server/tmComm/tmCommHttp.ts`
+  - `server/tmComm/tmCommService.ts`
+- **Tests agregados/actualizados**:
+  - `server/tmComm/tmComm.http.test.ts` (Suite completa `P2-6: replyToId included in idempotency identity with replay vs conflict semantics` cubriendo los 11 escenarios requeridos: 1. replay idéntico con replyToId -> 201; 2. null vs null / omitido replay -> 201; 3. replyToId A vs replyToId B -> 409 IDEMPOTENCY_CONFLICT; 4. antes sin reply y después con reply -> 409 conflict; 5. antes con reply y después sin reply -> 409 conflict; 6. target inexistente en reintento conflictivo -> 409 conflict en vez de éxito silencioso; 7. target de otra conversación en reintento conflictivo -> 409 conflict en vez de éxito silencioso; 8. body modificado -> 409 conflict; 9. inmutabilidad total de los registros originales en SQLite tras conflictos; 10. concurrencia serializada e idempotente bajo `Promise.all`; 11. string vacío `""` rechazado con 400 `REPLY_TARGET_INVALID`).
+
+---
+
+## Remediation Pass 1 (Codex Findings P2-1 to P2-4)
+
+El fresh Codex review ejecutado sobre el exact HEAD `0aef01d195bc4bbe15d564ab6187e65356365d17` identificó 4 findings P2. Los cuatro fueron formalmente remediados en `09e3d946e346cb58a3ef2e176cc8e12e7327e035` conservando todas las invariantes de arquitectura de TM-COMM A0 y sin introducir regresiones ni modificar código histórico de RMZWallet:
 
 ### P2-1: Local challenge validation before signing (`PRRC_kwDOQYWUus7xmPd7`)
 - **Causa raíz**: La UI de staging (`TmCommStaging.tsx`) tomaba el `canonicalMessage` provisto por el servidor y lo enviaba directamente a `xolosWalletService.signMessage` sin validar localmente los parámetros estructurados del challenge.
@@ -163,18 +208,18 @@ Mismo archivo de test: mensaje aceptado sobrevive close/reopen de SQLite + HTTP;
 
 ---
 
-## Resultados de tests post-remediación (HEAD `09e3d94`)
+## Resultados de tests post-remediación (HEAD actual tras Pass 2)
 
 | Comando | Exit | Clasificación |
 | --- | --- | --- |
 | `npm run typecheck` | 0 | **PASS** (0 errores) |
 | `npm run build` | 0 | **PASS** (compilación limpia para producción) |
-| TM-COMM focalizado (`npm run test:tm-comm`) | 0 | **PASS** (5 files / 46 tests) |
+| TM-COMM focalizado (`npm run test:tm-comm`) | 0 | **PASS** (5 files / 61 tests) |
 | Architecture/boundary (`privateMessaging.architecture.test.ts`) | 0 | **PASS** (8/8) |
-| `npm test` suite vigente | 0 | **PASS** (149 files / 2694 vitest + 10 node:test) |
+| `npm test` suite vigente | 0 | **PASS** (149 files / 2709 vitest + 10 node:test) |
 | `npm run test:tm1-regtest-e2e` | 20 | **ENVIRONMENTAL FAILURE** (preexistente en BASE y HEAD; requiere chronik local en :3000) |
 | `npm run lint` BASE | 1 | **FAIL preexistente en BASE** (328 errors / 0 warnings) |
-| `npm run lint` HEAD | 1 | **FAIL preexistente en HEAD** (328 errors / 0 warnings; NEW=0) |
+| `npm run lint` HEAD | 1 | **FAIL preexistente en HEAD** (328 errors / 0 warnings; NEW=0; 0 en TM-COMM) |
 
 Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAlias; WASM fallback en x402Activation.
 
@@ -199,16 +244,18 @@ Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAl
 ## GO / NO-GO para Fresh Codex Review
 
 **GO: READY FOR FRESH CODEX REVIEW**
-- **4/4 Findings P2 remediados**:
+- **6/6 Findings P2 remediados formalmente**:
   - P2-1: Validación client-side exhaustiva del challenge antes de invocar `signMessage`.
   - P2-2: Enforce estricto de origin en todas las mutaciones autenticadas con auditoría `ORIGIN_MISMATCH` y rechazo 415 a bypasses sin `application/json`.
   - P2-3: Prohibición de receipts propios del remitente (403 `SELF_RECEIPT_FORBIDDEN`), rechazo a impersonación (403 `RECEIPT_IMPERSONATION`) y derivación estricta de estado a partir de los destinatarios.
   - P2-4: Restauración determinista de conversaciones e historial durable en reload/mount, selector UI multiconversación y estado limpio en 401 sin uso de `localStorage`.
+  - P2-5: Fijación estricta de `expectedSessionContext` (`tm-comm-a0-staging:v1`) en cliente contra configuración confiable local, con fail-closed y 0 llamadas a `signMessage` ante cualquier discrepancia.
+  - P2-6: Incorporación de `replyToId` normalizado en la identidad idempotente con atomicidad transaccional SQLite (`BEGIN IMMEDIATE`), replay idempotente garantizado y rechazo 409 `IDEMPOTENCY_CONFLICT` inmutable ante variaciones.
 - **Validación 100% verde**:
   - `npm run typecheck`: PASS (código 0)
   - `npm run build`: PASS (código 0)
-  - `npm run test:tm-comm`: PASS (5 archivos, 46 tests)
-  - `npm test`: PASS (149 archivos, 2694 vitest + 10 node:test)
+  - `npm run test:tm-comm`: PASS (5 archivos, 61 tests)
+  - `npm test`: PASS (149 archivos, 2709 vitest + 10 node:test)
   - `npm run lint`: NEW findings = 0 (328 preexistentes en BASE, 328 en HEAD, 0 en archivos TM-COMM)
 - **Invariantes arquitectónicas preservadas**:
   - Cero OpenAI, cero clientes reales, cero fondos reales, cero autoridad financiera, cero Agent Wallet authority, cero settlement, cero broadcast, cero sendXec, cero eToken movement, cero auto-publicación en Tonalli Memo.
