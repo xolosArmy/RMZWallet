@@ -17,7 +17,9 @@ Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No m
 | **PASS 1 REMEDIATION SHA** | `09e3d946e346cb58a3ef2e176cc8e12e7327e035` |
 | **PASS 2 REVIEWED HEAD** | `a63aeacc6a407517805c4c2c31a351511281600c` |
 | **PASS 2 REMEDIATION SHA** | `ee5d2ad07e48e0b94c76eebf9d568e6dbe1cf7dd` |
-| **NEW FINAL HEAD** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 remediation pass 2 closure) |
+| **PASS 3 REVIEWED HEAD** | `f47f5fedb4195803d66622ddce76a137de72f12a` |
+| **PASS 3 REMEDIATION SHA** | `44e26fb2996d933ca94d13e3135a511fe1e36067` |
+| **NEW FINAL HEAD** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 final remediation pass 3 closure) |
 | Staging API | http://127.0.0.1:4178/v1/tm-comm/health |
 | Staging UI | http://127.0.0.1:5174/tm-comm-staging |
 | Estado | **READY FOR FRESH CODEX REVIEW** |
@@ -25,6 +27,38 @@ Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No m
 
 > [!NOTE]
 > **Aclaración de Genealogía y Corrección de SHA**: Se documenta explícitamente que la referencia previa `a63aeacef335ca7f42dcae2e83b8b64e6224168e` correspondió a una referencia errónea en notas. El commit HEAD remoto canónico de PR #98 efectivamente revisado por Codex para el Pass 2 fue `a63aeacc6a407517805c4c2c31a351511281600c`.
+
+---
+
+## Final Remediation Pass 3 (Codex Finding P2-7)
+
+El fresh Codex review ejecutado sobre el exact HEAD `f47f5fedb4195803d66622ddce76a137de72f12a` identificó 1 finding P2 pendiente en `scripts/tm-comm-staging-up.ts:20`. Ha sido formalmente remediado en `44e26fb2996d933ca94d13e3135a511fe1e36067` conservando todas las remediaciones previas y las invariantes de arquitectura de TM-COMM A0:
+
+### P2-7: Preserve the operator identity across staging restarts (`PRRC_kwDOQYWUus7xnYbm` / Thread `PRRT_kwDOQYWUus6kApH7`)
+- **Causa raíz**:
+  Al reiniciar el servidor staging mediante `npm run tm-comm:staging` contra una base de datos SQLite preexistente en `.tmp/`, el script `scripts/tm-comm-staging-up.ts` generaba incondicionalmente un nuevo par de llaves efímero mediante `createTmCommEphemeralWallet()`. El archivo `operator-wallet.json` contenía únicamente campos públicos (`address`, `publicKeyHex`) pero omitía la llave privada, haciendo imposible reconstituir la identidad original. Mientras tanto, `bootstrapTmCommStaging` retenía el `operatorPrincipal` original almacenado en SQLite. Al autenticarse el nuevo par de llaves tras el reinicio, `store.findPrincipalByAddress(newAddress)` no encontraba coincidencia y creaba un nuevo Principal de tipo `customer`, provocando la pérdida total de acceso a las conversaciones donde participaba el operador y la incapacidad de emitir recibos de entrega/lectura legítimos (`delivered`/`read`).
+- **Remediación**:
+  - **Persistencia de Credencial Fixture**: Se almacena la credencial del operador staging de forma determinista y segura en `.tmp/tm-comm-staging/operator-wallet.json` con permisos de archivo estrictos `0o600` (y directorio `0o700`).
+  - **Resolutor de Credencial con Garantías Fail-Closed**: Se implementó `resolveTmCommOperatorCredential` en `server/tmComm/tmCommTestUtils.ts` cubriendo los 5 casos de ciclo de vida:
+    1. *Directorio nuevo / base limpia + archivo ausente*: Genera un par de llaves secp256k1 determinista, escribe `operator-wallet.json` con modo `0o600` y registra al operador en base de datos.
+    2. *Base existente + archivo presente y válido*: Carga la credencial, verifica que la llave privada sea un escalar secp256k1 válido, valida consistencia interna (address y publicKeyHex derivados), y comprueba que coincida exactamente con el `operatorPrincipal` almacenado en SQLite.
+    3. *Base existente + archivo ausente*: **Falla cerrado**. Arroja un error explícito impidiendo la generación silenciosa de un operador sustituto sobre una base con historial activo.
+    4. *Archivo corrupto*: **Falla cerrado**. Arroja un error explícito ante JSON truncado/inválido, falta de campo `secretHex`, escalar fuera de rango o alteración de campos derivados.
+    5. *Credencial con identidad divergente*: **Falla cerrado**. Arroja un error explícito si la llave deriva una dirección distinta a la del operador almacenado en la base de datos.
+  - **Defensa en Profundidad en el Servicio de Bootstrap**: En `server/tmComm/tmCommBootstrap.ts`, `bootstrapTmCommStaging` comprueba explícitamente que si existe un `operatorPrincipal` previo en la base de datos, sus propiedades `walletAddress` y `publicKeyHex` coincidan de forma idéntica con el operador suministrado. De existir discrepancia, arroja `TmCommError(CONFLICT, 409, 'OPERATOR_IDENTITY_MISMATCH')`.
+  - **Alineación del Arnés de Staging**: En `scripts/tm-comm-staging-up.ts`, se reemplazó la invocación a ciegas de `createTmCommEphemeralWallet()` por `resolveTmCommOperatorCredential({ credentialPath, store })`.
+  - **Protección del Material Secreto**: El secreto jamás ingresa a Git (`.tmp/` está en `.gitignore`), jamás se imprime en la salida de consola/logs de staging, jamás se incluye en `bootstrap-receipt.json`, jamás se transmite al navegador y utiliza permisos `0o600`.
+- **Archivos modificados**:
+  - `server/tmComm/tmCommTestUtils.ts`
+  - `server/tmComm/tmCommBootstrap.ts`
+  - `scripts/tm-comm-staging-up.ts`
+- **Tests agregados**:
+  - `server/tmComm/tmCommRestart.test.ts` (5 pruebas exhaustivas):
+    1. *Ciclo completo de reinicio y durabilidad*: Inicia staging → bootstrap de operador → cliente se enrola y asocia conversación → cliente envía mensaje (`accepted`) → parada controlada del servidor y almacenamiento → reinicio sobre la misma base `.tmp` → restauración de credencial idéntica → autenticación como el mismo `operatorPrincipal` (0 creación de Principal cliente) → listado de la misma conversación → acceso a historial del mensaje → emisión legítima de recibos `delivered` y `read` (`status: read`, HTTP 200).
+    2. *Credencial ausente + base nueva*: Permite bootstrap inicial y escribe `operator-wallet.json` con permisos `0o600`.
+    3. *Credencial ausente + base existente*: Falla cerrado con error descriptivo y conserva el operador original intacto.
+    4. *Credencial corrupta*: Falla cerrado en todas las modalidades de corrupción (sintaxis JSON, tipo no-objeto, campo faltante, escalar secp256k1 inválido, dirección adulterada).
+    5. *Credencial de otra identidad*: Falla cerrado en el resolutor y en `bootstrapTmCommStaging` arrojando `OPERATOR_IDENTITY_MISMATCH` (409).
 
 ---
 
@@ -208,15 +242,16 @@ Mismo archivo de test: mensaje aceptado sobrevive close/reopen de SQLite + HTTP;
 
 ---
 
-## Resultados de tests post-remediación (HEAD actual tras Pass 2)
+## Resultados de tests post-remediación (HEAD actual tras Final Pass 3)
 
 | Comando | Exit | Clasificación |
 | --- | --- | --- |
 | `npm run typecheck` | 0 | **PASS** (0 errores) |
 | `npm run build` | 0 | **PASS** (compilación limpia para producción) |
-| TM-COMM focalizado (`npm run test:tm-comm`) | 0 | **PASS** (5 files / 61 tests) |
+| TM-COMM focalizado (`npm run test:tm-comm`) | 0 | **PASS** (6 files / 66 tests) |
 | Architecture/boundary (`privateMessaging.architecture.test.ts`) | 0 | **PASS** (8/8) |
-| `npm test` suite vigente | 0 | **PASS** (149 files / 2709 vitest + 10 node:test) |
+| Staging restart durability (`tmCommRestart.test.ts`) | 0 | **PASS** (5/5) |
+| `npm test` suite vigente | 0 | **PASS** (150 files / 2714 vitest + 10 node:test) |
 | `npm run test:tm1-regtest-e2e` | 20 | **ENVIRONMENTAL FAILURE** (preexistente en BASE y HEAD; requiere chronik local en :3000) |
 | `npm run lint` BASE | 1 | **FAIL preexistente en BASE** (328 errors / 0 warnings) |
 | `npm run lint` HEAD | 1 | **FAIL preexistente en HEAD** (328 errors / 0 warnings; NEW=0; 0 en TM-COMM) |
@@ -234,9 +269,9 @@ Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAl
 
 ## Riesgos residuales
 
-1. **Tokens de staging en `.tmp/`**: Se almacenan tokens de desarrollo y base de datos SQLite en directorio temporal local no versionado.
+1. **Tokens y credencial fixture en `.tmp/`**: Se almacenan tokens de desarrollo, la base SQLite local y la credencial ficticia de staging del operador en `.tmp/tm-comm-staging/` con permisos `0o600` (directorio `0o700`), no versionados en git.
 2. **Ambiente de staging local**: Cookies sin atributo `Secure` en HTTP local `127.0.0.1:4178`; sin rate-limiting de producción.
-3. **Ficticio y aislado**: Entorno restringido a staging; operador fixture en bootstrap; email e IA fencados (no implementados).
+3. **Ficticio y aislado**: Entorno estrictamente acotado a staging; operador fixture en bootstrap; email e IA fencados (no implementados).
 4. **328 lint findings históricos**: Preexisten en BASE en módulos fuera de TM-COMM (`Tonalli Memo`, `Agent Wallet Execution`, `Trusted Wallet Runtime`, `MemoCompose`, `aliasDiscovery`). Cero findings en archivos TM-COMM.
 
 ---
@@ -244,22 +279,25 @@ Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAl
 ## GO / NO-GO para Fresh Codex Review
 
 **GO: READY FOR FRESH CODEX REVIEW**
-- **6/6 Findings P2 remediados formalmente**:
+- **7/7 Findings P2 remediados formalmente**:
   - P2-1: Validación client-side exhaustiva del challenge antes de invocar `signMessage`.
   - P2-2: Enforce estricto de origin en todas las mutaciones autenticadas con auditoría `ORIGIN_MISMATCH` y rechazo 415 a bypasses sin `application/json`.
   - P2-3: Prohibición de receipts propios del remitente (403 `SELF_RECEIPT_FORBIDDEN`), rechazo a impersonación (403 `RECEIPT_IMPERSONATION`) y derivación estricta de estado a partir de los destinatarios.
   - P2-4: Restauración determinista de conversaciones e historial durable en reload/mount, selector UI multiconversación y estado limpio en 401 sin uso de `localStorage`.
   - P2-5: Fijación estricta de `expectedSessionContext` (`tm-comm-a0-staging:v1`) en cliente contra configuración confiable local, con fail-closed y 0 llamadas a `signMessage` ante cualquier discrepancia.
   - P2-6: Incorporación de `replyToId` normalizado en la identidad idempotente con atomicidad transaccional SQLite (`BEGIN IMMEDIATE`), replay idempotente garantizado y rechazo 409 `IDEMPOTENCY_CONFLICT` inmutable ante variaciones.
+  - P2-7: Persistencia determinista de la identidad del operador entre reinicios staging en `.tmp/tm-comm-staging/operator-wallet.json` (`0o600`), verificación estricta contra `operatorPrincipal` en SQLite, protección contra sustitución silenciosa y rechazo fail-closed ante credenciales ausentes o corruptas (409 `OPERATOR_IDENTITY_MISMATCH`).
 - **Validación 100% verde**:
   - `npm run typecheck`: PASS (código 0)
   - `npm run build`: PASS (código 0)
-  - `npm run test:tm-comm`: PASS (5 archivos, 61 tests)
-  - `npm test`: PASS (149 archivos, 2709 vitest + 10 node:test)
+  - `npm run test:tm-comm`: PASS (6 archivos, 66 tests)
+  - `src/features/privateMessaging/privateMessaging.architecture.test.ts`: PASS (8/8)
+  - `server/tmComm/tmCommRestart.test.ts`: PASS (5/5)
+  - `npm test`: PASS (150 archivos, 2714 vitest + 10 node:test)
   - `npm run lint`: NEW findings = 0 (328 preexistentes en BASE, 328 en HEAD, 0 en archivos TM-COMM)
 - **Invariantes arquitectónicas preservadas**:
   - Cero OpenAI, cero clientes reales, cero fondos reales, cero autoridad financiera, cero Agent Wallet authority, cero settlement, cero broadcast, cero sendXec, cero eToken movement, cero auto-publicación en Tonalli Memo.
-  - Sin merge a main, sin avance a M0, sin ampliación de scope.
+  - Sin merge a main, sin avance a M1, sin ampliación de scope.
 
 ---
 
