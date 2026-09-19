@@ -55,8 +55,10 @@ describe('Quick Start capability architecture', () => {
     expect(walletConnectSource).toContain('assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.WALLETCONNECT)')
     expect(walletConnectSource).toContain('CapabilityBlocked')
     expect(onboardingSource).toContain('createBlocked')
+    expect(onboardingSource).toContain('importBlocked')
     expect(walletContext).toContain('QUICK_START_RECORD_EXISTS')
     expect(walletContext).toContain('WALLET_ALREADY_INITIALIZED')
+    expect(walletContext).toMatch(/restoreWallet[\s\S]*QUICK_START_WALLET_EXISTS/)
   })
 
   it('declares TM_COMM as a reserved future capability without implementing internals', () => {

@@ -442,15 +442,30 @@ export function UnlockWallet() {
 
 export function ImportWallet() {
   const navigate = useNavigate()
-  const { restoreWallet, loading, error } = useWallet()
+  const { restoreWallet, loading, error, initialized, quickStartBootstrap } = useWallet()
   const [seedPhrase, setSeedPhrase] = useState('')
   const [passwordImport, setPasswordImport] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
   const [profileChoice, setProfileChoice] = useState<DerivationDiscovery | null>(null)
 
+  const bootstrapPending = quickStartBootstrap === 'pending'
+  const recoveryFailed = quickStartBootstrap === 'failed'
+  const existingQuickStart = quickStartBootstrap === 'recovered'
+  const importBlocked = bootstrapPending || recoveryFailed || existingQuickStart || initialized
+
   const continueWithProfile = async (profileId: DerivationProfileId) => {
     try {
       setLocalError(null)
+      if (importBlocked) {
+        setLocalError(
+          recoveryFailed
+            ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se restaurará otra wallet.'
+            : bootstrapPending
+              ? 'Espera a que Tonalli termine de preparar este dispositivo.'
+              : 'Ya hay una Tonalli en este dispositivo. No se restaurará otra wallet.'
+        )
+        return
+      }
       const phrase = seedPhrase.trim()
       const result = await restoreWallet(phrase, profileId)
       if (result.status !== 'restored') {
@@ -466,6 +481,16 @@ export function ImportWallet() {
   const handleImport = async (e: FormEvent) => {
     e.preventDefault()
     setLocalError(null)
+    if (importBlocked) {
+      setLocalError(
+        recoveryFailed
+          ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se restaurará otra wallet.'
+          : bootstrapPending
+            ? 'Espera a que Tonalli termine de preparar este dispositivo.'
+            : 'Ya hay una Tonalli en este dispositivo. No se restaurará otra wallet.'
+      )
+      return
+    }
     const passwordError = validateLocalPassword(passwordImport, 'El password/PIN debe tener al menos 6 caracteres.')
     if (passwordError) {
       setLocalError(passwordError)
@@ -504,6 +529,17 @@ export function ImportWallet() {
             dominio oficial.
           </p>
           <p className="warning">Nunca compartas tu frase de recuperación con soporte, terceros o sitios externos.</p>
+          {bootstrapPending && <p className="muted">Preparando este dispositivo…</p>}
+          {recoveryFailed && (
+            <div className="error" role="alert">
+              Hay una Tonalli guardada aquí que no se pudo recuperar. No se restaurará otra wallet.
+            </div>
+          )}
+          {(initialized || existingQuickStart) && !recoveryFailed && (
+            <div className="error" role="alert">
+              Ya hay una Tonalli en este dispositivo. No se restaurará otra wallet.
+            </div>
+          )}
           {profileChoice && (
             <DerivationProfileChoice
               detection={profileChoice}
@@ -534,8 +570,13 @@ export function ImportWallet() {
             onChange={(e) => setPasswordImport(e.target.value)}
           />
           <div className="actions">
-            <button className="cta primary" type="submit" disabled={loading}>
-              Restaurar wallet
+            <button
+              className="cta primary"
+              type="submit"
+              disabled={loading || importBlocked}
+              data-testid="import-tonalli"
+            >
+              {loading ? 'Restaurando...' : bootstrapPending ? 'Preparando...' : 'Restaurar wallet'}
             </button>
           </div>
           <RouteError message={localError || error} />

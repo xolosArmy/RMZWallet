@@ -144,6 +144,28 @@ describe('Tonalli onboarding routes', () => {
     expect(html).not.toContain('Generar seed')
   })
 
+  test('/onboarding/import stays blocked while Quick Start exists, is pending, or failed', () => {
+    const recovered = renderToStaticMarkup(
+      <MemoryRouter>
+        <WalletContext.Provider value={walletContextFixture({ initialized: true, quickStartBootstrap: 'recovered' })}>
+          <ImportWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+    expect(recovered).toContain('Ya hay una Tonalli')
+    expect(recovered).toContain('disabled')
+
+    const failed = renderToStaticMarkup(
+      <MemoryRouter>
+        <WalletContext.Provider value={walletContextFixture({ quickStartBootstrap: 'failed' })}>
+          <ImportWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+    expect(failed).toContain('no se pudo recuperar')
+    expect(failed).toContain('disabled')
+  })
+
   test('/onboarding/import shows only the seed form', () => {
     const html = renderRoute(<ImportWallet />)
 

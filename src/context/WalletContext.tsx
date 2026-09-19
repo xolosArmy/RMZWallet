@@ -465,6 +465,21 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     mnemonic: string,
     selectedProfileId?: DerivationProfileId
   ) => {
+    if (quickStartBootstrap === 'pending') {
+      throw new Error('QUICK_START_BOOTSTRAP_PENDING')
+    }
+    if (quickStartBootstrap === 'failed') {
+      throw new Error('QUICK_START_RECOVERY_FAILED')
+    }
+    if (quickStartBootstrap === 'recovered') {
+      throw new Error('QUICK_START_WALLET_EXISTS')
+    }
+    if (initialized) {
+      throw new Error('WALLET_ALREADY_INITIALIZED')
+    }
+    if (await xolosWalletService.hasQuickStartRecord()) {
+      throw new Error('QUICK_START_RECORD_EXISTS')
+    }
     setLoading(true)
     setError(null)
     try {
@@ -482,7 +497,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     } finally {
       setLoading(false)
     }
-  }, [syncAddressAndBalance])
+  }, [initialized, quickStartBootstrap, syncAddressAndBalance])
 
   const loadExistingWallet = useCallback(
     async (password: string, selectedProfileId?: DerivationProfileId) => {

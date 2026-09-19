@@ -26,6 +26,11 @@ const serviceMocks = vi.hoisted(() => ({
     profileId: 'ecash-standard-1899'
   })),
   createNewWallet: vi.fn(async () => 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'),
+  restoreFromMnemonic: vi.fn(async () => ({
+    status: 'restored' as const,
+    selectedProfileId: 'ecash-standard-1899',
+    notice: 'restored'
+  })),
   activateQuickStartFromDevice: vi.fn(async () => ({
     address: 'ecash:qquickstart',
     profileId: 'ecash-standard-1899'
@@ -84,6 +89,7 @@ describe('WalletContext Quick Start lifecycle', () => {
     serviceMocks.hasQuickStartRecord.mockResolvedValue(false)
     serviceMocks.createQuickStartWallet.mockClear()
     serviceMocks.createNewWallet.mockClear()
+    serviceMocks.restoreFromMnemonic.mockClear()
     serviceMocks.activateQuickStartFromDevice.mockClear()
     serviceMocks.loadFromStorage.mockReset()
     serviceMocks.loadFromStorage.mockResolvedValue({
@@ -298,6 +304,30 @@ describe('WalletContext Quick Start lifecycle', () => {
     await expect(wallet!.createNewWallet()).rejects.toThrow('QUICK_START_BOOTSTRAP_PENDING')
     expect(serviceMocks.createNewWallet).not.toHaveBeenCalled()
     resolveRecord?.(false)
+  })
+
+  it('refuses restoreWallet while a recovered Quick Start exists', async () => {
+    serviceMocks.hasQuickStartRecord.mockResolvedValue(true)
+    serviceMocks.activateQuickStartFromDevice.mockResolvedValue({
+      address: 'ecash:qoriginal',
+      profileId: 'ecash-standard-1899'
+    })
+    serviceMocks.getAddress.mockReturnValue('ecash:qoriginal')
+
+    let wallet: ReturnType<typeof useWallet> | null = null
+    render(
+      <WalletProvider>
+        <Harness onReady={(value) => { wallet = value }} />
+      </WalletProvider>
+    )
+    await waitFor(() => {
+      expect(wallet!.quickStartBootstrap).toBe('recovered')
+    })
+    await expect(wallet!.restoreWallet('abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'))
+      .rejects.toThrow('QUICK_START_WALLET_EXISTS')
+    expect(serviceMocks.restoreFromMnemonic).not.toHaveBeenCalled()
+    expect(wallet!.address).toBe('ecash:qoriginal')
+    expect(serviceMocks.discardQuickStartRecord).not.toHaveBeenCalled()
   })
 
   it('unlocks a backed-up Quick Start even when Chronik/balance never resolves', async () => {
