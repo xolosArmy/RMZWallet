@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { Worker } from 'node:worker_threads'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { TM_COMM_ERROR_CODES, TmCommError } from '../../src/features/privateMessaging/errors'
 import { bootstrapTmCommStaging } from './tmCommBootstrap'
 import { loadTmCommRuntimeConfig, TM_COMM_COOKIE_NAME } from './tmCommConfig'
@@ -18,6 +18,53 @@ import {
   resolveTmCommOperatorCredential
 } from './tmCommTestUtils'
 
+const { getFsMockState, setFsMockState, resetFsMock } = vi.hoisted(() => {
+  type FsMockState = {
+    targetDir: string
+    errorCode: 'EACCES' | 'EPERM'
+    operation: 'chmodSync' | 'mkdirSync'
+    invoked: boolean
+  }
+  let state: FsMockState | null = null
+  return {
+    getFsMockState: () => state,
+    setFsMockState: (s: FsMockState | null) => {
+      state = s
+    },
+    resetFsMock: () => {
+      state = null
+    }
+  }
+})
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return {
+    ...actual,
+    chmodSync: (path: import('node:fs').PathLike, mode: import('node:fs').Mode) => {
+      const mock = getFsMockState()
+      if (mock && mock.operation === 'chmodSync' && typeof path === 'string' && path === mock.targetDir) {
+        mock.invoked = true
+        const err = new Error(`${mock.errorCode}: permission denied, chmod '${path}'`) as NodeJS.ErrnoException
+        err.code = mock.errorCode
+        throw err
+      }
+      return actual.chmodSync(path, mode)
+    },
+    mkdirSync: (...args: Parameters<typeof actual.mkdirSync>) => {
+      const [path] = args
+      const mock = getFsMockState()
+      if (mock && mock.operation === 'mkdirSync' && typeof path === 'string' && path === mock.targetDir) {
+        mock.invoked = true
+        const err = new Error(`${mock.errorCode}: permission denied, mkdir '${path}'`) as NodeJS.ErrnoException
+        err.code = mock.errorCode
+        throw err
+      }
+      return actual.mkdirSync(...args)
+    }
+  }
+})
+
 const tempDirectories: string[] = []
 
 function makeTempDirectory(): string {
@@ -27,6 +74,7 @@ function makeTempDirectory(): string {
 }
 
 afterEach(() => {
+  resetFsMock()
   for (const dir of tempDirectories) {
     try {
       rmSync(dir, { recursive: true, force: true })
@@ -828,18 +876,70 @@ process.stdout.write(JSON.stringify(wallet));
       }
     })
 
-    test('fallo de permisos del sistema -> fail closed, no crea ni usa credencial', () => {
-      const dbPath = join(makeTempDirectory(), 'test.sqlite')
-      const credentialPath = '/root/tm-comm-staging-forbidden/operator-wallet.json'
+    test('fallo determinista de permisos (EACCES en chmodSync) -> fail closed, no crea ni usa credencial', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-permission-denied-chmod')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const credentialPath = join(parentDir, 'operator-wallet.json')
       const store = new TmCommStore(dbPath)
+
+      setFsMockState({
+        targetDir: parentDir,
+        errorCode: 'EACCES',
+        operation: 'chmodSync',
+        invoked: false
+      })
 
       try {
         expect(() =>
           resolveTmCommOperatorCredential({ credentialPath, store })
-        ).toThrow(/Failed to secure parent directory for operator credential at/i)
+        ).toThrow(/Failed to secure parent directory for operator credential at.*EACCES/i)
 
+        // Mock fue realmente invocado por ensureSecureParentDirectory
+        const mockState = getFsMockState()
+        expect(mockState?.invoked).toBe(true)
+
+        // La base de datos no contiene operador
         expect(store.findOperatorPrincipal()).toBeNull()
+
+        // El archivo de credencial no fue creado
+        expect(existsSync(credentialPath)).toBe(false)
       } finally {
+        resetFsMock()
+        store.close()
+      }
+    })
+
+    test('fallo determinista de permisos (EPERM en mkdirSync) -> fail closed, no crea ni usa credencial', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-permission-denied-mkdir')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const store = new TmCommStore(dbPath)
+
+      setFsMockState({
+        targetDir: parentDir,
+        errorCode: 'EPERM',
+        operation: 'mkdirSync',
+        invoked: false
+      })
+
+      try {
+        expect(() =>
+          resolveTmCommOperatorCredential({ credentialPath, store })
+        ).toThrow(/Failed to secure parent directory for operator credential at.*EPERM/i)
+
+        // Mock fue realmente invocado por ensureSecureParentDirectory
+        const mockState = getFsMockState()
+        expect(mockState?.invoked).toBe(true)
+
+        // La base de datos no contiene operador
+        expect(store.findOperatorPrincipal()).toBeNull()
+
+        // El archivo de credencial no fue creado
+        expect(existsSync(credentialPath)).toBe(false)
+      } finally {
+        resetFsMock()
         store.close()
       }
     })
