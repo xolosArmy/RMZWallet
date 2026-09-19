@@ -37,6 +37,7 @@ function TmCommStaging() {
 
   const sessionGenerationRef = useRef<number>(0)
   const hydrationAbortRef = useRef<AbortController | null>(null)
+  const messageAbortRef = useRef<AbortController | null>(null)
   const activeConversationIdRef = useRef<string | null>(null)
   const messageRequestGenRef = useRef<number>(0)
 
@@ -56,12 +57,24 @@ function TmCommStaging() {
       return
     }
 
+    messageAbortRef.current?.abort()
+    const msgAbort = new AbortController()
+    messageAbortRef.current = msgAbort
+
+    if (signal) {
+      if (signal.aborted) {
+        msgAbort.abort()
+      } else {
+        signal.addEventListener('abort', () => msgAbort.abort(), { once: true })
+      }
+    }
+
     const messageReqId = ++messageRequestGenRef.current
     activeConversationIdRef.current = conversationId
 
     const listed = await tmCommRequest<{ messages: Message[] }>(
       `/v1/tm-comm/conversations/${conversationId}/messages`,
-      signal ? { signal } : undefined
+      { signal: msgAbort.signal }
     )
 
     if (targetSessionGen !== sessionGenerationRef.current) return
@@ -125,6 +138,9 @@ function TmCommStaging() {
 
     if (targetSessionGen !== sessionGenerationRef.current) return
 
+    if (conversation?.id !== target.id) {
+      setMessages([])
+    }
     setConversation(target)
     activeConversationIdRef.current = target.id
     append(`Conversación activa: ${target.id} (${target.reservationId}).`)
@@ -142,6 +158,7 @@ function TmCommStaging() {
 
     return () => {
       mountAbort.abort()
+      messageAbortRef.current?.abort()
       sessionGen.current++
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -159,6 +176,8 @@ function TmCommStaging() {
     }
 
     hydrationAbortRef.current?.abort()
+    messageAbortRef.current?.abort()
+    messageRequestGenRef.current++
     const nextGen = ++sessionGenerationRef.current
     const sessionAbort = new AbortController()
     hydrationAbortRef.current = sessionAbort
@@ -336,13 +355,25 @@ function TmCommStaging() {
               aria-label="Seleccionar conversación"
               value={conversation?.id ?? ''}
               onChange={(e) => {
-                const selected = conversations.find((c) => c.id === e.target.value) ?? null
-                setConversation(selected)
+                const targetId = e.target.value
+                const selected = conversations.find((c) => c.id === targetId) ?? null
+
+                // Invalida cualquier request de historial anterior
+                messageAbortRef.current?.abort()
+                messageRequestGenRef.current++
+
+                // Ejecuta setMessages([]) sincrónicamente antes de cambiar/renderizar la nueva conversación
+                setMessages([])
+
+                // Actualiza activeConversationIdRef
                 activeConversationIdRef.current = selected?.id ?? null
+
+                // Cambiar/renderizar la nueva conversación
+                setConversation(selected)
+
+                // Inicia el fetch del nuevo historial; si el fetch falla o tarda, la UI permanece vacía
                 if (selected) {
                   void refreshMessages(selected.id, sessionGenerationRef.current)
-                } else {
-                  setMessages([])
                 }
               }}
               disabled={busy}

@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -713,5 +713,135 @@ process.stdout.write(JSON.stringify(wallet));
     } finally {
       store.close()
     }
+  })
+
+  describe('P2-12: Enforce parent directory mode 0700', () => {
+    test('directorio preexistente 0777 -> resolver -> queda 0700', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-0777')
+      mkdirSync(parentDir, { recursive: true })
+      chmodSync(parentDir, 0o777)
+      expect(statSync(parentDir).mode & 0o777).toBe(0o777)
+
+      const dbPath = join(dataDir, 'test.sqlite')
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const store = new TmCommStore(dbPath)
+      try {
+        const wallet = resolveTmCommOperatorCredential({ credentialPath, store })
+        expect(wallet.address).toBeDefined()
+        expect(statSync(parentDir).mode & 0o777).toBe(0o700)
+      } finally {
+        store.close()
+      }
+    })
+
+    test('directorio 0755 -> queda 0700', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-0755')
+      mkdirSync(parentDir, { recursive: true })
+      chmodSync(parentDir, 0o755)
+      expect(statSync(parentDir).mode & 0o777).toBe(0o755)
+
+      const dbPath = join(dataDir, 'test.sqlite')
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const store = new TmCommStore(dbPath)
+      try {
+        const wallet = resolveTmCommOperatorCredential({ credentialPath, store })
+        expect(wallet.address).toBeDefined()
+        expect(statSync(parentDir).mode & 0o777).toBe(0o700)
+      } finally {
+        store.close()
+      }
+    })
+
+    test('credential ya existente válida -> también corrige/verifica el parent', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-existing')
+      mkdirSync(parentDir, { recursive: true, mode: 0o700 })
+
+      const dbPath = join(dataDir, 'test.sqlite')
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const store = new TmCommStore(dbPath)
+      try {
+        // Initial creation
+        const originalWallet = resolveTmCommOperatorCredential({ credentialPath, store })
+        expect(statSync(parentDir).mode & 0o777).toBe(0o700)
+
+        // Simulate external tampering or relaxed permissions on existing directory
+        chmodSync(parentDir, 0o755)
+        expect(statSync(parentDir).mode & 0o777).toBe(0o755)
+
+        // Resolve again with valid existing credential
+        const reloaded = resolveTmCommOperatorCredential({ credentialPath, store })
+        expect(reloaded.address).toBe(originalWallet.address)
+        // Must correct and enforce 0o700
+        expect(statSync(parentDir).mode & 0o777).toBe(0o700)
+      } finally {
+        store.close()
+      }
+    })
+
+    test('restart normal -> sigue 0700', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-restart')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const store1 = new TmCommStore(dbPath)
+      let firstAddress = ''
+      try {
+        const wallet1 = resolveTmCommOperatorCredential({ credentialPath, store: store1 })
+        expect(statSync(parentDir).mode & 0o777).toBe(0o700)
+        firstAddress = wallet1.address
+      } finally {
+        store1.close()
+      }
+
+      // Restart with fresh store on same db
+      const store2 = new TmCommStore(dbPath)
+      try {
+        const wallet2 = resolveTmCommOperatorCredential({ credentialPath, store: store2 })
+        expect(wallet2.address).toBe(firstAddress)
+        expect(statSync(parentDir).mode & 0o777).toBe(0o700)
+      } finally {
+        store2.close()
+      }
+    })
+
+    test('fallo al asegurar permisos -> fail closed, no continúa usando la credencial', () => {
+      const dataDir = makeTempDirectory()
+      const blockedParentDir = join(dataDir, 'staging-file-block')
+      writeFileSync(blockedParentDir, 'not-a-directory')
+
+      const dbPath = join(dataDir, 'test.sqlite')
+      const credentialPath = join(blockedParentDir, 'operator-wallet.json')
+      const store = new TmCommStore(dbPath)
+
+      try {
+        expect(() =>
+          resolveTmCommOperatorCredential({ credentialPath, store })
+        ).toThrow(/Failed to secure parent directory for operator credential at/i)
+
+        expect(store.findOperatorPrincipal()).toBeNull()
+        expect(existsSync(credentialPath)).toBe(false)
+      } finally {
+        store.close()
+      }
+    })
+
+    test('fallo de permisos del sistema -> fail closed, no crea ni usa credencial', () => {
+      const dbPath = join(makeTempDirectory(), 'test.sqlite')
+      const credentialPath = '/root/tm-comm-staging-forbidden/operator-wallet.json'
+      const store = new TmCommStore(dbPath)
+
+      try {
+        expect(() =>
+          resolveTmCommOperatorCredential({ credentialPath, store })
+        ).toThrow(/Failed to secure parent directory for operator credential at/i)
+
+        expect(store.findOperatorPrincipal()).toBeNull()
+      } finally {
+        store.close()
+      }
+    })
   })
 })

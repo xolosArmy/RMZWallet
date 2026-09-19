@@ -326,8 +326,8 @@ Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAl
 
 ## GO / NO-GO para Fresh Codex Review
 
-**GO: READY FOR FRESH CODEX REVIEW**
-- **7/7 Findings P2 remediados formalmente**:
+**GO: READY FOR FRESH CODEX REVIEW (PASS 5)**
+- **12 Findings P2 remediados formalmente**:
   - P2-1: Validación client-side exhaustiva del challenge antes de invocar `signMessage`.
   - P2-2: Enforce estricto de origin en todas las mutaciones autenticadas con auditoría `ORIGIN_MISMATCH` y rechazo 415 a bypasses sin `application/json`.
   - P2-3: Prohibición de receipts propios del remitente (403 `SELF_RECEIPT_FORBIDDEN`), rechazo a impersonación (403 `RECEIPT_IMPERSONATION`) y derivación estricta de estado a partir de los destinatarios.
@@ -335,13 +335,19 @@ Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAl
   - P2-5: Fijación estricta de `expectedSessionContext` (`tm-comm-a0-staging:v1`) en cliente contra configuración confiable local, con fail-closed y 0 llamadas a `signMessage` ante cualquier discrepancia.
   - P2-6: Incorporación de `replyToId` normalizado en la identidad idempotente con atomicidad transaccional SQLite (`BEGIN IMMEDIATE`), replay idempotente garantizado y rechazo 409 `IDEMPOTENCY_CONFLICT` inmutable ante variaciones.
   - P2-7: Persistencia determinista de la identidad del operador entre reinicios staging en `.tmp/tm-comm-staging/operator-wallet.json` (`0o600`), verificación estricta contra `operatorPrincipal` en SQLite, protección contra sustitución silenciosa y rechazo fail-closed ante credenciales ausentes o corruptas (409 `OPERATOR_IDENTITY_MISMATCH`).
+  - P2-8: Creación atómica y exclusiva de la credencial de operador (`O_CREAT | O_EXCL` / flag `wx`) con permisos `0600` y reintento con backoff exponencial para el perdedor (`EEXIST`), recargando la credencial ganadora sin truncar ni regenerar.
+  - P2-9: Clasificación de `operator-wallet.json` como material criptográfico sensible / staging secret en documentación de seguridad, documentando invariante de infraestructura de fixtures.
+  - P2-10: Fencing estricto de generación de sesión (`sessionGenerationRef`) con `AbortController` en el cliente React de staging, garantizando descarte inmediato de respuestas tardías o 401s obsoletos de sesiones anteriores.
+  - P2-11: Limpieza síncrona inmediata de mensajes (`setMessages([])`) al cambiar de conversación con invalidación/abort de peticiones previas (`messageAbortRef`, `messageRequestGenRef`), asegurando que jamás se muestren mensajes del chat anterior mientras el nuevo fetch está pendiente o falla.
+  - P2-12: Enforce estricto de permisos `0700` en el directorio padre de la credencial del operador en todos los caminos de `resolveTmCommOperatorCredential` (incluyendo reinicios con credencial preexistente) antes de cualquier return, con verificación `statSync` y fail-closed ante discrepancias.
 - **Validación 100% verde**:
   - `npm run typecheck`: PASS (código 0)
   - `npm run build`: PASS (código 0)
-  - `npm run test:tm-comm`: PASS (6 archivos, 66 tests)
+  - `npm run test:tm-comm`: PASS (6 archivos, 87 tests)
   - `src/features/privateMessaging/privateMessaging.architecture.test.ts`: PASS (8/8)
-  - `server/tmComm/tmCommRestart.test.ts`: PASS (5/5)
-  - `npm test`: PASS (150 archivos, 2714 vitest + 10 node:test)
+  - `server/tmComm/tmCommRestart.test.ts`: PASS (16/16)
+  - `src/routes/TmCommStaging.test.tsx`: PASS (29/29)
+  - `npm test`: PASS (150 archivos, 2735 vitest + 10 node:test)
   - `npm run lint`: NEW findings = 0 (328 preexistentes en BASE, 328 en HEAD, 0 en archivos TM-COMM)
 - **Invariantes arquitectónicas preservadas**:
   - Cero OpenAI, cero clientes reales, cero fondos reales, cero autoridad financiera, cero Agent Wallet authority, cero settlement, cero broadcast, cero sendXec, cero eToken movement, cero auto-publicación en Tonalli Memo.

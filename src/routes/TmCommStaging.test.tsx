@@ -677,4 +677,260 @@ describe('P2-10: Session-generation-safe hydration and state containment', () =>
     })
     await new Promise((resolve) => setTimeout(resolve, 20))
   })
+
+  describe('P2-11: Clear stale messages when switching conversations', () => {
+    test('A tiene mensajes visibles -> seleccionar B -> los mensajes de A desaparecen inmediatamente, antes de resolver el fetch de B', async () => {
+      const convA = { id: 'conv-A', reservationId: 'rsv-A', createdAt: 2000 }
+      const convB = { id: 'conv-B', reservationId: 'rsv-B', createdAt: 1000 }
+      const msgA = {
+        id: 'msg-A-1',
+        clientMessageId: 'cli-A-1',
+        body: 'Message A visible content',
+        senderKind: 'customer',
+        serverCreatedAt: 2010,
+        status: 'delivered',
+        replyToId: null
+      }
+      const msgB = {
+        id: 'msg-B-1',
+        clientMessageId: 'cli-B-1',
+        body: 'Message B newly loaded',
+        senderKind: 'customer',
+        serverCreatedAt: 2020,
+        status: 'delivered',
+        replyToId: null
+      }
+
+      const deferredB = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+
+      mockTmCommRequest.mockImplementation((path: string) => {
+        if (path === '/v1/tm-comm/conversations') {
+          return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA, convB] } })
+        }
+        if (path === '/v1/tm-comm/conversations/conv-A/messages') {
+          return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+        }
+        if (path === '/v1/tm-comm/conversations/conv-B/messages') {
+          return deferredB.promise
+        }
+        return Promise.resolve({ ok: true, status: 200, data: {} })
+      })
+
+      render(<TmCommStaging />)
+
+      // Wait until conv-A is active and msgA is visible
+      await waitFor(() => {
+        expect(screen.getByText(/Conversación: conv-A · Reserva: rsv-A/i)).toBeDefined()
+        expect(screen.getByText(/Message A visible content/i)).toBeDefined()
+      })
+
+      // Now select conv-B
+      const select = screen.getByLabelText(/Seleccionar conversación/i)
+      fireEvent.change(select, { target: { value: 'conv-B' } })
+
+      // Immediately and synchronously before deferredB resolves:
+      // Conversation heading switches to conv-B
+      expect(screen.getByText(/Conversación: conv-B · Reserva: rsv-B/i)).toBeDefined()
+      // Message A disappeared immediately!
+      expect(screen.queryByText(/Message A visible content/i)).toBeNull()
+      // No messages rendered for B yet
+      expect(screen.queryByText(/Message B newly loaded/i)).toBeNull()
+
+      // Now resolve fetch for B
+      deferredB.resolve({ ok: true, status: 200, data: { messages: [msgB] } })
+
+      await waitFor(() => {
+        expect(screen.getByText(/Message B newly loaded/i)).toBeDefined()
+      })
+
+      // A remains gone
+      expect(screen.queryByText(/Message A visible content/i)).toBeNull()
+    })
+
+    test('fetch de B falla -> A nunca reaparece', async () => {
+      const convA = { id: 'conv-A', reservationId: 'rsv-A', createdAt: 2000 }
+      const convB = { id: 'conv-B', reservationId: 'rsv-B', createdAt: 1000 }
+      const msgA = {
+        id: 'msg-A-1',
+        clientMessageId: 'cli-A-1',
+        body: 'Message A visible content',
+        senderKind: 'customer',
+        serverCreatedAt: 2010,
+        status: 'delivered',
+        replyToId: null
+      }
+
+      mockTmCommRequest.mockImplementation((path: string) => {
+        if (path === '/v1/tm-comm/conversations') {
+          return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA, convB] } })
+        }
+        if (path === '/v1/tm-comm/conversations/conv-A/messages') {
+          return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+        }
+        if (path === '/v1/tm-comm/conversations/conv-B/messages') {
+          return Promise.resolve({ ok: false, status: 500, data: null })
+        }
+        return Promise.resolve({ ok: true, status: 200, data: {} })
+      })
+
+      render(<TmCommStaging />)
+
+      await waitFor(() => {
+        expect(screen.getByText(/Conversación: conv-A · Reserva: rsv-A/i)).toBeDefined()
+        expect(screen.getByText(/Message A visible content/i)).toBeDefined()
+      })
+
+      const select = screen.getByLabelText(/Seleccionar conversación/i)
+      fireEvent.change(select, { target: { value: 'conv-B' } })
+
+      // Messages of A disappear immediately
+      expect(screen.queryByText(/Message A visible content/i)).toBeNull()
+
+      // Wait for the failure to be logged
+      await waitFor(() => {
+        expect(screen.getByText(/No se pudieron leer mensajes \(500\)/i)).toBeDefined()
+      })
+
+      // A never reappears, UI remains empty
+      expect(screen.queryByText(/Message A visible content/i)).toBeNull()
+      expect(screen.getByText(/Conversación: conv-B · Reserva: rsv-B/i)).toBeDefined()
+    })
+
+    test('fetch de B queda pendiente -> UI de B permanece sin mensajes', async () => {
+      const convA = { id: 'conv-A', reservationId: 'rsv-A', createdAt: 2000 }
+      const convB = { id: 'conv-B', reservationId: 'rsv-B', createdAt: 1000 }
+      const msgA = {
+        id: 'msg-A-1',
+        clientMessageId: 'cli-A-1',
+        body: 'Message A visible content',
+        senderKind: 'customer',
+        serverCreatedAt: 2010,
+        status: 'delivered',
+        replyToId: null
+      }
+
+      const pendingPromise = new Promise<{ ok: boolean; status: number; data: unknown }>(() => {})
+
+      mockTmCommRequest.mockImplementation((path: string) => {
+        if (path === '/v1/tm-comm/conversations') {
+          return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA, convB] } })
+        }
+        if (path === '/v1/tm-comm/conversations/conv-A/messages') {
+          return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+        }
+        if (path === '/v1/tm-comm/conversations/conv-B/messages') {
+          return pendingPromise
+        }
+        return Promise.resolve({ ok: true, status: 200, data: {} })
+      })
+
+      render(<TmCommStaging />)
+
+      await waitFor(() => {
+        expect(screen.getByText(/Message A visible content/i)).toBeDefined()
+      })
+
+      const select = screen.getByLabelText(/Seleccionar conversación/i)
+      fireEvent.change(select, { target: { value: 'conv-B' } })
+
+      // Message A is gone immediately
+      expect(screen.queryByText(/Message A visible content/i)).toBeNull()
+
+      // Wait a brief delay to ensure no asynchronous effect populates stale messages
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      // UI of B remains without messages
+      expect(screen.queryByText(/Message A visible content/i)).toBeNull()
+      expect(screen.getByText(/Conversación: conv-B · Reserva: rsv-B/i)).toBeDefined()
+    })
+
+    test('cambios rápidos A -> B -> C -> solo C puede poblar estado', async () => {
+      const convA = { id: 'conv-A', reservationId: 'rsv-A', createdAt: 3000 }
+      const convB = { id: 'conv-B', reservationId: 'rsv-B', createdAt: 2000 }
+      const convC = { id: 'conv-C', reservationId: 'rsv-C', createdAt: 1000 }
+
+      const msgA = {
+        id: 'msg-A-1',
+        clientMessageId: 'cli-A-1',
+        body: 'Message A visible content',
+        senderKind: 'customer',
+        serverCreatedAt: 3010,
+        status: 'delivered',
+        replyToId: null
+      }
+      const msgB = {
+        id: 'msg-B-1',
+        clientMessageId: 'cli-B-1',
+        body: 'Stale message B content',
+        senderKind: 'customer',
+        serverCreatedAt: 2010,
+        status: 'delivered',
+        replyToId: null
+      }
+      const msgC = {
+        id: 'msg-C-1',
+        clientMessageId: 'cli-C-1',
+        body: 'Active message C content',
+        senderKind: 'customer',
+        serverCreatedAt: 1010,
+        status: 'delivered',
+        replyToId: null
+      }
+
+      const deferredB = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+      const deferredC = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+
+      mockTmCommRequest.mockImplementation((path: string) => {
+        if (path === '/v1/tm-comm/conversations') {
+          return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA, convB, convC] } })
+        }
+        if (path === '/v1/tm-comm/conversations/conv-A/messages') {
+          return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+        }
+        if (path === '/v1/tm-comm/conversations/conv-B/messages') {
+          return deferredB.promise
+        }
+        if (path === '/v1/tm-comm/conversations/conv-C/messages') {
+          return deferredC.promise
+        }
+        return Promise.resolve({ ok: true, status: 200, data: {} })
+      })
+
+      render(<TmCommStaging />)
+
+      await waitFor(() => {
+        expect(screen.getByText(/Message A visible content/i)).toBeDefined()
+      })
+
+      const select = screen.getByLabelText(/Seleccionar conversación/i)
+
+      // Rapidly switch A -> B -> C
+      fireEvent.change(select, { target: { value: 'conv-B' } })
+      expect(screen.queryByText(/Message A visible content/i)).toBeNull()
+
+      fireEvent.change(select, { target: { value: 'conv-C' } })
+      expect(screen.getByText(/Conversación: conv-C · Reserva: rsv-C/i)).toBeDefined()
+
+      // B resolves late
+      deferredB.resolve({ ok: true, status: 200, data: { messages: [msgB] } })
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      // B must NOT populate state
+      expect(screen.queryByText(/Stale message B content/i)).toBeNull()
+      expect(screen.queryByText(/Message A visible content/i)).toBeNull()
+
+      // C resolves
+      deferredC.resolve({ ok: true, status: 200, data: { messages: [msgC] } })
+
+      await waitFor(() => {
+        expect(screen.getByText(/Active message C content/i)).toBeDefined()
+      })
+
+      // Confirm only C populated state
+      expect(screen.getByText(/Conversación: conv-C · Reserva: rsv-C/i)).toBeDefined()
+      expect(screen.getByText(/Active message C content/i)).toBeDefined()
+      expect(screen.queryByText(/Stale message B content/i)).toBeNull()
+      expect(screen.queryByText(/Message A visible content/i)).toBeNull()
+    })
+  })
 })

@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { Address, Ecc, fromHex, shaRmd160, signMsg, toHex } from 'ecash-lib'
 import { randomTmCommBytes } from './tmCommIds'
@@ -20,6 +20,25 @@ export type ResolveTmCommOperatorCredentialOptions = Readonly<{
   maxRetries?: number
   retryDelayMs?: number
 }>
+
+export function ensureSecureParentDirectory(parentDir: string): void {
+  try {
+    mkdirSync(parentDir, { recursive: true, mode: 0o700 })
+    chmodSync(parentDir, 0o700)
+    const stats = statSync(parentDir)
+    if ((stats.mode & 0o777) !== 0o700) {
+      throw new Error(
+        `Directory mode for "${parentDir}" is 0o${(stats.mode & 0o777).toString(8)}, expected 0o700`
+      )
+    }
+  } catch (error) {
+    throw new Error(
+      `Failed to secure parent directory for operator credential at "${parentDir}": ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+  }
+}
 
 export function createTmCommDeterministicWallet(secretHex: string): TmCommDeterministicWallet {
   const trimmed = secretHex.trim()
@@ -204,6 +223,9 @@ function loadAndValidateWinningCredential(
 export function resolveTmCommOperatorCredential(
   options: ResolveTmCommOperatorCredentialOptions
 ): TmCommDeterministicWallet {
+  const parentDir = dirname(options.credentialPath)
+  ensureSecureParentDirectory(parentDir)
+
   const maxRetries = options.maxRetries ?? 25
   const retryDelayMs = options.retryDelayMs ?? 20
   const existingOperator = options.store.findOperatorPrincipal()
@@ -223,9 +245,6 @@ export function resolveTmCommOperatorCredential(
       retryDelayMs
     )
   }
-
-  const parentDir = dirname(options.credentialPath)
-  mkdirSync(parentDir, { recursive: true, mode: 0o700 })
 
   const wallet = createTmCommEphemeralWallet()
   const payload = {
