@@ -69,7 +69,7 @@ Checkout de trabajo: `/home/xolosarmy/ecashschool/RMZWallet-quickstart`. El chec
 | BASE `origin/main` | `f1964d220d23b214141e722ea5781adee32c0fc9` |
 | HEAD al inicio de esta revisión (referencia, no asumir) | `c26b70e06bf69568a7b2b5430917a79a3a9fb48c` |
 | HEAD Turnstile Quick Start | `4e32338a6aee3411c1d23d0b3257ca18300af841` |
-| HEAD de implementación (este pass) | `bb959a47e5096898204076944de87bca91470fc8` |
+| HEAD de implementación (este pass) | `d3bd4ef852d50748c9cd57a35402d1a32aeb3c7d` |
 | HEAD revisado por Codex (exact-head previo) | `aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71` |
 | PR | **#3** OPEN, no mergeado |
 | URL | https://github.com/xolosArmy/tonalli-faucet/pull/3 |
@@ -77,7 +77,7 @@ Checkout de trabajo: `/home/xolosarmy/ecashschool/RMZWallet-quickstart`. El chec
 
 Checkout de trabajo: `/home/xolosarmy/ecashschool/tonalli-faucet`.
 
-HEADs de implementación de esta remediación: RMZWallet `36eeae28b0788ce102640198799aa15d5295e24b`, tonalli-faucet `bb959a47e5096898204076944de87bca91470fc8`. El tip de PR #99 puede incluir commits documentales posteriores.
+HEADs de implementación de esta remediación: RMZWallet `50e16c2e2d4a312cdf2e5f57111eb11d51185d43`, tonalli-faucet `d3bd4ef852d50748c9cd57a35402d1a32aeb3c7d`. El tip de PR #99 puede incluir commits documentales posteriores.
 
 ---
 
