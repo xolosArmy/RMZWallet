@@ -51,7 +51,7 @@ git log --oneline origin/main..HEAD
 | Rama | `feat/tonalli-quickstart-onboarding` |
 | BASE `origin/main` | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
 | HEAD al inicio de esta revisión (referencia, no asumir) | `9e5aed17448d4cece6759f32ca7a18c436ff2865` |
-| HEAD de implementación (este pass) | `36eeae28b0788ce102640198799aa15d5295e24b` |
+| HEAD de implementación (este pass) | `50e16c2e2d4a312cdf2e5f57111eb11d51185d43` |
 | HEAD revisado por Codex (exact-head previo) | `084fc4660d5a92ee492ea54d91abd2721afb05bb` |
 | HEAD de reporte | el commit de este archivo; **no** es el HEAD de implementación |
 | Tip autoritativo | `git rev-parse HEAD` |
@@ -521,7 +521,43 @@ Current HEADs at the start of this remediation matched those reviewed commits. N
 - Files: `backend/src/routes/faucet.ts`, `backend/src/db.ts`, `backend/README.md`.
 - Tests: `GET /stats agrega welcome, legacy starter pack y social`.
 - Acceptance evidence: new welcome claim appears under `welcome`; legacy row remains under `legacyStarterPack`; dry-run vs live distinguished (`welcome.dryRun` vs `welcome.completed`).
-- Status: remediado en `bb959a47e5096898204076944de87bca91470fc8`; pendiente re-review Codex.
+- Status: remediado en `bb959a47e5096898204076944de87bca91470fc8`; re-review Codex `bb959a4` no reabrió este finding.
+
+### Codex re-review of remediación HEADs (`9548884` / `bb959a4`)
+
+Codex completed exact-head reviews of the first remediación commits on 2026-09-19T14:22Z.
+
+The original six findings were not re-opened. New findings:
+
+#### RMZ #99 — P1 import overwrite
+
+- Codex discussion: https://github.com/xolosArmy/RMZWallet/pull/99#discussion_r4053432317
+- Severity: P1
+- Root cause: `/onboarding/import` / `restoreWallet()` could replace a recovered or failed Quick Start mnemonic and later `discardQuickStartRecord()`.
+- Fix: same fail-closed gate as create-backed (pending / recovered / failed / initialized / existing record). No destructive reset.
+- Files: `src/routes/Onboarding.tsx`, `src/context/WalletContext.tsx`.
+- Tests: `Onboarding.test.tsx` import blocked; `WalletContext.quickStart.test.tsx` refuses `restoreWallet` while recovered.
+- Status: remediado en `50e16c2e2d4a312cdf2e5f57111eb11d51185d43`.
+
+#### Faucet #3 — P2 health advertises unavailable starter pack
+
+- Codex discussion: https://github.com/xolosArmy/tonalli-faucet/pull/3#discussion_r4053431746
+- Severity: P2
+- Root cause: `GET /health` used only `faucetEnabled`, so Turnstile-on still advertised `starterPackEnabled: true` while POST returned 503.
+- Fix: `starterPackEnabled = faucetEnabled && quickStartCompatible`; health also exposes `quickStartCompatible`.
+- Files: `backend/src/routes/faucet.ts`.
+- Tests: `GET /health no anuncia starter pack cuando Welcome Quick Start es incompatible`.
+- Status: remediado en `d3bd4ef852d50748c9cd57a35402d1a32aeb3c7d`.
+
+#### Faucet #3 — P2 stale starter-pack README
+
+- Codex discussion: https://github.com/xolosArmy/tonalli-faucet/pull/3#discussion_r4053431748
+- Severity: P2
+- Root cause: Dry Run / Anti-Abuse still described `starter_pack_claims`, RMZ dry-run txids, and `FAUCET_COOLDOWN_DAYS` as Welcome authority.
+- Fix: those sections now describe `welcome_claims`, one-time XEC, dry-run→live, and cooldown as social `/claim` only.
+- Files: `backend/README.md`.
+- Tests: `README describe welcome_claims y no el starter pack XEC+RMZ como autoridad actual`.
+- Status: remediado en `d3bd4ef852d50748c9cd57a35402d1a32aeb3c7d`.
 
 ### Exact list
 
@@ -529,12 +565,15 @@ Current HEADs at the start of this remediation matched those reviewed commits. N
 RMZ #99
 P1 capability bypass
 P1 create-backed overwrite
+P1 import overwrite (re-review)
 P2 Chronik-first-create persistence
 
 Faucet #3
 P1 legacy funded migration
 P2 dry-run → live
 P2 stats authority
+P2 health Turnstile advertisement (re-review)
+P2 README starter-pack authority (re-review)
 ```
 
 ### Validation after remediation
@@ -543,17 +582,19 @@ P2 stats authority
 |---|---|
 | RMZWallet BASE | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
 | RMZWallet reviewed-old HEAD | `084fc4660d5a92ee492ea54d91abd2721afb05bb` |
-| RMZWallet fixed HEAD | `36eeae28b0788ce102640198799aa15d5295e24b` |
+| RMZWallet first remediación HEAD | `36eeae28b0788ce102640198799aa15d5295e24b` |
+| RMZWallet fixed HEAD | `50e16c2e2d4a312cdf2e5f57111eb11d51185d43` |
 | `npx tsc -b` | PASS |
 | `npx tsc -p tsconfig.tm1-regtest-e2e.json` | PASS |
-| `npm test` | **2701** vitest + **10** slpNftTxBuilder PASS |
+| `npm test` | **2703** vitest + **10** slpNftTxBuilder PASS |
 | lint BASE | 328 errors / 0 warnings |
 | lint HEAD | 328 errors / 0 warnings |
 | new lint from this remediation | 0 |
 | faucet BASE | `f1964d220d23b214141e722ea5781adee32c0fc9` |
 | faucet reviewed-old HEAD | `aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71` |
-| faucet fixed HEAD | `bb959a47e5096898204076944de87bca91470fc8` |
-| `npm test` | **51/51**, 3 consecutive clean processes |
+| faucet first remediación HEAD | `bb959a47e5096898204076944de87bca91470fc8` |
+| faucet fixed HEAD | `d3bd4ef852d50748c9cd57a35402d1a32aeb3c7d` |
+| `npm test` | **53/53**, 3 consecutive clean processes |
 | `npm run typecheck` | PASS |
 | `npm run build` | PASS |
 
@@ -565,6 +606,6 @@ Live Firefox clean-profile was not re-run in this pass. Flows A–E are covered 
 
 **NO-GO**
 
-The six Codex exact-head findings are fixed in `36eeae2` / `bb959a4` with tests PASS. Codex has not yet re-reviewed those HEADs.
+The original six Codex findings are fixed. Re-review of `9548884` / `bb959a4` found one new RMZ P1 and two faucet P2s; those are fixed in `50e16c2` / `d3bd4ef`. Codex has not yet reviewed those later HEADs.
 
 **Do not merge. Do not deploy production. Do not use real funds.**
