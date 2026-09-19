@@ -1,5 +1,6 @@
 import {
-  createTmCommAuthChallengeView
+  createTmCommAuthChallengeView,
+  type TmCommAuthChallengeView
 } from '../../src/features/privateMessaging/authChallenge'
 import {
   TM_COMM_MAX_MESSAGE_BODY_CHARS
@@ -50,15 +51,7 @@ export class TmCommService {
     this.now = now
   }
 
-  createChallenge(requestOrigin: string | null): {
-    challengeId: string
-    nonce: string
-    expiresAt: number
-    audience: string
-    origin: string
-    sessionContext: string
-    canonicalMessage: string
-  } {
+  createChallenge(requestOrigin: string | null): TmCommAuthChallengeView {
     const origin = this.requireExpectedOrigin(requestOrigin)
     const now = this.now()
     const challengeId = createTmCommId('challenge')
@@ -92,15 +85,7 @@ export class TmCommService {
       outcome: 'allow',
       reasonCode: 'CHALLENGE_ISSUED'
     })
-    return {
-      challengeId,
-      nonce,
-      expiresAt,
-      audience: this.config.expectedOrigin,
-      origin,
-      sessionContext: this.config.sessionContext,
-      canonicalMessage: view.canonicalMessage
-    }
+    return view
   }
 
   createSession(input: {
@@ -510,12 +495,52 @@ export class TmCommService {
     return this.store.listReceipts(message.id)
   }
 
+  assertMutationOrigin(
+    principal: TmCommPrincipal,
+    requestOrigin: string | null,
+    action: string,
+    resourceType: string,
+    resourceId: string | null = null
+  ): void {
+    if (requestOrigin === null || requestOrigin !== this.config.expectedOrigin) {
+      this.deny(principal, action, resourceType, resourceId, 'ORIGIN_MISMATCH')
+      throw new TmCommError(
+        TM_COMM_ERROR_CODES.FORBIDDEN,
+        403,
+        'Request origin is not authorized for mutations.',
+        'ORIGIN_MISMATCH'
+      )
+    }
+  }
+
   upsertReceipt(
     principal: TmCommPrincipal,
     messageId: string,
-    state: TmCommReceiptState
+    state: TmCommReceiptState,
+    claimedPrincipalId?: string
   ): TmCommMessageReceipt {
-    this.requireMessageAccess(principal, messageId, 'receipt.upsert')
+    if (claimedPrincipalId && claimedPrincipalId !== principal.id) {
+      this.deny(principal, 'receipt.upsert', 'message', messageId, 'RECEIPT_IMPERSONATION')
+      throw tmCommForbidden('RECEIPT_IMPERSONATION')
+    }
+
+    const message = this.requireMessageAccess(principal, messageId, 'receipt.upsert')
+
+    if (principal.id === message.senderPrincipalId) {
+      this.deny(principal, 'receipt.upsert', 'message', messageId, 'SELF_RECEIPT_FORBIDDEN')
+      throw tmCommForbidden('SELF_RECEIPT_FORBIDDEN')
+    }
+
+    const conversation = this.store.findConversationById(message.conversationId)
+    const authorizedRecipients = conversation !== null
+      ? conversation.participantPrincipalIds.filter((id) => id !== message.senderPrincipalId)
+      : []
+
+    if (!authorizedRecipients.includes(principal.id)) {
+      this.deny(principal, 'receipt.upsert', 'message', messageId, 'RECIPIENT_REQUIRED')
+      throw tmCommForbidden('RECIPIENT_REQUIRED')
+    }
+
     const receipt = this.store.upsertReceipt({
       id: createTmCommId('receipt'),
       messageId,

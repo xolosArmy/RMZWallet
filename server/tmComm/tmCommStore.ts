@@ -469,10 +469,13 @@ export class TmCommStore {
   }
 
   private syncMessageStatus(messageId: string): void {
+    const message = this.findMessageById(messageId)
+    if (message === null) return
     const receipts = this.listReceipts(messageId)
+      .filter((receipt) => receipt.principalId !== message.senderPrincipalId)
     const status = receipts.some((receipt) => receipt.state === 'read')
       ? 'read'
-      : receipts.length > 0
+      : receipts.some((receipt) => receipt.state === 'delivered')
         ? 'delivered'
         : 'accepted'
     this.database.prepare(

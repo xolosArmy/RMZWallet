@@ -44,11 +44,14 @@ export {
   TM_COMM_AUTH_CHAIN,
   buildTmCommAuthChallengeMessage,
   createTmCommAuthChallengeView,
+  verifyAndReconstructAuthChallenge,
   isMiningGatewayConnectFlow
 } from './authChallenge'
 export type {
   TmCommAuthChallengeInput,
-  TmCommAuthChallengeView
+  TmCommAuthChallengeView,
+  TmCommAuthChallengePayload,
+  TmCommAuthChallengeValidationOptions
 } from './authChallenge'
 
 export {

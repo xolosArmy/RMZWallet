@@ -91,6 +91,89 @@ export function createTmCommAuthChallengeView(
   })
 }
 
+export type TmCommAuthChallengePayload = Readonly<{
+  protocol?: unknown
+  purpose?: unknown
+  challengeId?: unknown
+  nonce?: unknown
+  expiresAt?: unknown
+  audience?: unknown
+  origin?: unknown
+  sessionContext?: unknown
+  chain?: unknown
+  canonicalMessage?: unknown
+}>
+
+export type TmCommAuthChallengeValidationOptions = Readonly<{
+  expectedOrigin: string
+  now?: number
+}>
+
+export function verifyAndReconstructAuthChallenge(
+  payload: unknown,
+  options: TmCommAuthChallengeValidationOptions
+): { canonicalMessage: string; challengeId: string } {
+  if (typeof payload !== 'object' || payload === null) {
+    throw new Error('Challenge payload must be a non-null object.')
+  }
+  const raw = payload as Record<string, unknown>
+
+  if (raw.protocol !== TM_COMM_AUTH_PROTOCOL) {
+    throw new Error(`Invalid protocol: expected ${TM_COMM_AUTH_PROTOCOL}, got ${String(raw.protocol)}.`)
+  }
+  if (raw.purpose !== TM_COMM_AUTH_PURPOSE) {
+    throw new Error(`Invalid purpose: expected ${TM_COMM_AUTH_PURPOSE}, got ${String(raw.purpose)}.`)
+  }
+  if (raw.chain !== TM_COMM_AUTH_CHAIN) {
+    throw new Error(`Invalid chain: expected ${TM_COMM_AUTH_CHAIN}, got ${String(raw.chain)}.`)
+  }
+  if (typeof raw.challengeId !== 'string' || !REQUIRED_CHALLENGE_LINE.test(raw.challengeId)) {
+    throw new Error('challengeId must be a valid non-empty canonical token.')
+  }
+  if (typeof raw.nonce !== 'string' || !REQUIRED_CHALLENGE_LINE.test(raw.nonce)) {
+    throw new Error('nonce must be a valid non-empty canonical token.')
+  }
+  if (typeof raw.sessionContext !== 'string' || !REQUIRED_CHALLENGE_LINE.test(raw.sessionContext)) {
+    throw new Error('sessionContext must be a valid non-empty canonical token.')
+  }
+  if (typeof raw.audience !== 'string' || raw.audience !== options.expectedOrigin) {
+    throw new Error(`audience mismatch: expected ${options.expectedOrigin}, got ${String(raw.audience)}.`)
+  }
+  if (typeof raw.origin !== 'string' || raw.origin !== options.expectedOrigin) {
+    throw new Error(`origin mismatch: expected ${options.expectedOrigin}, got ${String(raw.origin)}.`)
+  }
+  if (
+    typeof raw.expiresAt !== 'number' ||
+    !Number.isInteger(raw.expiresAt) ||
+    raw.expiresAt <= 0
+  ) {
+    throw new Error('expiresAt must be a positive integer unix millisecond timestamp.')
+  }
+
+  const now = options.now ?? Date.now()
+  if (now >= raw.expiresAt) {
+    throw new Error(`Challenge has expired: now=${now} >= expiresAt=${raw.expiresAt}.`)
+  }
+
+  const localCanonical = buildTmCommAuthChallengeMessage({
+    challengeId: raw.challengeId,
+    nonce: raw.nonce,
+    expiresAt: raw.expiresAt,
+    audience: raw.audience,
+    origin: raw.origin,
+    sessionContext: raw.sessionContext
+  })
+
+  if (typeof raw.canonicalMessage !== 'string' || raw.canonicalMessage !== localCanonical) {
+    throw new Error('canonicalMessage does not match locally reconstructed canonical message.')
+  }
+
+  return {
+    canonicalMessage: localCanonical,
+    challengeId: raw.challengeId
+  }
+}
+
 export function isMiningGatewayConnectFlow(pathname: string): boolean {
   return pathname === '/connect/sign-message' || pathname === '/connect'
 }

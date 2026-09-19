@@ -112,6 +112,7 @@ async function handleRequest(
     }
 
     if (method === 'POST' && url.pathname === '/v1/tm-comm/bindings') {
+      service.assertMutationOrigin(principal, origin, 'binding.create', 'binding', null)
       const body = await readJson(request)
       const result = service.bindReservation(
         principal,
@@ -144,6 +145,7 @@ async function handleRequest(
         return
       }
       if (method === 'POST') {
+        service.assertMutationOrigin(principal, origin, 'message.send', 'conversation', conversationId)
         const body = await readJson(request)
         const message = service.sendMessage(principal, conversationId, {
           clientMessageId: readString(body, 'clientMessageId'),
@@ -171,6 +173,7 @@ async function handleRequest(
         return
       }
       if (method === 'PUT') {
+        service.assertMutationOrigin(principal, origin, 'receipt.upsert', 'message', messageId)
         const body = await readJson(request)
         const state = readString(body, 'state')
         if (state !== 'delivered' && state !== 'read') {
@@ -181,7 +184,16 @@ async function handleRequest(
             'RECEIPT_STATE_INVALID'
           )
         }
-        writeJson(response, 200, service.upsertReceipt(principal, messageId, state as TmCommReceiptState))
+        writeJson(
+          response,
+          200,
+          service.upsertReceipt(
+            principal,
+            messageId,
+            state as TmCommReceiptState,
+            optionalString(body, 'principalId') ?? optionalString(body, 'claimedPrincipalId')
+          )
+        )
         return
       }
     }
@@ -189,8 +201,21 @@ async function handleRequest(
     const attachmentMatch = /^\/v1\/tm-comm\/(?:attachments|conversations\/[^/]+\/attachments)\/([^/]+)$/.exec(
       url.pathname
     )
-    if (attachmentMatch && (method === 'GET' || method === 'HEAD')) {
+    if (attachmentMatch) {
+      if (method !== 'GET' && method !== 'HEAD') {
+        service.assertMutationOrigin(
+          principal,
+          origin,
+          'attachment.mutation',
+          'attachment',
+          decodeURIComponent(attachmentMatch[1])
+        )
+      }
       service.denyAttachment(principal, decodeURIComponent(attachmentMatch[1]))
+    }
+
+    if (method !== 'GET' && method !== 'HEAD') {
+      service.assertMutationOrigin(principal, origin, 'mutation.unknown', 'route', url.pathname)
     }
 
     writeJson(response, 404, {
@@ -264,6 +289,24 @@ function writeJson(response: ServerResponse, status: number, body: unknown): voi
 }
 
 async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
+  const rawContentType = request.headers['content-type']
+  if (typeof rawContentType !== 'string' || rawContentType.trim().length === 0) {
+    throw new TmCommError(
+      TM_COMM_ERROR_CODES.INVALID_INPUT,
+      415,
+      'Content-Type must be application/json.',
+      'CONTENT_TYPE_REQUIRED'
+    )
+  }
+  const [mime] = rawContentType.split(';').map((part) => part.trim().toLowerCase())
+  if (mime !== 'application/json') {
+    throw new TmCommError(
+      TM_COMM_ERROR_CODES.INVALID_INPUT,
+      415,
+      'Unsupported Content-Type. Only application/json is accepted.',
+      'CONTENT_TYPE_UNSUPPORTED'
+    )
+  }
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of request) {

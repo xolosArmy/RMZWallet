@@ -21,7 +21,8 @@ import {
   isMiningGatewayConnectFlow,
   isTmCommAgentSendEnabled,
   isTmCommMemoInCurrentMilestone,
-  tmCommEmailDispatchDedupeKey
+  tmCommEmailDispatchDedupeKey,
+  verifyAndReconstructAuthChallenge
 } from './index'
 
 describe('TM-COMM closed domain', () => {
@@ -100,5 +101,119 @@ describe('TM-COMM closed domain', () => {
       channel: 'email-fallback'
     })).toBe('msg_1:prin_1:email-fallback')
     expect(() => assertPrivateConversationNotAutoPublished()).not.toThrow()
+  })
+
+  describe('verifyAndReconstructAuthChallenge (P2-1 local challenge validation)', () => {
+    const validView = createTmCommAuthChallengeView({
+      challengeId: 'chlg_test_123',
+      nonce: 'nonce_secret_abc',
+      expiresAt: 2_000_000_000_000,
+      audience: 'http://127.0.0.1:5174',
+      origin: 'http://127.0.0.1:5174',
+      sessionContext: 'tm-comm-a0-staging:v1'
+    })
+
+    test('accepts and verifies a legitimate challenge', () => {
+      const result = verifyAndReconstructAuthChallenge(validView, {
+        expectedOrigin: 'http://127.0.0.1:5174',
+        now: 1_900_000_000_000
+      })
+      expect(result.challengeId).toBe('chlg_test_123')
+      expect(result.canonicalMessage).toBe(validView.canonicalMessage)
+    })
+
+    test('rejects altered protocol', () => {
+      expect(() =>
+        verifyAndReconstructAuthChallenge(
+          { ...validView, protocol: 'TM-COMM-AUTH-V2' },
+          { expectedOrigin: 'http://127.0.0.1:5174', now: 1_900_000_000_000 }
+        )
+      ).toThrow(/Invalid protocol/)
+    })
+
+    test('rejects altered purpose', () => {
+      expect(() =>
+        verifyAndReconstructAuthChallenge(
+          { ...validView, purpose: 'mining-gateway-connect' },
+          { expectedOrigin: 'http://127.0.0.1:5174', now: 1_900_000_000_000 }
+        )
+      ).toThrow(/Invalid purpose/)
+    })
+
+    test('rejects altered chain', () => {
+      expect(() =>
+        verifyAndReconstructAuthChallenge(
+          { ...validView, chain: 'btc' },
+          { expectedOrigin: 'http://127.0.0.1:5174', now: 1_900_000_000_000 }
+        )
+      ).toThrow(/Invalid chain/)
+    })
+
+    test('rejects audience mismatch', () => {
+      expect(() =>
+        verifyAndReconstructAuthChallenge(
+          { ...validView, audience: 'http://evil.site.com' },
+          { expectedOrigin: 'http://127.0.0.1:5174', now: 1_900_000_000_000 }
+        )
+      ).toThrow(/audience mismatch/)
+    })
+
+    test('rejects origin mismatch', () => {
+      expect(() =>
+        verifyAndReconstructAuthChallenge(
+          { ...validView, origin: 'http://evil.site.com' },
+          { expectedOrigin: 'http://127.0.0.1:5174', now: 1_900_000_000_000 }
+        )
+      ).toThrow(/origin mismatch/)
+    })
+
+    test('rejects invalid or non-canonical nonce tokens', () => {
+      expect(() =>
+        verifyAndReconstructAuthChallenge(
+          { ...validView, nonce: 'spaces in nonce' },
+          { expectedOrigin: 'http://127.0.0.1:5174', now: 1_900_000_000_000 }
+        )
+      ).toThrow(/nonce must be a valid non-empty canonical token/)
+    })
+
+    test('rejects expired challenge', () => {
+      expect(() =>
+        verifyAndReconstructAuthChallenge(validView, {
+          expectedOrigin: 'http://127.0.0.1:5174',
+          now: 2_000_000_000_001
+        })
+      ).toThrow(/Challenge has expired/)
+    })
+
+    test('rejects invalid expiry timestamps', () => {
+      expect(() =>
+        verifyAndReconstructAuthChallenge(
+          { ...validView, expiresAt: -1 },
+          { expectedOrigin: 'http://127.0.0.1:5174', now: 1_900_000_000_000 }
+        )
+      ).toThrow(/expiresAt must be a positive integer/)
+    })
+
+    test('rejects manipulated canonicalMessage that does not match local reconstruction', () => {
+      expect(() =>
+        verifyAndReconstructAuthChallenge(
+          { ...validView, canonicalMessage: validView.canonicalMessage + '\nextra=evil' },
+          { expectedOrigin: 'http://127.0.0.1:5174', now: 1_900_000_000_000 }
+        )
+      ).toThrow(/canonicalMessage does not match locally reconstructed/)
+    })
+
+    test('rejects non-object or null payloads', () => {
+      expect(() =>
+        verifyAndReconstructAuthChallenge(null, {
+          expectedOrigin: 'http://127.0.0.1:5174'
+        })
+      ).toThrow(/Challenge payload must be a non-null object/)
+      expect(() =>
+        verifyAndReconstructAuthChallenge('arbitrary string', {
+          expectedOrigin: 'http://127.0.0.1:5174'
+        })
+      ).toThrow(/Challenge payload must be a non-null object/)
+    })
   })
 })

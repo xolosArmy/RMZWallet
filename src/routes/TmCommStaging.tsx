@@ -1,21 +1,17 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
+import {
+  verifyAndReconstructAuthChallenge,
+  type TmCommAuthChallengePayload
+} from '../features/privateMessaging/authChallenge'
 import { xolosWalletService } from '../services/XolosWalletService'
 import { tmCommRequest } from './tmCommStagingClient'
-
-type ChallengeResponse = {
-  challengeId: string
-  canonicalMessage: string
-  nonce: string
-  expiresAt: number
-  audience: string
-  origin: string
-}
 
 type Conversation = {
   id: string
   reservationId: string
+  createdAt?: number
 }
 
 type Message = {
@@ -32,6 +28,7 @@ function TmCommStaging() {
   const { initialized, address } = useWallet()
   const [enrollmentToken, setEnrollmentToken] = useState('')
   const [messageBody, setMessageBody] = useState('Mensaje privado de staging A0')
+  const [conversations, setConversations] = useState<Conversation[]>([])
   const [conversation, setConversation] = useState<Conversation | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [log, setLog] = useState<string[]>([])
@@ -39,61 +36,6 @@ function TmCommStaging() {
 
   const append = (line: string) => {
     setLog((current) => [...current, line])
-  }
-
-  const authenticate = async () => {
-    if (!initialized || !address) {
-      append('La wallet debe estar desbloqueada en staging.')
-      return
-    }
-    const publicKeyHex = xolosWalletService.getPublicKeyHex()
-    if (!publicKeyHex) {
-      append('No se pudo leer la clave pública.')
-      return
-    }
-    setBusy(true)
-    try {
-      const challenge = await tmCommRequest<ChallengeResponse>('/v1/tm-comm/challenges', {
-        method: 'POST'
-      })
-      if (!challenge.ok) {
-        append(`Challenge rechazado (${challenge.status}).`)
-        return
-      }
-      const signature = await xolosWalletService.signMessage(challenge.data.canonicalMessage)
-      const session = await tmCommRequest('/v1/tm-comm/sessions', {
-        method: 'POST',
-        body: JSON.stringify({
-          challengeId: challenge.data.challengeId,
-          address,
-          publicKeyHex,
-          signature
-        })
-      })
-      append(session.ok
-        ? 'Sesión TM-COMM creada. La clave privada no salió de Tonalli.'
-        : `Sesión rechazada (${session.status}).`)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const bind = async () => {
-    setBusy(true)
-    try {
-      const result = await tmCommRequest<{ conversation: Conversation }>('/v1/tm-comm/bindings', {
-        method: 'POST',
-        body: JSON.stringify({ enrollmentToken })
-      })
-      if (!result.ok) {
-        append(`Binding rechazado (${result.status}). Una dirección conocida no basta.`)
-        return
-      }
-      setConversation(result.data.conversation)
-      append(`Reserva ficticia vinculada: ${result.data.conversation.reservationId}`)
-    } finally {
-      setBusy(false)
-    }
   }
 
   const refreshMessages = async (conversationId = conversation?.id) => {
@@ -110,6 +52,164 @@ function TmCommStaging() {
     }
     setMessages(listed.data.messages)
     append(`Historial recargado desde el servidor: ${listed.data.messages.length} mensaje(s).`)
+  }
+
+  const restoreAuthorizedConversations = async (preferredConversationId?: string) => {
+    const listed = await tmCommRequest<{ conversations: Conversation[] }>('/v1/tm-comm/conversations')
+    if (!listed.ok) {
+      if (listed.status === 401) {
+        setConversations([])
+        setConversation(null)
+        setMessages([])
+      }
+      return
+    }
+    const list = listed.data.conversations ?? []
+    setConversations(list)
+    if (list.length === 0) {
+      setConversation(null)
+      setMessages([])
+      return
+    }
+
+    const sorted = [...list].sort((a, b) => {
+      const timeA = a.createdAt ?? 0
+      const timeB = b.createdAt ?? 0
+      if (timeB !== timeA) return timeB - timeA
+      return b.id.localeCompare(a.id)
+    })
+
+    const target = (preferredConversationId ? sorted.find((c) => c.id === preferredConversationId) : undefined)
+      ?? (conversation?.id ? sorted.find((c) => c.id === conversation.id) : undefined)
+      ?? sorted[0]
+
+    setConversation(target)
+    append(`Conversación activa: ${target.id} (${target.reservationId}).`)
+    await refreshMessages(target.id)
+  }
+
+  useEffect(() => {
+    let active = true
+    async function hydrateConversationsOnMount() {
+      const listed = await tmCommRequest<{ conversations: Conversation[] }>('/v1/tm-comm/conversations')
+      if (!active) return
+      if (!listed.ok) {
+        if (listed.status === 401) {
+          setConversations([])
+          setConversation(null)
+          setMessages([])
+        }
+        return
+      }
+      const list = listed.data.conversations ?? []
+      setConversations(list)
+      if (list.length === 0) {
+        setConversation(null)
+        setMessages([])
+        return
+      }
+      const sorted = [...list].sort((a, b) => {
+        const timeA = a.createdAt ?? 0
+        const timeB = b.createdAt ?? 0
+        if (timeB !== timeA) return timeB - timeA
+        return b.id.localeCompare(a.id)
+      })
+      const target = sorted[0]
+      setConversation(target)
+      setLog((current) => [...current, `Conversación activa: ${target.id} (${target.reservationId}).`])
+      const msgRes = await tmCommRequest<{ messages: Message[] }>(
+        `/v1/tm-comm/conversations/${target.id}/messages`
+      )
+      if (!active) return
+      if (msgRes.ok) {
+        setMessages(msgRes.data.messages)
+        setLog((current) => [
+          ...current,
+          `Historial recargado desde el servidor: ${msgRes.data.messages.length} mensaje(s).`
+        ])
+      }
+    }
+    void hydrateConversationsOnMount()
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const authenticate = async () => {
+    if (!initialized || !address) {
+      append('La wallet debe estar desbloqueada en staging.')
+      return
+    }
+    const publicKeyHex = xolosWalletService.getPublicKeyHex()
+    if (!publicKeyHex) {
+      append('No se pudo leer la clave pública.')
+      return
+    }
+    setBusy(true)
+    try {
+      const challenge = await tmCommRequest<TmCommAuthChallengePayload>('/v1/tm-comm/challenges', {
+        method: 'POST'
+      })
+      if (!challenge.ok || !challenge.data) {
+        append(`Challenge rechazado (${challenge.status}).`)
+        return
+      }
+
+      const clientOrigin = typeof window !== 'undefined' && window.location?.origin && window.location.origin !== 'null'
+        ? window.location.origin
+        : 'http://127.0.0.1:5174'
+
+      let verified: { canonicalMessage: string; challengeId: string }
+      try {
+        verified = verifyAndReconstructAuthChallenge(challenge.data, {
+          expectedOrigin: clientOrigin
+        })
+      } catch (validationError) {
+        append(
+          `Challenge inválido o manipulado: ${
+            validationError instanceof Error ? validationError.message : 'FAIL_CLOSED'
+          }`
+        )
+        return
+      }
+
+      const signature = await xolosWalletService.signMessage(verified.canonicalMessage)
+      const session = await tmCommRequest('/v1/tm-comm/sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          challengeId: verified.challengeId,
+          address,
+          publicKeyHex,
+          signature
+        })
+      })
+      if (session.ok) {
+        append('Sesión TM-COMM creada. La clave privada no salió de Tonalli.')
+        await restoreAuthorizedConversations()
+      } else {
+        append(`Sesión rechazada (${session.status}).`)
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const bind = async () => {
+    setBusy(true)
+    try {
+      const result = await tmCommRequest<{ conversation: Conversation }>('/v1/tm-comm/bindings', {
+        method: 'POST',
+        body: JSON.stringify({ enrollmentToken })
+      })
+      if (!result.ok) {
+        append(`Binding rechazado (${result.status}). Una dirección conocida no basta.`)
+        return
+      }
+      append(`Reserva ficticia vinculada: ${result.data.conversation.reservationId}`)
+      await restoreAuthorizedConversations(result.data.conversation.id)
+    } finally {
+      setBusy(false)
+    }
   }
 
   const send = async () => {
@@ -177,6 +277,35 @@ function TmCommStaging() {
 
       <div className="card">
         <h2>3. Mensaje durable</h2>
+        {conversations.length > 1 && (
+          <div style={{ marginBottom: '1rem' }}>
+            <label
+              htmlFor="conversation-select"
+              style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.85rem' }}
+            >
+              Seleccionar conversación:
+            </label>
+            <select
+              id="conversation-select"
+              aria-label="Seleccionar conversación"
+              value={conversation?.id ?? ''}
+              onChange={(e) => {
+                const selected = conversations.find((c) => c.id === e.target.value) ?? null
+                setConversation(selected)
+                if (selected) {
+                  void refreshMessages(selected.id)
+                }
+              }}
+              disabled={busy}
+            >
+              {conversations.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.id} ({c.reservationId})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <p className="muted">
           Conversación: {conversation?.id ?? 'ninguna'} · Reserva: {conversation?.reservationId ?? '—'}
         </p>

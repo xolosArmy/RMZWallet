@@ -14,6 +14,7 @@ type Started = {
   origin: string
   store: TmCommStore
   service: TmCommService
+  operatorWallet: ReturnType<typeof createTmCommEphemeralWallet>
   enrollments: ReturnType<typeof bootstrapTmCommStaging>['enrollments']
   close: () => Promise<void>
 }
@@ -49,6 +50,7 @@ async function startStaging(): Promise<Started> {
     origin,
     store,
     service,
+    operatorWallet: operator,
     enrollments: bootstrap.enrollments,
     close: async () => {
       await new Promise<void>((resolve, reject) => {
@@ -65,11 +67,28 @@ async function startStaging(): Promise<Started> {
 async function request(
   started: Started,
   path: string,
-  init: RequestInit & { token?: string } = {}
+  init: RequestInit & {
+    token?: string
+    origin?: string | null
+    skipOrigin?: boolean
+    rawContentType?: string | null
+  } = {}
 ) {
   const headers = new Headers(init.headers)
-  headers.set('Origin', started.origin)
-  if (init.body && !headers.has('Content-Type')) {
+  if (!init.skipOrigin) {
+    if (init.origin !== undefined) {
+      if (init.origin !== null) headers.set('Origin', init.origin)
+    } else {
+      headers.set('Origin', started.origin)
+    }
+  }
+  if (init.rawContentType !== undefined) {
+    if (init.rawContentType !== null) {
+      headers.set('Content-Type', init.rawContentType)
+    } else {
+      headers.delete('Content-Type')
+    }
+  } else if (init.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
   if (init.token) {
@@ -79,10 +98,17 @@ async function request(
     ...init,
     headers
   })
-  const json = await response.json() as Record<string, unknown>
+  const text = await response.text()
+  let json: Record<string, unknown> = {}
+  try {
+    json = JSON.parse(text) as Record<string, unknown>
+  } catch {
+    // not json
+  }
   return {
     status: response.status,
     json,
+    text,
     token: cookieValue(response.headers.getSetCookie(), TM_COMM_COOKIE_NAME)
   }
 }
@@ -323,6 +349,7 @@ describe('TM-COMM A0 HTTP API', () => {
       origin,
       store,
       service,
+      operatorWallet: operator,
       enrollments: bootstrap.enrollments,
       close: async () => undefined
     }
@@ -386,12 +413,38 @@ describe('TM-COMM A0 HTTP API', () => {
       })
       expect(messages[0].serverCreatedAt).toBeGreaterThan(0)
 
-      const receipt = await request(started, `/v1/tm-comm/messages/${firstId}/receipts`, {
+      // P2-3: Sender attempts self-receipt -> rejected with 403 SELF_RECEIPT_FORBIDDEN
+      const selfReceipt = await request(started, `/v1/tm-comm/messages/${firstId}/receipts`, {
         method: 'PUT',
         token: session.token,
         body: JSON.stringify({ state: 'delivered' })
       })
+      expect(selfReceipt.status).toBe(403)
+      expect(selfReceipt.json).toMatchObject({
+        error: {
+          code: 'FORBIDDEN',
+          reasonCode: 'SELF_RECEIPT_FORBIDDEN'
+        }
+      })
+
+      // Authenticate the recipient (operator)
+      const operatorSession = await authenticate(started, operator)
+      const receipt = await request(started, `/v1/tm-comm/messages/${firstId}/receipts`, {
+        method: 'PUT',
+        token: operatorSession.token,
+        body: JSON.stringify({ state: 'delivered' })
+      })
       expect(receipt.status).toBe(200)
+
+      // Verify aggregate status reached delivered
+      const listedAfterDelivered = await request(started, `/v1/tm-comm/conversations/${conversationId}/messages`, {
+        token: session.token
+      })
+      const messagesAfterDelivered = listedAfterDelivered.json.messages as Array<{
+        id: string
+        status: string
+      }>
+      expect(messagesAfterDelivered[0].status).toBe('delivered')
     } finally {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => error ? reject(error) : resolve())
@@ -399,5 +452,281 @@ describe('TM-COMM A0 HTTP API', () => {
       store.close()
       rmSync(directory, { recursive: true, force: true })
     }
+  })
+
+  test('P2-2: enforces expected origin on authenticated mutations and rejects text/plain bypass with audit denial', async () => {
+    const started = await startStaging()
+    const wallet = createTmCommEphemeralWallet()
+    const session = await authenticate(started, wallet)
+
+    // 1. Authorized origin allowed on mutation (POST bindings)
+    const bindAllowed = await request(started, '/v1/tm-comm/bindings', {
+      method: 'POST',
+      token: session.token,
+      body: JSON.stringify({ enrollmentToken: started.enrollments[0].enrollmentToken })
+    })
+    expect(bindAllowed.status).toBe(201)
+    const conversationId = (bindAllowed.json.conversation as { id: string }).id
+
+    // 2. Foreign origin rejected on mutation (POST messages)
+    const foreignOrigin = await request(started, `/v1/tm-comm/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      token: session.token,
+      origin: 'https://attacker.com',
+      body: JSON.stringify({
+        clientMessageId: 'msg-attacker-origin-1',
+        body: 'Attacker message'
+      })
+    })
+    expect(foreignOrigin.status).toBe(403)
+    expect(foreignOrigin.json).toMatchObject({
+      error: {
+        code: 'FORBIDDEN',
+        reasonCode: 'ORIGIN_MISMATCH'
+      }
+    })
+
+    // 3. Port mismatch on 127.0.0.1 rejected
+    const portMismatch = await request(started, `/v1/tm-comm/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      token: session.token,
+      origin: 'http://127.0.0.1:5175',
+      body: JSON.stringify({
+        clientMessageId: 'msg-wrong-port-1',
+        body: 'Wrong port'
+      })
+    })
+    expect(portMismatch.status).toBe(403)
+    expect(portMismatch.json).toMatchObject({
+      error: {
+        code: 'FORBIDDEN',
+        reasonCode: 'ORIGIN_MISMATCH'
+      }
+    })
+
+    // 4. Missing origin header rejected on mutation
+    const missingOrigin = await request(started, `/v1/tm-comm/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      token: session.token,
+      skipOrigin: true,
+      body: JSON.stringify({
+        clientMessageId: 'msg-no-origin-1',
+        body: 'No origin'
+      })
+    })
+    expect(missingOrigin.status).toBe(403)
+    expect(missingOrigin.json).toMatchObject({
+      error: {
+        code: 'FORBIDDEN',
+        reasonCode: 'ORIGIN_MISMATCH'
+      }
+    })
+
+    // 5. text/plain Content-Type rejected with 415 CONTENT_TYPE_UNSUPPORTED
+    const textPlain = await request(started, `/v1/tm-comm/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      token: session.token,
+      rawContentType: 'text/plain',
+      body: JSON.stringify({
+        clientMessageId: 'msg-text-plain-1',
+        body: 'text plain bypass attempt'
+      })
+    })
+    expect(textPlain.status).toBe(415)
+    expect(textPlain.json).toMatchObject({
+      error: {
+        code: 'INVALID_INPUT',
+        reasonCode: 'CONTENT_TYPE_UNSUPPORTED'
+      }
+    })
+
+    // 6. Missing Content-Type rejected with 415 CONTENT_TYPE_REQUIRED
+    const missingContentType = await request(started, `/v1/tm-comm/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      token: session.token,
+      rawContentType: null,
+      body: JSON.stringify({
+        clientMessageId: 'msg-no-content-type-1',
+        body: 'no content type'
+      })
+    })
+    expect(missingContentType.status).toBe(415)
+    expect(missingContentType.json).toMatchObject({
+      error: {
+        code: 'INVALID_INPUT',
+        reasonCode: 'CONTENT_TYPE_UNSUPPORTED'
+      }
+    })
+
+    // 7. Valid session cookie with wrong origin rejected on receipt mutation
+    const validSend = await request(started, `/v1/tm-comm/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      token: session.token,
+      body: JSON.stringify({
+        clientMessageId: 'msg-valid-origin-1',
+        body: 'Valid message'
+      })
+    })
+    expect(validSend.status).toBe(201)
+    const messageId = (validSend.json as { id: string }).id
+
+    const wrongOriginReceipt = await request(started, `/v1/tm-comm/messages/${messageId}/receipts`, {
+      method: 'PUT',
+      token: session.token,
+      origin: 'https://evil.site',
+      body: JSON.stringify({ state: 'delivered' })
+    })
+    expect(wrongOriginReceipt.status).toBe(403)
+    expect(wrongOriginReceipt.json).toMatchObject({
+      error: {
+        code: 'FORBIDDEN',
+        reasonCode: 'ORIGIN_MISMATCH'
+      }
+    })
+
+    // 8. Audit log records denial events with reasonCode ORIGIN_MISMATCH
+    const deniedAudits = started.service.listDeniedAudits()
+    const originDenied = deniedAudits.filter((audit) => audit.reasonCode === 'ORIGIN_MISMATCH')
+    expect(originDenied.length).toBeGreaterThanOrEqual(4)
+    for (const audit of originDenied) {
+      expect(audit.outcome).toBe('deny')
+      expect(audit.actorPrincipalId).toBe(session.principalId)
+    }
+  })
+
+  test('P2-3: sender cannot generate receipts; aggregate message status derives strictly from recipients', async () => {
+    const started = await startStaging()
+    const senderWallet = createTmCommEphemeralWallet()
+    const senderSession = await authenticate(started, senderWallet)
+
+    const bind = await request(started, '/v1/tm-comm/bindings', {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({ enrollmentToken: started.enrollments[0].enrollmentToken })
+    })
+    expect(bind.status).toBe(201)
+    const conversationId = (bind.json.conversation as { id: string }).id
+
+    const sent = await request(started, `/v1/tm-comm/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      token: senderSession.token,
+      body: JSON.stringify({
+        clientMessageId: 'msg-p2-3-receipt-test',
+        body: 'Message for receipt testing'
+      })
+    })
+    expect(sent.status).toBe(201)
+    const messageId = (sent.json as { id: string }).id
+    expect((sent.json as { status: string }).status).toBe('accepted')
+
+    // 1. Sender attempts delivered receipt -> 403 SELF_RECEIPT_FORBIDDEN
+    const senderDelivered = await request(started, `/v1/tm-comm/messages/${messageId}/receipts`, {
+      method: 'PUT',
+      token: senderSession.token,
+      body: JSON.stringify({ state: 'delivered' })
+    })
+    expect(senderDelivered.status).toBe(403)
+    expect(senderDelivered.json).toMatchObject({
+      error: {
+        code: 'FORBIDDEN',
+        reasonCode: 'SELF_RECEIPT_FORBIDDEN'
+      }
+    })
+
+    // 2. Sender attempts read receipt -> 403 SELF_RECEIPT_FORBIDDEN
+    const senderRead = await request(started, `/v1/tm-comm/messages/${messageId}/receipts`, {
+      method: 'PUT',
+      token: senderSession.token,
+      body: JSON.stringify({ state: 'read' })
+    })
+    expect(senderRead.status).toBe(403)
+    expect(senderRead.json).toMatchObject({
+      error: {
+        code: 'FORBIDDEN',
+        reasonCode: 'SELF_RECEIPT_FORBIDDEN'
+      }
+    })
+
+    // Message status remains 'accepted' despite sender receipt attempts
+    const checkAfterSenderAttempts = await request(
+      started,
+      `/v1/tm-comm/conversations/${conversationId}/messages`,
+      { token: senderSession.token }
+    )
+    const msgs1 = checkAfterSenderAttempts.json.messages as Array<{ id: string; status: string }>
+    expect(msgs1[0].status).toBe('accepted')
+
+    // 3. Third-party principal (not in conversation) cannot issue receipt
+    const thirdPartyWallet = createTmCommEphemeralWallet()
+    const thirdPartySession = await authenticate(started, thirdPartyWallet)
+    const thirdPartyReceipt = await request(started, `/v1/tm-comm/messages/${messageId}/receipts`, {
+      method: 'PUT',
+      token: thirdPartySession.token,
+      body: JSON.stringify({ state: 'delivered' })
+    })
+    expect(thirdPartyReceipt.status).toBe(403)
+
+    // 4. Recipient attempts impersonation of another principal -> 403 RECEIPT_IMPERSONATION
+    const operatorSession = await authenticate(started, started.operatorWallet)
+    const impersonatedReceipt = await request(started, `/v1/tm-comm/messages/${messageId}/receipts`, {
+      method: 'PUT',
+      token: operatorSession.token,
+      body: JSON.stringify({ state: 'delivered', principalId: senderSession.principalId })
+    })
+    expect(impersonatedReceipt.status).toBe(403)
+    expect(impersonatedReceipt.json).toMatchObject({
+      error: {
+        code: 'FORBIDDEN',
+        reasonCode: 'RECEIPT_IMPERSONATION'
+      }
+    })
+
+    // 5. Valid recipient marks delivered -> status transitions to 'delivered'
+    const recipientDelivered = await request(started, `/v1/tm-comm/messages/${messageId}/receipts`, {
+      method: 'PUT',
+      token: operatorSession.token,
+      body: JSON.stringify({ state: 'delivered' })
+    })
+    expect(recipientDelivered.status).toBe(200)
+
+    const checkAfterDelivered = await request(
+      started,
+      `/v1/tm-comm/conversations/${conversationId}/messages`,
+      { token: senderSession.token }
+    )
+    const msgs2 = checkAfterDelivered.json.messages as Array<{ id: string; status: string }>
+    expect(msgs2[0].status).toBe('delivered')
+
+    // 6. Valid recipient marks read -> status transitions to 'read'
+    const recipientRead = await request(started, `/v1/tm-comm/messages/${messageId}/receipts`, {
+      method: 'PUT',
+      token: operatorSession.token,
+      body: JSON.stringify({ state: 'read' })
+    })
+    expect(recipientRead.status).toBe(200)
+
+    const checkAfterRead = await request(
+      started,
+      `/v1/tm-comm/conversations/${conversationId}/messages`,
+      { token: senderSession.token }
+    )
+    const msgs3 = checkAfterRead.json.messages as Array<{ id: string; status: string }>
+    expect(msgs3[0].status).toBe('read')
+
+    // 7. Idempotency: re-issuing read receipt succeeds and keeps status as read
+    const recipientReadAgain = await request(started, `/v1/tm-comm/messages/${messageId}/receipts`, {
+      method: 'PUT',
+      token: operatorSession.token,
+      body: JSON.stringify({ state: 'read' })
+    })
+    expect(recipientReadAgain.status).toBe(200)
+
+    const checkAfterReadAgain = await request(
+      started,
+      `/v1/tm-comm/conversations/${conversationId}/messages`,
+      { token: senderSession.token }
+    )
+    const msgs4 = checkAfterReadAgain.json.messages as Array<{ id: string; status: string }>
+    expect(msgs4[0].status).toBe('read')
   })
 })
