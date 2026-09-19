@@ -3,6 +3,8 @@ import { Link } from 'react-router-dom'
 import { calcTxFee } from 'ecash-lib'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
+import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
+import { assertWalletCapabilityEnabled } from '../domain/walletCapabilityGuard'
 import { getChronik } from '../services/ChronikClient'
 import { EXTENDED_GAP_LIMIT } from '../services/XolosWalletService'
 import {
@@ -80,7 +82,8 @@ function NftVerificationDetail({ nft, onClose }: { nft: NftAsset; onClose: () =>
 }
 
 function Nfts() {
-  const { address, initialized, backupVerified, loading, error, refreshBalances, rescanWallet } = useWallet()
+  const wallet = useWallet()
+  const { address, initialized, backupVerified, loading, error, refreshBalances, rescanWallet } = wallet
   const [activeTab, setActiveTab] = useState<'owned' | 'mint' | 'collection'>('owned')
   const [nfts, setNfts] = useState<NftAsset[]>([])
   const [nftsLoading, setNftsLoading] = useState(false)
@@ -300,6 +303,12 @@ function Nfts() {
     setMintTxid(null)
     setMintTokenId(null)
 
+    try {
+      assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.NFT_OPERATIONS)
+    } catch {
+      setMintError('Completa el onboarding y el respaldo antes de mintear.')
+      return
+    }
     if (!initialized || !backupVerified) {
       setMintError('Completa el onboarding y el respaldo antes de mintear.')
       return

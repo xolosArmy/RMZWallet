@@ -411,7 +411,8 @@ describe('X402 stored-wallet activation boundary', () => {
 
     expect(x402Boundary).toContain('this.activateDecryptedStoredMnemonic(decrypted.plainText)')
     expect(storedActivationBoundary).toContain('await this.activateMnemonic(')
-    expect(canonicalActivationBoundary).toContain('await wallet.initialize()')
+    expect(canonicalActivationBoundary).toContain('activateMnemonicLocalIdentity')
+    expect(canonicalActivationBoundary).toContain('void wallet.initialize()')
     expect(completeBoundary).not.toMatch(/\b(?:select\w*Utxos|TxBuilder|signTransaction|broadcastTx|sendXec|sendToken)\b/u)
     expect(completeBoundary).not.toContain('PAYMENT-SIGNATURE')
   })

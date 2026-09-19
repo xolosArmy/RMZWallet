@@ -19,14 +19,19 @@ import {
   useAgentWalletApproval,
   type AgentWalletApprovalContextValue
 } from '../../components/agentApproval/AgentWalletApprovalContext'
+import { useWallet } from '../../context/useWallet'
+import { WALLET_CAPABILITY } from '../../domain/walletCapabilities'
+import { assertWalletCapabilityEnabled } from '../../domain/walletCapabilityGuard'
 import { useTrustedWalletExecution } from './TrustedWalletExecutionContext'
 
 export function TrustedGate2bToC2Bridge({ children }: { readonly children: ReactNode }): ReactElement {
+  const wallet = useWallet()
   const approval = useAgentWalletApproval()
   const { publicEngine } = useTrustedWalletExecution()
 
   const requestHandoffApproval = useCallback<AgentWalletApprovalContextValue['requestHandoffApproval']>(
     async rawHandoffBytes => {
+      assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.AGENT_WALLET_EXECUTION)
       const receipt = await approval.requestHandoffApproval(rawHandoffBytes)
       if (receipt.status === 'approved' && publicEngine) {
         try {
@@ -37,7 +42,7 @@ export function TrustedGate2bToC2Bridge({ children }: { readonly children: React
       }
       return receipt
     },
-    [approval, publicEngine]
+    [approval, publicEngine, wallet]
   )
 
   const contextValue = useMemo<AgentWalletApprovalContextValue>(

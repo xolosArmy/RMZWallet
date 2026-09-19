@@ -12,6 +12,10 @@ import type {
 import type { DerivationProfileId } from '../services/derivationProfiles'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import type { FirmaSendPreview } from '../services/firmaAlphaSend'
+import type { WalletCapability } from '../domain/walletCapabilities'
+import type { WalletLifecycle } from '../domain/walletLifecycle'
+
+export type QuickStartBootstrapStatus = 'pending' | 'absent' | 'recovered' | 'failed'
 
 export interface WalletContextValue {
   address: string | null
@@ -21,7 +25,14 @@ export interface WalletContextValue {
   error: string | null
   initialized: boolean
   backupVerified: boolean
+  lifecycle: WalletLifecycle
+  quickStartBootstrap: QuickStartBootstrapStatus
+  hasBackedWalletOnDevice: boolean
+  hasCapability: (capability: WalletCapability) => boolean
   setAlias?: (alias: string | null) => void
+  startQuickStartWallet: () => Promise<{ address: string }>
+  activateQuickStartFromDevice: () => Promise<{ address: string } | null>
+  completeProgressiveBackup: (password: string) => Promise<void>
   createNewWallet: () => Promise<string>
   restoreWallet: (
     mnemonic: string,
