@@ -15,15 +15,18 @@ import {
   cookieValue,
   createTmCommDeterministicWallet,
   createTmCommEphemeralWallet,
+  ensureSecureCredentialFile,
   resolveTmCommOperatorCredential
 } from './tmCommTestUtils'
 
 const { getFsMockState, setFsMockState, resetFsMock } = vi.hoisted(() => {
   type FsMockState = {
-    targetDir: string
-    errorCode: 'EACCES' | 'EPERM'
-    operation: 'chmodSync' | 'mkdirSync'
+    targetPath?: string
+    targetDir?: string
+    errorCode?: 'EACCES' | 'EPERM' | 'EIO'
+    operation: 'chmodSync' | 'mkdirSync' | 'statSync'
     invoked: boolean
+    overrideMode?: number
   }
   let state: FsMockState | null = null
   return {
@@ -39,14 +42,21 @@ const { getFsMockState, setFsMockState, resetFsMock } = vi.hoisted(() => {
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>()
+  const matchesTarget = (p: unknown, mock: ReturnType<typeof getFsMockState>) => {
+    if (!mock) return false
+    const target = mock.targetPath ?? mock.targetDir
+    return typeof p === 'string' && target !== undefined && p === target
+  }
+
   return {
     ...actual,
     chmodSync: (path: import('node:fs').PathLike, mode: import('node:fs').Mode) => {
       const mock = getFsMockState()
-      if (mock && mock.operation === 'chmodSync' && typeof path === 'string' && path === mock.targetDir) {
+      if (mock && mock.operation === 'chmodSync' && matchesTarget(path, mock)) {
         mock.invoked = true
-        const err = new Error(`${mock.errorCode}: permission denied, chmod '${path}'`) as NodeJS.ErrnoException
-        err.code = mock.errorCode
+        const code = mock.errorCode ?? 'EACCES'
+        const err = new Error(`${code}: permission denied, chmod '${path}'`) as NodeJS.ErrnoException
+        err.code = code
         throw err
       }
       return actual.chmodSync(path, mode)
@@ -54,13 +64,32 @@ vi.mock('node:fs', async (importOriginal) => {
     mkdirSync: (...args: Parameters<typeof actual.mkdirSync>) => {
       const [path] = args
       const mock = getFsMockState()
-      if (mock && mock.operation === 'mkdirSync' && typeof path === 'string' && path === mock.targetDir) {
+      if (mock && mock.operation === 'mkdirSync' && matchesTarget(path, mock)) {
         mock.invoked = true
-        const err = new Error(`${mock.errorCode}: permission denied, mkdir '${path}'`) as NodeJS.ErrnoException
-        err.code = mock.errorCode
+        const code = mock.errorCode ?? 'EACCES'
+        const err = new Error(`${code}: permission denied, mkdir '${path}'`) as NodeJS.ErrnoException
+        err.code = code
         throw err
       }
       return actual.mkdirSync(...args)
+    },
+    statSync: (...args: Parameters<typeof actual.statSync>) => {
+      const [path] = args
+      const mock = getFsMockState()
+      if (mock && mock.operation === 'statSync' && matchesTarget(path, mock)) {
+        mock.invoked = true
+        if (mock.overrideMode !== undefined) {
+          const realStats = actual.statSync(...args)
+          return Object.assign(Object.create(Object.getPrototypeOf(realStats)), realStats, {
+            mode: mock.overrideMode
+          })
+        }
+        const code = mock.errorCode ?? 'EACCES'
+        const err = new Error(`${code}: permission denied, stat '${path}'`) as NodeJS.ErrnoException
+        err.code = code
+        throw err
+      }
+      return actual.statSync(...args)
     }
   }
 })
@@ -941,6 +970,367 @@ process.stdout.write(JSON.stringify(wallet));
       } finally {
         resetFsMock()
         store.close()
+      }
+    })
+  })
+
+  describe('P2-14: Strict credential file-mode 0600 enforcement', () => {
+    test('ensureSecureCredentialFile corrige modo a 0600 y falla si no se puede asegurar', () => {
+      const dataDir = makeTempDirectory()
+      const credPath = join(dataDir, 'direct-cred.json')
+      writeFileSync(credPath, '{"notice":"direct"}')
+      chmodSync(credPath, 0o644)
+      ensureSecureCredentialFile(credPath)
+      expect(statSync(credPath).mode & 0o777).toBe(0o600)
+
+      setFsMockState({
+        targetPath: credPath,
+        errorCode: 'EACCES',
+        operation: 'chmodSync',
+        invoked: false
+      })
+      try {
+        expect(() => ensureSecureCredentialFile(credPath)).toThrow(
+          /Failed to secure operator credential file at.*EACCES/i
+        )
+        expect(getFsMockState()?.invoked).toBe(true)
+      } finally {
+        resetFsMock()
+      }
+    })
+
+    test('existing credential 0644 -> corregida y verificada 0600', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-creds-0644')
+      mkdirSync(parentDir, { recursive: true, mode: 0o700 })
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const store = new TmCommStore(dbPath)
+
+      try {
+        const originalWallet = resolveTmCommOperatorCredential({ credentialPath, store })
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o600)
+
+        // Relajar permisos externamente a 0644
+        chmodSync(credentialPath, 0o644)
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o644)
+
+        // Resolver de nuevo: debe corregir y verificar a 0600
+        const reloaded = resolveTmCommOperatorCredential({ credentialPath, store })
+        expect(reloaded.address).toBe(originalWallet.address)
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o600)
+      } finally {
+        store.close()
+      }
+    })
+
+    test('existing credential 0666 -> corregida y verificada 0600', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-creds-0666')
+      mkdirSync(parentDir, { recursive: true, mode: 0o700 })
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const store = new TmCommStore(dbPath)
+
+      try {
+        const originalWallet = resolveTmCommOperatorCredential({ credentialPath, store })
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o600)
+
+        // Relajar permisos externamente a 0666
+        chmodSync(credentialPath, 0o666)
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o666)
+
+        // Resolver de nuevo: debe corregir y verificar a 0600
+        const reloaded = resolveTmCommOperatorCredential({ credentialPath, store })
+        expect(reloaded.address).toBe(originalWallet.address)
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o600)
+      } finally {
+        store.close()
+      }
+    })
+
+    test('new credential -> retorna únicamente después de verificar 0600', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-new-cred')
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const store = new TmCommStore(dbPath)
+
+      try {
+        const wallet = resolveTmCommOperatorCredential({ credentialPath, store })
+        expect(wallet.address).toMatch(/^ecash:/)
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o600)
+      } finally {
+        store.close()
+      }
+    })
+
+    test('chmodSync(credentialPath) lanza EACCES en existing credential -> fail closed, no retorna wallet ni crea operatorPrincipal', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-cred-eacces')
+      mkdirSync(parentDir, { recursive: true, mode: 0o700 })
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const store = new TmCommStore(dbPath)
+
+      try {
+        const wallet = createTmCommEphemeralWallet()
+        writeFileSync(
+          credentialPath,
+          JSON.stringify({
+            notice: 'STAGING ONLY',
+            address: wallet.address,
+            publicKeyHex: wallet.publicKeyHex,
+            secretHex: wallet.secretHex
+          }),
+          { mode: 0o600 }
+        )
+
+        setFsMockState({
+          targetPath: credentialPath,
+          errorCode: 'EACCES',
+          operation: 'chmodSync',
+          invoked: false
+        })
+
+        expect(() =>
+          resolveTmCommOperatorCredential({ credentialPath, store })
+        ).toThrow(/Failed to secure operator credential file at.*EACCES/i)
+
+        expect(getFsMockState()?.invoked).toBe(true)
+        expect(store.findOperatorPrincipal()).toBeNull()
+      } finally {
+        resetFsMock()
+        store.close()
+      }
+    })
+
+    test('chmodSync(credentialPath) lanza EACCES en new credential -> fail closed, no retorna wallet ni crea operatorPrincipal', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-new-cred-eacces')
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const store = new TmCommStore(dbPath)
+
+      setFsMockState({
+        targetPath: credentialPath,
+        errorCode: 'EACCES',
+        operation: 'chmodSync',
+        invoked: false
+      })
+
+      try {
+        expect(() =>
+          resolveTmCommOperatorCredential({ credentialPath, store })
+        ).toThrow(/Failed to secure operator credential file at.*EACCES/i)
+
+        expect(getFsMockState()?.invoked).toBe(true)
+        expect(store.findOperatorPrincipal()).toBeNull()
+      } finally {
+        resetFsMock()
+        store.close()
+      }
+    })
+
+    test('chmodSync(credentialPath) lanza EPERM -> fail closed, no retorna wallet ni crea operatorPrincipal', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-cred-eperm')
+      mkdirSync(parentDir, { recursive: true, mode: 0o700 })
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const store = new TmCommStore(dbPath)
+
+      try {
+        const wallet = createTmCommEphemeralWallet()
+        writeFileSync(
+          credentialPath,
+          JSON.stringify({
+            notice: 'STAGING ONLY',
+            address: wallet.address,
+            publicKeyHex: wallet.publicKeyHex,
+            secretHex: wallet.secretHex
+          }),
+          { mode: 0o600 }
+        )
+
+        setFsMockState({
+          targetPath: credentialPath,
+          errorCode: 'EPERM',
+          operation: 'chmodSync',
+          invoked: false
+        })
+
+        expect(() =>
+          resolveTmCommOperatorCredential({ credentialPath, store })
+        ).toThrow(/Failed to secure operator credential file at.*EPERM/i)
+
+        expect(getFsMockState()?.invoked).toBe(true)
+        expect(store.findOperatorPrincipal()).toBeNull()
+      } finally {
+        resetFsMock()
+        store.close()
+      }
+    })
+
+    test('statSync(credentialPath) lanza error -> fail closed, no retorna wallet ni crea operatorPrincipal', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-cred-stat-err')
+      mkdirSync(parentDir, { recursive: true, mode: 0o700 })
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const store = new TmCommStore(dbPath)
+
+      try {
+        const wallet = createTmCommEphemeralWallet()
+        writeFileSync(
+          credentialPath,
+          JSON.stringify({
+            notice: 'STAGING ONLY',
+            address: wallet.address,
+            publicKeyHex: wallet.publicKeyHex,
+            secretHex: wallet.secretHex
+          }),
+          { mode: 0o600 }
+        )
+
+        setFsMockState({
+          targetPath: credentialPath,
+          errorCode: 'EACCES',
+          operation: 'statSync',
+          invoked: false
+        })
+
+        expect(() =>
+          resolveTmCommOperatorCredential({ credentialPath, store })
+        ).toThrow(/Failed to secure operator credential file at.*EACCES/i)
+
+        expect(getFsMockState()?.invoked).toBe(true)
+        expect(store.findOperatorPrincipal()).toBeNull()
+      } finally {
+        resetFsMock()
+        store.close()
+      }
+    })
+
+    test('statSync reporta modo distinto de 0600 después de chmod -> fail closed, no retorna wallet ni crea operatorPrincipal', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-cred-stat-wrong-mode')
+      mkdirSync(parentDir, { recursive: true, mode: 0o700 })
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const store = new TmCommStore(dbPath)
+
+      try {
+        const wallet = createTmCommEphemeralWallet()
+        writeFileSync(
+          credentialPath,
+          JSON.stringify({
+            notice: 'STAGING ONLY',
+            address: wallet.address,
+            publicKeyHex: wallet.publicKeyHex,
+            secretHex: wallet.secretHex
+          }),
+          { mode: 0o600 }
+        )
+
+        setFsMockState({
+          targetPath: credentialPath,
+          operation: 'statSync',
+          overrideMode: 0o644,
+          invoked: false
+        })
+
+        expect(() =>
+          resolveTmCommOperatorCredential({ credentialPath, store })
+        ).toThrow(/Failed to secure operator credential file at.*expected 0o600/i)
+
+        expect(getFsMockState()?.invoked).toBe(true)
+        expect(store.findOperatorPrincipal()).toBeNull()
+      } finally {
+        resetFsMock()
+        store.close()
+      }
+    })
+
+    test('proceso perdedor en EEXIST -> verifica y asegura 0600 antes de devolver la credencial ganadora', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-eexist-cred')
+      mkdirSync(parentDir, { recursive: true, mode: 0o700 })
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const store = new TmCommStore(dbPath)
+
+      try {
+        const winningWallet = createTmCommEphemeralWallet()
+        writeFileSync(
+          credentialPath,
+          JSON.stringify({
+            notice: 'STAGING ONLY',
+            address: winningWallet.address,
+            publicKeyHex: winningWallet.publicKeyHex,
+            secretHex: winningWallet.secretHex
+          }),
+          { mode: 0o644 }
+        )
+        chmodSync(credentialPath, 0o644)
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o644)
+
+        const resolved = resolveTmCommOperatorCredential({ credentialPath, store })
+        expect(resolved.address).toBe(winningWallet.address)
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o600)
+      } finally {
+        store.close()
+      }
+    })
+
+    test('si nueva credencial fue creada pero verificación 0600 falla -> no bootstrappea operador y siguiente arranque vuelve a aplicar enforcement fail-closed', () => {
+      const dataDir = makeTempDirectory()
+      const parentDir = join(dataDir, 'staging-fail-enforcement-lifecycle')
+      const credentialPath = join(parentDir, 'operator-wallet.json')
+      const dbPath = join(dataDir, 'test.sqlite')
+      const store1 = new TmCommStore(dbPath)
+
+      setFsMockState({
+        targetPath: credentialPath,
+        errorCode: 'EACCES',
+        operation: 'chmodSync',
+        invoked: false
+      })
+
+      try {
+        expect(() =>
+          resolveTmCommOperatorCredential({ credentialPath, store: store1 })
+        ).toThrow(/Failed to secure operator credential file at.*EACCES/i)
+
+        // Archivo fue escrito en disco, pero verificación falló
+        expect(existsSync(credentialPath)).toBe(true)
+        // Store no registró ningún operador
+        expect(store1.findOperatorPrincipal()).toBeNull()
+      } finally {
+        store1.close()
+      }
+
+      // Siguiente arranque con mock aún activo -> sigue fallando cerrado
+      const store2 = new TmCommStore(dbPath)
+      try {
+        expect(() =>
+          resolveTmCommOperatorCredential({ credentialPath, store: store2 })
+        ).toThrow(/Failed to secure operator credential file at.*EACCES/i)
+
+        expect(store2.findOperatorPrincipal()).toBeNull()
+      } finally {
+        resetFsMock()
+        store2.close()
+      }
+
+      // Siguiente arranque con permisos asegurables -> éxito con la misma credencial
+      const store3 = new TmCommStore(dbPath)
+      try {
+        const wallet = resolveTmCommOperatorCredential({ credentialPath, store: store3 })
+        expect(wallet.address).toMatch(/^ecash:/)
+        expect(statSync(credentialPath).mode & 0o777).toBe(0o600)
+      } finally {
+        store3.close()
       }
     })
   })

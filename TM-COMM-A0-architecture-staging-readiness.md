@@ -290,17 +290,16 @@ Mismo archivo de test: mensaje aceptado sobrevive close/reopen de SQLite + HTTP;
 
 ---
 
-## Resultados de tests post-remediación (HEAD actual tras Final Pass 3)
+## Resultados de tests post-remediación (HEAD actual tras Pass 7)
 
 | Comando | Exit | Clasificación |
 | --- | --- | --- |
 | `npm run typecheck` | 0 | **PASS** (0 errores) |
 | `npm run build` | 0 | **PASS** (compilación limpia para producción) |
-| TM-COMM focalizado (`npm run test:tm-comm`) | 0 | **PASS** (6 files / 66 tests) |
+| TM-COMM focalizado (`npm run test:tm-comm`) | 0 | **PASS** (6 files / 98 tests) |
 | Architecture/boundary (`privateMessaging.architecture.test.ts`) | 0 | **PASS** (8/8) |
-| Architecture/boundary (`privateMessaging.architecture.test.ts`) | 0 | **PASS** (8/8) |
-| Staging restart durability (`tmCommRestart.test.ts`) | 0 | **PASS** (17/17) |
-| `npm test` suite vigente | 0 | **PASS** (150 files / 2736 vitest + 10 node:test) |
+| Staging restart durability (`tmCommRestart.test.ts`) | 0 | **PASS** (28/28) |
+| `npm test` suite vigente | 0 | **PASS** (150 files / 2747 vitest + 10 node:test) |
 | `npm run test:tm1-regtest-e2e` | 20 | **ENVIRONMENTAL FAILURE** (preexistente en BASE y HEAD; requiere chronik local en :3000) |
 | `npm run lint` BASE | 1 | **FAIL preexistente en BASE** (328 errors / 0 warnings) |
 | `npm run lint` HEAD | 1 | **PRE-EXISTING BASELINE FAILURE / DIFFERENTIAL CLEAN** (328 errors / 0 warnings; NEW=0; 0 en TM-COMM) |
@@ -327,7 +326,7 @@ Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAl
 
 ## GO / NO-GO para Fresh Codex Review
 
-**GO: READY FOR FRESH CODEX REVIEW (PASS 6)**
+**GO: READY FOR FRESH CODEX REVIEW (PASS 7)**
 - **Findings P2 remediados formalmente**:
   - P2-1: Validación client-side exhaustiva del challenge antes de invocar `signMessage`.
   - P2-2: Enforce estricto de origin en todas las mutaciones autenticadas con auditoría `ORIGIN_MISMATCH` y rechazo 415 a bypasses sin `application/json`.
@@ -342,14 +341,15 @@ Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAl
   - P2-11: Limpieza síncrona inmediata de mensajes (`setMessages([])`) al cambiar de conversación con invalidación/abort de peticiones previas (`messageAbortRef`, `messageRequestGenRef`), asegurando que jamás se muestren mensajes del chat anterior mientras el nuevo fetch está pendiente o falla.
   - P2-12: Enforce estricto de permisos `0700` en el directorio padre de la credencial del operador en todos los caminos de `resolveTmCommOperatorCredential` (incluyendo reinicios con credencial preexistente) antes de cualquier return, con verificación `statSync` y fail-closed ante discrepancias.
   - P2-13 (Pass 6): Eliminación completa de dependencia de permisos del host (`/root/`); simulación determinista de fallos de filesystem (`EACCES`/`EPERM`) mediante mock ESM hoisted (`vi.mock('node:fs')`), verificación de invocación del mock, contención estricta en `makeTempDirectory()`, fail-closed sin generación de identidades sustitutas y cleanup exhaustivo.
+  - P2-14 (Pass 7): Eliminación de comportamientos best-effort en la asignación de permisos `0600` a `operator-wallet.json`. Implementación de `ensureSecureCredentialFile` con aplicación mandatoria de `chmodSync(..., 0o600)`, verificación síncrona mediante `statSync`, y fail-closed inmediato ante cualquier error (`EACCES`, `EPERM`, error en `statSync` o modo distinto de `0600`). Se ejecuta en todos los caminos: creación nueva, carga de credencial preexistente y recarga ganadora tras `EEXIST`, garantizando que ninguna rama retorne una wallet ni registre un `operatorPrincipal` si la verificación no concluye con éxito.
 - **Validación 100% verde**:
   - `npm run typecheck`: PASS (código 0)
   - `npm run build`: PASS (código 0)
-  - `npm run test:tm-comm`: PASS (6 archivos, 88 tests)
+  - `npm run test:tm-comm`: PASS (6 archivos, 98 tests)
   - `src/features/privateMessaging/privateMessaging.architecture.test.ts`: PASS (8/8)
-  - `server/tmComm/tmCommRestart.test.ts`: PASS (17/17)
+  - `server/tmComm/tmCommRestart.test.ts`: PASS (28/28)
   - `src/routes/TmCommStaging.test.tsx`: PASS (29/29)
-  - `npm test`: PASS (150 archivos, 2736 vitest + 10 node:test)
+  - `npm test`: PASS (150 archivos, 2747 vitest + 10 node:test)
   - `npm run lint`: PRE-EXISTING BASELINE FAILURE / DIFFERENTIAL CLEAN (NEW findings = 0; 328 preexistentes en BASE, 328 en HEAD, 0 en archivos TM-COMM)
 - **Invariantes arquitectónicas preservadas**:
   - Cero OpenAI, cero clientes reales, cero fondos reales, cero autoridad financiera, cero Agent Wallet authority, cero settlement, cero broadcast, cero sendXec, cero eToken movement, cero auto-publicación en Tonalli Memo.

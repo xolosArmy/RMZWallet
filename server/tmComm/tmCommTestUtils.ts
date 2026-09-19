@@ -40,6 +40,28 @@ export function ensureSecureParentDirectory(parentDir: string): void {
   }
 }
 
+export function ensureSecureCredentialFile(credentialPath: string): void {
+  try {
+    chmodSync(credentialPath, 0o600)
+    const stats = statSync(credentialPath)
+    if ((stats.mode & 0o777) !== 0o600) {
+      throw new Error(
+        `File mode for "${credentialPath}" is 0o${(stats.mode & 0o777).toString(8)}, expected 0o600`
+      )
+    }
+  } catch (error) {
+    const err = new Error(
+      `Failed to secure operator credential file at "${credentialPath}": ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    )
+    if (error && typeof error === 'object' && 'code' in error) {
+      (err as NodeJS.ErrnoException).code = (error as NodeJS.ErrnoException).code
+    }
+    throw err
+  }
+}
+
 export function createTmCommDeterministicWallet(secretHex: string): TmCommDeterministicWallet {
   const trimmed = secretHex.trim()
   if (!/^[0-9a-fA-F]{64}$/.test(trimmed)) {
@@ -206,11 +228,7 @@ function loadAndValidateWinningCredential(
       }
     }
 
-    try {
-      chmodSync(credentialPath, 0o600)
-    } catch {
-      // Best-effort permission setting
-    }
+    ensureSecureCredentialFile(credentialPath)
 
     return wallet
   }
@@ -261,11 +279,7 @@ export function resolveTmCommOperatorCredential(
       mode: 0o600,
       flag: 'wx'
     })
-    try {
-      chmodSync(options.credentialPath, 0o600)
-    } catch {
-      // Best-effort permission setting
-    }
+    ensureSecureCredentialFile(options.credentialPath)
     return wallet
   } catch (err: unknown) {
     const code = (err as { code?: string })?.code
