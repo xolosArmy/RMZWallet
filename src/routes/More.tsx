@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom'
 import TopBar from '../components/TopBar'
 import { X402_DRY_RUN_ENABLED } from '../integrations/x402/x402DryRunFeature'
+import { TM_COMM_STAGING_ENABLED } from '../config/tmCommStaging'
 import { X402_STAGING_TEST_ENABLED } from '../integrations/x402/x402StagingFeature'
 
 type MoreItem = {
@@ -56,6 +57,9 @@ const developmentItems: MoreItem[] = [
     : []),
   ...(X402_STAGING_TEST_ENABLED
     ? [{ title: 'Test real staging authorization', description: 'Valida autorización contra staging controlado.', to: '/x402-staging' }]
+    : []),
+  ...(TM_COMM_STAGING_ENABLED
+    ? [{ title: 'TM-COMM staging A0', description: 'Harness aislado de mensajería privada. Datos ficticios únicamente.', to: '/tm-comm-staging' }]
     : [])
 ]
 
