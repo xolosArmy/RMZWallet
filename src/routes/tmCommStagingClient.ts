@@ -16,11 +16,18 @@ export async function tmCommRequest<T>(
     headers.set('Content-Type', 'application/json')
   }
 
-  const response = await fetch(`${TM_COMM_STAGING_API_PREFIX}${path}`, {
-    ...init,
-    credentials: 'include',
-    headers
-  })
-  const data = await response.json() as T
-  return { ok: response.ok, status: response.status, data }
+  try {
+    const response = await fetch(`${TM_COMM_STAGING_API_PREFIX}${path}`, {
+      ...init,
+      credentials: 'include',
+      headers
+    })
+    const data = await response.json() as T
+    return { ok: response.ok, status: response.status, data }
+  } catch (err: unknown) {
+    if (init.signal?.aborted || (err instanceof Error && err.name === 'AbortError')) {
+      return { ok: false, status: 0, data: null as unknown as T }
+    }
+    throw err
+  }
 }

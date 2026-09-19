@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import {
@@ -35,41 +35,80 @@ function TmCommStaging() {
   const [log, setLog] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
 
+  const sessionGenerationRef = useRef<number>(0)
+  const hydrationAbortRef = useRef<AbortController | null>(null)
+  const activeConversationIdRef = useRef<string | null>(null)
+  const messageRequestGenRef = useRef<number>(0)
+
   const append = (line: string) => {
     setLog((current) => [...current, line])
   }
 
-  const refreshMessages = async (conversationId = conversation?.id) => {
+  const refreshMessages = async (
+    conversationId = conversation?.id,
+    targetSessionGen = sessionGenerationRef.current,
+    signal?: AbortSignal
+  ) => {
     if (!conversationId) {
-      append('No hay conversación autorizada.')
+      if (targetSessionGen === sessionGenerationRef.current) {
+        append('No hay conversación autorizada.')
+      }
       return
     }
+
+    const messageReqId = ++messageRequestGenRef.current
+    activeConversationIdRef.current = conversationId
+
     const listed = await tmCommRequest<{ messages: Message[] }>(
-      `/v1/tm-comm/conversations/${conversationId}/messages`
+      `/v1/tm-comm/conversations/${conversationId}/messages`,
+      signal ? { signal } : undefined
     )
+
+    if (targetSessionGen !== sessionGenerationRef.current) return
+    if (activeConversationIdRef.current !== conversationId || messageReqId !== messageRequestGenRef.current) return
+
     if (!listed.ok) {
       append(`No se pudieron leer mensajes (${listed.status}).`)
       return
     }
+
     setMessages(listed.data.messages)
     append(`Historial recargado desde el servidor: ${listed.data.messages.length} mensaje(s).`)
   }
 
-  const restoreAuthorizedConversations = async (preferredConversationId?: string) => {
-    const listed = await tmCommRequest<{ conversations: Conversation[] }>('/v1/tm-comm/conversations')
+  const restoreAuthorizedConversations = async (
+    preferredConversationId?: string,
+    targetSessionGen = sessionGenerationRef.current,
+    signal?: AbortSignal
+  ) => {
+    if (targetSessionGen !== sessionGenerationRef.current) return
+
+    const listed = await tmCommRequest<{ conversations: Conversation[] }>(
+      '/v1/tm-comm/conversations',
+      signal ? { signal } : undefined
+    )
+
+    if (targetSessionGen !== sessionGenerationRef.current) return
+
     if (!listed.ok) {
       if (listed.status === 401) {
-        setConversations([])
-        setConversation(null)
-        setMessages([])
+        if (targetSessionGen === sessionGenerationRef.current) {
+          setConversations([])
+          setConversation(null)
+          setMessages([])
+          activeConversationIdRef.current = null
+        }
       }
       return
     }
+
     const list = listed.data.conversations ?? []
     setConversations(list)
+
     if (list.length === 0) {
       setConversation(null)
       setMessages([])
+      activeConversationIdRef.current = null
       return
     }
 
@@ -84,56 +123,28 @@ function TmCommStaging() {
       ?? (conversation?.id ? sorted.find((c) => c.id === conversation.id) : undefined)
       ?? sorted[0]
 
+    if (targetSessionGen !== sessionGenerationRef.current) return
+
     setConversation(target)
+    activeConversationIdRef.current = target.id
     append(`Conversación activa: ${target.id} (${target.reservationId}).`)
-    await refreshMessages(target.id)
+
+    await refreshMessages(target.id, targetSessionGen, signal)
   }
 
   useEffect(() => {
-    let active = true
-    async function hydrateConversationsOnMount() {
-      const listed = await tmCommRequest<{ conversations: Conversation[] }>('/v1/tm-comm/conversations')
-      if (!active) return
-      if (!listed.ok) {
-        if (listed.status === 401) {
-          setConversations([])
-          setConversation(null)
-          setMessages([])
-        }
-        return
-      }
-      const list = listed.data.conversations ?? []
-      setConversations(list)
-      if (list.length === 0) {
-        setConversation(null)
-        setMessages([])
-        return
-      }
-      const sorted = [...list].sort((a, b) => {
-        const timeA = a.createdAt ?? 0
-        const timeB = b.createdAt ?? 0
-        if (timeB !== timeA) return timeB - timeA
-        return b.id.localeCompare(a.id)
-      })
-      const target = sorted[0]
-      setConversation(target)
-      setLog((current) => [...current, `Conversación activa: ${target.id} (${target.reservationId}).`])
-      const msgRes = await tmCommRequest<{ messages: Message[] }>(
-        `/v1/tm-comm/conversations/${target.id}/messages`
-      )
-      if (!active) return
-      if (msgRes.ok) {
-        setMessages(msgRes.data.messages)
-        setLog((current) => [
-          ...current,
-          `Historial recargado desde el servidor: ${msgRes.data.messages.length} mensaje(s).`
-        ])
-      }
-    }
-    void hydrateConversationsOnMount()
+    const sessionGen = sessionGenerationRef
+    const mountGen = ++sessionGen.current
+    const mountAbort = new AbortController()
+    hydrationAbortRef.current = mountAbort
+
+    void restoreAuthorizedConversations(undefined, mountGen, mountAbort.signal)
+
     return () => {
-      active = false
+      mountAbort.abort()
+      sessionGen.current++
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const authenticate = async () => {
@@ -146,11 +157,26 @@ function TmCommStaging() {
       append('No se pudo leer la clave pública.')
       return
     }
+
+    hydrationAbortRef.current?.abort()
+    const nextGen = ++sessionGenerationRef.current
+    const sessionAbort = new AbortController()
+    hydrationAbortRef.current = sessionAbort
+
+    setConversation(null)
+    setConversations([])
+    setMessages([])
+    activeConversationIdRef.current = null
+
     setBusy(true)
     try {
       const challenge = await tmCommRequest<TmCommAuthChallengePayload>('/v1/tm-comm/challenges', {
-        method: 'POST'
+        method: 'POST',
+        signal: sessionAbort.signal
       })
+
+      if (nextGen !== sessionGenerationRef.current) return
+
       if (!challenge.ok || !challenge.data) {
         append(`Challenge rechazado (${challenge.status}).`)
         return
@@ -167,6 +193,7 @@ function TmCommStaging() {
           expectedSessionContext: TM_COMM_EXPECTED_SESSION_CONTEXT
         })
       } catch (validationError) {
+        if (nextGen !== sessionGenerationRef.current) return
         append(
           `Challenge inválido o manipulado: ${
             validationError instanceof Error ? validationError.message : 'FAIL_CLOSED'
@@ -176,8 +203,11 @@ function TmCommStaging() {
       }
 
       const signature = await xolosWalletService.signMessage(verified.canonicalMessage)
+      if (nextGen !== sessionGenerationRef.current) return
+
       const session = await tmCommRequest('/v1/tm-comm/sessions', {
         method: 'POST',
+        signal: sessionAbort.signal,
         body: JSON.stringify({
           challengeId: verified.challengeId,
           address,
@@ -185,32 +215,41 @@ function TmCommStaging() {
           signature
         })
       })
+
+      if (nextGen !== sessionGenerationRef.current) return
+
       if (session.ok) {
         append('Sesión TM-COMM creada. La clave privada no salió de Tonalli.')
-        await restoreAuthorizedConversations()
+        await restoreAuthorizedConversations(undefined, nextGen, sessionAbort.signal)
       } else {
         append(`Sesión rechazada (${session.status}).`)
       }
     } finally {
-      setBusy(false)
+      if (nextGen === sessionGenerationRef.current) {
+        setBusy(false)
+      }
     }
   }
 
   const bind = async () => {
+    const currentGen = sessionGenerationRef.current
     setBusy(true)
     try {
       const result = await tmCommRequest<{ conversation: Conversation }>('/v1/tm-comm/bindings', {
         method: 'POST',
         body: JSON.stringify({ enrollmentToken })
       })
+      if (currentGen !== sessionGenerationRef.current) return
       if (!result.ok) {
         append(`Binding rechazado (${result.status}). Una dirección conocida no basta.`)
         return
       }
       append(`Reserva ficticia vinculada: ${result.data.conversation.reservationId}`)
-      await restoreAuthorizedConversations(result.data.conversation.id)
+      await restoreAuthorizedConversations(result.data.conversation.id, currentGen)
     } finally {
-      setBusy(false)
+      if (currentGen === sessionGenerationRef.current) {
+        setBusy(false)
+      }
     }
   }
 
@@ -219,10 +258,12 @@ function TmCommStaging() {
       append('Enlaza una reserva antes de enviar.')
       return
     }
+    const currentGen = sessionGenerationRef.current
+    const targetConversationId = conversation.id
     setBusy(true)
     try {
       const sent = await tmCommRequest<Message>(
-        `/v1/tm-comm/conversations/${conversation.id}/messages`,
+        `/v1/tm-comm/conversations/${targetConversationId}/messages`,
         {
           method: 'POST',
           body: JSON.stringify({
@@ -231,14 +272,17 @@ function TmCommStaging() {
           })
         }
       )
+      if (currentGen !== sessionGenerationRef.current) return
       if (!sent.ok) {
         append(`Envío rechazado (${sent.status}).`)
         return
       }
       append(`Mensaje aceptado con id de servidor ${sent.data.id}.`)
-      await refreshMessages(conversation.id)
+      await refreshMessages(targetConversationId, currentGen)
     } finally {
-      setBusy(false)
+      if (currentGen === sessionGenerationRef.current) {
+        setBusy(false)
+      }
     }
   }
 
@@ -294,8 +338,11 @@ function TmCommStaging() {
               onChange={(e) => {
                 const selected = conversations.find((c) => c.id === e.target.value) ?? null
                 setConversation(selected)
+                activeConversationIdRef.current = selected?.id ?? null
                 if (selected) {
-                  void refreshMessages(selected.id)
+                  void refreshMessages(selected.id, sessionGenerationRef.current)
+                } else {
+                  setMessages([])
                 }
               }}
               disabled={busy}
@@ -321,7 +368,12 @@ function TmCommStaging() {
           <button className="cta" type="button" onClick={() => void send()} disabled={busy}>
             Enviar al servidor
           </button>
-          <button className="cta ghost" type="button" onClick={() => void refreshMessages()} disabled={busy}>
+          <button
+            className="cta ghost"
+            type="button"
+            onClick={() => void refreshMessages(conversation?.id, sessionGenerationRef.current)}
+            disabled={busy}
+          >
             Recargar historial
           </button>
         </div>

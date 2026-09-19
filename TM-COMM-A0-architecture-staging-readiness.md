@@ -19,14 +19,62 @@ Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No m
 | **PASS 2 REMEDIATION SHA** | `ee5d2ad07e48e0b94c76eebf9d568e6dbe1cf7dd` |
 | **PASS 3 REVIEWED HEAD** | `f47f5fedb4195803d66622ddce76a137de72f12a` |
 | **PASS 3 REMEDIATION SHA** | `44e26fb2996d933ca94d13e3135a511fe1e36067` |
-| **NEW FINAL HEAD** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 final remediation pass 3 closure) |
+| **PASS 4 REVIEWED HEAD** | `9d407a81f00605e73b9b8b76fb3ec4f350e7f117` |
+| **PASS 4 REMEDIATION SHA** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 Pass 4 closure) |
 | Staging API | http://127.0.0.1:4178/v1/tm-comm/health |
 | Staging UI | http://127.0.0.1:5174/tm-comm-staging |
-| Estado | **READY FOR FRESH CODEX REVIEW** |
+| Estado | **READY FOR FRESH CODEX REVIEW (PASS 4 CLOSURE)** |
 | Merge | **No** |
 
 > [!NOTE]
 > **Aclaración de Genealogía y Corrección de SHA**: Se documenta explícitamente que la referencia previa `a63aeacef335ca7f42dcae2e83b8b64e6224168e` correspondió a una referencia errónea en notas. El commit HEAD remoto canónico de PR #98 efectivamente revisado por Codex para el Pass 2 fue `a63aeacc6a407517805c4c2c31a351511281600c`.
+
+---
+
+## Remediation Pass 4 (Codex Findings P2-8, P2-9, P2-10)
+
+El fresh Codex review ejecutado sobre el exact HEAD `9d407a81f00605e73b9b8b76fb3ec4f350e7f117` identificó exactamente 3 findings P2. Han sido formalmente remediados conservando todas las remediaciones anteriores (P2-1 a P2-7) y las invariantes de arquitectura de TM-COMM A0:
+
+### P2-8: Atomic and exclusive operator credential creation (`PRRC_kwDOQYWUus7xoXfq` / Thread `PRRT_kwDOQYWUus6kBUcV`)
+- **Causa raíz**:
+  El patrón anterior `existsSync` seguido de `writeFileSync` en `server/tmComm/tmCommTestUtils.ts` presentaba una condición de carrera TOCTOU. Si dos procesos de staging arrancaban simultáneamente contra un directorio limpio, ambos podían observar la ausencia de credencial y de operador en SQLite; al no usar creación exclusiva, uno de los procesos podía sobrescribir/truncar el archivo persistiendo la billetera B mientras el otro proceso ya había inicializado la base de datos con la billetera A. Dado que el puerto se enlaza posteriormente, un fallo por `EADDRINUSE` no prevenía el descalce, provocando que todos los reinicios subsiguientes fallaran cerrado (`OPERATOR_IDENTITY_MISMATCH`).
+- **Remediación**:
+  - **Creación Atómica Exclusiva**: Se configuró `writeFileSync` con el flag `wx` (`O_CREAT | O_EXCL`) y modo estricto `0o600` (con directorio `0o700`). Exactamente un proceso del sistema operativo gana la creación del inodo en el kernel.
+  - **Manejo Determinista de EEXIST con Reintento Bounded**: El proceso que recibe `EEXIST` (perdedor) jamás regenera ni trunca el archivo. En su lugar, invoca `loadAndValidateWinningCredential`, la cual implementa reintentos con backoff síncrono (`sleepSync` basado en `Atomics.wait` sobre `SharedArrayBuffer`) tolerando la ventana transitoria en la que el ganador finaliza la escritura.
+  - **Fail-Closed Ante Archivos Incompletos / Corruptos**: Si el archivo continúa incompleto o corrupto tras agotar los reintentos, el sistema falla cerrado sin sustitución silenciosa ni regeneración.
+  - **Invariante de No-Truncamiento**: Los archivos existentes válidos se abren de forma segura y nunca son truncados ni reemplazados.
+- **Tests agregados en `server/tmComm/tmCommRestart.test.ts`**:
+  - Concurrencia real a nivel de proceso (`spawn` de dos procesos simultáneos vía `npx tsx` sobre directorio nuevo/limpio): ambos convergen deterministamente en la misma identidad ganadora, exactamente 1 archivo persistido, exactamente 1 Principal operador en SQLite, y 0 Principals cliente.
+  - Perdedor ante `EEXIST` recarga la credencial ganadora sin generar una nueva.
+  - Lectura durante escritura parcial se reintenta hasta disponer de JSON válido.
+  - Archivo parcial/corrupto permanente falla cerrado tras agotar intentos.
+  - Archivo existente jamás es truncado ni alterado.
+
+### P2-9: Correct Staging Documentation for Private Key Material (`PRRC_kwDOQYWUus7xoXfx` / Thread `PRRT_kwDOQYWUus6kBUca`)
+- **Causa raíz**:
+  La tabla de artefactos en `docs/tm-comm/a0-staging.md` describía `operator-wallet.json` indicando únicamente campos públicos, omitiendo que la remediación escribe `secretHex` (material de clave privada). Esto podía inducir a tratar o compartir el archivo como metadatos públicos en tickets o logs.
+- **Remediación**:
+  - Se actualizó la fila de la tabla en `docs/tm-comm/a0-staging.md` señalando explícitamente: `operator-wallet.json | Clave privada fixture del operador (secretHex, address, publicKeyHex) generada deterministamente para staging. PRIVATE KEY MATERIAL / STAGING SECRET.`
+  - Se añadió una sección de advertencia de seguridad detallando los requisitos de manejo: permisos `0600` para el archivo, `0700` para el directorio contenedor, exclusión estricta en `.gitignore`, prohibición de compartir en capturas/tickets/logs, destrucción junto con los artefactos de staging, y la invariante arquitectónica verbatim:
+    `"Staging operator credential persistence is test-fixture infrastructure only and MUST NOT become the production operator key-management model."`
+
+### P2-10: Session-Generation-Safe Hydration and State Containment (`PRRC_kwDOQYWUus7xouJS` / Thread `PRRT_kwDOQYWUus6kBjkS`)
+- **Causa raíz**:
+  Si la interfaz de staging montaba bajo la sesión del principal A e iniciaba la hidratación de mensajes, pero el usuario autenticaba como principal B antes de completar la petición de mensajes de A, la respuesta diferida de A ejecutaba su callback y sobrescribía el estado de mensajes activo bajo la sesión B. El flag `active` sólo protegía contra desmontaje del componente, no contra generaciones de sesión o cambios de conversación.
+- **Remediación**:
+  - **Session Generation Tracking**: Se introdujo `sessionGenerationRef` en `src/routes/TmCommStaging.tsx`. Cada inicio de autenticación incrementa la generación y cancela cualquier controlador de aborto previo (`hydrationAbortRef.current?.abort()`).
+  - **Limpieza Inmediata de Estado**: Al cambiar de sesión, se limpian sincrónicamente `conversation`, `conversations`, `messages` y `activeConversationIdRef.current`.
+  - **Fencing en Continuaciones Asíncronas**: Antes de invocar cualquier `setConversations`, `setConversation`, `setMessages` o `append(log)`, se comprueba rigurosamente `if (targetSessionGen !== sessionGenerationRef.current) return`.
+  - **Aislamiento de Errores 401**: Un 401 recibido durante la hidratación sólo limpia el estado si corresponde a la generación activa. Un 401 retrasado proveniente de una sesión previa es descartado sin alterar el estado válido de la sesión actual.
+  - **Protección de Selección de Conversación**: Las peticiones de historial están cercadas con `messageRequestGenRef` y `activeConversationIdRef` para garantizar que respuestas lentas de una conversación previa no sobrescriban la conversación recién seleccionada.
+  - **Cancelación Limpia en Cliente HTTP**: En `src/routes/tmCommStagingClient.ts`, `tmCommRequest` captura gracefulmente `AbortError` y cancelaciones de señal, evitando excepciones no controladas.
+- **Tests agregados en `src/routes/TmCommStaging.test.tsx`**:
+  - Respuestas diferidas de mensajes de sesión A se descartan completamente al autenticar sesión B; la UI muestra únicamente B, los mensajes de A nunca reaparecen, y el log local no inserta contenido sensible de A.
+  - Petición pendiente de conversaciones de sesión A se ignora al completar sesión B.
+  - Clics rápidos de autenticación (A → B → C) conservan únicamente la generación más reciente C.
+  - Cambio de conversación mientras el historial anterior está pendiente descarta el historial obsoleto.
+  - Error 401 retrasado de sesión previa no invalida ni limpia el estado válido de la sesión activa actual.
+  - Desmontaje del componente cancela de forma limpia las peticiones en curso sin warnings de React.
 
 ---
 

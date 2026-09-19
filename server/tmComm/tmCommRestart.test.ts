@@ -1,6 +1,9 @@
+import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { Worker } from 'node:worker_threads'
 import { afterEach, describe, expect, test } from 'vitest'
 import { TM_COMM_ERROR_CODES, TmCommError } from '../../src/features/privateMessaging/errors'
 import { bootstrapTmCommStaging } from './tmCommBootstrap'
@@ -475,6 +478,238 @@ describe('TM-COMM A0 staging operator identity restart persistence', () => {
         expect((err as TmCommError).code).toBe(TM_COMM_ERROR_CODES.CONFLICT)
         expect((err as TmCommError).reasonCode).toBe('OPERATOR_IDENTITY_MISMATCH')
       }
+    } finally {
+      store.close()
+    }
+  })
+
+  test('P2-8: two concurrent processes on new dir/DB converge on exact winning identity', async () => {
+    const dataDir = makeTempDirectory()
+    const dbPath = join(dataDir, 'concurrent.sqlite')
+    const credentialPath = join(dataDir, 'operator-wallet.json')
+
+    const childCode = `
+import { TmCommStore } from './server/tmComm/tmCommStore.ts';
+import { resolveTmCommOperatorCredential } from './server/tmComm/tmCommTestUtils.ts';
+const store = new TmCommStore(process.argv[1]);
+const wallet = resolveTmCommOperatorCredential({ credentialPath: process.argv[2], store });
+process.stdout.write(JSON.stringify(wallet));
+`
+
+    function runResolverProcess(): Promise<{ address: string; publicKeyHex: string; secretHex: string }> {
+      return new Promise((resolve, reject) => {
+        const cp = spawn('npx', ['tsx', '-e', childCode, dbPath, credentialPath], {
+          stdio: ['ignore', 'pipe', 'inherit']
+        })
+        let stdout = ''
+        cp.stdout.on('data', (d) => {
+          stdout += String(d)
+        })
+        cp.on('close', (code) => {
+          if (code === 0) {
+            try {
+              resolve(JSON.parse(stdout))
+            } catch (e) {
+              reject(e)
+            }
+          } else {
+            reject(new Error(`Child process failed with code ${code}`))
+          }
+        })
+      })
+    }
+
+    // Run two processes truly concurrently against uninitialized directory and DB
+    const [walletA, walletB] = await Promise.all([runResolverProcess(), runResolverProcess()])
+
+    // Both processes MUST converge on the exact same identity
+    expect(walletA.address).toBe(walletB.address)
+    expect(walletA.publicKeyHex).toBe(walletB.publicKeyHex)
+    expect(walletA.secretHex).toBe(walletB.secretHex)
+
+    // Exactly 1 credential persisted
+    expect(existsSync(credentialPath)).toBe(true)
+    const persisted = JSON.parse(readFileSync(credentialPath, 'utf8'))
+    expect(persisted.address).toBe(walletA.address)
+    expect(persisted.secretHex).toBe(walletA.secretHex)
+
+    // Bootstrap into SQLite
+    const store = new TmCommStore(dbPath)
+    try {
+      const config = loadTmCommRuntimeConfig({
+        databasePath: dbPath,
+        expectedOrigin: 'http://127.0.0.1:5174',
+        listenHost: '127.0.0.1',
+        listenPort: 0
+      })
+      const fullWallet = createTmCommDeterministicWallet(walletA.secretHex)
+      const boot = bootstrapTmCommStaging(store, config, fullWallet)
+      expect(boot.operatorPrincipalId).toBeDefined()
+
+      // Exactly one operator Principal in SQLite
+      const operator = store.findOperatorPrincipal()
+      expect(operator).not.toBeNull()
+      expect(operator?.walletAddress).toBe(walletA.address)
+      expect(operator?.kind).toBe('operator')
+
+      // Zero accidental customer Principals
+      const db = new DatabaseSync(dbPath)
+      try {
+        const rows = db.prepare('SELECT * FROM tm_comm_principals').all() as Array<{ kind: string }>
+        expect(rows.length).toBe(1)
+        expect(rows[0].kind).toBe('operator')
+      } finally {
+        db.close()
+      }
+    } finally {
+      store.close()
+    }
+  }, 15000)
+
+  test('P2-8: loser on EEXIST reloads winner instead of generating a new identity', () => {
+    const dataDir = makeTempDirectory()
+    const dbPath = join(dataDir, 'eexist-loser.sqlite')
+    const credentialPath = join(dataDir, 'operator-wallet.json')
+    const store = new TmCommStore(dbPath)
+
+    try {
+      // Create winner credential
+      const winner = createTmCommEphemeralWallet()
+      mkdirSync(dirname(credentialPath), { recursive: true, mode: 0o700 })
+      writeFileSync(
+        credentialPath,
+        JSON.stringify({
+          notice: 'STAGING ONLY. Fictitious operator wallet. Never a production key.',
+          address: winner.address,
+          publicKeyHex: winner.publicKeyHex,
+          secretHex: winner.secretHex
+        }),
+        { encoding: 'utf8', mode: 0o600 }
+      )
+
+      // Loser process calls resolveTmCommOperatorCredential
+      const loser = resolveTmCommOperatorCredential({ credentialPath, store })
+      expect(loser.address).toBe(winner.address)
+      expect(loser.publicKeyHex).toBe(winner.publicKeyHex)
+      expect(loser.secretHex).toBe(winner.secretHex)
+
+      // File was not modified/replaced
+      const content = JSON.parse(readFileSync(credentialPath, 'utf8'))
+      expect(content.address).toBe(winner.address)
+      expect(content.secretHex).toBe(winner.secretHex)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('P2-8: read during partial write is retried until valid JSON is available', async () => {
+    const dataDir = makeTempDirectory()
+    const dbPath = join(dataDir, 'partial-write-retry.sqlite')
+    const credentialPath = join(dataDir, 'operator-wallet.json')
+    const store = new TmCommStore(dbPath)
+
+    try {
+      mkdirSync(dirname(credentialPath), { recursive: true, mode: 0o700 })
+      // Write partial incomplete JSON to simulate winner inode creation in progress
+      writeFileSync(credentialPath, '{"notice": "STAGING ONLY"', { encoding: 'utf8', mode: 0o600 })
+
+      const fullWallet = createTmCommEphemeralWallet()
+      const payload = JSON.stringify({
+        notice: 'STAGING ONLY. Fictitious operator wallet. Never a production key.',
+        address: fullWallet.address,
+        publicKeyHex: fullWallet.publicKeyHex,
+        secretHex: fullWallet.secretHex
+      })
+
+      // Spawn background worker thread to complete the write after 40ms
+      const worker = new Worker(
+        `
+        const { writeFileSync } = require('node:fs');
+        setTimeout(() => {
+          writeFileSync(process.env.TEST_CRED_PATH, process.env.TEST_PAYLOAD, { encoding: 'utf8', mode: 0o600 });
+        }, 40);
+        `,
+        {
+          eval: true,
+          env: {
+            ...process.env,
+            TEST_CRED_PATH: credentialPath,
+            TEST_PAYLOAD: payload
+          }
+        }
+      )
+
+      try {
+        const resolved = resolveTmCommOperatorCredential({
+          credentialPath,
+          store,
+          retryDelayMs: 15,
+          maxRetries: 30
+        })
+
+        expect(resolved.address).toBe(fullWallet.address)
+        expect(resolved.publicKeyHex).toBe(fullWallet.publicKeyHex)
+        expect(resolved.secretHex).toBe(fullWallet.secretHex)
+      } finally {
+        await worker.terminate()
+      }
+    } finally {
+      store.close()
+    }
+  })
+
+  test('P2-8: permanent partial/corrupt file fails closed without regenerating or overwriting', () => {
+    const dataDir = makeTempDirectory()
+    const dbPath = join(dataDir, 'permanent-corrupt.sqlite')
+    const credentialPath = join(dataDir, 'operator-wallet.json')
+    const store = new TmCommStore(dbPath)
+
+    try {
+      mkdirSync(dirname(credentialPath), { recursive: true, mode: 0o700 })
+      const corruptPayload = '{"notice": "STAGING ONLY", "incomplete": true'
+      writeFileSync(credentialPath, corruptPayload, { encoding: 'utf8', mode: 0o600 })
+
+      expect(() =>
+        resolveTmCommOperatorCredential({
+          credentialPath,
+          store,
+          retryDelayMs: 5,
+          maxRetries: 3
+        })
+      ).toThrow(/could not be loaded or validated after 3 attempts/i)
+
+      // Existing corrupt file was NEVER overwritten or truncated
+      expect(readFileSync(credentialPath, 'utf8')).toBe(corruptPayload)
+      // Database has no operator
+      expect(store.findOperatorPrincipal()).toBeNull()
+    } finally {
+      store.close()
+    }
+  })
+
+  test('P2-8: existing credential file is never truncated or overwritten', () => {
+    const dataDir = makeTempDirectory()
+    const dbPath = join(dataDir, 'no-truncate.sqlite')
+    const credentialPath = join(dataDir, 'operator-wallet.json')
+    const store = new TmCommStore(dbPath)
+
+    try {
+      const originalWallet = createTmCommEphemeralWallet()
+      mkdirSync(dirname(credentialPath), { recursive: true, mode: 0o700 })
+      const originalText = `${JSON.stringify({
+        notice: 'STAGING ONLY. Fictitious operator wallet. Never a production key.',
+        address: originalWallet.address,
+        publicKeyHex: originalWallet.publicKeyHex,
+        secretHex: originalWallet.secretHex
+      }, null, 2)}\n`
+
+      writeFileSync(credentialPath, originalText, { encoding: 'utf8', mode: 0o600 })
+
+      const resolved = resolveTmCommOperatorCredential({ credentialPath, store })
+      expect(resolved.address).toBe(originalWallet.address)
+
+      // Ensure exact content is intact
+      expect(readFileSync(credentialPath, 'utf8')).toBe(originalText)
     } finally {
       store.close()
     }
