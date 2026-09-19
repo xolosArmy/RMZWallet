@@ -26,11 +26,11 @@ Do not treat this report commit as the implementation HEAD. Implementation HEAD 
 
 | Campo | Valor |
 |---|---|
-| Fecha | 2026-09-18 |
-| Gate | Tonalli Quick Start — release candidate freeze + exact-head audit |
+| Fecha | 2026-09-19 |
+| Gate | Tonalli Quick Start — Codex exact-head findings remediation |
 | Estado | cerrado en ramas de feature; **sin merge** |
-| Decisión | **GO — ready for merge review** |
-| Justificación | Audit independiente P0=0 / P1=0. Suites RMZWallet y faucet verdes. Faucet `npm test` 3/3 en proceso limpio. Clean-profile dry-run PASS. Sin findings de seguridad nuevos. **No merge** hasta el review exact-head de Codex (cuota agotada). |
+| Decisión | **NO-GO** hasta re-review exact-head de Codex sobre los HEAD remediados |
+| Justificación | Codex Connector revisó `084fc46` / `aeb5b2a` y emitió 3+3 findings reales (RMZ P1/P1/P2, faucet P1/P2/P2). Los seis están corregidos en código y tests. **No merge** hasta que Codex complete el re-review de los nuevos HEAD sin findings. |
 
 ---
 
@@ -51,7 +51,8 @@ git log --oneline origin/main..HEAD
 | Rama | `feat/tonalli-quickstart-onboarding` |
 | BASE `origin/main` | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
 | HEAD al inicio de esta revisión (referencia, no asumir) | `9e5aed17448d4cece6759f32ca7a18c436ff2865` |
-| HEAD de implementación (este pass) | `2050b35e80bda11ed85373284717b08425b77b14` |
+| HEAD de implementación (este pass) | `36eeae28b0788ce102640198799aa15d5295e24b` |
+| HEAD revisado por Codex (exact-head previo) | `084fc4660d5a92ee492ea54d91abd2721afb05bb` |
 | HEAD de reporte | el commit de este archivo; **no** es el HEAD de implementación |
 | Tip autoritativo | `git rev-parse HEAD` |
 | PR | **#99** OPEN, no mergeado |
@@ -68,14 +69,15 @@ Checkout de trabajo: `/home/xolosarmy/ecashschool/RMZWallet-quickstart`. El chec
 | BASE `origin/main` | `f1964d220d23b214141e722ea5781adee32c0fc9` |
 | HEAD al inicio de esta revisión (referencia, no asumir) | `c26b70e06bf69568a7b2b5430917a79a3a9fb48c` |
 | HEAD Turnstile Quick Start | `4e32338a6aee3411c1d23d0b3257ca18300af841` |
-| HEAD de implementación / PR tip (freeze) | `aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71` |
+| HEAD de implementación (este pass) | `bb959a47e5096898204076944de87bca91470fc8` |
+| HEAD revisado por Codex (exact-head previo) | `aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71` |
 | PR | **#3** OPEN, no mergeado |
 | URL | https://github.com/xolosArmy/tonalli-faucet/pull/3 |
 | Base del PR | `main` (`f1964d220d23b214141e722ea5781adee32c0fc9`) |
 
 Checkout de trabajo: `/home/xolosarmy/ecashschool/tonalli-faucet`.
 
-HEADs de implementación de este freeze: RMZWallet `2050b35e80bda11ed85373284717b08425b77b14`, tonalli-faucet `aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71`. El tip de PR #99 puede incluir commits documentales posteriores.
+HEADs de implementación de esta remediación: RMZWallet `36eeae28b0788ce102640198799aa15d5295e24b`, tonalli-faucet `bb959a47e5096898204076944de87bca91470fc8`. El tip de PR #99 puede incluir commits documentales posteriores.
 
 ---
 
@@ -444,10 +446,125 @@ Codex quota; Vercel SSO; historical ESLint 328; IndexedDB wipe before backup; Tu
 
 ---
 
+## Codex Exact-Head Findings Remediation
+
+Codex Connector completed exact-head reviews on 2026-09-19T13:39Z:
+
+| Repo | Reviewed commit | Review |
+|---|---|---|
+| RMZWallet PR #99 | `084fc4660d5a92ee492ea54d91abd2721afb05bb` | https://github.com/xolosArmy/RMZWallet/pull/99#pullrequestreview-5255891233 |
+| tonalli-faucet PR #3 | `aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71` | https://github.com/xolosArmy/tonalli-faucet/pull/3#pullrequestreview-5255890904 |
+
+Current HEADs at the start of this remediation matched those reviewed commits. No parallel branches were opened.
+
+### RMZ #99 — P1 capability bypass
+
+- Codex discussion: https://github.com/xolosArmy/RMZWallet/pull/99#discussion_r4053332973
+- Severity: P1
+- Root cause: `walletNavigationItemsForCapabilities` only hid `Enviar`. `/walletconnect` still initialized/paired, and `ApproveRequestModal` called `wcWallet.approvePendingRequest()` without `hasCapability`.
+- Fix: operation-boundary `assertWalletCapabilityEnabled` / `approveWalletConnectRequestIfAllowed` before WalletConnect approval; route `RequireCapability` for WalletConnect, send, Agora, NFT, memo compose, x402, external signing, multisig, Agent handoff host.
+- Files: `src/domain/walletCapabilityGuard.ts`, `src/lib/walletconnect/walletConnectCapability.ts`, `src/components/RequireCapability.tsx`, `src/App.tsx`, `src/routes/WalletConnect.tsx`, `src/components/walletconnect/ApproveSessionModal.tsx`, plus host guards in ConnectRequest, SendNft, MemoCompose, DEX, Nfts, SignProposal, X402AuthorizeRequest, TrustedGate2bToC2Bridge.
+- Tests: `walletCapabilityGuard.test.ts`, `walletConnectCapability.test.ts`, `RequireCapability.test.tsx`, architecture freeze in `walletCapabilities.architecture.test.ts`.
+- Acceptance evidence: QUICK_START_UNBACKED cannot use WalletConnect approval/signing/broadcast; BACKUP_VERIFIED restores the helper. Direct privileged route renders `capability-blocked`.
+- Status: remediado en `36eeae28b0788ce102640198799aa15d5295e24b`; pendiente re-review Codex.
+
+### RMZ #99 — P1 create-backed overwrite
+
+- Codex discussion: https://github.com/xolosArmy/RMZWallet/pull/99#discussion_r4053332979
+- Severity: P1
+- Root cause: `/onboarding/create-backed` called unrestricted `createNewWallet()` even with recovered or failed Quick Start.
+- Fix: UI, WalletContext, and service fail-closed if bootstrap is pending/recovered/failed, wallet is initialized, or a Quick Start record exists. No destructive reset flow.
+- Files: `src/routes/Onboarding.tsx`, `src/context/WalletContext.tsx`, `src/services/XolosWalletService.ts`.
+- Tests: `Onboarding.createBacked.test.tsx`, `Onboarding.test.tsx`, `WalletContext.quickStart.test.tsx`.
+- Acceptance evidence: recovered / failed / pending create-backed never calls `createNewWallet`; same address remains; ciphertext not deleted.
+- Status: remediado en `36eeae28b0788ce102640198799aa15d5295e24b`; pendiente re-review Codex.
+
+### RMZ #99 — P2 Chronik-first-create persistence
+
+- Codex discussion: https://github.com/xolosArmy/RMZWallet/pull/99#discussion_r4053332983
+- Severity: P2
+- Root cause: `createQuickStartWallet()` awaited `createNewWallet()` → `wallet.initialize()` before `storeQuickStartMnemonic()`.
+- Fix: generate mnemonic → `activateMnemonicLocalIdentity` → persist encrypted Quick Start → best-effort Chronik `initialize()`. PIN `createNewWallet` still waits on Chronik and still refuses if a Quick Start record exists.
+- Files: `src/services/XolosWalletService.ts`, `src/services/quickStartBoundaries.architecture.test.ts`.
+- Tests: architecture freeze (`storeQuickStartMnemonic` before `initialize()`, no `createNewWallet()` inside create Quick Start); existing Chronik-optional recovery tests.
+- Acceptance evidence: first create no longer depends on Chronik to persist ciphertext and address.
+- Status: remediado en `36eeae28b0788ce102640198799aa15d5295e24b`; pendiente re-review Codex.
+
+### Faucet #3 — P1 legacy funded migration
+
+- Codex discussion: https://github.com/xolosArmy/tonalli-faucet/pull/3#discussion_r4053332648
+- Severity: P1
+- Root cause: `welcome_claims` did not consult `starter_pack_claims`, so a previously funded address looked new.
+- Fix: automatic `INSERT OR IGNORE` adoption of real `xecTxid` rows (`dryRun=0`, not `dryrun-%`) on DB open and again inside reserve/get. Statuses `completed`, `xec_sent`, `failed` with txid are treated as already funded. Pure dry-run legacy rows are not imported.
+- Files: `backend/src/welcomeClaims.ts`.
+- Tests: `welcome.test.ts` legacy completed / xec_sent / failed+txid / failed without txid / dry-run legacy / idempotent adopt.
+- Acceptance evidence: Flow D — POST welcome against legacy funded fixture → `already_claimed`, zero RPC.
+- Status: remediado en `bb959a47e5096898204076944de87bca91470fc8`; pendiente re-review Codex.
+
+### Faucet #3 — P2 dry-run → live
+
+- Codex discussion: https://github.com/xolosArmy/tonalli-faucet/pull/3#discussion_r4053332649
+- Severity: P2
+- Root cause: `dry_run_completed` was permanently `already_claimed`.
+- Fix: live mode may re-reserve `dry_run_completed` once; real `completed` never retries across dry/live switches.
+- Files: `backend/src/welcomeClaims.ts`, `backend/src/routes/welcome.ts`.
+- Tests: `dry-run completed permite un claim live posterior y luego already_claimed`; `un completed real no vuelve a emitir al cambiar dry-run/live`.
+- Acceptance evidence: Flow E — one mocked live send after dry-run, subsequent `already_claimed`.
+- Status: remediado en `bb959a47e5096898204076944de87bca91470fc8`; pendiente re-review Codex.
+
+### Faucet #3 — P2 stats authority
+
+- Codex discussion: https://github.com/xolosArmy/tonalli-faucet/pull/3#discussion_r4053332650
+- Severity: P2
+- Root cause: `/v1/faucet/stats` still counted `starter_pack_claims` only.
+- Fix: endpoint now returns `{ social, legacyStarterPack, welcome }` so Welcome claims are visible and legacy counts are preserved.
+- Files: `backend/src/routes/faucet.ts`, `backend/src/db.ts`, `backend/README.md`.
+- Tests: `GET /stats agrega welcome, legacy starter pack y social`.
+- Acceptance evidence: new welcome claim appears under `welcome`; legacy row remains under `legacyStarterPack`; dry-run vs live distinguished (`welcome.dryRun` vs `welcome.completed`).
+- Status: remediado en `bb959a47e5096898204076944de87bca91470fc8`; pendiente re-review Codex.
+
+### Exact list
+
+```text
+RMZ #99
+P1 capability bypass
+P1 create-backed overwrite
+P2 Chronik-first-create persistence
+
+Faucet #3
+P1 legacy funded migration
+P2 dry-run → live
+P2 stats authority
+```
+
+### Validation after remediation
+
+| Check | Result |
+|---|---|
+| RMZWallet BASE | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
+| RMZWallet reviewed-old HEAD | `084fc4660d5a92ee492ea54d91abd2721afb05bb` |
+| RMZWallet fixed HEAD | `36eeae28b0788ce102640198799aa15d5295e24b` |
+| `npx tsc -b` | PASS |
+| `npx tsc -p tsconfig.tm1-regtest-e2e.json` | PASS |
+| `npm test` | **2701** vitest + **10** slpNftTxBuilder PASS |
+| lint BASE | 328 errors / 0 warnings |
+| lint HEAD | 328 errors / 0 warnings |
+| new lint from this remediation | 0 |
+| faucet BASE | `f1964d220d23b214141e722ea5781adee32c0fc9` |
+| faucet reviewed-old HEAD | `aeb5b2ad4f33f1d09205ea3584f59bfcbb0aae71` |
+| faucet fixed HEAD | `bb959a47e5096898204076944de87bca91470fc8` |
+| `npm test` | **51/51**, 3 consecutive clean processes |
+| `npm run typecheck` | PASS |
+| `npm run build` | PASS |
+
+Live Firefox clean-profile was not re-run in this pass. Flows A–E are covered by automated tests (Chronik-optional persist architecture, create-backed refuse, WalletConnect capability helper, legacy funded fixture, dry-run→live mocked RPC).
+
+---
+
 ## GO / NO-GO
 
-**GO — ready for merge review.**
+**NO-GO**
 
-Independent audit remaining product: P0=0 P1=0. RMZWallet suites PASS. Faucet suites PASS. Faucet `npm test` 3/3. Clean-profile acceptance PASS. No new security findings.
+The six Codex exact-head findings are fixed in `36eeae2` / `bb959a4` with tests PASS. Codex has not yet re-reviewed those HEADs.
 
-**Do not merge. Do not deploy production. Do not use real funds until Codex exact-head review completes.**
+**Do not merge. Do not deploy production. Do not use real funds.**
