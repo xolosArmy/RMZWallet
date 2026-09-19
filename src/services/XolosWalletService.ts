@@ -717,20 +717,21 @@ export class XolosWalletService {
       throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
     }
     try {
+      if (await hasQuickStartMnemonic()) {
+        throw new Error('QUICK_START_RECORD_EXISTS')
+      }
       const mnemonic = generateMnemonic(wordlist, 128)
-      this.buildWallet(DEFAULT_NEW_WALLET_PROFILE_ID)
-      const wallet = this.wallet as MinimalXecWallet
-      await wallet.walletInfoPromise
-      this.decryptedMnemonic = mnemonic
-      this.activeAccountState = deriveAccountPublicState(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
-      this.bindMinimalWalletToCanonicalProfile(mnemonic)
-      await wallet.initialize()
-      this.isReady = true
+      await this.activateMnemonicLocalIdentity(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
       this.encryptedMnemonic = null
-      this.scanCache = null
-      this.scanPromise = null
-      this.scanPromiseGapLimit = null
-      this.ensureHdAddressCache(this.getEffectiveGapLimit())
+      try {
+        await (this.wallet as MinimalXecWallet).initialize()
+      } catch (error) {
+        this.decryptedMnemonic = null
+        this.wallet = null
+        this.isReady = false
+        this.activeAccountState = null
+        throw error
+      }
       return this.decryptedMnemonic || ''
     } finally {
       this.releaseWalletActivation()
@@ -764,28 +765,41 @@ export class XolosWalletService {
     }
 
     await assertQuickStartStorageAvailable()
-    const mnemonic = await this.createNewWallet()
-    const profileId = this.activeProfileId
-    const address = this.getAddress()
-    if (!mnemonic || !address) {
-      throw new Error('QUICK_START_WALLET_IDENTITY_MISSING')
+    if (!this.tryAcquireWalletActivation()) {
+      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
     }
     try {
-      await storeQuickStartMnemonic(mnemonic, {
-        derivationProfileId: profileId,
-        address
-      })
-    } catch (error) {
-      this.decryptedMnemonic = null
-      this.wallet = null
-      this.isReady = false
-      this.activeAccountState = null
-      if (error instanceof QuickStartUnavailableError) throw error
-      throw new QuickStartUnavailableError(
-        error instanceof Error ? error.message : 'QUICK_START_SECURE_STORAGE_UNAVAILABLE'
-      )
+      const mnemonic = generateMnemonic(wordlist, 128)
+      await this.activateMnemonicLocalIdentity(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
+      const profileId = this.activeProfileId
+      const address = this.getAddress()
+      if (!mnemonic || !address) {
+        throw new Error('QUICK_START_WALLET_IDENTITY_MISSING')
+      }
+      try {
+        await storeQuickStartMnemonic(mnemonic, {
+          derivationProfileId: profileId,
+          address
+        })
+      } catch (error) {
+        this.decryptedMnemonic = null
+        this.wallet = null
+        this.isReady = false
+        this.activeAccountState = null
+        if (error instanceof QuickStartUnavailableError) throw error
+        throw new QuickStartUnavailableError(
+          error instanceof Error ? error.message : 'QUICK_START_SECURE_STORAGE_UNAVAILABLE'
+        )
+      }
+      try {
+        await (this.wallet as MinimalXecWallet).initialize()
+      } catch {
+        // Chronik/network failure must not prevent first-create persistence.
+      }
+      return { address, profileId }
+    } finally {
+      this.releaseWalletActivation()
     }
-    return { address, profileId }
   }
 
   async activateQuickStartWallet(

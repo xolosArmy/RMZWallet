@@ -86,9 +86,13 @@ describe('Quick Start seed and frozen-boundary architecture', () => {
       walletService.indexOf('async activateQuickStartWallet(')
     )
     expect(createQuickStart.indexOf('hasQuickStartMnemonic()')).toBeGreaterThanOrEqual(0)
-    expect(createQuickStart.indexOf('hasQuickStartMnemonic()'))
-      .toBeLessThan(createQuickStart.indexOf('createNewWallet()'))
+    expect(createQuickStart).not.toContain('createNewWallet()')
+    expect(createQuickStart).toContain('activateMnemonicLocalIdentity')
+    expect(createQuickStart).toContain('storeQuickStartMnemonic')
+    expect(createQuickStart.indexOf('storeQuickStartMnemonic'))
+      .toBeLessThan(createQuickStart.lastIndexOf('initialize()'))
     expect(createQuickStart).toContain('QUICK_START_RECOVERY_FAILED')
+    expect(createQuickStart).toContain('Chronik/network failure must not prevent first-create persistence')
 
     const activateMnemonic = walletService.slice(
       walletService.indexOf('private async activateMnemonic('),

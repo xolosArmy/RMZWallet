@@ -99,6 +99,38 @@ describe('Tonalli onboarding routes', () => {
     expect(html).not.toContain('id="seed-phrase"')
   })
 
+  test('/onboarding/create-backed stays blocked while Quick Start exists, is pending, or failed', () => {
+    const recovered = renderToStaticMarkup(
+      <MemoryRouter>
+        <WalletContext.Provider value={walletContextFixture({ initialized: true, quickStartBootstrap: 'recovered' })}>
+          <CreateBackedWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+    expect(recovered).toContain('Ya hay una Tonalli')
+    expect(recovered).toContain('disabled')
+
+    const pending = renderToStaticMarkup(
+      <MemoryRouter>
+        <WalletContext.Provider value={walletContextFixture({ quickStartBootstrap: 'pending' })}>
+          <CreateBackedWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+    expect(pending).toContain('Preparando')
+    expect(pending).toContain('disabled')
+
+    const failed = renderToStaticMarkup(
+      <MemoryRouter>
+        <WalletContext.Provider value={walletContextFixture({ quickStartBootstrap: 'failed' })}>
+          <CreateBackedWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+    expect(failed).toContain('no se pudo recuperar')
+    expect(failed).toContain('disabled')
+  })
+
   test('/onboarding/unlock shows only the unlock form', () => {
     const html = renderRoute(<UnlockWallet />)
 

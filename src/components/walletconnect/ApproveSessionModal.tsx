@@ -1,5 +1,8 @@
 import { useState, type ReactNode } from 'react'
 import type { SessionTypes } from '@walletconnect/types'
+import { useWallet } from '../../context/useWallet'
+import { WALLET_CAPABILITY } from '../../domain/walletCapabilities'
+import { assertWalletCapabilityEnabled } from '../../domain/walletCapabilityGuard'
 import { wcWallet } from '../../lib/walletconnect/WcWallet'
 
 export type ProposalLike = {
@@ -41,6 +44,7 @@ export default function ApproveSessionModal({
   onRejected,
   onClose
 }: ApproveSessionModalProps) {
+  const wallet = useWallet()
   const [isApproving, setIsApproving] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [successMsg, setSuccessMsg] = useState<string | null>(null)
@@ -73,6 +77,14 @@ export default function ApproveSessionModal({
     setSuccessMsg(null)
 
     console.log('[WC] approve click', { id: proposal.id, proposer: proposal.params?.proposer?.metadata })
+
+    try {
+      assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.WALLETCONNECT)
+    } catch (err) {
+      setErrorMsg((err as Error).message || 'WalletConnect no está disponible hasta el respaldo.')
+      setIsApproving(false)
+      return
+    }
 
     if (!activeAddress) {
       setErrorMsg('No hay dirección activa para aprobar el vínculo.')

@@ -1,13 +1,19 @@
 import { useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import TopBar from '../components/TopBar'
+import { CapabilityBlocked } from '../components/RequireCapability'
+import { useWallet } from '../context/useWallet'
+import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
+import { isWalletCapabilityEnabled } from '../domain/walletCapabilityGuard'
 import MintPassOffers from '../features/dex/components/MintPassOffers'
 import DEXLegacy from './DEXLegacy'
 
 const LEGACY_EXTERNAL_MARKETPLACE = 'https://marketplace.xolosarmy.xyz/'
 
 export default function DEX() {
+  const wallet = useWallet()
   const [searchParams, setSearchParams] = useSearchParams()
+  const agoraAllowed = isWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.AGORA_TRADING)
   const legacyDeepLink = useMemo(
     () =>
       searchParams.has('mode') ||
@@ -16,6 +22,10 @@ export default function DEX() {
     [searchParams]
   )
   const showTrading = searchParams.get('view') === 'trading' || legacyDeepLink
+
+  if (!agoraAllowed) {
+    return <CapabilityBlocked title="Protege tu Tonalli para usar Agora" />
+  }
 
   if (showTrading) {
     return (
