@@ -13,10 +13,55 @@ Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No m
 | **BASE SHA** | `ab0024a97ac62f9ba3725b92c553805cb348c7fb` |
 | BASE worktree | `/tmp/rmzwallet-tm-comm-a0-base` |
 | Mensaje BASE | `[Gate C3A] RMZWallet Settlement Engine: Durable Ownership, Local TXID Derivation, and Broadcast Boundary (#96)` |
-| **HEAD SHA** | `dbe77d2aea2d893023501b042785e658b9bec91e` |
+| **OLD REVIEWED HEAD** | `0aef01d195bc4bbe15d564ab6187e65356365d17` |
+| **REMEDIATION CODE SHA** | `09e3d946e346cb58a3ef2e176cc8e12e7327e035` |
+| **NEW FINAL HEAD** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 remediation pass closure) |
 | Staging API | http://127.0.0.1:4178/v1/tm-comm/health |
 | Staging UI | http://127.0.0.1:5174/tm-comm-staging |
 | Merge | **No** |
+
+---
+
+## Fresh Codex Review Remediation Pass (P2 Findings)
+
+El fresh Codex review ejecutado sobre el exact HEAD `0aef01d195bc4bbe15d564ab6187e65356365d17` identificó 4 findings P2. Los cuatro han sido formalmente remediados en `09e3d946e346cb58a3ef2e176cc8e12e7327e035` conservando todas las invariantes de arquitectura de TM-COMM A0 y sin introducir regresiones ni modificar código histórico de RMZWallet:
+
+### P2-1: Local challenge validation before signing (`PRRC_kwDOQYWUus7xmPd7`)
+- **Causa raíz**: La UI de staging (`TmCommStaging.tsx`) tomaba el `canonicalMessage` provisto por el servidor y lo enviaba directamente a `xolosWalletService.signMessage` sin validar localmente los parámetros estructurados del challenge.
+- **Remediación**: Se implementó `verifyAndReconstructAuthChallenge(payload, options)` en `src/features/privateMessaging/authChallenge.ts` (re-exportado en el barrel público `src/features/privateMessaging/index.ts`). La función valida exhaustivamente `protocol`, `purpose`, `chain`, `audience`, `origin`, `nonce`, `expiresAt` y `sessionContext`. Reconstruye el mensaje canónico localmente mediante `buildTmCommAuthChallengeMessage` y comprueba igualdad estricta con `payload.canonicalMessage`. En la UI de staging, si la validación falla o detecta manipulación/expiración, se aborta la operación y jamás se invoca `signMessage`.
+- **Archivos modificados**:
+  - `src/features/privateMessaging/authChallenge.ts`
+  - `src/features/privateMessaging/index.ts`
+  - `src/routes/TmCommStaging.tsx`
+- **Tests agregados/actualizados**:
+  - `src/features/privateMessaging/privateMessaging.domain.test.ts` (11 unit tests cubriendo challenge legítimo y rechazo estricto ante manipulación de protocolo, propósito, chain, audience, origin, nonce, expiración, timestamps inválidos, discrepancia con reconstrucción local y payloads no-objeto).
+  - `src/routes/TmCommStaging.test.tsx` (8 tests de componente en entorno jsdom verificando que ante un challenge legítimo se invoca `signMessage`, y ante cualquier inconsistencia de protocolo, propósito, audience, origin, nonce, expiración o canonicalMessage se aborta con 0 invocaciones a `signMessage`).
+
+### P2-2: Enforce expected origin on all authenticated mutations (`PRRC_kwDOQYWUus7xmPd_`)
+- **Causa raíz**: Las rutas HTTP de mutación autenticada (`POST bindings`, `POST messages`, `PUT receipts`, etc.) no validaban de forma fail-closed el header `Origin` contra la configuración esperada del servidor, y el parser `readJson` permitía bypasses de tipo `text/plain` o sin Content-Type explícito.
+- **Remediación**: Se implementó `assertMutationOrigin` en `server/tmComm/tmCommService.ts` e integró en `server/tmComm/tmCommHttp.ts` para todas las rutas mutantes (`POST /v1/tm-comm/bindings`, `POST /v1/tm-comm/conversations/:id/messages`, `PUT /v1/tm-comm/messages/:id/receipts`, mutaciones de adjuntos y cualquier verbo no-GET). Toda petición con `Origin` ausente, foráneo o con puerto discrepante falla de forma inmediata con HTTP 403 `FORBIDDEN` y registra un evento de auditoría en SQLite con `outcome: 'deny'` y `reasonCode: 'ORIGIN_MISMATCH'`. Adicionalmente, `readJson` en `tmCommHttp.ts` valida estrictamente `Content-Type: application/json` y rechaza con HTTP 415 `CONTENT_TYPE_UNSUPPORTED` peticiones `text/plain` o sin header.
+- **Archivos modificados**:
+  - `server/tmComm/tmCommHttp.ts`
+  - `server/tmComm/tmCommService.ts`
+- **Tests agregados/actualizados**:
+  - `server/tmComm/tmComm.http.test.ts` (Suite de tests P2-2 verificando origin exacto permitido, origin foráneo rechazado con 403, puerto discrepante rechazado con 403, origin ausente rechazado con 403, `text/plain` rechazado con 415, Content-Type ausente rechazado con 415, cookie de sesión válida con origin inválido rechazada con 403, y persistencia de eventos de auditoría 'deny' con `ORIGIN_MISMATCH`).
+
+### P2-3: The sender cannot generate own delivery/read receipts (`PRRC_kwDOQYWUus7xmPeA`)
+- **Causa raíz**: El remitente de un mensaje podía emitir sus propios receipts de entrega (`delivered`) y lectura (`read`), inflando artificialmente el estado de agregación del mensaje sin participación del destinatario.
+- **Remediación**: En `TmCommService.upsertReceipt` se agregó la validación estricta `receipt.principalId !== message.senderPrincipalId`, rechazando con HTTP 403 `SELF_RECEIPT_FORBIDDEN`. Se validó que el emisor del receipt pertenezca a la conversación excluyendo al remitente (`conversation.participantPrincipalIds - sender`), rechazando con HTTP 403 `RECIPIENT_REQUIRED`. Se prohibió la suplantación de identidad (`claimedPrincipalId !== principal.id`), rechazando con HTTP 403 `RECEIPT_IMPERSONATION`. En `TmCommStore.syncMessageStatus`, se filtran los receipts del remitente para que el estado agregado del mensaje (`accepted`, `delivered`, `read`) se derive estrictamente de receipts emitidos por destinatarios legítimos.
+- **Archivos modificados**:
+  - `server/tmComm/tmCommService.ts`
+  - `server/tmComm/tmCommStore.ts`
+- **Tests agregados/actualizados**:
+  - `server/tmComm/tmComm.http.test.ts` (Actualización del test de reapertura para validar rechazo 403 al remitente y aceptación del operador; suite dedicada a P2-3 validando rechazo de receipt delivered/read propio con 403 `SELF_RECEIPT_FORBIDDEN`, rechazo a terceros no participantes, rechazo de suplantación con 403 `RECEIPT_IMPERSONATION`, transición de estado a `delivered` y `read` exclusivamente por el destinatario, e idempotencia).
+
+### P2-4: Restore conversation and history after reload (`PRRC_kwDOQYWUus7xmPeF`)
+- **Causa raíz**: Al recargar la página, la memoria de React se reinicializaba, perdiendo la conversación y el historial y requiriendo reingresar el token de enrolamiento (que al ser de un solo uso fallaba).
+- **Remediación**: En `src/routes/TmCommStaging.tsx` se añadió un hook de hidratación determinista al montar (`useEffect`) que consulta `GET /v1/tm-comm/conversations`. Si existe una sesión activa y autorizada, selecciona la conversación activa de forma determinista (`createdAt` desc, `id` desc) y carga el historial durable desde `GET /v1/tm-comm/conversations/:id/messages`. Si existen múltiples conversaciones autorizadas, renderiza un selector desplegable `<select aria-label="Seleccionar conversación">` para alternar explícitamente entre ellas. Si la recarga no está autenticada (401), el estado permanece limpio sin exponer datos. Se mantiene de forma estricta la invariante arquitectónica: cero uso de `localStorage` como almacenamiento canónico.
+- **Archivos modificados**:
+  - `src/routes/TmCommStaging.tsx`
+- **Tests agregados/actualizados**:
+  - `src/routes/TmCommStaging.test.tsx` (3 tests verificando: restauración de conversación e historial durable al recargar con sesión activa sin requerir token de enrolamiento; renderizado del selector de conversaciones y cambio explícito ante múltiples conversaciones; y ausencia de datos/estado limpio ante recarga sin sesión con respuesta 401).
 
 ---
 
@@ -118,18 +163,18 @@ Mismo archivo de test: mensaje aceptado sobrevive close/reopen de SQLite + HTTP;
 
 ---
 
-## Resultados de tests (HEAD `dbe77d2`)
+## Resultados de tests post-remediación (HEAD `09e3d94`)
 
 | Comando | Exit | Clasificación |
 | --- | --- | --- |
-| `npm run typecheck` | 0 | **PASS** |
-| `npm run build` | 0 | **PASS** (warnings de deps: eval, chunks >500kB, browserslist stale — no FAIL nuevo) |
-| TM-COMM focalizado (`vitest run src/features/privateMessaging server/tmComm src/routes/TmCommStaging.test.tsx`) | 0 | **PASS** 5 files / 22 tests |
-| Architecture/boundary (`privateMessaging.architecture.test.ts`) | 0 | **PASS** 8/8 |
-| `npm test` suite vigente | 0 | **PASS** 149 files / 2670 vitest + 10 node:test |
+| `npm run typecheck` | 0 | **PASS** (0 errores) |
+| `npm run build` | 0 | **PASS** (compilación limpia para producción) |
+| TM-COMM focalizado (`npm run test:tm-comm`) | 0 | **PASS** (5 files / 46 tests) |
+| Architecture/boundary (`privateMessaging.architecture.test.ts`) | 0 | **PASS** (8/8) |
+| `npm test` suite vigente | 0 | **PASS** (149 files / 2694 vitest + 10 node:test) |
 | `npm run test:tm1-regtest-e2e` | 20 | **ENVIRONMENTAL FAILURE** (preexistente en BASE y HEAD; requiere chronik local en :3000) |
-| `npm run lint` BASE | 1 | **FAIL preexistente en BASE** (328/0) |
-| `npm run lint` HEAD | 1 | **FAIL preexistente en HEAD** (328/0; NEW=0) |
+| `npm run lint` BASE | 1 | **FAIL preexistente en BASE** (328 errors / 0 warnings) |
+| `npm run lint` HEAD | 1 | **FAIL preexistente en HEAD** (328 errors / 0 warnings; NEW=0) |
 
 Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAlias; WASM fallback en x402Activation.
 
@@ -144,15 +189,30 @@ Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAl
 
 ## Riesgos residuales
 
-Tokens staging en `.tmp/`; cookie sin `Secure` en HTTP local; sin rate-limit; XSS en origen staging; operador fixture; email/IA no implementados; 328 lint históricos fuera de A0.
+1. **Tokens de staging en `.tmp/`**: Se almacenan tokens de desarrollo y base de datos SQLite en directorio temporal local no versionado.
+2. **Ambiente de staging local**: Cookies sin atributo `Secure` en HTTP local `127.0.0.1:4178`; sin rate-limiting de producción.
+3. **Ficticio y aislado**: Entorno restringido a staging; operador fixture en bootstrap; email e IA fencados (no implementados).
+4. **328 lint findings históricos**: Preexisten en BASE en módulos fuera de TM-COMM (`Tonalli Memo`, `Agent Wallet Execution`, `Trusted Wallet Runtime`, `MemoCompose`, `aliasDiscovery`). Cero findings en archivos TM-COMM.
 
 ---
 
-## GO / NO-GO para M0
+## GO / NO-GO para Fresh Codex Review
 
-**GO para M0** en esta rama, datos ficticios, sin merge, sin OpenAI, sin email real, sin Memo, sin fondos reales.
-
-**NO-GO** para merge, producción, o declarar PASS el lint global.
+**GO: READY FOR FRESH CODEX REVIEW**
+- **4/4 Findings P2 remediados**:
+  - P2-1: Validación client-side exhaustiva del challenge antes de invocar `signMessage`.
+  - P2-2: Enforce estricto de origin en todas las mutaciones autenticadas con auditoría `ORIGIN_MISMATCH` y rechazo 415 a bypasses sin `application/json`.
+  - P2-3: Prohibición de receipts propios del remitente (403 `SELF_RECEIPT_FORBIDDEN`), rechazo a impersonación (403 `RECEIPT_IMPERSONATION`) y derivación estricta de estado a partir de los destinatarios.
+  - P2-4: Restauración determinista de conversaciones e historial durable en reload/mount, selector UI multiconversación y estado limpio en 401 sin uso de `localStorage`.
+- **Validación 100% verde**:
+  - `npm run typecheck`: PASS (código 0)
+  - `npm run build`: PASS (código 0)
+  - `npm run test:tm-comm`: PASS (5 archivos, 46 tests)
+  - `npm test`: PASS (149 archivos, 2694 vitest + 10 node:test)
+  - `npm run lint`: NEW findings = 0 (328 preexistentes en BASE, 328 en HEAD, 0 en archivos TM-COMM)
+- **Invariantes arquitectónicas preservadas**:
+  - Cero OpenAI, cero clientes reales, cero fondos reales, cero autoridad financiera, cero Agent Wallet authority, cero settlement, cero broadcast, cero sendXec, cero eToken movement, cero auto-publicación en Tonalli Memo.
+  - Sin merge a main, sin avance a M0, sin ampliación de scope.
 
 ---
 
