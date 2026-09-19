@@ -4,11 +4,15 @@ import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { ECASH_STANDARD_PROFILE_ID } from './derivationProfiles'
 import {
+  QuickStartUnavailableError,
   assertQuickStartStorageAvailable,
   clearQuickStartMnemonic,
+  hasQuickStartMnemonic,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
-  storeQuickStartMnemonic
+  setQuickStartCreationLockForTests,
+  storeQuickStartMnemonic,
+  withQuickStartCreationLock
 } from './quickStartStorage'
 
 const MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
@@ -37,6 +41,7 @@ describe('Quick Start encrypted storage', () => {
   })
 
   afterEach(async () => {
+    setQuickStartCreationLockForTests(null)
     await clearQuickStartMnemonic()
   })
 
@@ -139,5 +144,170 @@ describe('Quick Start encrypted storage', () => {
     })
     db.close()
     await expect(loadQuickStartMnemonic()).rejects.toThrow('QUICK_START_STORAGE_CORRUPT')
+  })
+
+  test('fresh profile IndexedDB open rejection is unavailable, not recovery failure', async () => {
+    const originalOpen = indexedDB.open.bind(indexedDB)
+    indexedDB.open = (() => {
+      throw new DOMException('denied', 'UnknownError')
+    }) as typeof indexedDB.open
+    try {
+      await expect(assertQuickStartStorageAvailable()).rejects.toBeInstanceOf(QuickStartUnavailableError)
+      await expect(hasQuickStartMnemonic()).resolves.toBe(false)
+      await expect(storeQuickStartMnemonic(MNEMONIC, {
+        derivationProfileId: ECASH_STANDARD_PROFILE_ID
+      })).rejects.toBeInstanceOf(QuickStartUnavailableError)
+    } finally {
+      indexedDB.open = originalOpen
+    }
+    expect(await hasQuickStartMnemonic()).toBe(false)
+  })
+
+  test('fresh profile transaction rejection is unavailable and leaves no partial record', async () => {
+    const originalTransaction = IDBDatabase.prototype.transaction
+    IDBDatabase.prototype.transaction = function () {
+      throw new DOMException('transaction unavailable', 'InvalidStateError')
+    }
+    try {
+      await expect(storeQuickStartMnemonic(MNEMONIC, {
+        derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+        address: 'ecash:qtest'
+      })).rejects.toBeInstanceOf(QuickStartUnavailableError)
+    } finally {
+      IDBDatabase.prototype.transaction = originalTransaction
+    }
+    expect(await hasQuickStartMnemonic()).toBe(false)
+    expect(await allStoreRecords()).toEqual([])
+  })
+
+  test('CryptoKey structured-clone failure is unavailable and does not persist a seed', async () => {
+    const originalPut = IDBObjectStore.prototype.put
+    IDBObjectStore.prototype.put = function (value: unknown) {
+      if (value && typeof value === 'object' && 'key' in (value as { key?: unknown })) {
+        throw new DOMException('could not clone CryptoKey', 'DataCloneError')
+      }
+      return originalPut.call(this, value)
+    }
+    try {
+      await expect(storeQuickStartMnemonic(MNEMONIC, {
+        derivationProfileId: ECASH_STANDARD_PROFILE_ID
+      })).rejects.toBeInstanceOf(QuickStartUnavailableError)
+      await expect(storeQuickStartMnemonic(MNEMONIC, {
+        derivationProfileId: ECASH_STANDARD_PROFILE_ID
+      })).rejects.toThrow('QUICK_START_DEVICE_KEY_NOT_PERSISTED')
+    } finally {
+      IDBObjectStore.prototype.put = originalPut
+    }
+    expect(await hasQuickStartMnemonic()).toBe(false)
+  })
+
+  test('existing seed with missing key stays a recovery failure, not availability', async () => {
+    await storeQuickStartMnemonic(MNEMONIC, { derivationProfileId: ECASH_STANDARD_PROFILE_ID })
+    const request = indexedDB.open('tonalli-quickstart-v1', 1)
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction('wallet', 'readwrite')
+      tx.objectStore('wallet').delete('device-key')
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+    })
+    db.close()
+    await expect(loadQuickStartMnemonic()).rejects.toThrow('QUICK_START_DEVICE_KEY_MISSING')
+    expect(await hasQuickStartMnemonic()).toBe(true)
+    await expect(storeQuickStartMnemonic(MNEMONIC, {
+      derivationProfileId: ECASH_STANDARD_PROFILE_ID
+    })).rejects.toThrow('QUICK_START_RECORD_EXISTS')
+  })
+
+  test('two concurrent creators under an exclusive lock persist exactly one identity', async () => {
+    let mutex = Promise.resolve()
+    setQuickStartCreationLockForTests(async (operation) => {
+      const previous = mutex
+      let release!: () => void
+      mutex = new Promise<void>((resolve) => { release = resolve })
+      await previous
+      try {
+        return await operation()
+      } finally {
+        release()
+      }
+    })
+    const first = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
+    const second = 'legal winner thank year wave sausage worth useful legal winner thank yellow'
+    const results = await Promise.allSettled([
+      withQuickStartCreationLock(() => storeQuickStartMnemonic(first, {
+        derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+        address: 'ecash:qone'
+      })),
+      withQuickStartCreationLock(() => storeQuickStartMnemonic(second, {
+        derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+        address: 'ecash:qtwo'
+      }))
+    ])
+    const fulfilled = results.filter((result) => result.status === 'fulfilled')
+    const rejected = results.filter((result) => result.status === 'rejected')
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({ message: 'QUICK_START_RECORD_EXISTS' })
+    const loaded = await loadQuickStartMnemonic()
+    const metadata = await loadQuickStartMetadata()
+    expect(loaded === first || loaded === second).toBe(true)
+    if (loaded === first) expect(metadata?.address).toBe('ecash:qone')
+    else expect(metadata?.address).toBe('ecash:qtwo')
+  })
+
+  test('lock acquisition failure fail-closes without seed or key writes', async () => {
+    setQuickStartCreationLockForTests(async () => {
+      throw new QuickStartUnavailableError('QUICK_START_CREATION_LOCK_UNAVAILABLE')
+    })
+    await expect(withQuickStartCreationLock(() => storeQuickStartMnemonic(MNEMONIC, {
+      derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+      address: 'ecash:qtest'
+    }))).rejects.toBeInstanceOf(QuickStartUnavailableError)
+    expect(await hasQuickStartMnemonic()).toBe(false)
+    expect(await allStoreRecords()).toEqual([])
+  })
+
+  test('missing Web Locks fail-closes without persisting a Quick Start record', async () => {
+    setQuickStartCreationLockForTests(null)
+    const originalLocks = navigator.locks
+    Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined })
+    try {
+      await expect(withQuickStartCreationLock(async () => {
+        await storeQuickStartMnemonic(MNEMONIC, { derivationProfileId: ECASH_STANDARD_PROFILE_ID })
+        return 'created'
+      })).rejects.toThrow('QUICK_START_CREATION_LOCK_UNAVAILABLE')
+    } finally {
+      Object.defineProperty(navigator, 'locks', { configurable: true, value: originalLocks })
+    }
+    expect(await hasQuickStartMnemonic()).toBe(false)
+  })
+
+  test('aborted persist transaction does not accept a mismatched key/ciphertext pair', async () => {
+    const originalPut = IDBObjectStore.prototype.put
+    let puts = 0
+    IDBObjectStore.prototype.put = function (value: unknown) {
+      puts += 1
+      if (puts >= 2) {
+        throw new DOMException('crash after first write', 'UnknownError')
+      }
+      return originalPut.call(this, value)
+    }
+    try {
+      await expect(storeQuickStartMnemonic(MNEMONIC, {
+        derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+        address: 'ecash:qcrash'
+      })).rejects.toBeInstanceOf(QuickStartUnavailableError)
+    } finally {
+      IDBObjectStore.prototype.put = originalPut
+    }
+    expect(await hasQuickStartMnemonic()).toBe(false)
+    const records = await allStoreRecords()
+    expect(records.some((record) => (
+      record && typeof record === 'object' && 'id' in record && (record as { id?: string }).id === 'seed-ciphertext'
+    ))).toBe(false)
   })
 })

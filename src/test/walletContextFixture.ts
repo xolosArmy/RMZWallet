@@ -24,6 +24,7 @@ export function walletContextFixture(
     backupVerified,
     lifecycle,
     quickStartBootstrap: overrides.quickStartBootstrap ?? 'absent',
+    hasBackedWalletOnDevice: overrides.hasBackedWalletOnDevice ?? false,
     hasCapability: (capability) => isCapabilityAllowed(lifecycle, capability),
     startQuickStartWallet: vi.fn(),
     activateQuickStartFromDevice: vi.fn(),

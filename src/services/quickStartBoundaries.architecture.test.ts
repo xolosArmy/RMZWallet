@@ -93,6 +93,33 @@ describe('Quick Start seed and frozen-boundary architecture', () => {
       .toBeLessThan(createQuickStart.lastIndexOf('initialize()'))
     expect(createQuickStart).toContain('QUICK_START_RECOVERY_FAILED')
     expect(createQuickStart).toContain('Chronik/network failure must not prevent first-create persistence')
+    expect(createQuickStart).toContain('withQuickStartCreationLock')
+    expect(createQuickStart.indexOf('withQuickStartCreationLock'))
+      .toBeLessThan(createQuickStart.indexOf('hasBackedWalletCiphertextOnDevice'))
+    expect(createQuickStart.indexOf('hasBackedWalletCiphertextOnDevice'))
+      .toBeLessThan(createQuickStart.indexOf('hasQuickStartMnemonic()'))
+    expect(createQuickStart).toContain('BACKED_WALLET_EXISTS')
+    expect(createQuickStart).toContain('QUICK_START_IDENTITY_MISMATCH')
+    expect(createQuickStart).not.toContain("throw new QuickStartUnavailableError(\n          error instanceof Error ? error.message")
+
+    expect(walletService).toContain('hasBackedWalletCiphertextOnDevice()')
+    expect(context).toContain('BACKED_WALLET_EXISTS')
+    expect(context).toContain('hasBackedWalletCiphertextOnDevice')
+    expect(onboarding).toContain('BACKED_WALLET_EXISTS')
+    expect(onboarding).toContain('/onboarding/unlock')
+
+    expect(storage).toContain('withQuickStartCreationLock')
+    expect(storage).toContain('toAvailabilityError')
+    expect(storage).toContain('QUICK_START_CREATION_LOCK_UNAVAILABLE')
+    expect(storage).toContain('DataCloneError')
+    const hasQuickStart = storage.slice(
+      storage.indexOf('export async function hasQuickStartMnemonic'),
+      storage.length
+    )
+    expect(hasQuickStart).toContain('QuickStartUnavailableError')
+    expect(hasQuickStart).toContain('return false')
+    expect(hasQuickStart).not.toContain('QUICK_START_STORAGE_CORRUPT')
+    expect(hasQuickStart).not.toContain('QUICK_START_DEVICE_KEY_MISSING')
 
     const activateMnemonic = walletService.slice(
       walletService.indexOf('private async activateMnemonic('),

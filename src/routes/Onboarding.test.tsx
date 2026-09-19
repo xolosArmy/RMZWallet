@@ -67,6 +67,21 @@ describe('Tonalli onboarding routes', () => {
     expect(html).toContain('href="/onboarding"')
   })
 
+  test('/onboarding/create stays blocked and offers unlock when a backed wallet exists', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <WalletContext.Provider value={walletContextFixture({ hasBackedWalletOnDevice: true })}>
+          <CreateWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+    expect(html).toContain('wallet cifrada')
+    expect(html).toContain('Desbloquear wallet')
+    expect(html).toContain('href="/onboarding/unlock"')
+    expect(html).toContain('disabled')
+    expect(html).not.toContain('href="/onboarding/create-backed"')
+  })
+
   test('/onboarding/create stays blocked while Quick Start hydration is pending or failed', () => {
     const pending = renderToStaticMarkup(
       <MemoryRouter>

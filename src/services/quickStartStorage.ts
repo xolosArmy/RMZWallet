@@ -39,6 +39,27 @@ export type QuickStartMetadata = Readonly<{
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
+const QUICK_START_CREATION_LOCK_NAME = 'tonalli-quickstart-create'
+
+type QuickStartCreationLockRunner = <T>(operation: () => Promise<T>) => Promise<T>
+
+let testCreationLock: QuickStartCreationLockRunner | null = null
+
+export function setQuickStartCreationLockForTests(
+  runner: QuickStartCreationLockRunner | null
+): void {
+  testCreationLock = runner
+}
+
+function toAvailabilityError(error: unknown): QuickStartUnavailableError {
+  if (error instanceof QuickStartUnavailableError) return error
+  const name = error instanceof DOMException ? error.name : ''
+  if (name === 'DataCloneError') {
+    return new QuickStartUnavailableError('QUICK_START_DEVICE_KEY_NOT_PERSISTED')
+  }
+  return new QuickStartUnavailableError('QUICK_START_SECURE_STORAGE_UNAVAILABLE')
+}
+
 function assertAvailable() {
   if (
     typeof indexedDB === 'undefined' ||
@@ -52,28 +73,32 @@ function assertAvailable() {
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error ?? new Error('INDEXEDDB_REQUEST_FAILED'))
+    request.onerror = () => reject(toAvailabilityError(request.error ?? new Error('INDEXEDDB_REQUEST_FAILED')))
   })
 }
 
 function transactionDone(transaction: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
     transaction.oncomplete = () => resolve()
-    transaction.onerror = () => reject(transaction.error ?? new Error('INDEXEDDB_TRANSACTION_FAILED'))
-    transaction.onabort = () => reject(transaction.error ?? new Error('INDEXEDDB_TRANSACTION_ABORTED'))
+    transaction.onerror = () => reject(toAvailabilityError(transaction.error ?? new Error('INDEXEDDB_TRANSACTION_FAILED')))
+    transaction.onabort = () => reject(toAvailabilityError(transaction.error ?? new Error('INDEXEDDB_TRANSACTION_ABORTED')))
   })
 }
 
 async function openDb(): Promise<IDBDatabase> {
   assertAvailable()
-  const request = indexedDB.open(DB_NAME, DB_VERSION)
-  request.onupgradeneeded = () => {
-    const db = request.result
-    if (!db.objectStoreNames.contains(STORE_NAME)) {
-      db.createObjectStore(STORE_NAME, { keyPath: 'id' })
+  try {
+    const request = indexedDB.open(DB_NAME, DB_VERSION)
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' })
+      }
     }
+    return await requestResult(request)
+  } catch (error) {
+    throw toAvailabilityError(error)
   }
-  return requestResult(request)
 }
 
 async function readRecord<T>(id: string): Promise<T | undefined> {
@@ -83,6 +108,8 @@ async function readRecord<T>(id: string): Promise<T | undefined> {
     const result = await requestResult(transaction.objectStore(STORE_NAME).get(id))
     await transactionDone(transaction)
     return result as T | undefined
+  } catch (error) {
+    throw toAvailabilityError(error)
   } finally {
     db.close()
   }
@@ -95,9 +122,49 @@ async function writeRecords(records: Array<Record<string, unknown>>): Promise<vo
     const store = transaction.objectStore(STORE_NAME)
     for (const record of records) store.put(record)
     await transactionDone(transaction)
+  } catch (error) {
+    throw toAvailabilityError(error)
   } finally {
     db.close()
   }
+}
+
+export async function withQuickStartCreationLock<T>(operation: () => Promise<T>): Promise<T> {
+  if (testCreationLock) {
+    return testCreationLock(operation)
+  }
+
+  const locks = globalThis.navigator?.locks
+  if (!locks || typeof locks.request !== 'function') {
+    throw new QuickStartUnavailableError('QUICK_START_CREATION_LOCK_UNAVAILABLE')
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let operationStarted = false
+    void locks.request(
+      QUICK_START_CREATION_LOCK_NAME,
+      { mode: 'exclusive' },
+      async (lock) => {
+        if (!lock) {
+          reject(new QuickStartUnavailableError('QUICK_START_CREATION_LOCK_UNAVAILABLE'))
+          return
+        }
+        operationStarted = true
+        try {
+          resolve(await operation())
+        } catch (error) {
+          reject(error)
+        }
+      }
+    ).catch((error: unknown) => {
+      if (operationStarted) return
+      if (error instanceof QuickStartUnavailableError) {
+        reject(error)
+        return
+      }
+      reject(new QuickStartUnavailableError('QUICK_START_CREATION_LOCK_UNAVAILABLE'))
+    })
+  })
 }
 
 function assertNonExtractableAesGcmKey(key: CryptoKey): void {
@@ -172,51 +239,14 @@ function parseSeedRecord(raw: unknown): QuickStartSeedRecord | null {
   }
 }
 
-async function persistNonExtractableDeviceKey(): Promise<CryptoKey> {
-  const existingSeed = await readRecord<unknown>(SEED_RECORD)
-  if (existingSeed) {
-    throw new Error('QUICK_START_RECORD_EXISTS')
-  }
-  const existingKey = await readRecord<{ id: string; key: CryptoKey }>(KEY_RECORD)
-  if (existingKey?.key) {
-    assertNonExtractableAesGcmKey(existingKey.key)
-    return existingKey.key
-  }
-  assertAvailable()
-  const key = await crypto.subtle.generateKey(
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  )
-  assertNonExtractableAesGcmKey(key)
-  await writeRecords([{ id: KEY_RECORD, key }])
-  const stored = await readRecord<{ id: string; key: CryptoKey }>(KEY_RECORD)
-  if (!stored?.key) {
-    throw new QuickStartUnavailableError('QUICK_START_DEVICE_KEY_NOT_PERSISTED')
-  }
-  assertNonExtractableAesGcmKey(stored.key)
-  return stored.key
-}
-
-async function getOrCreateDeviceKey(): Promise<CryptoKey> {
-  const stored = await readRecord<{ id: string; key: CryptoKey }>(KEY_RECORD)
-  if (stored?.key) {
-    assertNonExtractableAesGcmKey(stored.key)
-    return stored.key
-  }
-  const existingSeed = await readRecord<unknown>(SEED_RECORD)
-  if (existingSeed) {
-    throw new Error('QUICK_START_DEVICE_KEY_MISSING')
-  }
-  return persistNonExtractableDeviceKey()
-}
-
 async function deleteRecord(id: string): Promise<void> {
   const db = await openDb()
   try {
     const transaction = db.transaction(STORE_NAME, 'readwrite')
     transaction.objectStore(STORE_NAME).delete(id)
     await transactionDone(transaction)
+  } catch (error) {
+    throw toAvailabilityError(error)
   } finally {
     db.close()
   }
@@ -270,7 +300,13 @@ export async function storeQuickStartMnemonic(
     throw new Error('QUICK_START_RECORD_EXISTS')
   }
 
-  const key = await getOrCreateDeviceKey()
+  assertAvailable()
+  const key = await crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  )
+  assertNonExtractableAesGcmKey(key)
   const iv = crypto.getRandomValues(new Uint8Array(12))
   const ciphertext = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: toBufferSource(iv) },
@@ -286,15 +322,35 @@ export async function storeQuickStartMnemonic(
     address: metadata.address ?? null,
     createdAt: new Date().toISOString()
   }
-  await writeRecords([record as unknown as Record<string, unknown>])
+  await writeRecords([
+    { id: KEY_RECORD, key },
+    record as unknown as Record<string, unknown>
+  ])
 
-  const persisted = await readRecord<unknown>(SEED_RECORD)
-  const parsed = parseSeedRecord(persisted)
-  if (!parsed) throw new Error('QUICK_START_STORAGE_CORRUPT')
+  const storedKey = await readRecord<{ id: string; key: CryptoKey }>(KEY_RECORD)
+  const parsed = parseSeedRecord(await readRecord<unknown>(SEED_RECORD))
+  if (!storedKey?.key || !parsed) throw new Error('QUICK_START_STORAGE_CORRUPT')
+  assertNonExtractableAesGcmKey(storedKey.key)
   const persistedBytes = new Uint8Array(parsed.ciphertext)
   if (decoder.decode(persistedBytes) === normalized) {
     await clearQuickStartMnemonic()
     throw new Error('QUICK_START_PLAINTEXT_FALLBACK_FORBIDDEN')
+  }
+  try {
+    const plain = decoder.decode(await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: toBufferSource(parsed.iv) },
+      storedKey.key,
+      parsed.ciphertext
+    ))
+    if (plain !== normalized) {
+      throw new Error('QUICK_START_IDENTITY_MISMATCH')
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === 'QUICK_START_IDENTITY_MISMATCH') throw error
+    throw new Error('QUICK_START_DECRYPT_FAILED')
+  }
+  if (metadata.address && parsed.address && parsed.address !== metadata.address) {
+    throw new Error('QUICK_START_IDENTITY_MISMATCH')
   }
   return {
     version: parsed.version,
