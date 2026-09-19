@@ -1,11 +1,11 @@
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { bootstrapTmCommStaging, writeTmCommBootstrapReceipt } from '../server/tmComm/tmCommBootstrap.ts'
 import { loadTmCommRuntimeConfig } from '../server/tmComm/tmCommConfig.ts'
 import { createTmCommHttpServer, listenTmCommHttpServer } from '../server/tmComm/tmCommHttp.ts'
 import { TmCommService } from '../server/tmComm/tmCommService.ts'
 import { TmCommStore } from '../server/tmComm/tmCommStore.ts'
-import { createTmCommEphemeralWallet } from '../server/tmComm/tmCommTestUtils.ts'
+import { resolveTmCommOperatorCredential } from '../server/tmComm/tmCommTestUtils.ts'
 
 const dataDirectory = resolve('.tmp/tm-comm-staging')
 mkdirSync(dataDirectory, { recursive: true, mode: 0o700 })
@@ -17,18 +17,13 @@ const config = loadTmCommRuntimeConfig({
   listenPort: Number.parseInt(process.env.TM_COMM_LISTEN_PORT ?? '4178', 10)
 })
 
-const operator = createTmCommEphemeralWallet()
-writeFileSync(
-  resolve(dataDirectory, 'operator-wallet.json'),
-  `${JSON.stringify({
-    notice: 'STAGING ONLY. Fictitious operator wallet. Never a production key.',
-    address: operator.address,
-    publicKeyHex: operator.publicKeyHex
-  }, null, 2)}\n`,
-  { encoding: 'utf8', mode: 0o600 }
-)
-
 const store = new TmCommStore(config.databasePath)
+const credentialPath = resolve(dataDirectory, 'operator-wallet.json')
+const operator = resolveTmCommOperatorCredential({
+  credentialPath,
+  store
+})
+
 const bootstrap = bootstrapTmCommStaging(store, config, {
   address: operator.address,
   publicKeyHex: operator.publicKeyHex

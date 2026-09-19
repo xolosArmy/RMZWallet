@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { TM_COMM_ERROR_CODES, TmCommError } from '../../src/features/privateMessaging/errors'
 import type { TmCommRuntimeConfig } from './tmCommConfig'
 import { createTmCommId, createTmCommSecretHex } from './tmCommIds'
 import type { TmCommStore } from './tmCommStore'
@@ -27,11 +28,24 @@ export function bootstrapTmCommStaging(
 ): TmCommBootstrapResult {
   const createdAt = now()
   const existingOperator = store.findOperatorPrincipal()
+  if (existingOperator) {
+    if (
+      existingOperator.walletAddress !== operator.address ||
+      existingOperator.publicKeyHex.toLowerCase() !== operator.publicKeyHex.trim().toLowerCase()
+    ) {
+      throw new TmCommError(
+        TM_COMM_ERROR_CODES.CONFLICT,
+        409,
+        'Existing operator principal in database does not match provided operator credential.',
+        'OPERATOR_IDENTITY_MISMATCH'
+      )
+    }
+  }
   const operatorPrincipal = existingOperator ?? store.insertPrincipal({
     id: createTmCommId('principal'),
     kind: 'operator',
     walletAddress: operator.address,
-    publicKeyHex: operator.publicKeyHex,
+    publicKeyHex: operator.publicKeyHex.trim().toLowerCase(),
     createdAt
   })
 
