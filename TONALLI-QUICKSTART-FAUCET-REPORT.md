@@ -602,10 +602,95 @@ Live Firefox clean-profile was not re-run in this pass. Flows A–E are covered 
 
 ---
 
+## Codex Fourth-Wave Remediation
+
+Codex Connector reviewed exact HEADs:
+
+| Repo | Reviewed HEAD |
+|---|---|
+| RMZWallet PR #99 | `e39087a0d3a3c7ee8301e15f28c7e7768ab2a03c` |
+| tonalli-faucet PR #3 | `4c8bacbafc645b3415a1461286f31390f00c7a78` |
+
+Worktree tips matched those SHAs before editing. No parallel branches. No merge. No production deploy. No real funds. No force-push.
+
+Fourth-wave implementation HEADs:
+
+| Repo | Fixed implementation HEAD |
+|---|---|
+| RMZWallet | `22f41a37dedc357902a4371d20338f9e6643afd1` |
+| tonalli-faucet | `a131a0037874aacfea1cc2041526bd1b5b537c7b` |
+
+### RMZ #99 — P1 backed-wallet overwrite — `4053465987`
+
+- Severity: P1
+- Root cause: an encrypted PIN wallet in `localStorage` (`xoloswallet_encrypted_mnemonic`) was ignored when `initialized=false` and no Quick Start record existed. `hasEncryptedWalletOnDevice()` also required in-memory ciphertext equality (X402 semantics), so a locked session looked empty. "Crear mi Tonalli" generated a new mnemonic and later progressive backup overwrote the stored ciphertext.
+- Fix: `hasBackedWalletCiphertextOnDevice()` treats persisted ciphertext as sufficient authority (fail-closed on storage throw). `createQuickStartWallet()` and `startQuickStartWallet()` deny with `BACKED_WALLET_EXISTS`. `/onboarding/create` shows unlock, not another create. X402 `hasEncryptedWalletOnDevice()` is unchanged.
+- Tests: `createQuickStartWallet is denied when encrypted backed ciphertext exists and stays byte-for-byte`; `refuses startQuickStartWallet when an encrypted backed wallet exists`; `/onboarding/create stays blocked and offers unlock`; CTA submit does not call `startQuickStartWallet`.
+- Acceptance A: encrypted backed wallet + reload without unlock → Quick Start blocked; unlock restores the original ciphertext/address path.
+- Status: remediado en `22f41a37dedc357902a4371d20338f9e6643afd1`.
+
+### RMZ #99 — P2 multi-tab Quick Start race — `4053465990`
+
+- Severity: P2
+- Root cause: two same-origin tabs could generate distinct identities and persist key vs seed in separate writes, producing a key/ciphertext mismatch or two fundable addresses.
+- Fix: `withQuickStartCreationLock()` (Web Locks exclusive; missing API → `QUICK_START_CREATION_LOCK_UNAVAILABLE` fail-closed to PIN). Inside the lock: re-check backed wallet, re-check existing Quick Start, generate, persist key+seed in one IndexedDB transaction, decrypt and verify persisted identity before exposing a fundable address. Loser recovers the winner or fails closed. No localStorage lock fallback.
+- Tests: two concurrent creators persist exactly one identity; lock acquisition failure writes nothing; aborted persist does not accept mismatched key/ciphertext; architecture asserts lock wraps authority checks.
+- Acceptance B: simulated two-tab create → one authoritative identity; loser does not expose a second address.
+- Status: remediado en `22f41a37dedc357902a4371d20338f9e6643afd1`.
+
+### RMZ #99 — P2 IndexedDB availability classification — `4053465996`
+
+- Severity: P2
+- Root cause: `indexedDB.open` / transaction / CryptoKey structured-clone failures escaped as generic errors. Bootstrap then became `failed`, which blocked even PIN create-backed on a fresh profile.
+- Fix: IDB open/transaction/DataCloneError map to `QuickStartUnavailableError`. `hasQuickStartMnemonic()` still maps Unavailable → `false` so bootstrap is `absent` and PIN fallback is available. Existing seed + missing key / corrupt ciphertext / decrypt failure stay recovery errors (`QUICK_START_DEVICE_KEY_MISSING`, `QUICK_START_STORAGE_CORRUPT`, `QUICK_START_DECRYPT_FAILED`) and do not allow a replacement identity.
+- Tests: open reject → Unavailable + `hasQuickStartMnemonic()===false`; transaction reject → no partial record; DataCloneError → Unavailable; existing seed missing key stays recovery and `RECORD_EXISTS`; recovery-failed UI does not offer PIN create; architecture asserts availability errors are not wrapped as generic bootstrap failure.
+- Acceptance C: fresh profile IDB deny → PIN fallback; existing corrupt record → no overwrite.
+- Status: remediado en `22f41a37dedc357902a4371d20338f9e6643afd1`.
+
+### Faucet #3 — P2 non-finite / unsafe payout — `4053471053`
+
+- Severity: P2
+- Root cause: `starterPackPayload()` ran before `reserveWelcomeClaim()` but still accepted arbitrary-length digit strings. BigInt parsed them; `Number(xec)` became `Infinity` inside `sendXecToAddress` after the row was reserved, leaving `pending` → `needs_review` with zero broadcast.
+- Fix: single `parseWelcomePayout()` primitive: integer syntax, `> 0`, finite `rpcAmount`, `rpcAmount > 0`, `rpcAmount <= Number.MAX_SAFE_INTEGER`. Same object is reused for HTTP `starterPack` and RPC. Invalid config → HTTP 500 before reservation, zero RPC, zero `welcome_claims` row. After config is restored, the same address can claim once.
+- Tests: `"0"`; 400-digit integer; Infinity-producing sats; valid `100000` → `1000` XEC; invalid then restored config claims normally; architecture: `parseWelcomePayout` / payload before reserve; `sendXecToAddress(address, starterPack.rpcAmount)`.
+- Acceptance D: huge `STARTER_XEC_SATS` → HTTP/config failure, zero reservation, zero RPC.
+- Status: remediado en `a131a0037874aacfea1cc2041526bd1b5b537c7b`.
+
+### Regression (previous findings — not redesigned)
+
+RMZWallet: WalletConnect operation-boundary, create-backed cannot replace QS, import cannot replace QS, Chronik-down initial persist, Chronik-down recovery, TM_COMM blocked, intent persists, backup migration crash-safe, seed never plaintext — covered by existing suite (`2719` vitest + `10` slpNftTxBuilder PASS).
+
+Faucet: legacy funded adoption, dry-run → live exactly one real send, stats include welcome ledger, Turnstile incompatible → unavailable, invalid payout before reservation, ambiguous RPC → needs_review, failed pre-broadcast → retryable — covered by `57/57` tests, 3 consecutive clean processes.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| RMZWallet reviewed-old HEAD | `e39087a0d3a3c7ee8301e15f28c7e7768ab2a03c` |
+| RMZWallet fixed implementation HEAD | `22f41a37dedc357902a4371d20338f9e6643afd1` |
+| `npx tsc -b` | PASS |
+| `npx tsc -p tsconfig.tm1-regtest-e2e.json` | PASS |
+| `npm test` | **2719** vitest + **10** slpNftTxBuilder PASS |
+| lint BASE | 328 errors / 0 warnings |
+| lint HEAD | 328 errors / 0 warnings |
+| new lint from this remediation | 0 (touched files eslint-clean) |
+| faucet reviewed-old HEAD | `4c8bacbafc645b3415a1461286f31390f00c7a78` |
+| faucet fixed HEAD | `a131a0037874aacfea1cc2041526bd1b5b537c7b` |
+| `npm test` | **57/57**, 3 consecutive clean processes |
+| `npm run typecheck` | PASS |
+| `npm run build` | PASS |
+
+Live Firefox two-tab / clean-profile was not re-run. Acceptance A–D are covered by automated tests (ciphertext byte-for-byte, exclusive lock, IDB Unavailable vs recovery, huge payout before reserve). No real funds.
+
+---
+
 ## GO / NO-GO
 
 **NO-GO**
 
-The original six Codex findings are fixed. Re-review of `9548884` / `bb959a4` found one new RMZ P1 and two faucet P2s; those are fixed in `50e16c2` / `d3bd4ef`. Codex has not yet reviewed those later HEADs.
+The four fourth-wave findings are fixed in `22f41a3` / `a131a00`. Suites PASS. Codex exact-head re-review of those HEADs has not completed.
+
+If Codex emits any new P1/P2 on the final HEADs: remain **NO-GO**.
+If both exact-head reviews finish with zero findings: **GO — ready for controlled merge**, but still **do not merge in this pass**.
 
 **Do not merge. Do not deploy production. Do not use real funds.**
