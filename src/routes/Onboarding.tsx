@@ -191,14 +191,16 @@ export function CreateWallet() {
     loading,
     error,
     initialized,
-    quickStartBootstrap
+    quickStartBootstrap,
+    hasBackedWalletOnDevice
   } = useWallet()
   const [localError, setLocalError] = useState<string | null>(null)
   const [needsPinFallback, setNeedsPinFallback] = useState(false)
 
   const bootstrapPending = quickStartBootstrap === 'pending'
   const recoveryFailed = quickStartBootstrap === 'failed'
-  const createBlocked = bootstrapPending || recoveryFailed || initialized
+  const backedWalletExists = hasBackedWalletOnDevice && !initialized
+  const createBlocked = bootstrapPending || recoveryFailed || initialized || backedWalletExists
 
   useEffect(() => {
     if (initialized) resumeAfterQuickStart(navigate)
@@ -224,6 +226,10 @@ export function CreateWallet() {
         setLocalError('Este navegador no puede guardar una Tonalli temporal de forma segura. Usa un PIN local.')
         return
       }
+      if ((err as Error).message === 'BACKED_WALLET_EXISTS') {
+        setLocalError('Ya hay una wallet cifrada en este dispositivo. Desbloquéala para continuar.')
+        return
+      }
       setLocalError((err as Error).message)
     }
   }
@@ -245,6 +251,11 @@ export function CreateWallet() {
               Hay una Tonalli guardada aquí que no se pudo recuperar. No se creará otra wallet.
             </div>
           )}
+          {backedWalletExists && !recoveryFailed && (
+            <div className="error" role="alert">
+              Ya hay una wallet cifrada en este dispositivo. Desbloquéala para continuar.
+            </div>
+          )}
           <div className="actions">
             <button
               className="cta primary"
@@ -255,7 +266,12 @@ export function CreateWallet() {
               {loading ? 'Creando...' : bootstrapPending ? 'Preparando...' : 'Crear mi Tonalli'}
             </button>
           </div>
-          {needsPinFallback && (
+          {backedWalletExists && (
+            <Link className="cta outline" to="/onboarding/unlock" data-testid="unlock-existing-wallet">
+              Desbloquear wallet
+            </Link>
+          )}
+          {needsPinFallback && !backedWalletExists && (
             <Link className="cta outline" to="/onboarding/create-backed">
               Continuar con PIN local
             </Link>

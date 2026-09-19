@@ -47,7 +47,8 @@ const serviceMocks = vi.hoisted(() => ({
   sendRMZ: vi.fn(),
   sendFirma: vi.fn(),
   prepareFirmaSend: vi.fn(),
-  getMnemonic: vi.fn(() => 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about')
+  getMnemonic: vi.fn(() => 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'),
+  hasBackedWalletCiphertextOnDevice: vi.fn(() => false)
 }))
 
 vi.mock('../services/XolosWalletService', () => ({
@@ -110,6 +111,8 @@ describe('WalletContext Quick Start lifecycle', () => {
       firmaFormatted: '0',
       firmaDecimals: 4
     })
+    serviceMocks.hasBackedWalletCiphertextOnDevice.mockReset()
+    serviceMocks.hasBackedWalletCiphertextOnDevice.mockReturnValue(false)
   })
 
   it('activates a limited wallet and blocks privileged sends until backup is verified', async () => {
@@ -304,6 +307,24 @@ describe('WalletContext Quick Start lifecycle', () => {
     await expect(wallet!.createNewWallet()).rejects.toThrow('QUICK_START_BOOTSTRAP_PENDING')
     expect(serviceMocks.createNewWallet).not.toHaveBeenCalled()
     resolveRecord?.(false)
+  })
+
+  it('refuses startQuickStartWallet when an encrypted backed wallet exists and is not unlocked', async () => {
+    serviceMocks.hasBackedWalletCiphertextOnDevice.mockReturnValue(true)
+
+    let wallet: ReturnType<typeof useWallet> | null = null
+    render(
+      <WalletProvider>
+        <Harness onReady={(value) => { wallet = value }} />
+      </WalletProvider>
+    )
+    await waitFor(() => {
+      expect(wallet!.quickStartBootstrap).toBe('absent')
+    })
+    expect(wallet!.hasBackedWalletOnDevice).toBe(true)
+    await expect(wallet!.startQuickStartWallet()).rejects.toThrow('BACKED_WALLET_EXISTS')
+    expect(serviceMocks.createQuickStartWallet).not.toHaveBeenCalled()
+    expect(wallet!.initialized).toBe(false)
   })
 
   it('refuses restoreWallet while a recovered Quick Start exists', async () => {

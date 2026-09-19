@@ -29,13 +29,13 @@ import { extractAliasFromOutputScript } from './aliasDiscovery'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 import type { DecryptPasswordResult } from './crypto'
 import {
-  QuickStartUnavailableError,
   assertQuickStartStorageAvailable,
   clearQuickStartMnemonic,
   hasQuickStartMnemonic,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
-  storeQuickStartMnemonic
+  storeQuickStartMnemonic,
+  withQuickStartCreationLock
 } from './quickStartStorage'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
 import type {
@@ -756,50 +756,75 @@ export class XolosWalletService {
   }
 
   async createQuickStartWallet(): Promise<{ address: string; profileId: DerivationProfileId }> {
-    if (await hasQuickStartMnemonic()) {
-      const recovered = await this.activateQuickStartFromDevice()
-      if (!recovered) {
-        throw new Error('QUICK_START_RECOVERY_FAILED')
+    return withQuickStartCreationLock(async () => {
+      if (this.hasBackedWalletCiphertextOnDevice()) {
+        throw new Error('BACKED_WALLET_EXISTS')
       }
-      return recovered
-    }
+      if (await hasQuickStartMnemonic()) {
+        const recovered = await this.activateQuickStartFromDevice()
+        if (!recovered) {
+          throw new Error('QUICK_START_RECOVERY_FAILED')
+        }
+        return recovered
+      }
 
-    await assertQuickStartStorageAvailable()
-    if (!this.tryAcquireWalletActivation()) {
-      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
-    }
-    try {
-      const mnemonic = generateMnemonic(wordlist, 128)
-      await this.activateMnemonicLocalIdentity(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
-      const profileId = this.activeProfileId
-      const address = this.getAddress()
-      if (!mnemonic || !address) {
-        throw new Error('QUICK_START_WALLET_IDENTITY_MISSING')
+      await assertQuickStartStorageAvailable()
+      if (!this.tryAcquireWalletActivation()) {
+        throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
       }
       try {
-        await storeQuickStartMnemonic(mnemonic, {
-          derivationProfileId: profileId,
-          address
-        })
-      } catch (error) {
-        this.decryptedMnemonic = null
-        this.wallet = null
-        this.isReady = false
-        this.activeAccountState = null
-        if (error instanceof QuickStartUnavailableError) throw error
-        throw new QuickStartUnavailableError(
-          error instanceof Error ? error.message : 'QUICK_START_SECURE_STORAGE_UNAVAILABLE'
-        )
+        const mnemonic = generateMnemonic(wordlist, 128)
+        await this.activateMnemonicLocalIdentity(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
+        const profileId = this.activeProfileId
+        const address = this.getAddress()
+        if (!mnemonic || !address) {
+          throw new Error('QUICK_START_WALLET_IDENTITY_MISSING')
+        }
+        try {
+          await storeQuickStartMnemonic(mnemonic, {
+            derivationProfileId: profileId,
+            address
+          })
+        } catch (error) {
+          this.decryptedMnemonic = null
+          this.wallet = null
+          this.isReady = false
+          this.activeAccountState = null
+          if (
+            error instanceof Error
+            && error.message === 'QUICK_START_RECORD_EXISTS'
+          ) {
+            const recovered = await this.activateQuickStartFromDevice()
+            if (!recovered) {
+              throw new Error('QUICK_START_RECOVERY_FAILED')
+            }
+            return recovered
+          }
+          throw error
+        }
+        const persistedMnemonic = await loadQuickStartMnemonic()
+        const persistedMetadata = await loadQuickStartMetadata()
+        if (
+          persistedMnemonic !== mnemonic
+          || !persistedMetadata
+          || (persistedMetadata.address && persistedMetadata.address !== address)
+        ) {
+          this.decryptedMnemonic = null
+          this.wallet = null
+          this.isReady = false
+          this.activeAccountState = null
+          throw new Error('QUICK_START_IDENTITY_MISMATCH')
+        }
+        try {
+          await (this.wallet as MinimalXecWallet).initialize()
+        } catch {
+          // Chronik/network failure must not prevent first-create persistence.
+        }
+        return { address, profileId }
+      } finally {
+        this.releaseWalletActivation()
       }
-      try {
-        await (this.wallet as MinimalXecWallet).initialize()
-      } catch {
-        // Chronik/network failure must not prevent first-create persistence.
-      }
-      return { address, profileId }
-    } finally {
-      this.releaseWalletActivation()
-    }
+    })
   }
 
   async activateQuickStartWallet(
@@ -1030,6 +1055,21 @@ export class XolosWalletService {
       return storedCiphertext !== null && storedCiphertext === this.encryptedMnemonic
     } catch {
       return false
+    }
+  }
+
+  hasBackedWalletCiphertextOnDevice(): boolean {
+    try {
+      if (typeof window === 'undefined') {
+        return Boolean(this.encryptedMnemonic)
+      }
+      const storedCiphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
+      if (typeof storedCiphertext === 'string' && storedCiphertext.length > 0) {
+        return true
+      }
+      return Boolean(this.encryptedMnemonic)
+    } catch {
+      return true
     }
   }
 

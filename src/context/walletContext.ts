@@ -27,6 +27,7 @@ export interface WalletContextValue {
   backupVerified: boolean
   lifecycle: WalletLifecycle
   quickStartBootstrap: QuickStartBootstrapStatus
+  hasBackedWalletOnDevice: boolean
   hasCapability: (capability: WalletCapability) => boolean
   setAlias?: (alias: string | null) => void
   startQuickStartWallet: () => Promise<{ address: string }>

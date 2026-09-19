@@ -373,6 +373,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       const current = xolosWalletService.getAddress() ?? address
       if (current) return { address: current }
     }
+    if (
+      typeof xolosWalletService.hasBackedWalletCiphertextOnDevice === 'function'
+      && xolosWalletService.hasBackedWalletCiphertextOnDevice()
+    ) {
+      throw new Error('BACKED_WALLET_EXISTS')
+    }
     setLoading(true)
     setError(null)
     try {
@@ -778,6 +784,9 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       backupVerified,
       lifecycle,
       quickStartBootstrap,
+      hasBackedWalletOnDevice: typeof xolosWalletService.hasBackedWalletCiphertextOnDevice === 'function'
+        ? xolosWalletService.hasBackedWalletCiphertextOnDevice()
+        : false,
       hasCapability,
       startQuickStartWallet,
       activateQuickStartFromDevice,
