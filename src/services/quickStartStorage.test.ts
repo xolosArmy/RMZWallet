@@ -1,19 +1,23 @@
 // @vitest-environment jsdom
 
 import 'fake-indexeddb/auto'
-import { afterEach, beforeEach, describe, expect, test } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { ECASH_STANDARD_PROFILE_ID } from './derivationProfiles'
 import {
+  PENDING_IDENTITY_STORAGE_KEY,
+  QUICK_START_MARKER_STORAGE_KEY,
   QuickStartUnavailableError,
   assertQuickStartStorageAvailable,
   clearQuickStartMarker,
   clearQuickStartMnemonic,
+  getPendingIdentityRecord,
   getQuickStartRecordStatus,
   hasQuickStartMarker,
   hasQuickStartMnemonic,
   isWebLocksSupported,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
+  setPendingIdentityRecord,
   setQuickStartCreationLockForTests,
   setQuickStartMarker,
   storeQuickStartMnemonic,
@@ -432,5 +436,149 @@ describe('Quick Start encrypted storage', () => {
       }
     })
   })
+
+  describe('Quick Start marker durable authority and reconciliation', () => {
+    test('marker setItem throws -> storeQuickStartMnemonic fails and writes no seed', async () => {
+      const originalSetItem = Storage.prototype.setItem
+      const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation((key, val) => {
+        if (key === QUICK_START_MARKER_STORAGE_KEY) {
+          throw new Error('QuotaExceeded')
+        }
+        return originalSetItem.call(localStorage, key, val)
+      })
+      try {
+        await expect(
+          storeQuickStartMnemonic(MNEMONIC, { derivationProfileId: ECASH_STANDARD_PROFILE_ID })
+        ).rejects.toThrow('QuotaExceeded')
+      } finally {
+        spy.mockRestore()
+      }
+      expect(await hasQuickStartMnemonic()).toBe(false)
+      expect(await loadQuickStartMetadata()).toBeNull()
+    })
+
+    test('marker read-back missing -> storeQuickStartMnemonic fails', async () => {
+      const originalGetItem = Storage.prototype.getItem
+      const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation((key) => {
+        if (key === QUICK_START_MARKER_STORAGE_KEY) {
+          return null
+        }
+        return originalGetItem.call(localStorage, key)
+      })
+      try {
+        await expect(
+          storeQuickStartMnemonic(MNEMONIC, { derivationProfileId: ECASH_STANDARD_PROFILE_ID })
+        ).rejects.toThrow('QUICK_START_MARKER_PERSIST_FAILED')
+      } finally {
+        spy.mockRestore()
+      }
+      expect(await hasQuickStartMnemonic()).toBe(false)
+    })
+
+    test('marker malformed/mismatched -> storeQuickStartMnemonic fails', async () => {
+      const originalGetItem = Storage.prototype.getItem
+      const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation((key) => {
+        if (key === QUICK_START_MARKER_STORAGE_KEY) {
+          return '{"version": 2}'
+        }
+        return originalGetItem.call(localStorage, key)
+      })
+      try {
+        await expect(
+          storeQuickStartMnemonic(MNEMONIC, { derivationProfileId: ECASH_STANDARD_PROFILE_ID })
+        ).rejects.toThrow('QUICK_START_MARKER_PERSIST_FAILED')
+      } finally {
+        spy.mockRestore()
+      }
+      expect(await hasQuickStartMnemonic()).toBe(false)
+    })
+
+    test('stale marker + IndexedDB accessible and positively empty -> safe reconciliation to ABSENT_CONFIRMED', async () => {
+      setQuickStartMarker()
+      expect(hasQuickStartMarker()).toBe(true)
+      expect(await loadQuickStartMetadata()).toBeNull()
+
+      const status = await getQuickStartRecordStatus()
+      expect(status).toBe('ABSENT_CONFIRMED')
+      expect(hasQuickStartMarker()).toBe(false)
+      expect(await hasQuickStartMnemonic()).toBe(false)
+    })
+  })
+
+  describe('Pending identity reservation strict persistence and durable authority', () => {
+    test('reservation write throws -> setPendingIdentityRecord throws PENDING_IDENTITY_PERSIST_FAILED', () => {
+      const originalSetItem = Storage.prototype.setItem
+      const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation((key, val) => {
+        if (key === PENDING_IDENTITY_STORAGE_KEY) {
+          throw new Error('QuotaExceeded')
+        }
+        return originalSetItem.call(localStorage, key, val)
+      })
+      try {
+        expect(() =>
+          setPendingIdentityRecord({
+            ownerToken: 'tok1',
+            commitment: 'com1',
+            address: 'ecash:qtest'
+          })
+        ).toThrow('QuotaExceeded')
+      } finally {
+        spy.mockRestore()
+      }
+      expect(getPendingIdentityRecord()).toBeNull()
+    })
+
+    test('reservation read-back missing -> setPendingIdentityRecord throws PENDING_IDENTITY_PERSIST_FAILED', () => {
+      const originalGetItem = Storage.prototype.getItem
+      const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation((key) => {
+        if (key === PENDING_IDENTITY_STORAGE_KEY) {
+          return null
+        }
+        return originalGetItem.call(localStorage, key)
+      })
+      try {
+        expect(() =>
+          setPendingIdentityRecord({
+            ownerToken: 'tok1',
+            commitment: 'com1',
+            address: 'ecash:qtest'
+          })
+        ).toThrow('PENDING_IDENTITY_PERSIST_FAILED')
+      } finally {
+        spy.mockRestore()
+      }
+      expect(getPendingIdentityRecord()).toBeNull()
+    })
+
+    test('reservation read-back differs -> setPendingIdentityRecord throws PENDING_IDENTITY_PERSIST_FAILED', () => {
+      const originalGetItem = Storage.prototype.getItem
+      const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation((key) => {
+        if (key === PENDING_IDENTITY_STORAGE_KEY) {
+          return JSON.stringify({
+            version: 1,
+            ownerToken: 'tampered',
+            commitment: 'com1',
+            address: 'ecash:qtest',
+            createdAt: Date.now()
+          })
+        }
+        return originalGetItem.call(localStorage, key)
+      })
+      try {
+        expect(() =>
+          setPendingIdentityRecord({
+            ownerToken: 'tok1',
+            commitment: 'com1',
+            address: 'ecash:qtest'
+          })
+        ).toThrow('PENDING_IDENTITY_PERSIST_FAILED')
+      } finally {
+        spy.mockRestore()
+      }
+      expect(getPendingIdentityRecord()).toBeNull()
+    })
+  })
+
 })
+
 

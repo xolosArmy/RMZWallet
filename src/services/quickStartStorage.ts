@@ -311,6 +311,8 @@ export async function storeQuickStartMnemonic(
   }
 
   assertAvailable()
+  setQuickStartMarker()
+
   const key = await crypto.subtle.generateKey(
     { name: 'AES-GCM', length: 256 },
     false,
@@ -362,7 +364,9 @@ export async function storeQuickStartMnemonic(
   if (metadata.address && parsed.address && parsed.address !== metadata.address) {
     throw new Error('QUICK_START_IDENTITY_MISMATCH')
   }
-  setQuickStartMarker()
+  if (!hasQuickStartMarker()) {
+    setQuickStartMarker()
+  }
   return {
     version: parsed.version,
     derivationProfileId: parsed.derivationProfileId,
@@ -409,21 +413,48 @@ export async function loadQuickStartMnemonic(): Promise<string | null> {
 export const QUICK_START_MARKER_STORAGE_KEY = 'tonalli_quickstart_marker'
 
 export function setQuickStartMarker(): void {
-  if (typeof localStorage === 'undefined') return
+  if (typeof localStorage === 'undefined') {
+    throw new Error('QUICK_START_MARKER_STORAGE_UNAVAILABLE')
+  }
+  const payload = JSON.stringify({ version: 1, createdAt: Date.now() })
+  localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, payload)
+  const readBack = localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)
+  if (!readBack) {
+    try {
+      localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
+    } catch {
+      // best-effort
+    }
+    throw new Error('QUICK_START_MARKER_PERSIST_FAILED')
+  }
+  let parsed: { version?: unknown; createdAt?: unknown } | null = null
   try {
-    localStorage.setItem(
-      QUICK_START_MARKER_STORAGE_KEY,
-      JSON.stringify({ version: 1, createdAt: Date.now() })
-    )
+    parsed = JSON.parse(readBack) as { version?: unknown; createdAt?: unknown }
   } catch {
-    // best-effort
+    try {
+      localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
+    } catch {
+      // best-effort
+    }
+    throw new Error('QUICK_START_MARKER_PERSIST_FAILED')
+  }
+  if (!parsed || parsed.version !== 1 || typeof parsed.createdAt !== 'number') {
+    try {
+      localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
+    } catch {
+      // best-effort
+    }
+    throw new Error('QUICK_START_MARKER_PERSIST_FAILED')
   }
 }
 
 export function hasQuickStartMarker(): boolean {
   if (typeof localStorage === 'undefined') return false
   try {
-    return localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY) !== null
+    const raw = localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)
+    if (!raw) return false
+    const parsed = JSON.parse(raw) as { version?: unknown; createdAt?: unknown }
+    return Boolean(parsed && parsed.version === 1 && typeof parsed.createdAt === 'number')
   } catch {
     return false
   }
@@ -454,7 +485,11 @@ export async function getQuickStartRecordStatus(): Promise<QuickStartRecordStatu
   try {
     const metadata = await loadQuickStartMetadata()
     if (metadata) {
-      setQuickStartMarker()
+      try {
+        setQuickStartMarker()
+      } catch {
+        // best-effort refresh during status check, status is PRESENT
+      }
       return 'PRESENT'
     }
     if (marker) {
@@ -517,6 +552,7 @@ export async function hasQuickStartMnemonic(): Promise<boolean> {
 }
 
 export interface PendingIdentityRecord {
+  version: 1
   ownerToken: string
   commitment: string
   address: string
@@ -524,16 +560,30 @@ export interface PendingIdentityRecord {
 }
 
 export const PENDING_IDENTITY_STORAGE_KEY = 'xoloswallet_pending_identity'
-export const PENDING_IDENTITY_TTL_MS = 15 * 60 * 1000
 
 export function getPendingIdentityRecord(): PendingIdentityRecord | null {
   if (typeof localStorage === 'undefined') return null
   try {
     const raw = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
     if (!raw) return null
-    const parsed = JSON.parse(raw) as PendingIdentityRecord
-    if (parsed && typeof parsed.commitment === 'string' && typeof parsed.ownerToken === 'string') {
-      return parsed
+    const parsed = JSON.parse(raw) as Partial<PendingIdentityRecord>
+    if (
+      parsed &&
+      parsed.version === 1 &&
+      typeof parsed.commitment === 'string' &&
+      parsed.commitment.length > 0 &&
+      typeof parsed.ownerToken === 'string' &&
+      parsed.ownerToken.length > 0 &&
+      typeof parsed.address === 'string' &&
+      typeof parsed.createdAt === 'number'
+    ) {
+      return {
+        version: 1,
+        ownerToken: parsed.ownerToken,
+        commitment: parsed.commitment,
+        address: parsed.address,
+        createdAt: parsed.createdAt
+      }
     }
     return null
   } catch {
@@ -541,19 +591,62 @@ export function getPendingIdentityRecord(): PendingIdentityRecord | null {
   }
 }
 
-export function isPendingIdentityExpired(record: PendingIdentityRecord): boolean {
-  if (typeof record.createdAt !== 'number') return true
-  return Date.now() - record.createdAt > PENDING_IDENTITY_TTL_MS
-}
-
-export function setPendingIdentityRecord(record: PendingIdentityRecord): void {
-  if (typeof localStorage === 'undefined') return
+export function setPendingIdentityRecord(record: {
+  version?: 1
+  ownerToken: string
+  commitment: string
+  address: string
+  createdAt?: number
+}): void {
+  if (typeof localStorage === 'undefined') {
+    throw new Error('PENDING_IDENTITY_STORAGE_UNAVAILABLE')
+  }
+  const fullRecord: PendingIdentityRecord = {
+    version: 1,
+    ownerToken: record.ownerToken,
+    commitment: record.commitment,
+    address: record.address,
+    createdAt: typeof record.createdAt === 'number' ? record.createdAt : Date.now()
+  }
+  const payload = JSON.stringify(fullRecord)
+  localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, payload)
+  const readBack = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
+  if (!readBack) {
+    try {
+      localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
+    } catch {
+      // best-effort
+    }
+    throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+  }
+  let parsed: Partial<PendingIdentityRecord> | null = null
   try {
-    localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, JSON.stringify(record))
+    parsed = JSON.parse(readBack) as Partial<PendingIdentityRecord>
   } catch {
-    // best-effort
+    try {
+      localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
+    } catch {
+      // best-effort
+    }
+    throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+  }
+  if (
+    !parsed ||
+    parsed.version !== 1 ||
+    parsed.ownerToken !== fullRecord.ownerToken ||
+    parsed.commitment !== fullRecord.commitment ||
+    parsed.address !== fullRecord.address ||
+    typeof parsed.createdAt !== 'number'
+  ) {
+    try {
+      localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
+    } catch {
+      // best-effort
+    }
+    throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
   }
 }
+
 
 export function clearPendingIdentityRecord(): void {
   if (typeof localStorage === 'undefined') return
@@ -577,3 +670,4 @@ export async function computeMnemonicCommitment(mnemonic: string): Promise<strin
   }
   return hash.toString(16)
 }
+

@@ -37,7 +37,6 @@ import {
   getPendingIdentityRecord,
   getQuickStartRecordStatus,
   hasQuickStartMnemonic,
-  isPendingIdentityExpired,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
   setPendingIdentityRecord,
@@ -744,7 +743,7 @@ export class XolosWalletService {
         throw new Error('QUICK_START_RECORD_EXISTS')
       }
       const pending = getPendingIdentityRecord()
-      if (pending && !isPendingIdentityExpired(pending)) {
+      if (pending) {
         if (!this.pendingIdentityOwnerToken || pending.ownerToken !== this.pendingIdentityOwnerToken) {
           throw new Error('PENDING_IDENTITY_EXISTS')
         }
@@ -767,13 +766,24 @@ export class XolosWalletService {
         }
         const ownerToken = generateOwnerToken()
         const commitment = await computeMnemonicCommitment(mnemonic)
-        this.pendingIdentityOwnerToken = ownerToken
-        setPendingIdentityRecord({
-          ownerToken,
-          commitment,
-          address: this.getAddress() || '',
-          createdAt: Date.now()
-        })
+        const candidateAddress = this.getAddress() || ''
+        try {
+          setPendingIdentityRecord({
+            version: 1,
+            ownerToken,
+            commitment,
+            address: candidateAddress,
+            createdAt: Date.now()
+          })
+          this.pendingIdentityOwnerToken = ownerToken
+        } catch (error) {
+          this.decryptedMnemonic = null
+          this.wallet = null
+          this.isReady = false
+          this.activeAccountState = null
+          this.pendingIdentityOwnerToken = null
+          throw error
+        }
         return this.decryptedMnemonic || ''
       } finally {
         this.releaseWalletActivation()
@@ -811,7 +821,7 @@ export class XolosWalletService {
         return recovered
       }
       const pending = getPendingIdentityRecord()
-      if (pending && !isPendingIdentityExpired(pending)) {
+      if (pending) {
         throw new Error('PENDING_IDENTITY_EXISTS')
       }
 
@@ -953,12 +963,12 @@ export class XolosWalletService {
       }
 
       const pendingRecord = getPendingIdentityRecord()
-      if (pendingRecord && !isPendingIdentityExpired(pendingRecord)) {
+      if (pendingRecord) {
         const commitment = await computeMnemonicCommitment(mnemonic)
         if (pendingRecord.commitment !== commitment) {
           throw new Error('PENDING_IDENTITY_MISMATCH')
         }
-        if (this.pendingIdentityOwnerToken && pendingRecord.ownerToken !== this.pendingIdentityOwnerToken) {
+        if (!this.pendingIdentityOwnerToken || pendingRecord.ownerToken !== this.pendingIdentityOwnerToken) {
           throw new Error('PENDING_IDENTITY_OWNER_MISMATCH')
         }
       }
@@ -1019,7 +1029,7 @@ export class XolosWalletService {
         throw new Error('QUICK_START_RECORD_EXISTS')
       }
       const pending = getPendingIdentityRecord()
-      if (pending && !isPendingIdentityExpired(pending)) {
+      if (pending) {
         if (!this.pendingIdentityOwnerToken || pending.ownerToken !== this.pendingIdentityOwnerToken) {
           throw new Error('PENDING_IDENTITY_EXISTS')
         }
@@ -1059,13 +1069,24 @@ export class XolosWalletService {
         await this.activateMnemonic(normalizedMnemonic, resolvedProfileId)
         const ownerToken = generateOwnerToken()
         const commitment = await computeMnemonicCommitment(normalizedMnemonic)
-        this.pendingIdentityOwnerToken = ownerToken
-        setPendingIdentityRecord({
-          ownerToken,
-          commitment,
-          address: this.getAddress() || '',
-          createdAt: Date.now()
-        })
+        const candidateAddress = this.getAddress() || ''
+        try {
+          setPendingIdentityRecord({
+            version: 1,
+            ownerToken,
+            commitment,
+            address: candidateAddress,
+            createdAt: Date.now()
+          })
+          this.pendingIdentityOwnerToken = ownerToken
+        } catch (error) {
+          this.decryptedMnemonic = null
+          this.wallet = null
+          this.isReady = false
+          this.activeAccountState = null
+          this.pendingIdentityOwnerToken = null
+          throw error
+        }
         const notice = resolvedProfileId === ECASH_STANDARD_PROFILE_ID
           ? detection.reason === 'empty'
             ? 'No se encontró actividad previa. Se utilizará el perfil compatible con eCash/Cashtab.'
@@ -1398,7 +1419,11 @@ export class XolosWalletService {
 
   hasPendingIdentityRecord(): boolean {
     const pending = getPendingIdentityRecord()
-    return Boolean(pending && !isPendingIdentityExpired(pending))
+    if (!pending) return false
+    if (this.pendingIdentityOwnerToken && pending.ownerToken === this.pendingIdentityOwnerToken) {
+      return false
+    }
+    return true
   }
 
   clearPendingIdentity(): void {

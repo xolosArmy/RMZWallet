@@ -4,8 +4,11 @@ import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { xolosWalletService } from './XolosWalletService'
 import {
+  PENDING_IDENTITY_STORAGE_KEY,
+  QUICK_START_MARKER_STORAGE_KEY,
   QuickStartUnavailableError,
   clearQuickStartMnemonic,
+  getPendingIdentityRecord,
   hasQuickStartMnemonic,
   loadQuickStartMnemonic,
   setQuickStartCreationLockForTests
@@ -350,6 +353,142 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       const recoveredSeed = await loadQuickStartMnemonic()
       expect(recoveredSeed).toBeTruthy()
     })
+
+    test('candidate generation -> pending reservation write fails -> operation rejects -> zero exposed active identity', async () => {
+      const originalSetItem = Storage.prototype.setItem
+      const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation((key, val) => {
+        if (key === PENDING_IDENTITY_STORAGE_KEY) {
+          throw new Error('QuotaExceeded')
+        }
+        return originalSetItem.call(localStorage, key, val)
+      })
+      try {
+        await expect(xolosWalletService.createNewWallet()).rejects.toThrow('QuotaExceeded')
+      } finally {
+        spy.mockRestore()
+      }
+
+      // Zero returned identity, zero usable/fundable address, zero mnemonic in memory
+      expect(xolosWalletService.getAddress()).toBeNull()
+      expect(xolosWalletService.getMnemonic()).toBeNull()
+      expect(internals.isReady).toBe(false)
+      expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(false)
+      expect(getPendingIdentityRecord()).toBeNull()
+      // Second tab cannot observe a successful first creation
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(false)
+    })
+
+    test('candidate generation -> pending reservation read-back fails -> operation rejects -> zero exposed active identity', async () => {
+      const originalGetItem = Storage.prototype.getItem
+      const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation((key) => {
+        if (key === PENDING_IDENTITY_STORAGE_KEY) {
+          return null
+        }
+        return originalGetItem.call(localStorage, key)
+      })
+      try {
+        await expect(xolosWalletService.createNewWallet()).rejects.toThrow('PENDING_IDENTITY_PERSIST_FAILED')
+      } finally {
+        spy.mockRestore()
+      }
+
+      expect(xolosWalletService.getAddress()).toBeNull()
+      expect(xolosWalletService.getMnemonic()).toBeNull()
+      expect(internals.isReady).toBe(false)
+      expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(false)
+      expect(getPendingIdentityRecord()).toBeNull()
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(false)
+    })
+
+    test('reservation survives >15 min -> competing tab still blocked', async () => {
+      // Tab A creates wallet
+      await xolosWalletService.createNewWallet()
+      const addressA = xolosWalletService.getAddress()
+      expect(addressA).toBeTruthy()
+
+      // Backdate the reservation by 30 minutes (> 15 min TTL that used to exist)
+      const record = getPendingIdentityRecord()
+      expect(record).not.toBeNull()
+      if (record) {
+        localStorage.setItem(
+          PENDING_IDENTITY_STORAGE_KEY,
+          JSON.stringify({
+            ...record,
+            createdAt: Date.now() - 30 * 60 * 1000
+          })
+        )
+      }
+
+      // Competing Tab B tries to create or restore
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+      await expect(xolosWalletService.createNewWallet()).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+      await expect(xolosWalletService.restoreFromMnemonic(TEST_RESTORE_MNEMONIC)).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+
+      // Competing tab cannot become backup candidate
+      internals.decryptedMnemonic = TEST_RESTORE_MNEMONIC
+      await expect(xolosWalletService.persistVerifiedBackup('competingPIN')).rejects.toThrow('PENDING_IDENTITY_MISMATCH')
+    })
+
+    test('owner completes backup -> reservation cleared only after verified commit', async () => {
+      // Tab A creates wallet
+      await xolosWalletService.createNewWallet()
+      expect(getPendingIdentityRecord()).not.toBeNull()
+      expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(false)
+
+      // Reservation remains authoritative prior to verified backup
+      expect(getPendingIdentityRecord()?.ownerToken).toBeTruthy()
+
+      // Tab A completes verified backup
+      await xolosWalletService.persistVerifiedBackup('mySecurePIN123')
+
+      // Ciphertext committed and reservation cleared
+      expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+      expect(getPendingIdentityRecord()).toBeNull()
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(false)
+    })
+
+    test('no explicit completion or reset -> reservation remains authoritative', async () => {
+      // Tab A creates wallet
+      await xolosWalletService.createNewWallet()
+      expect(getPendingIdentityRecord()).not.toBeNull()
+
+      // Simulate passage of time (hours later)
+      const record = getPendingIdentityRecord()!
+      localStorage.setItem(
+        PENDING_IDENTITY_STORAGE_KEY,
+        JSON.stringify({
+          ...record,
+          createdAt: Date.now() - 2 * 60 * 60 * 1000
+        })
+      )
+
+      // Reservation is still authoritative without explicit completion
+      expect(getPendingIdentityRecord()).not.toBeNull()
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
+      await expect(xolosWalletService.createNewWallet()).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+    })
+
+    test('Quick Start marker setItem fails -> Quick Start creation fails closed before exposing identity', async () => {
+      const originalSetItem = Storage.prototype.setItem
+      const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation((key, val) => {
+        if (key === QUICK_START_MARKER_STORAGE_KEY) {
+          throw new Error('QuotaExceeded')
+        }
+        return originalSetItem.call(localStorage, key, val)
+      })
+      try {
+        await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow('QuotaExceeded')
+      } finally {
+        spy.mockRestore()
+      }
+
+      expect(xolosWalletService.getAddress()).toBeNull()
+      expect(xolosWalletService.getMnemonic()).toBeNull()
+      expect(internals.isReady).toBe(false)
+      expect(await hasQuickStartMnemonic()).toBe(false)
+    })
   })
 })
+
 
