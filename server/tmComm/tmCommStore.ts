@@ -16,6 +16,7 @@ import {
   TM_COMM_SQLITE_SCHEMA_SQL,
   TM_COMM_SQLITE_SCHEMA_VERSION
 } from './tmCommSchema'
+export { TM_COMM_SQLITE_APPLICATION_ID, TM_COMM_SQLITE_SCHEMA_VERSION } from './tmCommSchema'
 
 export type TmCommChallengeRecord = Readonly<{
   id: string
@@ -77,6 +78,15 @@ const asNullableNumber = (value: unknown): number | null => {
   return asNumber(value)
 }
 
+export class TmCommMetadataMismatchError extends Error {
+  readonly code = 'TM_COMM_METADATA_MISMATCH'
+
+  constructor(message: string) {
+    super(`TM_COMM_METADATA_MISMATCH: ${message}`)
+    this.name = 'TmCommMetadataMismatchError'
+  }
+}
+
 export class TmCommStore {
   readonly databasePath: string
   private readonly database: DatabaseSync
@@ -92,19 +102,30 @@ export class TmCommStore {
       enableDoubleQuotedStringLiterals: false,
       enableForeignKeyConstraints: true
     })
-    this.database.enableLoadExtension(false)
-    this.database.exec('PRAGMA foreign_keys = ON')
-    this.database.exec('PRAGMA trusted_schema = OFF')
-    this.database.exec('PRAGMA busy_timeout = 5000')
-    if (databasePath !== ':memory:') {
-      this.database.exec('PRAGMA journal_mode = WAL')
-      this.database.exec('PRAGMA synchronous = FULL')
+    try {
+      this.database.enableLoadExtension(false)
+      this.database.exec('PRAGMA foreign_keys = ON')
+      this.database.exec('PRAGMA trusted_schema = OFF')
+      this.database.exec('PRAGMA busy_timeout = 5000')
+      if (databasePath !== ':memory:') {
+        this.database.exec('PRAGMA journal_mode = WAL')
+        this.database.exec('PRAGMA synchronous = FULL')
+      }
+      this.initializeSchemaAndMetadata(now)
+    } catch (error) {
+      this.close()
+      throw error
     }
-    this.database.exec(TM_COMM_SQLITE_SCHEMA_SQL)
-    const existing = this.database.prepare(
-      'SELECT schema_version, environment FROM tm_comm_metadata WHERE singleton_id = 1'
-    ).get() as SqlRow | undefined
-    if (existing === undefined) {
+  }
+
+  private initializeSchemaAndMetadata(now: () => number): void {
+    const tables = this.database.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    ).all() as Array<{ name: string }>
+
+    if (tables.length === 0) {
+      // Empty / brand-new database: create schema, insert canonical metadata, verify
+      this.database.exec(TM_COMM_SQLITE_SCHEMA_SQL)
       this.database.prepare(`
         INSERT INTO tm_comm_metadata (
           singleton_id, schema_version, application_id, environment, created_at
@@ -113,6 +134,74 @@ export class TmCommStore {
         TM_COMM_SQLITE_SCHEMA_VERSION,
         TM_COMM_SQLITE_APPLICATION_ID,
         now()
+      )
+      this.verifyCanonicalMetadata()
+      return
+    }
+
+    // Existing non-empty database: check tm_comm_metadata existence and validate
+    const hasMetadataTable = tables.some((t) => t.name === 'tm_comm_metadata')
+    if (!hasMetadataTable) {
+      throw new TmCommMetadataMismatchError(
+        'Non-empty database does not contain tm_comm_metadata table.'
+      )
+    }
+
+    this.verifyCanonicalMetadata()
+
+    // Once metadata is validated to be completely compatible, we can safely ensure schema definition
+    this.database.exec(TM_COMM_SQLITE_SCHEMA_SQL)
+  }
+
+  private verifyCanonicalMetadata(): void {
+    let row: SqlRow | undefined
+    try {
+      row = this.database.prepare(
+        'SELECT singleton_id, schema_version, application_id, environment FROM tm_comm_metadata WHERE singleton_id = 1'
+      ).get() as SqlRow | undefined
+    } catch (err) {
+      throw new TmCommMetadataMismatchError(
+        `Failed to read tm_comm_metadata: ${err instanceof Error ? err.message : String(err)}`
+      )
+    }
+
+    if (row === undefined) {
+      throw new TmCommMetadataMismatchError(
+        'Singleton metadata row (singleton_id = 1) is missing.'
+      )
+    }
+
+    const schemaVersion = row.schema_version
+    const applicationId = row.application_id
+    const environment = row.environment
+
+    if (
+      typeof schemaVersion !== 'number' ||
+      !Number.isInteger(schemaVersion) ||
+      typeof applicationId !== 'number' ||
+      !Number.isInteger(applicationId) ||
+      typeof environment !== 'string'
+    ) {
+      throw new TmCommMetadataMismatchError(
+        'Malformed tm_comm_metadata row: expected integer schema_version, integer application_id, string environment.'
+      )
+    }
+
+    if (schemaVersion !== TM_COMM_SQLITE_SCHEMA_VERSION) {
+      throw new TmCommMetadataMismatchError(
+        `Incompatible schema_version: expected ${TM_COMM_SQLITE_SCHEMA_VERSION}, got ${schemaVersion}.`
+      )
+    }
+
+    if (applicationId !== TM_COMM_SQLITE_APPLICATION_ID) {
+      throw new TmCommMetadataMismatchError(
+        `Incompatible application_id: expected 0x${TM_COMM_SQLITE_APPLICATION_ID.toString(16)}, got 0x${applicationId.toString(16)}.`
+      )
+    }
+
+    if (environment !== 'staging') {
+      throw new TmCommMetadataMismatchError(
+        `Incompatible environment: expected "staging", got "${environment}".`
       )
     }
   }

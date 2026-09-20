@@ -34,12 +34,22 @@ function TmCommStaging() {
   const [messages, setMessages] = useState<Message[]>([])
   const [log, setLog] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
+  const [authenticatedWalletAddress, setAuthenticatedWalletAddress] = useState<string | null>(null)
+
+  const authenticatedWalletAddressRef = useRef<string | null>(null)
+  const prevAddressRef = useRef<string | null | undefined>(undefined)
+  const prevInitializedRef = useRef<boolean | undefined>(undefined)
 
   const sessionGenerationRef = useRef<number>(0)
   const hydrationAbortRef = useRef<AbortController | null>(null)
   const messageAbortRef = useRef<AbortController | null>(null)
   const activeConversationIdRef = useRef<string | null>(null)
   const messageRequestGenRef = useRef<number>(0)
+
+  const setAuthWallet = (addr: string | null) => {
+    authenticatedWalletAddressRef.current = addr
+    setAuthenticatedWalletAddress(addr)
+  }
 
   const append = (line: string) => {
     setLog((current) => [...current, line])
@@ -50,6 +60,13 @@ function TmCommStaging() {
     targetSessionGen = sessionGenerationRef.current,
     signal?: AbortSignal
   ) => {
+    if (!initialized || !address || authenticatedWalletAddressRef.current !== address) {
+      if (targetSessionGen === sessionGenerationRef.current) {
+        append('Se requiere autenticación para la wallet activa.')
+      }
+      return
+    }
+
     if (!conversationId) {
       if (targetSessionGen === sessionGenerationRef.current) {
         append('No hay conversación autorizada.')
@@ -85,16 +102,53 @@ function TmCommStaging() {
       return
     }
 
-    setMessages(listed.data.messages)
-    append(`Historial recargado desde el servidor: ${listed.data.messages.length} mensaje(s).`)
+    const msgs = Array.isArray(listed.data?.messages) ? listed.data.messages : []
+    setMessages(msgs)
+    append(`Historial recargado desde el servidor: ${msgs.length} mensaje(s).`)
   }
 
   const restoreAuthorizedConversations = async (
+    targetAddress: string,
     preferredConversationId?: string,
     targetSessionGen = sessionGenerationRef.current,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    skipIdentityCheck = false
   ) => {
     if (targetSessionGen !== sessionGenerationRef.current) return
+
+    if (!skipIdentityCheck) {
+      const meRes = await tmCommRequest<{
+        principal?: { id: string; kind: string; walletAddress: string }
+      }>('/v1/tm-comm/me', signal ? { signal } : undefined)
+
+      if (targetSessionGen !== sessionGenerationRef.current) return
+
+      if (!meRes.ok) {
+        if (targetSessionGen === sessionGenerationRef.current) {
+          setAuthWallet(null)
+          setConversations([])
+          setConversation(null)
+          setMessages([])
+          activeConversationIdRef.current = null
+        }
+        return
+      }
+
+      const sessionWalletAddress = meRes.data?.principal?.walletAddress
+      if (!sessionWalletAddress || sessionWalletAddress !== targetAddress) {
+        if (targetSessionGen === sessionGenerationRef.current) {
+          setAuthWallet(null)
+          setConversations([])
+          setConversation(null)
+          setMessages([])
+          activeConversationIdRef.current = null
+          append('Sesión TM-COMM no coincide con la wallet activa. Se requiere reautenticación.')
+        }
+        return
+      }
+    }
+
+    setAuthWallet(targetAddress)
 
     const listed = await tmCommRequest<{ conversations: Conversation[] }>(
       '/v1/tm-comm/conversations',
@@ -106,6 +160,7 @@ function TmCommStaging() {
     if (!listed.ok) {
       if (listed.status === 401) {
         if (targetSessionGen === sessionGenerationRef.current) {
+          setAuthWallet(null)
           setConversations([])
           setConversation(null)
           setMessages([])
@@ -115,7 +170,7 @@ function TmCommStaging() {
       return
     }
 
-    const list = listed.data.conversations ?? []
+    const list = listed.data?.conversations ?? []
     setConversations(list)
 
     if (list.length === 0) {
@@ -149,20 +204,52 @@ function TmCommStaging() {
   }
 
   useEffect(() => {
-    const sessionGen = sessionGenerationRef
-    const mountGen = ++sessionGen.current
-    const mountAbort = new AbortController()
-    hydrationAbortRef.current = mountAbort
+    const prevAddr = prevAddressRef.current
+    const prevInit = prevInitializedRef.current
+    const addressChanged = address !== prevAddr
 
-    void restoreAuthorizedConversations(undefined, mountGen, mountAbort.signal)
+    prevAddressRef.current = address
+    prevInitializedRef.current = initialized
+
+    // Abort in-flight operations
+    hydrationAbortRef.current?.abort()
+    messageAbortRef.current?.abort()
+
+    // Increment generations to invalidate any pending promises
+    const nextGen = ++sessionGenerationRef.current
+    messageRequestGenRef.current++
+
+    // Clean state immediately
+    setConversations([])
+    setConversation(null)
+    setMessages([])
+    activeConversationIdRef.current = null
+    setAuthWallet(null)
+
+    if (!initialized || !address) {
+      if (prevInit) {
+        append('Wallet desinicializada o bloqueada. Estado de TM-COMM purgado.')
+      }
+      return
+    }
+
+    if (addressChanged && prevAddr !== undefined) {
+      append(`Wallet activa cambió a ${address}. Se requiere autenticación para esta wallet.`)
+    }
+
+    const hydrationAbort = new AbortController()
+    hydrationAbortRef.current = hydrationAbort
+
+    void restoreAuthorizedConversations(address, undefined, nextGen, hydrationAbort.signal, false)
 
     return () => {
-      mountAbort.abort()
+      hydrationAbort.abort()
       messageAbortRef.current?.abort()
-      sessionGen.current++
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      sessionGenerationRef.current++
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [address, initialized])
 
   const authenticate = async () => {
     if (!initialized || !address) {
@@ -186,6 +273,7 @@ function TmCommStaging() {
     setConversations([])
     setMessages([])
     activeConversationIdRef.current = null
+    setAuthWallet(null)
 
     setBusy(true)
     try {
@@ -224,7 +312,9 @@ function TmCommStaging() {
       const signature = await xolosWalletService.signMessage(verified.canonicalMessage)
       if (nextGen !== sessionGenerationRef.current) return
 
-      const session = await tmCommRequest('/v1/tm-comm/sessions', {
+      const session = await tmCommRequest<{
+        principal?: { id: string; kind: string; walletAddress: string }
+      }>('/v1/tm-comm/sessions', {
         method: 'POST',
         signal: sessionAbort.signal,
         body: JSON.stringify({
@@ -238,9 +328,11 @@ function TmCommStaging() {
       if (nextGen !== sessionGenerationRef.current) return
 
       if (session.ok) {
+        setAuthWallet(address)
         append('Sesión TM-COMM creada. La clave privada no salió de Tonalli.')
-        await restoreAuthorizedConversations(undefined, nextGen, sessionAbort.signal)
+        await restoreAuthorizedConversations(address, undefined, nextGen, sessionAbort.signal, true)
       } else {
+        setAuthWallet(null)
         append(`Sesión rechazada (${session.status}).`)
       }
     } finally {
@@ -251,6 +343,10 @@ function TmCommStaging() {
   }
 
   const bind = async () => {
+    if (!initialized || !address || authenticatedWalletAddressRef.current !== address) {
+      append('Se requiere autenticación para la wallet activa antes de enlazar un expediente.')
+      return
+    }
     const currentGen = sessionGenerationRef.current
     setBusy(true)
     try {
@@ -264,7 +360,7 @@ function TmCommStaging() {
         return
       }
       append(`Reserva ficticia vinculada: ${result.data.conversation.reservationId}`)
-      await restoreAuthorizedConversations(result.data.conversation.id, currentGen)
+      await restoreAuthorizedConversations(address, result.data.conversation.id, currentGen, undefined, true)
     } finally {
       if (currentGen === sessionGenerationRef.current) {
         setBusy(false)
@@ -273,6 +369,10 @@ function TmCommStaging() {
   }
 
   const send = async () => {
+    if (!initialized || !address || authenticatedWalletAddressRef.current !== address) {
+      append('Se requiere autenticación para la wallet activa antes de enviar.')
+      return
+    }
     if (!conversation) {
       append('Enlaza una reserva antes de enviar.')
       return
@@ -322,7 +422,16 @@ function TmCommStaging() {
       <div className="card">
         <h2>1. Autenticar con firma de challenge</h2>
         <p className="muted">Wallet: {address ?? 'no desbloqueada'}</p>
-        <button className="cta" type="button" onClick={() => void authenticate()} disabled={busy}>
+        <p className="muted">
+          Sesión TM-COMM:{' '}
+          {authenticatedWalletAddress === address && address ? `autenticada (${address})` : 'no autenticada'}
+        </p>
+        <button
+          className="cta"
+          type="button"
+          onClick={() => void authenticate()}
+          disabled={busy || !initialized || !address}
+        >
           Firmar challenge TM-COMM
         </button>
       </div>
@@ -334,8 +443,14 @@ function TmCommStaging() {
           onChange={(event) => setEnrollmentToken(event.target.value)}
           placeholder="Token de enrolamiento de Xolos Ramírez"
           aria-label="Token de enrolamiento"
+          disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
         />
-        <button className="cta outline" type="button" onClick={() => void bind()} disabled={busy}>
+        <button
+          className="cta outline"
+          type="button"
+          onClick={() => void bind()}
+          disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
+        >
           Consumir invitación
         </button>
       </div>
@@ -376,7 +491,7 @@ function TmCommStaging() {
                   void refreshMessages(selected.id, sessionGenerationRef.current)
                 }
               }}
-              disabled={busy}
+              disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
             >
               {conversations.map((c) => (
                 <option key={c.id} value={c.id}>
@@ -394,16 +509,22 @@ function TmCommStaging() {
           onChange={(event) => setMessageBody(event.target.value)}
           rows={3}
           aria-label="Cuerpo del mensaje"
+          disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
         />
         <div className="actions">
-          <button className="cta" type="button" onClick={() => void send()} disabled={busy}>
+          <button
+            className="cta"
+            type="button"
+            onClick={() => void send()}
+            disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
+          >
             Enviar al servidor
           </button>
           <button
             className="cta ghost"
             type="button"
             onClick={() => void refreshMessages(conversation?.id, sessionGenerationRef.current)}
-            disabled={busy}
+            disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
           >
             Recargar historial
           </button>

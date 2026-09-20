@@ -10,7 +10,12 @@ import { bootstrapTmCommStaging } from './tmCommBootstrap'
 import { loadTmCommRuntimeConfig, TM_COMM_COOKIE_NAME } from './tmCommConfig'
 import { createTmCommHttpServer, listenTmCommHttpServer } from './tmCommHttp'
 import { TmCommService } from './tmCommService'
-import { TmCommStore } from './tmCommStore'
+import {
+  TmCommStore,
+  TmCommMetadataMismatchError,
+  TM_COMM_SQLITE_APPLICATION_ID,
+  TM_COMM_SQLITE_SCHEMA_VERSION
+} from './tmCommStore'
 import {
   cookieValue,
   createTmCommDeterministicWallet,
@@ -1332,6 +1337,369 @@ process.stdout.write(JSON.stringify(wallet));
       } finally {
         store3.close()
       }
+    })
+  })
+
+  describe('P2-15: SQLite metadata compatibility gate', () => {
+    test('1. DB nueva se inicializa con metadata canónica completa', () => {
+      const dataDir = makeTempDirectory()
+      const dbPath = join(dataDir, 'new.sqlite')
+      const store = new TmCommStore(dbPath)
+      store.close()
+
+      const raw = new DatabaseSync(dbPath)
+      try {
+        const row = raw.prepare('SELECT * FROM tm_comm_metadata WHERE singleton_id = 1').get() as {
+          singleton_id: number
+          schema_version: number
+          application_id: number
+          environment: string
+          created_at: number
+        }
+        expect(row).toBeDefined()
+        expect(row.singleton_id).toBe(1)
+        expect(row.schema_version).toBe(TM_COMM_SQLITE_SCHEMA_VERSION)
+        expect(row.application_id).toBe(TM_COMM_SQLITE_APPLICATION_ID)
+        expect(row.environment).toBe('staging')
+        expect(typeof row.created_at).toBe('number')
+      } finally {
+        raw.close()
+      }
+    })
+
+    test('2. DB existente con metadata v1 canónica se abre y valida limpiamente', () => {
+      const dataDir = makeTempDirectory()
+      const dbPath = join(dataDir, 'canonical.sqlite')
+      const raw = new DatabaseSync(dbPath)
+      raw.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata (singleton_id, schema_version, application_id, environment, created_at)
+        VALUES (1, 1, 1414349617, 'staging', 1700000000);
+      `)
+      raw.close()
+
+      const store = new TmCommStore(dbPath)
+      expect(store.databasePath).toBe(dbPath)
+      store.close()
+    })
+
+    test('3. DB existente con schema_version superior (ej. 2) falla closed con TM_COMM_METADATA_MISMATCH', () => {
+      const dataDir = makeTempDirectory()
+      const dbPath = join(dataDir, 'future.sqlite')
+      const raw = new DatabaseSync(dbPath)
+      raw.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata (singleton_id, schema_version, application_id, environment, created_at)
+        VALUES (1, 2, 1414349617, 'staging', 1700000000);
+      `)
+      raw.close()
+
+      expect(() => new TmCommStore(dbPath)).toThrow(TmCommMetadataMismatchError)
+      try {
+        new TmCommStore(dbPath)
+      } catch (err) {
+        expect(err).toBeInstanceOf(TmCommMetadataMismatchError)
+        expect((err as TmCommMetadataMismatchError).code).toBe('TM_COMM_METADATA_MISMATCH')
+        expect((err as Error).message).toMatch(/Incompatible schema_version/i)
+      }
+    })
+
+    test('4. DB existente con schema_version inferior (ej. 0 o negativo) falla closed con TM_COMM_METADATA_MISMATCH', () => {
+      const dataDir = makeTempDirectory()
+      const dbPathZero = join(dataDir, 'v0.sqlite')
+      const raw0 = new DatabaseSync(dbPathZero)
+      raw0.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata (singleton_id, schema_version, application_id, environment, created_at)
+        VALUES (1, 0, 1414349617, 'staging', 1700000000);
+      `)
+      raw0.close()
+
+      expect(() => new TmCommStore(dbPathZero)).toThrow(TmCommMetadataMismatchError)
+
+      const dbPathNeg = join(dataDir, 'v_neg.sqlite')
+      const rawNeg = new DatabaseSync(dbPathNeg)
+      rawNeg.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata (singleton_id, schema_version, application_id, environment, created_at)
+        VALUES (1, -1, 1414349617, 'staging', 1700000000);
+      `)
+      rawNeg.close()
+
+      expect(() => new TmCommStore(dbPathNeg)).toThrow(TmCommMetadataMismatchError)
+    })
+
+    test('5. DB existente con application_id distinto falla closed con TM_COMM_METADATA_MISMATCH', () => {
+      const dataDir = makeTempDirectory()
+      const dbPath = join(dataDir, 'app_id.sqlite')
+      const raw = new DatabaseSync(dbPath)
+      raw.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata (singleton_id, schema_version, application_id, environment, created_at)
+        VALUES (1, 1, 1414349618, 'staging', 1700000000);
+      `)
+      raw.close()
+
+      expect(() => new TmCommStore(dbPath)).toThrow(TmCommMetadataMismatchError)
+      try {
+        new TmCommStore(dbPath)
+      } catch (err) {
+        expect(err).toBeInstanceOf(TmCommMetadataMismatchError)
+        expect((err as TmCommMetadataMismatchError).code).toBe('TM_COMM_METADATA_MISMATCH')
+        expect((err as Error).message).toMatch(/Incompatible application_id/i)
+      }
+    })
+
+    test('6. DB existente con environment distinto falla closed con TM_COMM_METADATA_MISMATCH', () => {
+      const dataDir = makeTempDirectory()
+      const dbPath = join(dataDir, 'env.sqlite')
+      const raw = new DatabaseSync(dbPath)
+      raw.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata (singleton_id, schema_version, application_id, environment, created_at)
+        VALUES (1, 1, 1414349617, 'production', 1700000000);
+      `)
+      raw.close()
+
+      expect(() => new TmCommStore(dbPath)).toThrow(TmCommMetadataMismatchError)
+      try {
+        new TmCommStore(dbPath)
+      } catch (err) {
+        expect(err).toBeInstanceOf(TmCommMetadataMismatchError)
+        expect((err as TmCommMetadataMismatchError).code).toBe('TM_COMM_METADATA_MISMATCH')
+        expect((err as Error).message).toMatch(/Incompatible environment/i)
+      }
+    })
+
+    test('7. DB existente no vacía pero sin tabla tm_comm_metadata falla closed sin escribir metadata ni esquema nuevo encima', () => {
+      const dataDir = makeTempDirectory()
+      const dbPath = join(dataDir, 'foreign.sqlite')
+      const raw = new DatabaseSync(dbPath)
+      raw.exec(`
+        CREATE TABLE unrelated_users (
+          id TEXT PRIMARY KEY,
+          balance INTEGER NOT NULL
+        );
+        INSERT INTO unrelated_users (id, balance) VALUES ('user_1', 100);
+      `)
+      raw.close()
+
+      expect(() => new TmCommStore(dbPath)).toThrow(TmCommMetadataMismatchError)
+
+      // Verificar que tm_comm_metadata NO fue creada ni conversaciones inyectadas
+      const rawAfter = new DatabaseSync(dbPath)
+      try {
+        const metadataTable = rawAfter.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tm_comm_metadata'"
+        ).get()
+        expect(metadataTable).toBeUndefined()
+
+        const convTable = rawAfter.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tm_comm_conversations'"
+        ).get()
+        expect(convTable).toBeUndefined()
+
+        const userRow = rawAfter.prepare("SELECT * FROM unrelated_users WHERE id = 'user_1'").get() as { id: string; balance: number }
+        expect(userRow.balance).toBe(100)
+      } finally {
+        rawAfter.close()
+      }
+    })
+
+    test('8. DB existente con fila metadata incompleta o tipos corruptos falla closed', () => {
+      const dataDir = makeTempDirectory()
+
+      // Caso A: tabla existe pero está vacía (sin fila singleton_id = 1)
+      const dbPathEmpty = join(dataDir, 'meta_empty.sqlite')
+      const rawA = new DatabaseSync(dbPathEmpty)
+      rawA.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+      `)
+      rawA.close()
+      expect(() => new TmCommStore(dbPathEmpty)).toThrow(TmCommMetadataMismatchError)
+
+      // Caso B: schema_version es TEXT
+      const dbPathTextVer = join(dataDir, 'meta_text_ver.sqlite')
+      const rawB = new DatabaseSync(dbPathTextVer)
+      rawB.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version TEXT NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata VALUES (1, '1', 1414349617, 'staging', 1700000000);
+      `)
+      rawB.close()
+      expect(() => new TmCommStore(dbPathTextVer)).toThrow(TmCommMetadataMismatchError)
+
+      // Caso C: application_id es NULL
+      const dbPathNullApp = join(dataDir, 'meta_null_app.sqlite')
+      const rawC = new DatabaseSync(dbPathNullApp)
+      rawC.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata VALUES (1, 1, NULL, 'staging', 1700000000);
+      `)
+      rawC.close()
+      expect(() => new TmCommStore(dbPathNullApp)).toThrow(TmCommMetadataMismatchError)
+    })
+
+    test('9. Ninguna de las discrepancias anteriores crea tablas de aplicación si la validación falla', () => {
+      const dataDir = makeTempDirectory()
+      const dbPath = join(dataDir, 'no_app_tables.sqlite')
+      const raw = new DatabaseSync(dbPath)
+      raw.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata VALUES (1, 999, 1414349617, 'staging', 1700000000);
+      `)
+      raw.close()
+
+      expect(() => new TmCommStore(dbPath)).toThrow(TmCommMetadataMismatchError)
+
+      const rawAfter = new DatabaseSync(dbPath)
+      try {
+        const appTables = rawAfter.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('tm_comm_conversations', 'tm_comm_messages', 'tm_comm_principals', 'tm_comm_enrollment_tokens')"
+        ).all()
+        expect(appTables).toHaveLength(0)
+      } finally {
+        rawAfter.close()
+      }
+    })
+
+    test('10. bootstrapTmCommStaging() sobre DB incompatible falla antes de escribir principals o enrollment tokens', () => {
+      const dataDir = makeTempDirectory()
+      const dbPath = join(dataDir, 'incompatible_bootstrap.sqlite')
+      const raw = new DatabaseSync(dbPath)
+      raw.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata VALUES (1, 999, 1414349617, 'staging', 1700000000);
+      `)
+      raw.close()
+
+      const config = loadTmCommRuntimeConfig({
+        databasePath: dbPath
+      })
+      const operator = createTmCommDeterministicWallet(
+        '1111111111111111111111111111111111111111111111111111111111111111'
+      )
+
+      // Attempting to instantiate store / bootstrap on incompatible DB fails before writes
+      expect(() => {
+        const store = new TmCommStore(dbPath)
+        bootstrapTmCommStaging(store, config, operator)
+      }).toThrow(TmCommMetadataMismatchError)
+
+      const rawAfter = new DatabaseSync(dbPath)
+      try {
+        const principalsTable = rawAfter.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tm_comm_principals'"
+        ).get()
+        expect(principalsTable).toBeUndefined()
+
+        const row = rawAfter.prepare('SELECT schema_version FROM tm_comm_metadata WHERE singleton_id = 1').get() as {
+          schema_version: number
+        }
+        expect(row.schema_version).toBe(999)
+      } finally {
+        rawAfter.close()
+      }
+    })
+
+    test('11. Fallo en el constructor cierra el handle subyacente y no deja locks activos', () => {
+      const dataDir = makeTempDirectory()
+      const dbPath = join(dataDir, 'locks.sqlite')
+      const raw = new DatabaseSync(dbPath)
+      raw.exec(`
+        CREATE TABLE tm_comm_metadata (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          schema_version INTEGER NOT NULL,
+          application_id INTEGER NOT NULL,
+          environment TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        INSERT INTO tm_comm_metadata VALUES (1, 999, 1414349617, 'staging', 1700000000);
+      `)
+      raw.close()
+
+      try {
+        new TmCommStore(dbPath)
+      } catch (err) {
+        expect(err).toBeInstanceOf(TmCommMetadataMismatchError)
+      }
+
+      // El archivo debe poder eliminarse o abrirse inmediatamente sin error de lock o EBUSY
+      expect(() => {
+        const rawCheck = new DatabaseSync(dbPath)
+        rawCheck.exec('SELECT 1;')
+        rawCheck.close()
+      }).not.toThrow()
+
+      expect(() => {
+        rmSync(dbPath)
+      }).not.toThrow()
+      expect(existsSync(dbPath)).toBe(false)
     })
   })
 })

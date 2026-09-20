@@ -20,14 +20,53 @@ Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No m
 | **PASS 3 REVIEWED HEAD** | `f47f5fedb4195803d66622ddce76a137de72f12a` |
 | **PASS 3 REMEDIATION SHA** | `44e26fb2996d933ca94d13e3135a511fe1e36067` |
 | **PASS 4 REVIEWED HEAD** | `9d407a81f00605e73b9b8b76fb3ec4f350e7f117` |
-| **PASS 4 REMEDIATION SHA** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 Pass 4 closure) |
+| **PASS 4 REMEDIATION SHA** | `037b420067ffec3bf577884d5f2ca0ec79ea54a5` |
+| **PASS 8 REVIEWED HEAD** | `97a45686a7c533f6c9867bc6ebd155140c61a3a2` |
+| **PASS 8 REMEDIATION SHA** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 Pass 8 closure) |
 | Staging API | http://127.0.0.1:4178/v1/tm-comm/health |
 | Staging UI | http://127.0.0.1:5174/tm-comm-staging |
-| Estado | **READY FOR FRESH CODEX REVIEW (PASS 4 CLOSURE)** |
+| Estado | **READY FOR FRESH CODEX REVIEW (PASS 8 CLOSURE)** |
 | Merge | **No** |
 
 > [!NOTE]
 > **Aclaración de Genealogía y Corrección de SHA**: Se documenta explícitamente que la referencia previa `a63aeacef335ca7f42dcae2e83b8b64e6224168e` correspondió a una referencia errónea en notas. El commit HEAD remoto canónico de PR #98 efectivamente revisado por Codex para el Pass 2 fue `a63aeacc6a407517805c4c2c31a351511281600c`.
+
+---
+
+## Remediation Pass 8 (Codex Findings P2-15 & P2-16)
+
+El fresh Codex review ejecutado sobre el exact HEAD `97a45686a7c533f6c9867bc6ebd155140c61a3a2` identificó exactamente 2 findings P2 abiertos:
+1. `Reset TM-COMM state when the active wallet changes` (Thread `PRRT_kwDOQYWUus6kDt62`)
+2. `Reject databases with mismatched metadata` (Thread `PRRT_kwDOQYWUus6kDt64`)
+
+Ambos findings han sido completamente remediados conservando todas las remediaciones e invariantes de arquitectura anteriores:
+
+### P2-15: Reset TM-COMM state when the active wallet changes (Thread `PRRT_kwDOQYWUus6kDt62`)
+- **Causa raíz**: Cuando el usuario alternaba de cuenta en la wallet activa mientras la ruta `TmCommStaging` permanecía montada, o cuando la wallet se bloqueaba/desinicializaba, el valor de `address` cambiaba pero el estado local (`conversations`, `conversation`, `messages`, cookie HttpOnly de sesión y generaciones) continuaba asociado a la identidad previa. La página mostraba visualmente la wallet B pero retenía el historial privado de A, y cualquier acción de enrolamiento (`bind`) o envío de mensajes consumía la sesión de A, arriesgando vincular tokens de B a favor de A. Asimismo, al montar o recargar la ruta con una sesión de A persistente en cookie pero con la wallet activa fijada en B, el cliente intentaba hidratar el historial de A bajo la identidad de B.
+- **Remediación**:
+  1. **Identidad autenticada explícita**: Se introdujo el concepto de `authenticatedWalletAddress` y `authenticatedWalletAddressRef` en `src/routes/TmCommStaging.tsx`, estrictamente diferenciado de la wallet actualmente seleccionada en el contexto global. Solo se establece tras un handshake exitoso de autenticación TM-COMM o tras verificar que la sesión persistente en cookie pertenece a la wallet activa.
+  2. **Verificación de identidad en hidratación / reload**: `restoreAuthorizedConversations` realiza una consulta previa a `GET /v1/tm-comm/me` para cotejar criptográficamente el `walletAddress` de la sesión devuelta contra la wallet activa (`targetAddress`). Si la sesión pertenece a otra wallet o retorna 401, se purga todo el estado y se falla cerrado (`authenticatedWalletAddress = null`).
+  3. **Reacción reactiva a cambios de wallet o bloqueo**: El `useEffect` suscrito a `[address, initialized]` aborta inmediatamente las operaciones en curso (`hydrationAbortRef.current?.abort()`, `messageAbortRef.current?.abort()`), incrementa `sessionGenerationRef` y `messageRequestGenRef` para invalidar respuestas asíncronas tardías, y limpia sincrónicamente todo el estado sensible (`conversations`, `conversation`, `messages`, `activeConversationIdRef = null`, `authenticatedWalletAddress = null`). Si la wallet se bloquea o desinicializa, el estado se contiene y purga de inmediato.
+  4. **Guards de mutación y controles UI**: Las funciones `bind()`, `send()` y `refreshMessages()` aplican verificaciones defensivas síncronas (`authenticatedWalletAddressRef.current === address`). Si no hay coherencia exacta entre la sesión autenticada y la wallet activa, la mutación es abortada de forma fail-closed. En la UI, los inputs, botones de acción y selector de conversaciones permanecen deshabilitados si no se cuenta con una sesión autenticada para la wallet activa, mostrando un indicador claro del estado de la sesión TM-COMM.
+- **Archivos modificados**:
+  - `src/routes/TmCommStaging.tsx`
+- **Tests agregados/actualizados**:
+  - `src/routes/TmCommStaging.test.tsx` (8 nuevos tests deterministas en `describe('P2-13: Wallet-session coherence and state containment')` cubriendo: mount con cookie de A y wallet activa B falla cerrado; reload con cookie y wallet coincidentes restaura sesión; alternar de wallet A a B purga inmediatamente historial y conversaciones de A; peticiones pendientes de A no mutan a B; bind y send bloqueados tras switch hasta reautenticar B; reautenticación de B solo hidrata estado de B; desinicialización/bloqueo de wallet purga estado privado de inmediato; y respuestas tardías o 401s obsoletos de sesión anterior no mutan la sesión actual. 37/37 tests passing).
+
+### P2-16: Reject databases with mismatched metadata (Thread `PRRT_kwDOQYWUus6kDt64`)
+- **Causa raíz**: Cuando el proceso abría una base de datos creada por otra versión o proceso, `TmCommStore` ejecutaba `CREATE TABLE IF NOT EXISTS` sin validar `schema_version`, `environment` ni `application_id` contra las constantes del sistema. Dado que SQLite no migra tablas existentes bajo `IF NOT EXISTS`, el arranque procedía y `bootstrapTmCommStaging` escribía principals y tokens asumiendo la semántica canónica de v1, arriesgando corrupción silenciosa de esquemas ajenos o de versiones futuras/incompatibles.
+- **Remediación**:
+  1. **Error específico de compatibilidad**: Se implementó `TmCommMetadataMismatchError` con código canónico `'TM_COMM_METADATA_MISMATCH'`.
+  2. **Detección y orden de inicialización fail-closed**: En `initializeSchemaAndMetadata`, se consulta `sqlite_master`:
+     - **Base de datos nueva (cero tablas de usuario)**: Crea el esquema canónico completo vía `TM_COMM_SQLITE_SCHEMA_SQL`, inserta la fila canónica en `tm_comm_metadata` (`singleton_id = 1`, `schema_version = 1`, `application_id = 0x544d4331`, `environment = 'staging'`) y valida la inserción.
+     - **Base de datos existente (con tablas)**: Comprueba si existe la tabla `tm_comm_metadata`. Si está ausente (base de datos ajena o no inicializada por TM-COMM), falla cerrado inmediatamente lanzando `TmCommMetadataMismatchError` sin crear esquemas ni adoptar tablas ajenas. Si existe, valida que la fila única (`singleton_id = 1`) contenga tipos válidos y valores exactos: `schema_version === TM_COMM_SQLITE_SCHEMA_VERSION (1)`, `application_id === TM_COMM_SQLITE_APPLICATION_ID (0x544d4331)` y `environment === 'staging'`. Ante cualquier discrepancia, lanza `TmCommMetadataMismatchError`.
+  3. **Cierre limpio del handle SQLite**: El constructor de `TmCommStore` encapsula toda la inicialización en `try ... catch` y ejecuta `this.close()` ante cualquier excepción antes de propagarla, liberando de inmediato file descriptors y bloqueos activos.
+  4. **Exportación de constantes de compatibilidad**: `TM_COMM_SQLITE_APPLICATION_ID` y `TM_COMM_SQLITE_SCHEMA_VERSION` se exportan públicamente desde `server/tmComm`.
+- **Archivos modificados**:
+  - `server/tmComm/tmCommStore.ts`
+  - `server/tmComm/index.ts`
+- **Tests agregados/actualizados**:
+  - `server/tmComm/tmCommRestart.test.ts` (11 nuevos tests deterministas en `describe('P2-15: SQLite metadata compatibility gate')` cubriendo: inicialización correcta de DB nueva con metadata canónica; validación limpia de DB existente compatible; rechazo con fail-closed ante `schema_version` superior (2); rechazo ante `schema_version` inferior (0 o negativo); rechazo ante `application_id` discrepante; rechazo ante `environment` discrepante; rechazo de DB ajena no vacía sin `tm_comm_metadata`; rechazo de fila de metadata incompleta o con tipos corruptos; garantía de que ninguna discrepancia crea tablas de aplicación; fallo de `bootstrapTmCommStaging` antes de escribir principals o tokens sobre DB incompatible; y cierre limpio del handle sin bloqueos residuales tras error de inicialización. 39/39 tests passing).
 
 ---
 
@@ -342,14 +381,16 @@ Stderr en tests que pasan (no FAIL): `QuotaExceededError` esperado en RegisterAl
   - P2-12: Enforce estricto de permisos `0700` en el directorio padre de la credencial del operador en todos los caminos de `resolveTmCommOperatorCredential` (incluyendo reinicios con credencial preexistente) antes de cualquier return, con verificación `statSync` y fail-closed ante discrepancias.
   - P2-13 (Pass 6): Eliminación completa de dependencia de permisos del host (`/root/`); simulación determinista de fallos de filesystem (`EACCES`/`EPERM`) mediante mock ESM hoisted (`vi.mock('node:fs')`), verificación de invocación del mock, contención estricta en `makeTempDirectory()`, fail-closed sin generación de identidades sustitutas y cleanup exhaustivo.
   - P2-14 (Pass 7): Eliminación de comportamientos best-effort en la asignación de permisos `0600` a `operator-wallet.json`. Implementación de `ensureSecureCredentialFile` con aplicación mandatoria de `chmodSync(..., 0o600)`, verificación síncrona mediante `statSync`, y fail-closed inmediato ante cualquier error (`EACCES`, `EPERM`, error en `statSync` o modo distinto de `0600`). Se ejecuta en todos los caminos: creación nueva, carga de credencial preexistente y recarga ganadora tras `EEXIST`, garantizando que ninguna rama retorne una wallet ni registre un `operatorPrincipal` si la verificación no concluye con éxito.
+  - P2-15 (Pass 8): Coherencia estricta wallet ↔ sesión TM-COMM en cliente React (`TmCommStaging.tsx`). Introducción de `authenticatedWalletAddress`, verificación de sesión persistente contra `GET /v1/tm-comm/me`, purga reactiva inmediata de conversaciones, mensajes y generaciones ante cambio de `address` o bloqueo de wallet, guards síncronos fail-closed en `bind`, `send` y `refreshMessages`, e inhabilitación de controles UI para evitar filtración de historial o consumo no intencionado de tokens.
+  - P2-16 (Pass 8): Compuerta de compatibilidad estricta de metadata SQLite en `TmCommStore`. Detección de base nueva vs preexistente; rechazo fail-closed inmediato (`TmCommMetadataMismatchError`) ante bases de datos ajenas sin `tm_comm_metadata` o con discrepancias en `schema_version`, `application_id` o `environment`, impidiendo la adopción silenciosa o corrupción de esquemas incompatibles antes de cualquier mutación o bootstrap; y cierre garantizado del handle SQLite en el constructor.
 - **Validación 100% verde**:
   - `npm run typecheck`: PASS (código 0)
   - `npm run build`: PASS (código 0)
-  - `npm run test:tm-comm`: PASS (6 archivos, 98 tests)
+  - `npm run test:tm-comm`: PASS (6 archivos, 118 tests)
   - `src/features/privateMessaging/privateMessaging.architecture.test.ts`: PASS (8/8)
-  - `server/tmComm/tmCommRestart.test.ts`: PASS (28/28)
-  - `src/routes/TmCommStaging.test.tsx`: PASS (29/29)
-  - `npm test`: PASS (150 archivos, 2747 vitest + 10 node:test)
+  - `server/tmComm/tmCommRestart.test.ts`: PASS (39/39)
+  - `src/routes/TmCommStaging.test.tsx`: PASS (37/37)
+  - `npm test`: PASS (150 archivos, 2766 vitest + 10 node:test)
   - `npm run lint`: PRE-EXISTING BASELINE FAILURE / DIFFERENTIAL CLEAN (NEW findings = 0; 328 preexistentes en BASE, 328 en HEAD, 0 en archivos TM-COMM)
 - **Invariantes arquitectónicas preservadas**:
   - Cero OpenAI, cero clientes reales, cero fondos reales, cero autoridad financiera, cero Agent Wallet authority, cero settlement, cero broadcast, cero sendXec, cero eToken movement, cero auto-publicación en Tonalli Memo.
