@@ -2,7 +2,7 @@
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { WalletContext } from '../context/walletContext'
 import type { WalletContextValue } from '../context/walletContext'
 import { walletContextFixture } from '../test/walletContextFixture'
@@ -52,8 +52,19 @@ function walletValue(
   })
 }
 
+const mockLocks = {
+  request: vi.fn(async (_name: string, _opts: unknown, callback: (lock: unknown) => Promise<unknown>) => callback({}))
+}
+
 describe('dual-profile restore resolution UI', () => {
-  afterEach(cleanup)
+  beforeEach(() => {
+    Object.defineProperty(navigator, 'locks', { configurable: true, value: mockLocks })
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
 
   test('requires and forwards an explicit profile choice when both profiles are active', async () => {
     const restoreWallet = vi.fn<WalletContextValue['restoreWallet']>()
@@ -136,5 +147,29 @@ describe('dual-profile restore resolution UI', () => {
       '123456',
       ECASH_STANDARD_PROFILE_ID
     )
+  })
+
+  test('navigator.locks absent renders unsupported-browser state, blocks restore, zero seed persistence', () => {
+    Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined })
+    const restoreWallet = vi.fn()
+    render(
+      <MemoryRouter initialEntries={['/onboarding/import']}>
+        <WalletContext.Provider value={walletValue(restoreWallet)}>
+          <ImportWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+
+    expect(screen.getByTestId('import-tonalli')).toHaveProperty('disabled', true)
+    expect(screen.getByTestId('unsupported-browser-state')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Frase seed'), {
+      target: { value: PUBLIC_TEST_MNEMONIC }
+    })
+    fireEvent.change(screen.getByLabelText('Nuevo Password/PIN local'), {
+      target: { value: '123456' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Restaurar wallet' }))
+    expect(restoreWallet).not.toHaveBeenCalled()
+    expect(localStorage.getItem('xoloswallet_encrypted_mnemonic')).toBeNull()
   })
 })

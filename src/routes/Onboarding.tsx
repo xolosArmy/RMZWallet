@@ -11,7 +11,7 @@ import {
 } from '../services/derivationProfiles'
 import type { DerivationProfileId } from '../services/derivationProfiles'
 import type { DerivationDiscovery } from '../services/dualDerivationDiscovery'
-import { QuickStartUnavailableError } from '../services/quickStartStorage'
+import { QuickStartUnavailableError, isWebLocksSupported } from '../services/quickStartStorage'
 import { readTonalliIntent } from '../services/tonalliIntent'
 import { setPendingBackupPassword } from '../services/backupSession'
 
@@ -196,11 +196,12 @@ export function CreateWallet() {
   } = useWallet()
   const [localError, setLocalError] = useState<string | null>(null)
   const [needsPinFallback, setNeedsPinFallback] = useState(false)
+  const webLocksSupported = isWebLocksSupported()
 
   const bootstrapPending = quickStartBootstrap === 'pending'
   const recoveryFailed = quickStartBootstrap === 'failed'
   const backedWalletExists = hasBackedWalletOnDevice && !initialized
-  const createBlocked = bootstrapPending || recoveryFailed || initialized || backedWalletExists
+  const createBlocked = !webLocksSupported || bootstrapPending || recoveryFailed || initialized || backedWalletExists
 
   useEffect(() => {
     if (initialized) resumeAfterQuickStart(navigate)
@@ -209,6 +210,10 @@ export function CreateWallet() {
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault()
     setLocalError(null)
+    if (!webLocksSupported) {
+      setLocalError('Tu navegador no cuenta con soporte de Web Locks. Actualiza tu navegador para usar Tonalli de forma segura.')
+      return
+    }
     if (createBlocked && !initialized) {
       setLocalError(
         recoveryFailed
@@ -222,12 +227,20 @@ export function CreateWallet() {
       resumeAfterQuickStart(navigate)
     } catch (err) {
       if (err instanceof QuickStartUnavailableError) {
+        if (!webLocksSupported) {
+          setLocalError('Tu navegador no cuenta con soporte de Web Locks. Actualiza tu navegador para usar Tonalli de forma segura.')
+          return
+        }
         setNeedsPinFallback(true)
         setLocalError('Este navegador no puede guardar una Tonalli temporal de forma segura. Usa un PIN local.')
         return
       }
       if ((err as Error).message === 'BACKED_WALLET_EXISTS') {
         setLocalError('Ya hay una wallet cifrada en este dispositivo. Desbloquéala para continuar.')
+        return
+      }
+      if ((err as Error).message === 'PENDING_IDENTITY_EXISTS') {
+        setLocalError('Hay otra operación de creación de wallet pendiente en otra pestaña.')
         return
       }
       setLocalError((err as Error).message)
@@ -245,6 +258,11 @@ export function CreateWallet() {
             Generamos tu wallet en este dispositivo. Puedes empezar a usarla ahora y protegerla cuando quieras.
           </p>
           <p className="warning">Tonalli Wallet no custodia ni puede recuperar tu frase de recuperación.</p>
+          {!webLocksSupported && (
+            <div className="error" role="alert" data-testid="unsupported-browser-state">
+              Tu navegador no cuenta con soporte de Web Locks para coordinar operaciones de forma segura entre pestañas. Actualiza tu navegador para usar Tonalli de forma segura.
+            </div>
+          )}
           {bootstrapPending && <p className="muted">Preparando este dispositivo…</p>}
           {recoveryFailed && (
             <div className="error" role="alert">
@@ -271,7 +289,7 @@ export function CreateWallet() {
               Desbloquear wallet
             </Link>
           )}
-          {needsPinFallback && !backedWalletExists && (
+          {needsPinFallback && webLocksSupported && !backedWalletExists && (
             <Link className="cta outline" to="/onboarding/create-backed">
               Continuar con PIN local
             </Link>
@@ -283,20 +301,26 @@ export function CreateWallet() {
   )
 }
 
+
 export function CreateBackedWallet() {
   const navigate = useNavigate()
   const { createNewWallet, loading, error, initialized, quickStartBootstrap } = useWallet()
   const [passwordNew, setPasswordNew] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
+  const webLocksSupported = isWebLocksSupported()
 
   const bootstrapPending = quickStartBootstrap === 'pending'
   const recoveryFailed = quickStartBootstrap === 'failed'
   const existingQuickStart = quickStartBootstrap === 'recovered'
-  const createBlocked = bootstrapPending || recoveryFailed || existingQuickStart || initialized
+  const createBlocked = !webLocksSupported || bootstrapPending || recoveryFailed || existingQuickStart || initialized
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault()
     setLocalError(null)
+    if (!webLocksSupported) {
+      setLocalError('Tu navegador no cuenta con soporte de Web Locks. Actualiza tu navegador para usar Tonalli de forma segura.')
+      return
+    }
     if (createBlocked) {
       setLocalError(
         recoveryFailed
@@ -318,6 +342,10 @@ export function CreateBackedWallet() {
       setPendingBackupPassword(passwordNew)
       navigate('/backup')
     } catch (err) {
+      if ((err as Error).message === 'PENDING_IDENTITY_EXISTS') {
+        setLocalError('Hay otra operación de creación de wallet pendiente en otra pestaña.')
+        return
+      }
       setLocalError((err as Error).message)
     }
   }
@@ -331,6 +359,11 @@ export function CreateBackedWallet() {
           <h1 id="create-backed-wallet-title" className="section-title">Crear con PIN y respaldo inmediato</h1>
           <p className="muted">La frase de recuperación se genera localmente y nunca sale de tu dispositivo.</p>
           <p className="warning">Tonalli Wallet no custodia ni puede recuperar tu frase de recuperación.</p>
+          {!webLocksSupported && (
+            <div className="error" role="alert" data-testid="unsupported-browser-state">
+              Tu navegador no cuenta con soporte de Web Locks para coordinar operaciones de forma segura entre pestañas. Actualiza tu navegador para usar Tonalli de forma segura.
+            </div>
+          )}
           {bootstrapPending && <p className="muted">Preparando este dispositivo…</p>}
           {recoveryFailed && (
             <div className="error" role="alert">
@@ -464,14 +497,19 @@ export function ImportWallet() {
   const [localError, setLocalError] = useState<string | null>(null)
   const [profileChoice, setProfileChoice] = useState<DerivationDiscovery | null>(null)
 
+  const webLocksSupported = isWebLocksSupported()
   const bootstrapPending = quickStartBootstrap === 'pending'
   const recoveryFailed = quickStartBootstrap === 'failed'
   const existingQuickStart = quickStartBootstrap === 'recovered'
-  const importBlocked = bootstrapPending || recoveryFailed || existingQuickStart || initialized
+  const importBlocked = !webLocksSupported || bootstrapPending || recoveryFailed || existingQuickStart || initialized
 
   const continueWithProfile = async (profileId: DerivationProfileId) => {
     try {
       setLocalError(null)
+      if (!webLocksSupported) {
+        setLocalError('Tu navegador no cuenta con soporte de Web Locks. Actualiza tu navegador para usar Tonalli de forma segura.')
+        return
+      }
       if (importBlocked) {
         setLocalError(
           recoveryFailed
@@ -490,6 +528,10 @@ export function ImportWallet() {
       setPendingBackupPassword(passwordImport)
       navigate('/backup', { state: { restoreNotice: result.notice } })
     } catch (err) {
+      if ((err as Error).message === 'PENDING_IDENTITY_EXISTS') {
+        setLocalError('Hay otra operación de creación o restauración de wallet pendiente en otra pestaña.')
+        return
+      }
       setLocalError((err as Error).message)
     }
   }
@@ -497,6 +539,10 @@ export function ImportWallet() {
   const handleImport = async (e: FormEvent) => {
     e.preventDefault()
     setLocalError(null)
+    if (!webLocksSupported) {
+      setLocalError('Tu navegador no cuenta con soporte de Web Locks. Actualiza tu navegador para usar Tonalli de forma segura.')
+      return
+    }
     if (importBlocked) {
       setLocalError(
         recoveryFailed
@@ -529,6 +575,10 @@ export function ImportWallet() {
       setPendingBackupPassword(passwordImport)
       navigate('/backup', { state: { restoreNotice: result.notice } })
     } catch (err) {
+      if ((err as Error).message === 'PENDING_IDENTITY_EXISTS') {
+        setLocalError('Hay otra operación de creación o restauración de wallet pendiente en otra pestaña.')
+        return
+      }
       setLocalError((err as Error).message)
     }
   }
@@ -545,6 +595,11 @@ export function ImportWallet() {
             dominio oficial.
           </p>
           <p className="warning">Nunca compartas tu frase de recuperación con soporte, terceros o sitios externos.</p>
+          {!webLocksSupported && (
+            <div className="error" role="alert" data-testid="unsupported-browser-state">
+              Tu navegador no cuenta con soporte de Web Locks para coordinar operaciones de forma segura entre pestañas. Actualiza tu navegador para usar Tonalli de forma segura.
+            </div>
+          )}
           {bootstrapPending && <p className="muted">Preparando este dispositivo…</p>}
           {recoveryFailed && (
             <div className="error" role="alert">

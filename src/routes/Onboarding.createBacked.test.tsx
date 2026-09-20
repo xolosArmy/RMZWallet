@@ -1,14 +1,23 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { MemoryRouter } from 'react-router-dom'
 import { WalletContext } from '../context/walletContext'
 import { walletContextFixture } from '../test/walletContextFixture'
 import { CreateBackedWallet } from './Onboarding'
 
+const mockLocks = {
+  request: vi.fn(async (_name: string, _opts: unknown, callback: (lock: unknown) => Promise<unknown>) => callback({}))
+}
+
+beforeEach(() => {
+  Object.defineProperty(navigator, 'locks', { configurable: true, value: mockLocks })
+})
+
 afterEach(() => {
   cleanup()
+  vi.restoreAllMocks()
 })
 
 function renderCreateBacked(overrides: Parameters<typeof walletContextFixture>[0] = {}) {
@@ -55,5 +64,16 @@ describe('/onboarding/create-backed refuse overwrite', () => {
     expect(screen.getByTestId('create-backed-tonalli')).toHaveProperty('disabled', true)
     fireEvent.submit(screen.getByTestId('create-backed-tonalli').closest('form')!)
     expect(wallet.createNewWallet).not.toHaveBeenCalled()
+  })
+
+  test('navigator.locks absent renders unsupported-browser state, blocks create-backed, zero seed persistence', () => {
+    Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined })
+    const wallet = renderCreateBacked({ initialized: false })
+    expect(screen.getByTestId('create-backed-tonalli')).toHaveProperty('disabled', true)
+    expect(screen.getByTestId('unsupported-browser-state')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Password/PIN local'), { target: { value: '123456' } })
+    fireEvent.submit(screen.getByTestId('create-backed-tonalli').closest('form')!)
+    expect(wallet.createNewWallet).not.toHaveBeenCalled()
+    expect(localStorage.getItem('xoloswallet_encrypted_mnemonic')).toBeNull()
   })
 })

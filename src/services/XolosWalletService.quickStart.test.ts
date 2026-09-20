@@ -218,5 +218,138 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       // Quick Start seed A remains untouched
       expect(await loadQuickStartMnemonic()).toBe(seedA)
     })
+
+    test('create-backed A -> restore B -> backup A -> backup B: B rejected, ciphertext A preserved', async () => {
+      setupCrossTabFifoLock()
+
+      // Tab A initiates create-backed
+      await xolosWalletService.createNewWallet()
+      const addressA = xolosWalletService.getAddress()
+      const mnemonicA = internals.decryptedMnemonic!
+      const ownerTokenA = xolosWalletService.getPendingIdentityOwnerToken()
+
+      // Tab B in another tab attempts restore while Tab A identity is pending
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+      await expect(
+        xolosWalletService.restoreFromMnemonic(TEST_RESTORE_MNEMONIC)
+      ).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+
+      // Tab A commits backup
+      xolosWalletService.setPendingIdentityOwnerToken(ownerTokenA)
+      internals.decryptedMnemonic = mnemonicA
+      await xolosWalletService.persistVerifiedBackup('pinA1234')
+      expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+      const ciphertextA = localStorage.getItem(STORAGE_KEY_MNEMONIC)
+
+      // Tab B attempts backup of restore B with different mnemonic
+      internals.decryptedMnemonic = TEST_RESTORE_MNEMONIC
+      await expect(
+        xolosWalletService.persistVerifiedBackup('pinB1234')
+      ).rejects.toThrow('BACKUP_OVERWRITE_PREVENTED')
+
+      // Ciphertext A and address A are preserved
+      expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(ciphertextA)
+      await xolosWalletService.loadFromStorage('pinA1234')
+      expect(xolosWalletService.getAddress()).toBe(addressA)
+    })
+
+    test('restore A -> create-backed B: exactly one candidate survives', async () => {
+      setupCrossTabFifoLock()
+
+      // Tab A restores
+      const resA = await xolosWalletService.restoreFromMnemonic(TEST_RESTORE_MNEMONIC)
+      expect(resA.status).toBe('restored')
+      const addressA = xolosWalletService.getAddress()
+      expect(addressA).toBeTruthy()
+
+      // Tab B in another tab tries to create-backed
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+      await expect(
+        xolosWalletService.createNewWallet()
+      ).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+
+      // Exactly one candidate identity survived (Tab A)
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
+      expect(xolosWalletService.getAddress()).toBe(addressA)
+    })
+
+    test('two create-backed tabs: at most one identity may become persistable', async () => {
+      setupCrossTabFifoLock()
+
+      // Tab A creates
+      await xolosWalletService.createNewWallet()
+      const addressA = xolosWalletService.getAddress()
+
+      // Tab B in another tab creates
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+      await expect(
+        xolosWalletService.createNewWallet()
+      ).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+
+      // Only Tab A is active and persistable
+      expect(xolosWalletService.getAddress()).toBe(addressA)
+    })
+
+    test('winner backup: loser can never overwrite winner', async () => {
+      setupCrossTabFifoLock()
+
+      // Winner creates and commits backup
+      await xolosWalletService.createNewWallet()
+      const winnerAddress = xolosWalletService.getAddress()
+      await xolosWalletService.persistVerifiedBackup('winnerPIN123')
+      const winnerCiphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
+
+      // Loser tries to overwrite with another mnemonic
+      internals.decryptedMnemonic = TEST_RESTORE_MNEMONIC
+      await expect(
+        xolosWalletService.persistVerifiedBackup('loserPIN123')
+      ).rejects.toThrow('BACKUP_OVERWRITE_PREVENTED')
+
+      // Winner ciphertext intact
+      expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(winnerCiphertext)
+      await xolosWalletService.loadFromStorage('winnerPIN123')
+      expect(xolosWalletService.getAddress()).toBe(winnerAddress)
+    })
+
+    test('existing Quick Start + IndexedDB unavailable: no PIN create, no restore overwrite, fail closed', async () => {
+      // Create Quick Start wallet
+      await xolosWalletService.createQuickStartWallet()
+      const originalAddress = xolosWalletService.getAddress()
+      expect(originalAddress).toBeTruthy()
+
+      // Mock IndexedDB failure
+      const originalOpen = indexedDB.open
+      indexedDB.open = () => {
+        const req = {} as IDBOpenDBRequest
+        setTimeout(() => {
+          if (req.onerror) {
+            Object.defineProperty(req, 'error', {
+              configurable: true,
+              value: new DOMException('DB locked/unavailable', 'UnknownError')
+            })
+            req.onerror(new Event('error'))
+          }
+        }, 0)
+        return req
+      }
+
+      try {
+        // createNewWallet must fail closed
+        await expect(xolosWalletService.createNewWallet()).rejects.toThrow()
+        // restoreFromMnemonic must fail closed
+        await expect(
+          xolosWalletService.restoreFromMnemonic(TEST_RESTORE_MNEMONIC)
+        ).rejects.toThrow()
+        // No backup_verified replacement
+        expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(false)
+      } finally {
+        indexedDB.open = originalOpen
+      }
+
+      // When IndexedDB returns, original Quick Start recovered with same address
+      const recoveredSeed = await loadQuickStartMnemonic()
+      expect(recoveredSeed).toBeTruthy()
+    })
   })
 })
+

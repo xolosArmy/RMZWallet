@@ -352,6 +352,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     ) {
       throw new Error('QUICK_START_RECORD_EXISTS')
     }
+    if (
+      typeof xolosWalletService.hasPendingIdentityRecord === 'function' &&
+      xolosWalletService.hasPendingIdentityRecord()
+    ) {
+      throw new Error('PENDING_IDENTITY_EXISTS')
+    }
     setLoading(true)
     setError(null)
     try {
@@ -386,6 +392,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       && xolosWalletService.hasBackedWalletCiphertextOnDevice()
     ) {
       throw new Error('BACKED_WALLET_EXISTS')
+    }
+    if (
+      typeof xolosWalletService.hasPendingIdentityRecord === 'function' &&
+      xolosWalletService.hasPendingIdentityRecord()
+    ) {
+      throw new Error('PENDING_IDENTITY_EXISTS')
     }
     setLoading(true)
     setError(null)
@@ -441,12 +453,18 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     let cancelled = false
     void (async () => {
       try {
-        const hasRecord = typeof xolosWalletService.hasQuickStartRecord === 'function'
-          ? await xolosWalletService.hasQuickStartRecord()
-          : false
+        const status = typeof xolosWalletService.getQuickStartRecordStatus === 'function'
+          ? await xolosWalletService.getQuickStartRecordStatus()
+          : (typeof xolosWalletService.hasQuickStartRecord === 'function' && await xolosWalletService.hasQuickStartRecord())
+            ? 'PRESENT'
+            : 'ABSENT_CONFIRMED'
         if (cancelled) return
-        if (!hasRecord) {
+        if (status === 'ABSENT_CONFIRMED') {
           setQuickStartBootstrap('absent')
+          return
+        }
+        if (status === 'STORAGE_UNAVAILABLE_UNKNOWN' || status === 'RECOVERY_FAILED') {
+          setQuickStartBootstrap('failed')
           return
         }
         const restored = await activateQuickStartFromDevice()
@@ -507,6 +525,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       (await xolosWalletService.hasQuickStartRecord())
     ) {
       throw new Error('QUICK_START_RECORD_EXISTS')
+    }
+    if (
+      typeof xolosWalletService.hasPendingIdentityRecord === 'function' &&
+      xolosWalletService.hasPendingIdentityRecord()
+    ) {
+      throw new Error('PENDING_IDENTITY_EXISTS')
     }
     setLoading(true)
     setError(null)
@@ -576,13 +600,19 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const encryptAndStore = useCallback(
     async (password: string) => {
       try {
-        await xolosWalletService.encryptAndStoreMnemonic(password)
+        await xolosWalletService.persistVerifiedBackup(password)
         setBackupVerifiedState(true)
         localStorage.setItem(BACKUP_KEY, 'true')
       } catch (e) {
         console.error(e)
         setError('No pudimos acceder a tu seed para cifrarla. Vuelve a iniciar el proceso de onboarding y respaldo.')
         throw e
+      }
+
+      try {
+        await xolosWalletService.discardQuickStartRecord()
+      } catch (cleanupError) {
+        console.warn('Quick Start cleanup after encryptAndStore encountered an error:', cleanupError)
       }
     },
     []

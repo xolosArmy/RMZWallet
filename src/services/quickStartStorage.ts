@@ -167,6 +167,14 @@ export async function withQuickStartCreationLock<T>(operation: () => Promise<T>)
   })
 }
 
+export function isWebLocksSupported(): boolean {
+  if (testCreationLock) return true
+  return (
+    typeof globalThis.navigator !== 'undefined' &&
+    Boolean(globalThis.navigator.locks && typeof globalThis.navigator.locks.request === 'function')
+  )
+}
+
 export const withIdentityMutationLock = withQuickStartCreationLock
 
 function assertNonExtractableAesGcmKey(key: CryptoKey): void {
@@ -354,6 +362,7 @@ export async function storeQuickStartMnemonic(
   if (metadata.address && parsed.address && parsed.address !== metadata.address) {
     throw new Error('QUICK_START_IDENTITY_MISMATCH')
   }
+  setQuickStartMarker()
   return {
     version: parsed.version,
     derivationProfileId: parsed.derivationProfileId,
@@ -397,7 +406,74 @@ export async function loadQuickStartMnemonic(): Promise<string | null> {
   }
 }
 
+export const QUICK_START_MARKER_STORAGE_KEY = 'tonalli_quickstart_marker'
+
+export function setQuickStartMarker(): void {
+  if (typeof localStorage === 'undefined') return
+  try {
+    localStorage.setItem(
+      QUICK_START_MARKER_STORAGE_KEY,
+      JSON.stringify({ version: 1, createdAt: Date.now() })
+    )
+  } catch {
+    // best-effort
+  }
+}
+
+export function hasQuickStartMarker(): boolean {
+  if (typeof localStorage === 'undefined') return false
+  try {
+    return localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY) !== null
+  } catch {
+    return false
+  }
+}
+
+export function clearQuickStartMarker(): void {
+  if (typeof localStorage === 'undefined') return
+  try {
+    localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
+  } catch {
+    // best-effort
+  }
+}
+
+export type QuickStartRecordStatus =
+  | 'ABSENT_CONFIRMED'
+  | 'PRESENT'
+  | 'STORAGE_UNAVAILABLE_UNKNOWN'
+  | 'RECOVERY_FAILED'
+
+export async function getQuickStartRecordStatus(): Promise<QuickStartRecordStatus> {
+  const marker = hasQuickStartMarker()
+
+  if (typeof indexedDB === 'undefined') {
+    return marker ? 'STORAGE_UNAVAILABLE_UNKNOWN' : 'ABSENT_CONFIRMED'
+  }
+
+  try {
+    const metadata = await loadQuickStartMetadata()
+    if (metadata) {
+      setQuickStartMarker()
+      return 'PRESENT'
+    }
+    if (marker) {
+      clearQuickStartMarker()
+    }
+    return 'ABSENT_CONFIRMED'
+  } catch (error) {
+    if (error instanceof QuickStartUnavailableError) {
+      if (marker) {
+        return 'STORAGE_UNAVAILABLE_UNKNOWN'
+      }
+      return 'ABSENT_CONFIRMED'
+    }
+    return 'RECOVERY_FAILED'
+  }
+}
+
 export async function clearQuickStartMnemonic(): Promise<void> {
+  clearQuickStartMarker()
   if (typeof indexedDB === 'undefined') return
   try {
     const db = await openDb()
@@ -420,9 +496,84 @@ export async function clearQuickStartMnemonic(): Promise<void> {
 
 export async function hasQuickStartMnemonic(): Promise<boolean> {
   try {
-    return Boolean(await loadQuickStartMetadata())
+    const status = await getQuickStartRecordStatus()
+    if (status === 'PRESENT') return true
+    if (status === 'STORAGE_UNAVAILABLE_UNKNOWN') {
+      throw new QuickStartUnavailableError('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
+    }
+    if (status === 'RECOVERY_FAILED') {
+      throw new Error('QUICK_START_RECOVERY_FAILED')
+    }
+    return false
   } catch (error) {
-    if (error instanceof QuickStartUnavailableError) return false
+    if (error instanceof QuickStartUnavailableError) {
+      if (error.message === 'QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN') {
+        throw error
+      }
+      return false
+    }
     throw error
   }
+}
+
+export interface PendingIdentityRecord {
+  ownerToken: string
+  commitment: string
+  address: string
+  createdAt: number
+}
+
+export const PENDING_IDENTITY_STORAGE_KEY = 'xoloswallet_pending_identity'
+export const PENDING_IDENTITY_TTL_MS = 15 * 60 * 1000
+
+export function getPendingIdentityRecord(): PendingIdentityRecord | null {
+  if (typeof localStorage === 'undefined') return null
+  try {
+    const raw = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as PendingIdentityRecord
+    if (parsed && typeof parsed.commitment === 'string' && typeof parsed.ownerToken === 'string') {
+      return parsed
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+export function isPendingIdentityExpired(record: PendingIdentityRecord): boolean {
+  if (typeof record.createdAt !== 'number') return true
+  return Date.now() - record.createdAt > PENDING_IDENTITY_TTL_MS
+}
+
+export function setPendingIdentityRecord(record: PendingIdentityRecord): void {
+  if (typeof localStorage === 'undefined') return
+  try {
+    localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, JSON.stringify(record))
+  } catch {
+    // best-effort
+  }
+}
+
+export function clearPendingIdentityRecord(): void {
+  if (typeof localStorage === 'undefined') return
+  try {
+    localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
+  } catch {
+    // best-effort
+  }
+}
+
+export async function computeMnemonicCommitment(mnemonic: string): Promise<string> {
+  const normalized = mnemonic.trim().toLowerCase().replace(/\s+/g, ' ')
+  if (typeof crypto !== 'undefined' && crypto.subtle && typeof crypto.subtle.digest === 'function') {
+    const data = new TextEncoder().encode(normalized)
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data)
+    return Array.from(new Uint8Array(hashBuffer), b => b.toString(16).padStart(2, '0')).join('')
+  }
+  let hash = 0
+  for (let i = 0; i < normalized.length; i++) {
+    hash = (hash * 31 + normalized.charCodeAt(i)) >>> 0
+  }
+  return hash.toString(16)
 }

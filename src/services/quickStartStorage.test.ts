@@ -6,11 +6,16 @@ import { ECASH_STANDARD_PROFILE_ID } from './derivationProfiles'
 import {
   QuickStartUnavailableError,
   assertQuickStartStorageAvailable,
+  clearQuickStartMarker,
   clearQuickStartMnemonic,
+  getQuickStartRecordStatus,
+  hasQuickStartMarker,
   hasQuickStartMnemonic,
+  isWebLocksSupported,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
   setQuickStartCreationLockForTests,
+  setQuickStartMarker,
   storeQuickStartMnemonic,
   withQuickStartCreationLock
 } from './quickStartStorage'
@@ -310,4 +315,122 @@ describe('Quick Start encrypted storage', () => {
       record && typeof record === 'object' && 'id' in record && (record as { id?: string }).id === 'seed-ciphertext'
     ))).toBe(false)
   })
+
+  describe('Quick Start record status and fail-closed storage unavailable policy', () => {
+    test('fresh profile + IndexedDB unavailable: status is ABSENT_CONFIRMED and hasQuickStartMnemonic is false', async () => {
+      clearQuickStartMarker()
+      const originalOpen = indexedDB.open
+      indexedDB.open = () => {
+        const req = {} as IDBOpenDBRequest
+        setTimeout(() => {
+          if (req.onerror) {
+            Object.defineProperty(req, 'error', {
+              configurable: true,
+              value: new DOMException('IDB inaccessible', 'UnknownError')
+            })
+            req.onerror(new Event('error'))
+          }
+        }, 0)
+        return req
+      }
+
+      try {
+        const status = await getQuickStartRecordStatus()
+        expect(status).toBe('ABSENT_CONFIRMED')
+        expect(await hasQuickStartMnemonic()).toBe(false)
+      } finally {
+        indexedDB.open = originalOpen
+      }
+    })
+
+    test('marker/evidence exists + DB unavailable: fails closed with STORAGE_UNAVAILABLE_UNKNOWN', async () => {
+      setQuickStartMarker()
+      expect(hasQuickStartMarker()).toBe(true)
+
+      const originalOpen = indexedDB.open
+      indexedDB.open = () => {
+        const req = {} as IDBOpenDBRequest
+        setTimeout(() => {
+          if (req.onerror) {
+            Object.defineProperty(req, 'error', {
+              configurable: true,
+              value: new DOMException('IDB inaccessible', 'UnknownError')
+            })
+            req.onerror(new Event('error'))
+          }
+        }, 0)
+        return req
+      }
+
+      try {
+        const status = await getQuickStartRecordStatus()
+        expect(status).toBe('STORAGE_UNAVAILABLE_UNKNOWN')
+        await expect(hasQuickStartMnemonic()).rejects.toThrow('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
+      } finally {
+        indexedDB.open = originalOpen
+        clearQuickStartMarker()
+      }
+    })
+
+    test('IndexedDB returns: original Quick Start recovered with same address and status PRESENT', async () => {
+      await storeQuickStartMnemonic(MNEMONIC, {
+        derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+        address: 'ecash:qoriginalrecover'
+      })
+      expect(hasQuickStartMarker()).toBe(true)
+
+      // Break IDB
+      const originalOpen = indexedDB.open
+      indexedDB.open = () => {
+        const req = {} as IDBOpenDBRequest
+        setTimeout(() => {
+          if (req.onerror) {
+            Object.defineProperty(req, 'error', {
+              configurable: true,
+              value: new DOMException('DB locked', 'UnknownError')
+            })
+            req.onerror(new Event('error'))
+          }
+        }, 0)
+        return req
+      }
+
+      try {
+        expect(await getQuickStartRecordStatus()).toBe('STORAGE_UNAVAILABLE_UNKNOWN')
+      } finally {
+        indexedDB.open = originalOpen
+      }
+
+      // IDB returns
+      expect(await getQuickStartRecordStatus()).toBe('PRESENT')
+      expect(await hasQuickStartMnemonic()).toBe(true)
+      expect(await loadQuickStartMnemonic()).toBe(MNEMONIC)
+      const meta = await loadQuickStartMetadata()
+      expect(meta?.address).toBe('ecash:qoriginalrecover')
+    })
+
+    test('isWebLocksSupported detects Web Locks availability accurately', () => {
+      setQuickStartCreationLockForTests(null)
+      const originalLocks = navigator.locks
+      try {
+        Object.defineProperty(navigator, 'locks', {
+          configurable: true,
+          value: { request: async () => {} }
+        })
+        expect(isWebLocksSupported()).toBe(true)
+
+        Object.defineProperty(navigator, 'locks', {
+          configurable: true,
+          value: undefined
+        })
+        expect(isWebLocksSupported()).toBe(false)
+      } finally {
+        Object.defineProperty(navigator, 'locks', {
+          configurable: true,
+          value: originalLocks
+        })
+      }
+    })
+  })
 })
+

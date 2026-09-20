@@ -29,15 +29,37 @@ import { extractAliasFromOutputScript } from './aliasDiscovery'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 import type { DecryptPasswordResult } from './crypto'
 import {
+  QuickStartUnavailableError,
   assertQuickStartStorageAvailable,
+  clearPendingIdentityRecord,
   clearQuickStartMnemonic,
+  computeMnemonicCommitment,
+  getPendingIdentityRecord,
+  getQuickStartRecordStatus,
   hasQuickStartMnemonic,
+  isPendingIdentityExpired,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
+  setPendingIdentityRecord,
   storeQuickStartMnemonic,
   withQuickStartCreationLock
 } from './quickStartStorage'
+import type { QuickStartRecordStatus } from './quickStartStorage'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
+
+function generateOwnerToken(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  const bytes = new Uint8Array(16)
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes)
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256)
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 import type {
   MinimalXecWallet,
   MinimalXECWalletConstructor,
@@ -420,6 +442,7 @@ export class XolosWalletService {
   private rmzDecimals: number | null = null
   private rmzDecimalsPromise: Promise<number> | null = null
   private pendingAliasReservationExcludedTxids: string[] = []
+  private pendingIdentityOwnerToken: string | null = null
 
   private constructor() {
     this.encryptedMnemonic = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_MNEMONIC) : null
@@ -720,6 +743,12 @@ export class XolosWalletService {
       if (await hasQuickStartMnemonic()) {
         throw new Error('QUICK_START_RECORD_EXISTS')
       }
+      const pending = getPendingIdentityRecord()
+      if (pending && !isPendingIdentityExpired(pending)) {
+        if (!this.pendingIdentityOwnerToken || pending.ownerToken !== this.pendingIdentityOwnerToken) {
+          throw new Error('PENDING_IDENTITY_EXISTS')
+        }
+      }
       if (!this.tryAcquireWalletActivation()) {
         throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
       }
@@ -736,6 +765,15 @@ export class XolosWalletService {
           this.activeAccountState = null
           throw error
         }
+        const ownerToken = generateOwnerToken()
+        const commitment = await computeMnemonicCommitment(mnemonic)
+        this.pendingIdentityOwnerToken = ownerToken
+        setPendingIdentityRecord({
+          ownerToken,
+          commitment,
+          address: this.getAddress() || '',
+          createdAt: Date.now()
+        })
         return this.decryptedMnemonic || ''
       } finally {
         this.releaseWalletActivation()
@@ -771,6 +809,10 @@ export class XolosWalletService {
           throw new Error('QUICK_START_RECOVERY_FAILED')
         }
         return recovered
+      }
+      const pending = getPendingIdentityRecord()
+      if (pending && !isPendingIdentityExpired(pending)) {
+        throw new Error('PENDING_IDENTITY_EXISTS')
       }
 
       await assertQuickStartStorageAvailable()
@@ -872,7 +914,19 @@ export class XolosWalletService {
   }
 
   async hasQuickStartRecord(): Promise<boolean> {
-    return hasQuickStartMnemonic()
+    const status = await getQuickStartRecordStatus()
+    if (status === 'PRESENT') return true
+    if (status === 'STORAGE_UNAVAILABLE_UNKNOWN') {
+      throw new QuickStartUnavailableError('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
+    }
+    if (status === 'RECOVERY_FAILED') {
+      throw new Error('QUICK_START_RECOVERY_FAILED')
+    }
+    return false
+  }
+
+  async getQuickStartRecordStatus(): Promise<QuickStartRecordStatus> {
+    return getQuickStartRecordStatus()
   }
 
   async verifyStoredMnemonic(password: string, expectedMnemonic: string): Promise<boolean> {
@@ -890,6 +944,25 @@ export class XolosWalletService {
       if (!mnemonic) {
         throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
       }
+
+      if (this.hasBackedWalletCiphertextOnDevice()) {
+        const matches = await this.verifyStoredMnemonic(password, mnemonic).catch(() => false)
+        if (!matches) {
+          throw new Error('BACKUP_OVERWRITE_PREVENTED')
+        }
+      }
+
+      const pendingRecord = getPendingIdentityRecord()
+      if (pendingRecord && !isPendingIdentityExpired(pendingRecord)) {
+        const commitment = await computeMnemonicCommitment(mnemonic)
+        if (pendingRecord.commitment !== commitment) {
+          throw new Error('PENDING_IDENTITY_MISMATCH')
+        }
+        if (this.pendingIdentityOwnerToken && pendingRecord.ownerToken !== this.pendingIdentityOwnerToken) {
+          throw new Error('PENDING_IDENTITY_OWNER_MISMATCH')
+        }
+      }
+
       if (await hasQuickStartMnemonic()) {
         const storedMnemonic = await loadQuickStartMnemonic().catch(() => null)
         if (storedMnemonic && storedMnemonic !== mnemonic) {
@@ -901,6 +974,8 @@ export class XolosWalletService {
       if (!verified) {
         throw new Error('QUICK_START_BACKUP_VERIFY_FAILED')
       }
+      clearPendingIdentityRecord()
+      this.pendingIdentityOwnerToken = null
     })
   }
 
@@ -943,6 +1018,12 @@ export class XolosWalletService {
       if (await hasQuickStartMnemonic()) {
         throw new Error('QUICK_START_RECORD_EXISTS')
       }
+      const pending = getPendingIdentityRecord()
+      if (pending && !isPendingIdentityExpired(pending)) {
+        if (!this.pendingIdentityOwnerToken || pending.ownerToken !== this.pendingIdentityOwnerToken) {
+          throw new Error('PENDING_IDENTITY_EXISTS')
+        }
+      }
       if (!this.tryAcquireWalletActivation()) {
         throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
       }
@@ -976,6 +1057,15 @@ export class XolosWalletService {
         }
 
         await this.activateMnemonic(normalizedMnemonic, resolvedProfileId)
+        const ownerToken = generateOwnerToken()
+        const commitment = await computeMnemonicCommitment(normalizedMnemonic)
+        this.pendingIdentityOwnerToken = ownerToken
+        setPendingIdentityRecord({
+          ownerToken,
+          commitment,
+          address: this.getAddress() || '',
+          createdAt: Date.now()
+        })
         const notice = resolvedProfileId === ECASH_STANDARD_PROFILE_ID
           ? detection.reason === 'empty'
             ? 'No se encontró actividad previa. Se utilizará el perfil compatible con eCash/Cashtab.'
@@ -1287,6 +1377,8 @@ export class XolosWalletService {
     try {
       localStorage.removeItem(STORAGE_KEY_MNEMONIC)
       localStorage.removeItem(DERIVATION_PROFILE_STORAGE_KEY)
+      clearPendingIdentityRecord()
+      this.pendingIdentityOwnerToken = null
       this.encryptedMnemonic = null
       this.decryptedMnemonic = null
       this.wallet = null
@@ -1302,6 +1394,24 @@ export class XolosWalletService {
     } finally {
       this.releaseWalletActivation()
     }
+  }
+
+  hasPendingIdentityRecord(): boolean {
+    const pending = getPendingIdentityRecord()
+    return Boolean(pending && !isPendingIdentityExpired(pending))
+  }
+
+  clearPendingIdentity(): void {
+    this.pendingIdentityOwnerToken = null
+    clearPendingIdentityRecord()
+  }
+
+  getPendingIdentityOwnerToken(): string | null {
+    return this.pendingIdentityOwnerToken
+  }
+
+  setPendingIdentityOwnerToken(token: string | null): void {
+    this.pendingIdentityOwnerToken = token
   }
 
   private getEffectiveGapLimit(): number {

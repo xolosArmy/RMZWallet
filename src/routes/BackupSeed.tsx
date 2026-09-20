@@ -59,8 +59,17 @@ function BackupSeed() {
       await completeProgressiveBackup(password)
       setSuccess('Seed respaldada. Puedes usar la billetera.')
       navigate('/')
-    } catch {
-      setError('No pudimos cifrar y verificar el respaldo en este dispositivo. Tu Tonalli temporal se conserva.')
+    } catch (err) {
+      if ((err as Error).message === 'BACKUP_OVERWRITE_PREVENTED') {
+        setError('Ya existe otra wallet cifrada respaldada en este dispositivo. No se sobrescribirá.')
+      } else if (
+        (err as Error).message === 'PENDING_IDENTITY_MISMATCH' ||
+        (err as Error).message === 'PENDING_IDENTITY_OWNER_MISMATCH'
+      ) {
+        setError('La identidad pendiente no coincide con esta sesión.')
+      } else {
+        setError('No pudimos cifrar y verificar el respaldo en este dispositivo. Tu Tonalli temporal se conserva.')
+      }
     } finally {
       setSaving(false)
     }
