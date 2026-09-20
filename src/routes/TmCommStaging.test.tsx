@@ -2563,3 +2563,769 @@ describe('P2-19: Session-expiry invalidation on 401 in refreshMessages', () => {
   })
 })
 
+describe('P2-20: Centralized 401 session invalidation across refresh, bind, and send mutations', () => {
+  const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : 'http://127.0.0.1:5174'
+
+  const makeValidChallenge = (id = 'chlg_p2_20') =>
+    createTmCommAuthChallengeView({
+      challengeId: id,
+      nonce: 'nonce_secret_p2_20',
+      expiresAt: Date.now() + 600_000,
+      audience: origin,
+      origin: origin,
+      sessionContext: 'tm-comm-a0-staging:v1'
+    })
+
+  function createDeferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void
+    let reject!: (reason?: unknown) => void
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    walletListeners.clear()
+    mockSignMessage.mockResolvedValue('signature_p2_20_sig')
+    mockGetPublicKeyHex.mockReturnValue('02' + '11'.repeat(32))
+    setMockWallet({
+      address: 'ecash:walletA',
+      initialized: true,
+      balance: null,
+      loading: false,
+      error: null
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  test('bind() devuelve 401 -> sesión no autenticada, conversación/mensajes purgados, controles protegidos deshabilitados', async () => {
+    const convA = { id: 'conv-bind-401', reservationId: 'rsv-bind-401', createdAt: 1000 }
+    const msgA = {
+      id: 'msg-bind-401-1',
+      clientMessageId: 'cli-b401-1',
+      body: 'BIND_401_SECRET_MSG',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    mockTmCommRequest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (options?.method === 'POST' && path === '/v1/tm-comm/bindings') {
+        return Promise.resolve({ ok: false, status: 401, data: { error: 'SESSION_EXPIRED' } })
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-bind-401/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-bind-401/i)).toBeDefined()
+      expect(screen.getByText(/Reserva: rsv-bind-401/i)).toBeDefined()
+      expect(screen.getByText(/BIND_401_SECRET_MSG/i)).toBeDefined()
+    })
+
+    const bindBtn = screen.getByRole('button', { name: /Consumir invitación/i }) as HTMLButtonElement
+    const sendBtn = screen.getByRole('button', { name: /Enviar al servidor/i }) as HTMLButtonElement
+    const refreshBtn = screen.getByRole('button', { name: /Recargar historial/i }) as HTMLButtonElement
+    const tokenInput = screen.getByLabelText(/Token de enrolamiento/i) as HTMLInputElement
+    const msgInput = screen.getByLabelText(/Cuerpo del mensaje/i) as HTMLTextAreaElement
+    const authBtn = screen.getByRole('button', { name: /Firmar challenge TM-COMM/i }) as HTMLButtonElement
+
+    expect(bindBtn.disabled).toBe(false)
+    expect(sendBtn.disabled).toBe(false)
+    expect(refreshBtn.disabled).toBe(false)
+    expect(tokenInput.disabled).toBe(false)
+    expect(msgInput.disabled).toBe(false)
+
+    fireEvent.click(bindBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM: no autenticada/i)).toBeDefined()
+    })
+
+    expect(screen.queryByText(/BIND_401_SECRET_MSG/i)).toBeNull()
+    expect(screen.getByText(/Conversación: ninguna/i)).toBeDefined()
+    expect(screen.getByText(/Reserva: —/i)).toBeDefined()
+
+    expect(bindBtn.disabled).toBe(true)
+    expect(sendBtn.disabled).toBe(true)
+    expect(refreshBtn.disabled).toBe(true)
+    expect(tokenInput.disabled).toBe(true)
+    expect(msgInput.disabled).toBe(true)
+
+    expect(authBtn.disabled).toBe(false)
+
+    const logText = screen.getByText(/Registro local de evidencia/i).parentElement?.textContent ?? ''
+    expect(logText).toContain('Sesión TM-COMM expirada o no autorizada (401). Se requiere reautenticación.')
+    expect(logText).not.toContain('Binding rechazado (401)')
+  })
+
+  test('send() devuelve 401 -> misma invalidación completa', async () => {
+    const convA = { id: 'conv-send-401', reservationId: 'rsv-send-401', createdAt: 1000 }
+    const msgA = {
+      id: 'msg-send-401-1',
+      clientMessageId: 'cli-s401-1',
+      body: 'SEND_401_SECRET_MSG',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    mockTmCommRequest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (options?.method === 'POST' && path === '/v1/tm-comm/conversations/conv-send-401/messages') {
+        return Promise.resolve({ ok: false, status: 401, data: { error: 'SESSION_EXPIRED' } })
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-send-401/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-send-401/i)).toBeDefined()
+      expect(screen.getByText(/Reserva: rsv-send-401/i)).toBeDefined()
+      expect(screen.getByText(/SEND_401_SECRET_MSG/i)).toBeDefined()
+    })
+
+    const sendBtn = screen.getByRole('button', { name: /Enviar al servidor/i }) as HTMLButtonElement
+    const bindBtn = screen.getByRole('button', { name: /Consumir invitación/i }) as HTMLButtonElement
+    const refreshBtn = screen.getByRole('button', { name: /Recargar historial/i }) as HTMLButtonElement
+    const tokenInput = screen.getByLabelText(/Token de enrolamiento/i) as HTMLInputElement
+    const msgInput = screen.getByLabelText(/Cuerpo del mensaje/i) as HTMLTextAreaElement
+    const authBtn = screen.getByRole('button', { name: /Firmar challenge TM-COMM/i }) as HTMLButtonElement
+
+    fireEvent.click(sendBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM: no autenticada/i)).toBeDefined()
+    })
+
+    expect(screen.queryByText(/SEND_401_SECRET_MSG/i)).toBeNull()
+    expect(screen.getByText(/Conversación: ninguna/i)).toBeDefined()
+    expect(screen.getByText(/Reserva: —/i)).toBeDefined()
+
+    expect(sendBtn.disabled).toBe(true)
+    expect(bindBtn.disabled).toBe(true)
+    expect(refreshBtn.disabled).toBe(true)
+    expect(tokenInput.disabled).toBe(true)
+    expect(msgInput.disabled).toBe(true)
+
+    expect(authBtn.disabled).toBe(false)
+
+    const logText = screen.getByText(/Registro local de evidencia/i).parentElement?.textContent ?? ''
+    expect(logText).toContain('Sesión TM-COMM expirada o no autorizada (401). Se requiere reautenticación.')
+    expect(logText).not.toContain('Envío rechazado (401)')
+  })
+
+  test('refreshMessages() 401 continúa usando el helper centralizado', async () => {
+    const convA = { id: 'conv-ref-401', reservationId: 'rsv-ref-401', createdAt: 1000 }
+    const msgA = {
+      id: 'msg-ref-401-1',
+      clientMessageId: 'cli-r401-1',
+      body: 'REFRESH_401_SECRET_MSG',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    let refreshCallCount = 0
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-ref-401/messages') {
+        refreshCallCount++
+        if (refreshCallCount === 1) {
+          return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+        }
+        return Promise.resolve({ ok: false, status: 401, data: { error: 'SESSION_EXPIRED' } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/REFRESH_401_SECRET_MSG/i)).toBeDefined()
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+    })
+
+    const refreshBtn = screen.getByRole('button', { name: /Recargar historial/i }) as HTMLButtonElement
+    fireEvent.click(refreshBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM: no autenticada/i)).toBeDefined()
+    })
+
+    expect(screen.queryByText(/REFRESH_401_SECRET_MSG/i)).toBeNull()
+    expect(screen.getByText(/Conversación: ninguna/i)).toBeDefined()
+    expect(screen.getByText(/Reserva: —/i)).toBeDefined()
+    expect(refreshBtn.disabled).toBe(true)
+
+    const logText = screen.getByText(/Registro local de evidencia/i).parentElement?.textContent ?? ''
+    expect(logText).toContain('Sesión TM-COMM expirada o no autorizada (401). Se requiere reautenticación.')
+    expect(logText).not.toContain('No se pudieron leer mensajes (401)')
+  })
+
+  test('stale 401 de bind() de generación anterior no destruye una sesión nueva', async () => {
+    const convA = { id: 'conv-b-stale-1', reservationId: 'rsv-b-stale-1', createdAt: 1000 }
+    const convB = { id: 'conv-b-stale-2', reservationId: 'rsv-b-stale-2', createdAt: 2000 }
+    const msgA = {
+      id: 'msg-b-stale-1',
+      clientMessageId: 'cli-bs1',
+      body: 'GEN1_BIND_MSG',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+    const msgB = {
+      id: 'msg-b-stale-2',
+      clientMessageId: 'cli-bs2',
+      body: 'GEN2_AUTHENTICATED_BIND_MSG',
+      senderKind: 'customer',
+      serverCreatedAt: 2010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    const deferredBind401 = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+
+    mockTmCommRequest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (options?.method === 'POST' && path === '/v1/tm-comm/bindings') {
+        return deferredBind401.promise
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-b-stale-1/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/GEN1_BIND_MSG/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-b-stale-1/i)).toBeDefined()
+    })
+
+    // Click bind() which stays pending
+    const bindBtn = screen.getByRole('button', { name: /Consumir invitación/i })
+    fireEvent.click(bindBtn)
+
+    // Switch wallet to B to advance session generation and clear busy state
+    setMockWallet({ address: 'ecash:walletB', initialized: true })
+
+    mockSignMessage.mockResolvedValue('signature_wallet_B')
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/challenges') {
+        return Promise.resolve({ ok: true, status: 201, data: makeValidChallenge('chlg_B_bind_stale') })
+      }
+      if (path === '/v1/tm-comm/sessions') {
+        return Promise.resolve({
+          ok: true,
+          status: 201,
+          data: {
+            principal: { id: 'prn-B', kind: 'customer', walletAddress: 'ecash:walletB' }
+          }
+        })
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-B', kind: 'customer', walletAddress: 'ecash:walletB' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convB] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-b-stale-2/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgB] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /Firmar challenge TM-COMM/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/GEN2_AUTHENTICATED_BIND_MSG/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-b-stale-2/i)).toBeDefined()
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletB\)/i)).toBeDefined()
+    })
+
+    // Now resolve the stale bind() request from generation 1 with 401
+    deferredBind401.resolve({ ok: false, status: 401, data: { error: 'STALE_SESSION_EXPIRED' } })
+
+    // Wait microtasks
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // The stale 401 from generation 1 MUST be ignored; session B stays intact
+    expect(screen.getByText(/GEN2_AUTHENTICATED_BIND_MSG/i)).toBeDefined()
+    expect(screen.getByText(/Conversación: conv-b-stale-2/i)).toBeDefined()
+    expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletB\)/i)).toBeDefined()
+  })
+
+  test('stale 401 de send() de generación anterior no destruye una sesión nueva', async () => {
+    const convA = { id: 'conv-s-stale-1', reservationId: 'rsv-s-stale-1', createdAt: 1000 }
+    const convB = { id: 'conv-s-stale-2', reservationId: 'rsv-s-stale-2', createdAt: 2000 }
+    const msgA = {
+      id: 'msg-s-stale-1',
+      clientMessageId: 'cli-ss1',
+      body: 'GEN1_SEND_MSG',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+    const msgB = {
+      id: 'msg-s-stale-2',
+      clientMessageId: 'cli-ss2',
+      body: 'GEN2_AUTHENTICATED_SEND_MSG',
+      senderKind: 'customer',
+      serverCreatedAt: 2010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    const deferredSend401 = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+
+    mockTmCommRequest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (options?.method === 'POST' && path === '/v1/tm-comm/conversations/conv-s-stale-1/messages') {
+        return deferredSend401.promise
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-s-stale-1/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/GEN1_SEND_MSG/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-s-stale-1/i)).toBeDefined()
+    })
+
+    // Click send() which stays pending
+    const sendBtn = screen.getByRole('button', { name: /Enviar al servidor/i })
+    fireEvent.click(sendBtn)
+
+    // Switch wallet to B to advance session generation and clear busy state
+    setMockWallet({ address: 'ecash:walletB', initialized: true })
+
+    mockSignMessage.mockResolvedValue('signature_wallet_B')
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/challenges') {
+        return Promise.resolve({ ok: true, status: 201, data: makeValidChallenge('chlg_B_send_stale') })
+      }
+      if (path === '/v1/tm-comm/sessions') {
+        return Promise.resolve({
+          ok: true,
+          status: 201,
+          data: {
+            principal: { id: 'prn-B', kind: 'customer', walletAddress: 'ecash:walletB' }
+          }
+        })
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-B', kind: 'customer', walletAddress: 'ecash:walletB' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convB] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-s-stale-2/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgB] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /Firmar challenge TM-COMM/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/GEN2_AUTHENTICATED_SEND_MSG/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-s-stale-2/i)).toBeDefined()
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletB\)/i)).toBeDefined()
+    })
+
+    // Now resolve the stale send() request from generation 1 with 401
+    deferredSend401.resolve({ ok: false, status: 401, data: { error: 'STALE_SESSION_EXPIRED' } })
+
+    // Wait microtasks
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // The stale 401 from generation 1 MUST be ignored; session B stays intact
+    expect(screen.getByText(/GEN2_AUTHENTICATED_SEND_MSG/i)).toBeDefined()
+    expect(screen.getByText(/Conversación: conv-s-stale-2/i)).toBeDefined()
+    expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletB\)/i)).toBeDefined()
+  })
+
+  test('bind() 500 no invalida sesión', async () => {
+    const convA = { id: 'conv-b-500', reservationId: 'rsv-b-500', createdAt: 1000 }
+    const msgA = {
+      id: 'msg-b-500-1',
+      clientMessageId: 'cli-b500-1',
+      body: 'STILL_VISIBLE_AFTER_BIND_500',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    mockTmCommRequest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (options?.method === 'POST' && path === '/v1/tm-comm/bindings') {
+        return Promise.resolve({ ok: false, status: 500, data: { error: 'SERVER_ERROR' } })
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-b-500/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/STILL_VISIBLE_AFTER_BIND_500/i)).toBeDefined()
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+    })
+
+    const bindBtn = screen.getByRole('button', { name: /Consumir invitación/i }) as HTMLButtonElement
+    const sendBtn = screen.getByRole('button', { name: /Enviar al servidor/i }) as HTMLButtonElement
+    const refreshBtn = screen.getByRole('button', { name: /Recargar historial/i }) as HTMLButtonElement
+    fireEvent.click(bindBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Binding rechazado \(500\)\. Una dirección conocida no basta\./i)).toBeDefined()
+    })
+
+    // Session remains authenticated
+    expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+    expect(screen.getByText(/Conversación: conv-b-500/i)).toBeDefined()
+    expect(screen.getByText(/STILL_VISIBLE_AFTER_BIND_500/i)).toBeDefined()
+
+    // Controls remain enabled
+    expect(bindBtn.disabled).toBe(false)
+    expect(sendBtn.disabled).toBe(false)
+    expect(refreshBtn.disabled).toBe(false)
+  })
+
+  test('send() 500 no invalida sesión', async () => {
+    const convA = { id: 'conv-s-500', reservationId: 'rsv-s-500', createdAt: 1000 }
+    const msgA = {
+      id: 'msg-s-500-1',
+      clientMessageId: 'cli-s500-1',
+      body: 'STILL_VISIBLE_AFTER_SEND_500',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    mockTmCommRequest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (options?.method === 'POST' && path === '/v1/tm-comm/conversations/conv-s-500/messages') {
+        return Promise.resolve({ ok: false, status: 500, data: { error: 'SERVER_ERROR' } })
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-s-500/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/STILL_VISIBLE_AFTER_SEND_500/i)).toBeDefined()
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+    })
+
+    const sendBtn = screen.getByRole('button', { name: /Enviar al servidor/i }) as HTMLButtonElement
+    const bindBtn = screen.getByRole('button', { name: /Consumir invitación/i }) as HTMLButtonElement
+    const refreshBtn = screen.getByRole('button', { name: /Recargar historial/i }) as HTMLButtonElement
+    fireEvent.click(sendBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Envío rechazado \(500\)\./i)).toBeDefined()
+    })
+
+    // Session remains authenticated
+    expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+    expect(screen.getByText(/Conversación: conv-s-500/i)).toBeDefined()
+    expect(screen.getByText(/STILL_VISIBLE_AFTER_SEND_500/i)).toBeDefined()
+
+    // Controls remain enabled
+    expect(sendBtn.disabled).toBe(false)
+    expect(bindBtn.disabled).toBe(false)
+    expect(refreshBtn.disabled).toBe(false)
+  })
+
+  test('reautenticación después de un mutation-401 funciona normalmente', async () => {
+    const convA = { id: 'conv-mut-401', reservationId: 'rsv-mut-401', createdAt: 1000 }
+    const convRestored = { id: 'conv-mut-restored', reservationId: 'rsv-mut-restored', createdAt: 2000 }
+    const msgA = {
+      id: 'msg-mut-1',
+      clientMessageId: 'cli-m-1',
+      body: 'BEFORE_MUT_401_MSG',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+    const msgRestored = {
+      id: 'msg-mut-2',
+      clientMessageId: 'cli-m-2',
+      body: 'RESTORED_AFTER_MUT_401_MSG',
+      senderKind: 'customer',
+      serverCreatedAt: 2010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    let isReauthenticated = false
+
+    mockTmCommRequest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (options?.method === 'POST' && path === '/v1/tm-comm/conversations/conv-mut-401/messages') {
+        return Promise.resolve({ ok: false, status: 401, data: { error: 'SESSION_EXPIRED' } })
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { conversations: isReauthenticated ? [convRestored] : [convA] }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-mut-401/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-mut-restored/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgRestored] } })
+      }
+      if (path === '/v1/tm-comm/challenges') {
+        return Promise.resolve({ ok: true, status: 200, data: makeValidChallenge('chlg_reauth_mut') })
+      }
+      if (path === '/v1/tm-comm/sessions') {
+        isReauthenticated = true
+        return Promise.resolve({ ok: true, status: 200, data: { session: { id: 'sess-restored' } } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/BEFORE_MUT_401_MSG/i)).toBeDefined()
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+    })
+
+    // Trigger mutation 401 via send()
+    const sendBtn = screen.getByRole('button', { name: /Enviar al servidor/i })
+    fireEvent.click(sendBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM: no autenticada/i)).toBeDefined()
+    })
+    expect(screen.queryByText(/BEFORE_MUT_401_MSG/i)).toBeNull()
+
+    // Re-authenticate
+    const authBtn = screen.getByRole('button', { name: /Firmar challenge TM-COMM/i })
+    fireEvent.click(authBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-mut-restored/i)).toBeDefined()
+      expect(screen.getByText(/RESTORED_AFTER_MUT_401_MSG/i)).toBeDefined()
+    })
+
+    // Controls re-enabled
+    const newSendBtn = screen.getByRole('button', { name: /Enviar al servidor/i }) as HTMLButtonElement
+    const newBindBtn = screen.getByRole('button', { name: /Consumir invitación/i }) as HTMLButtonElement
+    const newRefreshBtn = screen.getByRole('button', { name: /Recargar historial/i }) as HTMLButtonElement
+    expect(newSendBtn.disabled).toBe(false)
+    expect(newBindBtn.disabled).toBe(false)
+    expect(newRefreshBtn.disabled).toBe(false)
+  })
+
+  test('late completion de requests de la sesión invalidada no repuebla estado', async () => {
+    const convA = { id: 'conv-late-comp', reservationId: 'rsv-late-comp', createdAt: 1000 }
+    const msgA = {
+      id: 'msg-late-1',
+      clientMessageId: 'cli-lc-1',
+      body: 'EARLY_INITIAL_MSG',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    const deferredLateFetch = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+    let msgCallCount = 0
+
+    mockTmCommRequest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (options?.method === 'POST' && path === '/v1/tm-comm/bindings') {
+        // Mutation returns 401
+        return Promise.resolve({ ok: false, status: 401, data: { error: 'SESSION_EXPIRED' } })
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-late-comp/messages') {
+        msgCallCount++
+        if (msgCallCount === 1) {
+          return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+        }
+        // Second fetch is held pending
+        return deferredLateFetch.promise
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/EARLY_INITIAL_MSG/i)).toBeDefined()
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+    })
+
+    // Start a message refresh that stays pending
+    const refreshBtn = screen.getByRole('button', { name: /Recargar historial/i })
+    fireEvent.click(refreshBtn)
+
+    // Now trigger bind() which returns 401 and invalidates session
+    const bindBtn = screen.getByRole('button', { name: /Consumir invitación/i })
+    fireEvent.click(bindBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM: no autenticada/i)).toBeDefined()
+    })
+    expect(screen.queryByText(/EARLY_INITIAL_MSG/i)).toBeNull()
+
+    // Now resolve the old pending fetch with data
+    deferredLateFetch.resolve({
+      ok: true,
+      status: 200,
+      data: {
+        messages: [
+          {
+            id: 'msg-polluting-late',
+            clientMessageId: 'cli-late-pollute',
+            body: 'POLLUTING_LATE_MSG_DATA',
+            senderKind: 'customer',
+            serverCreatedAt: 3000,
+            status: 'delivered',
+            replyToId: null
+          }
+        ]
+      }
+    })
+
+    // Wait microtasks
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // Late completion cannot repopulate state
+    expect(screen.queryByText(/POLLUTING_LATE_MSG_DATA/i)).toBeNull()
+    expect(screen.queryByText(/EARLY_INITIAL_MSG/i)).toBeNull()
+    expect(screen.getByText(/Conversación: ninguna/i)).toBeDefined()
+    expect(screen.getByText(/Sesión TM-COMM: no autenticada/i)).toBeDefined()
+  })
+})
+
+

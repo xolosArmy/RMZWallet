@@ -82,6 +82,28 @@ function TmCommStaging() {
     setLog((current) => [...current, { address, isPrivate, text: line }])
   }
 
+  const invalidateTmCommSession = (
+    expectedGeneration: number,
+    reason: string
+  ): boolean => {
+    if (expectedGeneration !== sessionGenerationRef.current) {
+      return false
+    }
+
+    hydrationAbortRef.current?.abort()
+    messageAbortRef.current?.abort()
+    sessionGenerationRef.current++
+    messageRequestGenRef.current++
+    setAuthWallet(null)
+    setConversations([])
+    setConversation(null)
+    setMessages([])
+    activeConversationIdRef.current = null
+    setOperationBusy(false)
+    append(reason)
+    return true
+  }
+
   const refreshMessages = async (
     conversationId = conversation?.id,
     targetSessionGen = sessionGenerationRef.current,
@@ -126,17 +148,10 @@ function TmCommStaging() {
 
     if (!listed.ok) {
       if (listed.status === 401) {
-        hydrationAbortRef.current?.abort()
-        messageAbortRef.current?.abort()
-        sessionGenerationRef.current++
-        messageRequestGenRef.current++
-        setAuthWallet(null)
-        setConversations([])
-        setConversation(null)
-        setMessages([])
-        activeConversationIdRef.current = null
-        setOperationBusy(false)
-        append('Sesión TM-COMM expirada o no autorizada (401). Se requiere reautenticación.')
+        invalidateTmCommSession(
+          targetSessionGen,
+          'Sesión TM-COMM expirada o no autorizada (401). Se requiere reautenticación.'
+        )
         return
       }
       append(`No se pudieron leer mensajes (${listed.status}).`)
@@ -403,6 +418,13 @@ function TmCommStaging() {
         body: JSON.stringify({ enrollmentToken })
       })
       if (currentGen !== sessionGenerationRef.current) return
+      if (result.status === 401) {
+        invalidateTmCommSession(
+          currentGen,
+          'Sesión TM-COMM expirada o no autorizada (401). Se requiere reautenticación.'
+        )
+        return
+      }
       if (!result.ok) {
         append(`Binding rechazado (${result.status}). Una dirección conocida no basta.`)
         return
@@ -441,6 +463,13 @@ function TmCommStaging() {
         }
       )
       if (currentGen !== sessionGenerationRef.current) return
+      if (sent.status === 401) {
+        invalidateTmCommSession(
+          currentGen,
+          'Sesión TM-COMM expirada o no autorizada (401). Se requiere reautenticación.'
+        )
+        return
+      }
       if (!sent.ok) {
         append(`Envío rechazado (${sent.status}).`)
         return

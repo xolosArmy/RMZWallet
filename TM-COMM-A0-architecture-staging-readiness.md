@@ -26,11 +26,90 @@ Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No m
 | **PASS 9 REVIEWED HEAD** | `6c06d481d1b43666a5ce8ee9578b580fdbb6f79c` |
 | **PASS 9 REMEDIATION SHA** | `07bd04a99025fe9bf8aa6bebb2ec90d5e422d8ea` |
 | **PASS 10 REVIEWED HEAD** | `07bd04a99025fe9bf8aa6bebb2ec90d5e422d8ea` |
-| **PASS 10 REMEDIATION SHA** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 Pass 10 closure) |
+| **PASS 10 REMEDIATION SHA** | `4696de3ea0df0300c174d7313cff22022ce39747` |
+| **PASS 11 REVIEWED HEAD** | `4696de3ea0df0300c174d7313cff22022ce39747` |
+| **PASS 11 REMEDIATION SHA** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 Pass 11 closure) |
 | Staging API | http://127.0.0.1:4178/v1/tm-comm/health |
 | Staging UI | http://127.0.0.1:5174/tm-comm-staging |
-| Estado | **READY FOR FRESH CODEX REVIEW (PASS 10 CLOSURE)** |
+| Estado | **READY FOR FRESH CODEX REVIEW (PASS 11 CLOSURE)** |
 | Merge | **No** |
+
+---
+
+## Remediation Pass 11 (Codex Finding P2-20)
+
+El fresh Codex review ejecutado sobre el exact HEAD `4696de3ea0df0300c174d7313cff22022ce39747` identificó exactamente 1 finding P2 abierto:
+1. `Invalidate the session on mutation 401 responses` (Thread `PRRT_kwDOQYWUus6kGH5D`)
+
+El finding ha sido completamente remediado conservando todas las remediaciones e invariantes de arquitectura anteriores:
+
+### P2-20: Invalidate the session on mutation 401 responses (Thread `PRRT_kwDOQYWUus6kGH5D`)
+- **Causa raíz**: En `src/routes/TmCommStaging.tsx`, mientras que `refreshMessages()` invalidaba el estado local y la autenticación ante un HTTP 401 (remediado en Pass 10), los manejadores de mutaciones `bind()` (POST `/v1/tm-comm/bindings`) y `send()` (POST `/v1/tm-comm/conversations/:id/messages`) trataban el HTTP 401 como un fallo genérico sin limpiar el estado (`Binding rechazado (${result.status})` y `Envío rechazado (${sent.status})`). Si la sesión HttpOnly expiraba o era revocada antes o durante un bind o un POST de mensaje, la respuesta 401 no llegaba nunca a `refreshMessages()`. En consecuencia, la interfaz continuaba presentando la sesión como autenticada (`authenticatedWalletAddress`), reteniendo las conversaciones, el historial confidencial de mensajes y las referencias a reservas en pantalla, con los controles de mutación en un estado incongruente.
+- **Remediación**:
+  1. **Helper Centralizado de Invalidación de Sesión (`invalidateTmCommSession`)**:
+     Se extrajo la lógica fail-closed a una función interna única:
+     ```ts
+     const invalidateTmCommSession = (
+       expectedGeneration: number,
+       reason: string
+     ): boolean => {
+       if (expectedGeneration !== sessionGenerationRef.current) {
+         return false
+       }
+
+       hydrationAbortRef.current?.abort()
+       messageAbortRef.current?.abort()
+       sessionGenerationRef.current++
+       messageRequestGenRef.current++
+       setAuthWallet(null)
+       setConversations([])
+       setConversation(null)
+       setMessages([])
+       activeConversationIdRef.current = null
+       setOperationBusy(false)
+       append(reason)
+       return true
+     }
+     ```
+     - Inicia verificando la condición estricta de generación: `if (expectedGeneration !== sessionGenerationRef.current) return false`.
+     - Cancela señales en curso (`hydrationAbortRef?.abort()`, `messageAbortRef?.abort()`).
+     - Incrementa atómicamente `sessionGenerationRef` y `messageRequestGenRef` para volver obsoletas irrevocablemente todas las solicitudes pendientes de la sesión invalidada.
+     - Invoca `setAuthWallet(null)` manteniendo sincronizados en un solo paso reactivo el estado React `authenticatedWalletAddress` y su referencia interna `authenticatedWalletAddressRef.current`.
+     - Restablece a vacío/nulo `conversations`, `conversation`, `messages` y `activeConversationIdRef.current`.
+     - Libera el bloqueo operativo `setOperationBusy(false)`.
+     - Registra la razón de invalidación: `Sesión TM-COMM expirada o no autorizada (401). Se requiere reautenticación.`
+     - Retorna `true`.
+  2. **Reutilización en los Tres Caminos de 401**:
+     - `refreshMessages()`: Invoca `invalidateTmCommSession(targetSessionGen, reason)` ante `listed.status === 401`.
+     - `bind()`: Inmediatamente tras `if (currentGen !== sessionGenerationRef.current) return`, si `result.status === 401` invoca `invalidateTmCommSession(currentGen, reason)` y retorna inmediatamente.
+     - `send()`: Inmediatamente tras `if (currentGen !== sessionGenerationRef.current) return`, si `sent.status === 401` invoca `invalidateTmCommSession(currentGen, reason)` y retorna inmediatamente.
+     - Conservación de semántica para errores no-401 (ej. HTTP 500, 400):
+       - `bind` non-401: error operativo, registra en log y conserva sesión.
+       - `send` non-401: error operativo, registra en log y conserva sesión.
+       - `refreshMessages` non-401: conserva sesión.
+  3. **Generation Safety y Concurrencia**:
+     - Respuestas 401 viejas de generaciones anteriores nunca invalidan una sesión nueva legítima. El helper es la autoridad final verificando `expectedGeneration === sessionGenerationRef.current`.
+     - Tras el incremento de generación en el helper, los bloques `finally` de callers anteriores fallan congruentemente su guard `currentGen === sessionGenerationRef.current`, lo cual es el comportamiento correcto ya que el helper ya ejecutó `setOperationBusy(false)`.
+- **Archivos modificados**:
+  - `src/routes/TmCommStaging.tsx`
+  - `src/routes/TmCommStaging.test.tsx`
+  - `TM-COMM-A0-architecture-staging-readiness.md`
+- **Tests agregados**:
+  - `src/routes/TmCommStaging.test.tsx`: 9 nuevos tests unitarios e integrados bajo `describe('P2-20: Centralized 401 session invalidation across refresh, bind, and send mutations')`:
+    1. `bind() devuelve 401 -> sesión no autenticada, conversación/mensajes purgados, controles protegidos deshabilitados`
+    2. `send() devuelve 401 -> misma invalidación completa`
+    3. `refreshMessages() 401 continúa usando el helper centralizado`
+    4. `stale 401 de bind() de generación anterior no destruye una sesión nueva`
+    5. `stale 401 de send() de generación anterior no destruye una sesión nueva`
+    6. `bind() 500 no invalida sesión`
+    7. `send() 500 no invalida sesión`
+    8. `reautenticación después de un mutation-401 funciona normalmente`
+    9. `late completion de requests de la sesión invalidada no repuebla estado`
+  - Total suite de TM-COMM: 6 suites, 142/142 tests passing.
+  - Total suite del repositorio: 150 suites, 2790/2790 tests passing.
+  - Differential lint: 0 nuevos findings (328 problemas preexistentes idénticos a la línea base).
+
+---
 
 ---
 
