@@ -18,7 +18,8 @@ const morePaths = new Set([
   '/settings',
   '/reveal-seed',
   '/x402-demo',
-  '/x402-staging'
+  '/x402-staging',
+  '/tm-comm-staging'
 ])
 
 export const walletNavigationItems: WalletNavigationItem[] = [

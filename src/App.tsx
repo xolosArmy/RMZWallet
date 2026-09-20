@@ -32,10 +32,12 @@ import { wcWallet } from './lib/walletconnect/WcWallet'
 import { X402_DRY_RUN_ENABLED } from './integrations/x402/x402DryRunFeature'
 import { X402_STAGING_TEST_ENABLED } from './integrations/x402/x402StagingFeature'
 import { X402_H3B_ENABLED } from './integrations/x402/x402H3BFeature'
+import { TM_COMM_STAGING_ENABLED } from './config/tmCommStaging'
 import AppNavigationLayout from './components/AppNavigationLayout'
 const X402Demo = lazy(() => import('./routes/X402Demo'))
 const X402Staging = lazy(() => import('./routes/X402Staging'))
 const X402AuthorizeRequest = lazy(() => import('./routes/X402AuthorizeRequest'))
+const TmCommStaging = lazy(() => import('./routes/TmCommStaging'))
 
 function App() {
   const [wcState, setWcState] = useState(() => wcWallet.getState())
@@ -94,6 +96,12 @@ function App() {
             <Route
               path="/x402-staging"
               element={<Suspense fallback={<div className="muted">Cargando prueba staging...</div>}><X402Staging /></Suspense>}
+            />
+          )}
+          {TM_COMM_STAGING_ENABLED && (
+            <Route
+              path="/tm-comm-staging"
+              element={<Suspense fallback={<div className="muted">Cargando staging TM-COMM...</div>}><TmCommStaging /></Suspense>}
             />
           )}
           {X402_H3B_ENABLED && (
