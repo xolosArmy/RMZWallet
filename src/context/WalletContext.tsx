@@ -12,8 +12,7 @@ import type { DerivationProfileId } from '../services/derivationProfiles'
 import { WalletContext, type QuickStartBootstrapStatus } from './walletContext'
 import { WALLET_REFRESH_EVENT, type WalletRefreshDetail } from '../utils/walletRefresh'
 import { discoverAliasForAddress } from '../services/aliasDiscovery'
-import { WALLET_CAPABILITY, assertCapability, isCapabilityAllowed } from '../domain/walletCapabilities'
-import type { WalletCapability } from '../domain/walletCapabilities'
+import { WALLET_CAPABILITY, assertCapability, isCapabilityAllowed, type WalletCapability } from '../domain/walletCapabilities'
 import { resolveWalletLifecycle } from '../domain/walletLifecycle'
 import { QuickStartUnavailableError } from '../services/quickStartStorage'
 
@@ -341,7 +340,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     if (initialized) {
       throw new Error('WALLET_ALREADY_INITIALIZED')
     }
-    if (await xolosWalletService.hasQuickStartRecord()) {
+    if (
+      typeof xolosWalletService.hasBackedWalletCiphertextOnDevice === 'function' &&
+      xolosWalletService.hasBackedWalletCiphertextOnDevice()
+    ) {
+      throw new Error('BACKED_WALLET_EXISTS')
+    }
+    if (
+      typeof xolosWalletService.hasQuickStartRecord === 'function' &&
+      (await xolosWalletService.hasQuickStartRecord())
+    ) {
       throw new Error('QUICK_START_RECORD_EXISTS')
     }
     setLoading(true)
@@ -459,11 +467,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       await xolosWalletService.persistVerifiedBackup(password)
       setBackupVerifiedState(true)
       localStorage.setItem(BACKUP_KEY, 'true')
-      await xolosWalletService.discardQuickStartRecord()
     } catch (e) {
       console.error(e)
       setError('No pudimos cifrar y verificar el respaldo en este dispositivo.')
       throw e
+    }
+
+    try {
+      await xolosWalletService.discardQuickStartRecord()
+    } catch (cleanupError) {
+      console.warn('Quick Start cleanup after verified backup commit encountered an error:', cleanupError)
     }
   }, [])
 
@@ -483,7 +496,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     if (initialized) {
       throw new Error('WALLET_ALREADY_INITIALIZED')
     }
-    if (await xolosWalletService.hasQuickStartRecord()) {
+    if (
+      typeof xolosWalletService.hasBackedWalletCiphertextOnDevice === 'function' &&
+      xolosWalletService.hasBackedWalletCiphertextOnDevice()
+    ) {
+      throw new Error('BACKED_WALLET_EXISTS')
+    }
+    if (
+      typeof xolosWalletService.hasQuickStartRecord === 'function' &&
+      (await xolosWalletService.hasQuickStartRecord())
+    ) {
       throw new Error('QUICK_START_RECORD_EXISTS')
     }
     setLoading(true)
@@ -518,7 +540,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         setInitialized(true)
         setBackupVerifiedState(verified)
         if (verified && typeof xolosWalletService.discardQuickStartRecord === 'function') {
-          await xolosWalletService.discardQuickStartRecord()
+          try {
+            await xolosWalletService.discardQuickStartRecord()
+          } catch (cleanupError) {
+            console.warn('Quick Start cleanup after loadExistingWallet encountered an error:', cleanupError)
+          }
         }
         void syncAddressAndBalance({ optionalBalance: true })
         return result

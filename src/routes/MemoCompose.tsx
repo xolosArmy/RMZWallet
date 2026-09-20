@@ -51,7 +51,7 @@ export function MemoCompose({
   const executor = customExecutor ?? productionExecutor
   const effectiveRecoveryStore =
     customRecoveryStore ??
-    (customExecutor as any)?.recoveryStore ??
+    (customExecutor as { recoveryStore?: typeof productionRecoveryStore } | null | undefined)?.recoveryStore ??
     productionRecoveryStore
 
   if (!canPublishMemo) {

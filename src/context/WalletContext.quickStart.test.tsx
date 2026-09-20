@@ -6,6 +6,7 @@ import { WalletProvider } from './WalletContext'
 import { useWallet } from './useWallet'
 import { WALLET_LIFECYCLE } from '../domain/walletLifecycle'
 import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
+import { QuickStartUnavailableError } from '../services/quickStartStorage'
 
 const serviceMocks = vi.hoisted(() => ({
   getAddress: vi.fn(() => 'ecash:qquickstart'),
@@ -173,6 +174,36 @@ describe('WalletContext Quick Start lifecycle', () => {
     await expect(wallet!.completeProgressiveBackup('123456')).rejects.toThrow()
     expect(wallet!.lifecycle).toBe(WALLET_LIFECYCLE.QUICK_START_UNBACKED)
     expect(serviceMocks.discardQuickStartRecord).not.toHaveBeenCalled()
+  })
+
+  it('IndexedDB unavailable -> PIN backup completes -> BACKUP_VERIFIED -> UI success -> no destructive replacement', async () => {
+    serviceMocks.persistVerifiedBackup.mockResolvedValueOnce(undefined)
+    serviceMocks.discardQuickStartRecord.mockRejectedValueOnce(
+      new QuickStartUnavailableError('QUICK_START_STORAGE_UNAVAILABLE')
+    )
+    let wallet: ReturnType<typeof useWallet> | null = null
+    render(
+      <WalletProvider>
+        <Harness onReady={(value) => { wallet = value }} />
+      </WalletProvider>
+    )
+    await waitFor(() => {
+      expect(wallet!.quickStartBootstrap).toBe('absent')
+    })
+    await wallet!.startQuickStartWallet()
+    await waitFor(() => {
+      expect(wallet!.lifecycle).toBe(WALLET_LIFECYCLE.QUICK_START_UNBACKED)
+    })
+
+    await expect(wallet!.completeProgressiveBackup('123456')).resolves.toBeUndefined()
+    await waitFor(() => {
+      expect(wallet!.lifecycle).toBe(WALLET_LIFECYCLE.BACKUP_VERIFIED)
+    })
+    expect(wallet!.error).toBeNull()
+    expect(serviceMocks.persistVerifiedBackup).toHaveBeenCalledWith('123456')
+    expect(serviceMocks.discardQuickStartRecord).toHaveBeenCalled()
+    expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('true')
+    expect(serviceMocks.createNewWallet).not.toHaveBeenCalled()
   })
 
   it('does not create a second wallet when hydration is delayed and create is clicked', async () => {

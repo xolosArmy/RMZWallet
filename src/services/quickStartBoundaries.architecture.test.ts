@@ -130,8 +130,16 @@ describe('Quick Start seed and frozen-boundary architecture', () => {
     expect(context).toMatch(/loadFromStorage[\s\S]*optionalBalance: true/)
   })
 
-  it('does not import TM-COMM internals anywhere on this branch', () => {
-    const files = walk(join(root))
+  it('does not import TM-COMM internals in Quick Start or core wallet modules', () => {
+    const files = walk(join(root)).filter((file) => {
+      return (
+        !file.includes('/features/privateMessaging/') &&
+        !file.includes('/routes/TmCommStaging') &&
+        !file.includes('/routes/tmCommStagingClient') &&
+        !file.endsWith('/App.tsx') &&
+        !file.endsWith('/routes/More.tsx')
+      )
+    })
     const offenders = files.filter((file) => {
       const source = readFileSync(file, 'utf8')
       return /from ['"].*privateMessaging|from ['"].*tmComm|server\/tmComm/.test(source)

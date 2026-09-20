@@ -713,29 +713,34 @@ export class XolosWalletService {
   }
 
   async createNewWallet(): Promise<string> {
-    if (!this.tryAcquireWalletActivation()) {
-      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
-    }
-    try {
+    return withQuickStartCreationLock(async () => {
+      if (this.hasBackedWalletCiphertextOnDevice()) {
+        throw new Error('BACKED_WALLET_EXISTS')
+      }
       if (await hasQuickStartMnemonic()) {
         throw new Error('QUICK_START_RECORD_EXISTS')
       }
-      const mnemonic = generateMnemonic(wordlist, 128)
-      await this.activateMnemonicLocalIdentity(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
-      this.encryptedMnemonic = null
-      try {
-        await (this.wallet as MinimalXecWallet).initialize()
-      } catch (error) {
-        this.decryptedMnemonic = null
-        this.wallet = null
-        this.isReady = false
-        this.activeAccountState = null
-        throw error
+      if (!this.tryAcquireWalletActivation()) {
+        throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
       }
-      return this.decryptedMnemonic || ''
-    } finally {
-      this.releaseWalletActivation()
-    }
+      try {
+        const mnemonic = generateMnemonic(wordlist, 128)
+        await this.activateMnemonicLocalIdentity(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
+        this.encryptedMnemonic = null
+        try {
+          await (this.wallet as MinimalXecWallet).initialize()
+        } catch (error) {
+          this.decryptedMnemonic = null
+          this.wallet = null
+          this.isReady = false
+          this.activeAccountState = null
+          throw error
+        }
+        return this.decryptedMnemonic || ''
+      } finally {
+        this.releaseWalletActivation()
+      }
+    })
   }
 
   private async activateMnemonicLocalIdentity(
@@ -880,18 +885,37 @@ export class XolosWalletService {
   }
 
   async persistVerifiedBackup(password: string): Promise<void> {
-    const mnemonic = this.getMnemonic()
-    if (!mnemonic) {
-      throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
-    }
-    await this.encryptAndStoreMnemonic(password)
-    const verified = await this.verifyStoredMnemonic(password, mnemonic)
-    if (!verified) {
-      throw new Error('QUICK_START_BACKUP_VERIFY_FAILED')
-    }
+    return withQuickStartCreationLock(async () => {
+      const mnemonic = this.getMnemonic()
+      if (!mnemonic) {
+        throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
+      }
+      if (await hasQuickStartMnemonic()) {
+        const storedMnemonic = await loadQuickStartMnemonic().catch(() => null)
+        if (storedMnemonic && storedMnemonic !== mnemonic) {
+          throw new Error('QUICK_START_WALLET_EXISTS')
+        }
+      }
+      await this.encryptAndStoreMnemonic(password)
+      const verified = await this.verifyStoredMnemonic(password, mnemonic)
+      if (!verified) {
+        throw new Error('QUICK_START_BACKUP_VERIFY_FAILED')
+      }
+    })
   }
 
   async discardQuickStartRecord(): Promise<void> {
+    const currentMnemonic = this.getMnemonic()
+    if (currentMnemonic) {
+      try {
+        const storedMnemonic = await loadQuickStartMnemonic()
+        if (storedMnemonic && storedMnemonic !== currentMnemonic) {
+          return
+        }
+      } catch {
+        // If loading fails due to unavailable storage or corrupt record, proceed
+      }
+    }
     await clearQuickStartMnemonic()
   }
 
@@ -912,56 +936,64 @@ export class XolosWalletService {
     mnemonic: string,
     selectedProfileId?: DerivationProfileId
   ): Promise<WalletRestoreResult> {
-    if (!this.tryAcquireWalletActivation()) {
-      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
-    }
-    try {
-      const normalizedMnemonic = mnemonic.trim()
-      const detection = await this.detectDerivationProfiles(normalizedMnemonic)
+    return withQuickStartCreationLock(async () => {
+      if (this.hasBackedWalletCiphertextOnDevice()) {
+        throw new Error('BACKED_WALLET_EXISTS')
+      }
+      if (await hasQuickStartMnemonic()) {
+        throw new Error('QUICK_START_RECORD_EXISTS')
+      }
+      if (!this.tryAcquireWalletActivation()) {
+        throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
+      }
+      try {
+        const normalizedMnemonic = mnemonic.trim()
+        const detection = await this.detectDerivationProfiles(normalizedMnemonic)
 
-      if (detection.kind === 'choice-required' && selectedProfileId === undefined) {
+        if (detection.kind === 'choice-required' && selectedProfileId === undefined) {
+          return Object.freeze({
+            status: 'choice-required',
+            detection,
+            notice: 'Encontramos actividad en varios engines asociados a esta seed. Elige cuál quieres abrir.'
+          })
+        }
+
+        const resolvedProfileId = selectedProfileId ?? detection.selectedProfileId
+        if (!isDerivationProfileId(resolvedProfileId)) {
+          throw new Error('No se pudo resolver un perfil de derivación válido.')
+        }
+        if (
+          detection.kind === 'choice-required' &&
+          !detection.profiles[resolvedProfileId].hasActivity
+        ) {
+          throw new Error('El perfil solicitado no contiene actividad detectada para esta seed.')
+        }
+        if (
+          detection.kind === 'selected' &&
+          detection.selectedProfileId !== resolvedProfileId
+        ) {
+          throw new Error('El perfil solicitado no coincide con la actividad detectada para esta seed.')
+        }
+
+        await this.activateMnemonic(normalizedMnemonic, resolvedProfileId)
+        const notice = resolvedProfileId === ECASH_STANDARD_PROFILE_ID
+          ? detection.reason === 'empty'
+            ? 'No se encontró actividad previa. Se utilizará el perfil compatible con eCash/Cashtab.'
+            : 'Se encontró una wallet compatible con eCash/Cashtab.'
+          : resolvedProfileId === TONALLI_LEGACY_PROFILE_ID
+            ? 'Se encontró una wallet Tonalli con derivación criptográfica histórica.'
+            : 'Se encontró una wallet de la ventana transitoria eCash Standard 899.'
+
         return Object.freeze({
-          status: 'choice-required',
+          status: 'restored',
           detection,
-          notice: 'Encontramos actividad en varios engines asociados a esta seed. Elige cuál quieres abrir.'
+          selectedProfileId: resolvedProfileId,
+          notice
         })
+      } finally {
+        this.releaseWalletActivation()
       }
-
-      const resolvedProfileId = selectedProfileId ?? detection.selectedProfileId
-      if (!isDerivationProfileId(resolvedProfileId)) {
-        throw new Error('No se pudo resolver un perfil de derivación válido.')
-      }
-      if (
-        detection.kind === 'choice-required' &&
-        !detection.profiles[resolvedProfileId].hasActivity
-      ) {
-        throw new Error('El perfil solicitado no contiene actividad detectada para esta seed.')
-      }
-      if (
-        detection.kind === 'selected' &&
-        detection.selectedProfileId !== resolvedProfileId
-      ) {
-        throw new Error('El perfil solicitado no coincide con la actividad detectada para esta seed.')
-      }
-
-      await this.activateMnemonic(normalizedMnemonic, resolvedProfileId)
-      const notice = resolvedProfileId === ECASH_STANDARD_PROFILE_ID
-        ? detection.reason === 'empty'
-          ? 'No se encontró actividad previa. Se utilizará el perfil compatible con eCash/Cashtab.'
-          : 'Se encontró una wallet compatible con eCash/Cashtab.'
-        : resolvedProfileId === TONALLI_LEGACY_PROFILE_ID
-          ? 'Se encontró una wallet Tonalli con derivación criptográfica histórica.'
-          : 'Se encontró una wallet de la ventana transitoria eCash Standard 899.'
-
-      return Object.freeze({
-        status: 'restored',
-        detection,
-        selectedProfileId: resolvedProfileId,
-        notice
-      })
-    } finally {
-      this.releaseWalletActivation()
-    }
+    })
   }
 
   async loadFromStorage(

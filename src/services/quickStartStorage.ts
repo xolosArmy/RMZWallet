@@ -167,6 +167,8 @@ export async function withQuickStartCreationLock<T>(operation: () => Promise<T>)
   })
 }
 
+export const withIdentityMutationLock = withQuickStartCreationLock
+
 function assertNonExtractableAesGcmKey(key: CryptoKey): void {
   if (!(key instanceof CryptoKey)) {
     throw new QuickStartUnavailableError('QUICK_START_DEVICE_KEY_INVALID')
@@ -397,15 +399,22 @@ export async function loadQuickStartMnemonic(): Promise<string | null> {
 
 export async function clearQuickStartMnemonic(): Promise<void> {
   if (typeof indexedDB === 'undefined') return
-  const db = await openDb()
   try {
-    const transaction = db.transaction(STORE_NAME, 'readwrite')
-    const store = transaction.objectStore(STORE_NAME)
-    store.delete(SEED_RECORD)
-    store.delete(KEY_RECORD)
-    await transactionDone(transaction)
-  } finally {
-    db.close()
+    const db = await openDb()
+    try {
+      const transaction = db.transaction(STORE_NAME, 'readwrite')
+      const store = transaction.objectStore(STORE_NAME)
+      store.delete(SEED_RECORD)
+      store.delete(KEY_RECORD)
+      await transactionDone(transaction)
+    } finally {
+      db.close()
+    }
+  } catch (error) {
+    if (error instanceof QuickStartUnavailableError) {
+      return
+    }
+    throw error
   }
 }
 
