@@ -22,14 +22,63 @@ Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No m
 | **PASS 4 REVIEWED HEAD** | `9d407a81f00605e73b9b8b76fb3ec4f350e7f117` |
 | **PASS 4 REMEDIATION SHA** | `037b420067ffec3bf577884d5f2ca0ec79ea54a5` |
 | **PASS 8 REVIEWED HEAD** | `97a45686a7c533f6c9867bc6ebd155140c61a3a2` |
-| **PASS 8 REMEDIATION SHA** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 Pass 8 closure) |
+| **PASS 8 REMEDIATION SHA** | `6c06d481d1b43666a5ce8ee9578b580fdbb6f79c` |
+| **PASS 9 REVIEWED HEAD** | `6c06d481d1b43666a5ce8ee9578b580fdbb6f79c` |
+| **PASS 9 REMEDIATION SHA** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 Pass 9 closure) |
 | Staging API | http://127.0.0.1:4178/v1/tm-comm/health |
 | Staging UI | http://127.0.0.1:5174/tm-comm-staging |
-| Estado | **READY FOR FRESH CODEX REVIEW (PASS 8 CLOSURE)** |
+| Estado | **READY FOR FRESH CODEX REVIEW (PASS 9 CLOSURE)** |
 | Merge | **No** |
 
-> [!NOTE]
-> **Aclaración de Genealogía y Corrección de SHA**: Se documenta explícitamente que la referencia previa `a63aeacef335ca7f42dcae2e83b8b64e6224168e` correspondió a una referencia errónea en notas. El commit HEAD remoto canónico de PR #98 efectivamente revisado por Codex para el Pass 2 fue `a63aeacc6a407517805c4c2c31a351511281600c`.
+---
+
+## Remediation Pass 9 (Codex Findings P2-17 & P2-18)
+
+El fresh Codex review ejecutado sobre el exact HEAD `6c06d481d1b43666a5ce8ee9578b580fdbb6f79c` identificó exactamente 2 findings P2 abiertos:
+1. `Reset busy state when invalidating an operation` (Thread `PRRT_kwDOQYWUus6kFE6n`)
+2. `Hide private history before a wallet-change render commits` (Thread `PRRT_kwDOQYWUus6kFE6p`)
+
+Ambos findings han sido completamente remediados conservando todas las remediaciones e invariantes de arquitectura anteriores:
+
+### P2-17: Hide private history before a wallet-change render commits (Thread `PRRT_kwDOQYWUus6kFE6p`)
+- **Causa raíz**: En React, `useEffect` se ejecuta asíncronamente después del layout y commit del DOM. Al alternar la wallet activa de `addressA` a `addressB` en el contexto global, React ejecutaba un ciclo de renderizado bajo `addressB` *antes* de que el effect pudiera ejecutarse y limpiar `conversations`, `conversation`, `messages` y el log de evidencia. Como resultado, durante ese render intermedio, el árbol JSX continuaba exponiendo conversaciones, mensajes e identificadores pertenecientes a la identidad anterior bajo el nuevo encabezado de cuenta.
+- **Remediación**:
+  1. **Render Gate Canónico Pre-Commit**: Se definió la condición canónica estricta durante el render:
+     `const sessionCoherent = initialized && Boolean(address) && authenticatedWalletAddress === address`
+     Cualquier render donde `sessionCoherent === false` tiene la garantía absoluta de no exponer en el árbol Virtual DOM ningún elemento derivado de la sesión anterior, independientemente de los tiempos de ejecución de los effects.
+  2. **Valores Derivados Seguros**: En lugar de renderizar directamente las variables de estado reactivo, se derivan valores limpios en la fase de render:
+     - `visibleConversations = sessionCoherent ? conversations : []`
+     - `visibleConversation = sessionCoherent ? conversation : null`
+     - `visibleMessages = sessionCoherent ? messages : []`
+     - `visibleEnrollmentToken = sessionCoherent ? enrollmentToken : ''`
+     - `visibleMessageBody = sessionCoherent ? messageBody : ''`
+  3. **Particionamiento y Privacidad de Log**: El log local de evidencia se modeló con tipado explícito `LogEntry = { address: string | null; isPrivate: boolean; text: string }`.
+     `visibleLog = log.filter((entry) => entry.address === address && (sessionCoherent || !entry.isPrivate)).map((entry) => entry.text)`
+     Cualquier entrada que contenga metadatos de sesión (IDs de conversación, reservas, mensajes o conteos de sincronización) se registra con `isPrivate: true` y se oculta de inmediato si `sessionCoherent` es falso o si pertenece a una wallet distinta. Las trazas operativas (fallos de autenticación, rechazos de red) permanecen visibles para la wallet activa.
+  4. **Purga y Aislamiento de Formularios**: Los campos `enrollmentToken` y `messageBody` se ocultan inmediatamente en render (`visible*`) y se purgan sincrónicamente en `useEffect` al cambiar de wallet, impidiendo que borradores o invitaciones de una cuenta queden disponibles para otra.
+
+### P2-18: Reset busy state when invalidating an operation (Thread `PRRT_kwDOQYWUus6kFE6n`)
+- **Causa raíz**: Cuando una operación de red (`authenticate`, `bind`, `send`) quedaba en vuelo bajo la wallet A (`busy = true`), cambiar de cuenta a B abortaba los controladores de aborto e incrementaba las generaciones de sesión, pero el flag `busy` permanecía activo hasta que la promesa en vuelo resolviera o rechazara. Esto dejaba la interfaz de la nueva wallet bloqueada con botones deshabilitados de forma innecesaria.
+- **Remediación**:
+  1. **Invalidación Síncrona de Busy**: En el `useEffect` que monitorea `[address, initialized]` y en su función de limpieza (cleanup), se invoca explícitamente `setOperationBusy(false)` en el mismo paso donde se invalidan las generaciones y se abortan las peticiones.
+  2. **Busy Rastreado por Dirección**: Se introdujo `busyAddress` para vincular cualquier operación en curso a la wallet que la originó: `const isBusy = busy && busyAddress === address`. Al cambiar de wallet, la nueva identidad no hereda el estado ocupado de la anterior.
+  3. **Preservación de Generation Guards**: Los bloques `finally` en `authenticate`, `bind` y `send` mantienen sus comprobaciones de generación (`if (activeGen === currentGen)`), impidiendo que operaciones retrasadas de generaciones antiguas alteren el estado de ocupado de la nueva sesión.
+
+- **Archivos modificados**:
+  - `src/routes/TmCommStaging.tsx`
+  - `src/routes/TmCommStaging.test.tsx`
+- **Tests agregados**:
+  - `src/routes/TmCommStaging.test.tsx`: 9 nuevos tests unitarios e integrados bajo `describe('P2-17 & P2-18: Pre-commit privacy gate and busy state invalidation')` verificando:
+    1. Render gate inmediato al alternar A → B (mensajes, IDs, reservas, selector y logs de A ausentes del DOM en el primer render).
+    2. Auth pendiente en A + cambio a B (botón de autenticación en B inmediatamente habilitado; resolución tardía de A no bloquea a B).
+    3. Bind pendiente en A + cambio a B (UI de B no bloqueada; resolución de A no afecta a B).
+    4. Send pendiente en A + cambio a B (UI de B no bloqueada; resolución de A no afecta a B).
+    5. Finalización tardía de A no altera busy ni repuebla contenido bajo B.
+    6. Cambios rápidos A → B → C retienen únicamente estado compatible con C.
+    7. Montaje inicial con cookie de A y wallet activa B falla cerrado sin datos privados en DOM.
+    8. Recarga con wallet A y cookie de A restaura sesión válida.
+    9. Formularios (token y mensaje) de A se purgan y no se filtran a B.
+  - Total suite de TM-COMM: 6 suites, 127/127 tests passing.
 
 ---
 

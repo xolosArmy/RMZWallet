@@ -25,6 +25,12 @@ type Message = {
   replyToId: string | null
 }
 
+type LogEntry = {
+  address: string | null
+  isPrivate: boolean
+  text: string
+}
+
 function TmCommStaging() {
   const { initialized, address } = useWallet()
   const [enrollmentToken, setEnrollmentToken] = useState('')
@@ -32,9 +38,30 @@ function TmCommStaging() {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [conversation, setConversation] = useState<Conversation | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
-  const [log, setLog] = useState<string[]>([])
+  const [log, setLog] = useState<LogEntry[]>([])
   const [busy, setBusy] = useState(false)
+  const [busyAddress, setBusyAddress] = useState<string | null>(null)
   const [authenticatedWalletAddress, setAuthenticatedWalletAddress] = useState<string | null>(null)
+
+  const sessionCoherent =
+    initialized &&
+    Boolean(address) &&
+    authenticatedWalletAddress === address
+
+  const visibleConversations = sessionCoherent ? conversations : []
+  const visibleConversation = sessionCoherent ? conversation : null
+  const visibleMessages = sessionCoherent ? messages : []
+  const visibleLog = log
+    .filter((entry) => entry.address === address && (sessionCoherent || !entry.isPrivate))
+    .map((entry) => entry.text)
+  const visibleEnrollmentToken = sessionCoherent ? enrollmentToken : ''
+  const visibleMessageBody = sessionCoherent ? messageBody : ''
+  const isBusy = busy && busyAddress === address
+
+  const setOperationBusy = (isBusyFlag: boolean, targetAddress: string | null = null) => {
+    setBusy(isBusyFlag)
+    setBusyAddress(isBusyFlag ? targetAddress : null)
+  }
 
   const authenticatedWalletAddressRef = useRef<string | null>(null)
   const prevAddressRef = useRef<string | null | undefined>(undefined)
@@ -51,8 +78,8 @@ function TmCommStaging() {
     setAuthenticatedWalletAddress(addr)
   }
 
-  const append = (line: string) => {
-    setLog((current) => [...current, line])
+  const append = (line: string, isPrivate = false) => {
+    setLog((current) => [...current, { address, isPrivate, text: line }])
   }
 
   const refreshMessages = async (
@@ -104,7 +131,7 @@ function TmCommStaging() {
 
     const msgs = Array.isArray(listed.data?.messages) ? listed.data.messages : []
     setMessages(msgs)
-    append(`Historial recargado desde el servidor: ${msgs.length} mensaje(s).`)
+    append(`Historial recargado desde el servidor: ${msgs.length} mensaje(s).`, true)
   }
 
   const restoreAuthorizedConversations = async (
@@ -198,7 +225,7 @@ function TmCommStaging() {
     }
     setConversation(target)
     activeConversationIdRef.current = target.id
-    append(`Conversación activa: ${target.id} (${target.reservationId}).`)
+    append(`Conversación activa: ${target.id} (${target.reservationId}).`, true)
 
     await refreshMessages(target.id, targetSessionGen, signal)
   }
@@ -223,6 +250,10 @@ function TmCommStaging() {
     setConversations([])
     setConversation(null)
     setMessages([])
+    setEnrollmentToken('')
+    setMessageBody('Mensaje privado de staging A0')
+    setLog([])
+    setOperationBusy(false)
     activeConversationIdRef.current = null
     setAuthWallet(null)
 
@@ -245,6 +276,7 @@ function TmCommStaging() {
     return () => {
       hydrationAbort.abort()
       messageAbortRef.current?.abort()
+      setOperationBusy(false)
       // eslint-disable-next-line react-hooks/exhaustive-deps
       sessionGenerationRef.current++
     }
@@ -275,7 +307,8 @@ function TmCommStaging() {
     activeConversationIdRef.current = null
     setAuthWallet(null)
 
-    setBusy(true)
+    const currentAddress = address
+    setOperationBusy(true, currentAddress)
     try {
       const challenge = await tmCommRequest<TmCommAuthChallengePayload>('/v1/tm-comm/challenges', {
         method: 'POST',
@@ -319,7 +352,7 @@ function TmCommStaging() {
         signal: sessionAbort.signal,
         body: JSON.stringify({
           challengeId: verified.challengeId,
-          address,
+          address: currentAddress,
           publicKeyHex,
           signature
         })
@@ -328,16 +361,16 @@ function TmCommStaging() {
       if (nextGen !== sessionGenerationRef.current) return
 
       if (session.ok) {
-        setAuthWallet(address)
+        setAuthWallet(currentAddress)
         append('Sesión TM-COMM creada. La clave privada no salió de Tonalli.')
-        await restoreAuthorizedConversations(address, undefined, nextGen, sessionAbort.signal, true)
+        await restoreAuthorizedConversations(currentAddress, undefined, nextGen, sessionAbort.signal, true)
       } else {
         setAuthWallet(null)
         append(`Sesión rechazada (${session.status}).`)
       }
     } finally {
       if (nextGen === sessionGenerationRef.current) {
-        setBusy(false)
+        setOperationBusy(false)
       }
     }
   }
@@ -347,8 +380,9 @@ function TmCommStaging() {
       append('Se requiere autenticación para la wallet activa antes de enlazar un expediente.')
       return
     }
+    const currentAddress = address
     const currentGen = sessionGenerationRef.current
-    setBusy(true)
+    setOperationBusy(true, currentAddress)
     try {
       const result = await tmCommRequest<{ conversation: Conversation }>('/v1/tm-comm/bindings', {
         method: 'POST',
@@ -359,11 +393,11 @@ function TmCommStaging() {
         append(`Binding rechazado (${result.status}). Una dirección conocida no basta.`)
         return
       }
-      append(`Reserva ficticia vinculada: ${result.data.conversation.reservationId}`)
-      await restoreAuthorizedConversations(address, result.data.conversation.id, currentGen, undefined, true)
+      append(`Reserva ficticia vinculada: ${result.data.conversation.reservationId}`, true)
+      await restoreAuthorizedConversations(currentAddress, result.data.conversation.id, currentGen, undefined, true)
     } finally {
       if (currentGen === sessionGenerationRef.current) {
-        setBusy(false)
+        setOperationBusy(false)
       }
     }
   }
@@ -377,9 +411,10 @@ function TmCommStaging() {
       append('Enlaza una reserva antes de enviar.')
       return
     }
+    const currentAddress = address
     const currentGen = sessionGenerationRef.current
     const targetConversationId = conversation.id
-    setBusy(true)
+    setOperationBusy(true, currentAddress)
     try {
       const sent = await tmCommRequest<Message>(
         `/v1/tm-comm/conversations/${targetConversationId}/messages`,
@@ -396,11 +431,11 @@ function TmCommStaging() {
         append(`Envío rechazado (${sent.status}).`)
         return
       }
-      append(`Mensaje aceptado con id de servidor ${sent.data.id}.`)
+      append(`Mensaje aceptado con id de servidor ${sent.data.id}.`, true)
       await refreshMessages(targetConversationId, currentGen)
     } finally {
       if (currentGen === sessionGenerationRef.current) {
-        setBusy(false)
+        setOperationBusy(false)
       }
     }
   }
@@ -424,13 +459,13 @@ function TmCommStaging() {
         <p className="muted">Wallet: {address ?? 'no desbloqueada'}</p>
         <p className="muted">
           Sesión TM-COMM:{' '}
-          {authenticatedWalletAddress === address && address ? `autenticada (${address})` : 'no autenticada'}
+          {sessionCoherent ? `autenticada (${address})` : 'no autenticada'}
         </p>
         <button
           className="cta"
           type="button"
           onClick={() => void authenticate()}
-          disabled={busy || !initialized || !address}
+          disabled={isBusy || !initialized || !address}
         >
           Firmar challenge TM-COMM
         </button>
@@ -439,17 +474,17 @@ function TmCommStaging() {
       <div className="card">
         <h2>2. Enlazar expediente ficticio</h2>
         <input
-          value={enrollmentToken}
+          value={visibleEnrollmentToken}
           onChange={(event) => setEnrollmentToken(event.target.value)}
           placeholder="Token de enrolamiento de Xolos Ramírez"
           aria-label="Token de enrolamiento"
-          disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
+          disabled={isBusy || !sessionCoherent}
         />
         <button
           className="cta outline"
           type="button"
           onClick={() => void bind()}
-          disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
+          disabled={isBusy || !sessionCoherent}
         >
           Consumir invitación
         </button>
@@ -457,7 +492,7 @@ function TmCommStaging() {
 
       <div className="card">
         <h2>3. Mensaje durable</h2>
-        {conversations.length > 1 && (
+        {visibleConversations.length > 1 && (
           <div style={{ marginBottom: '1rem' }}>
             <label
               htmlFor="conversation-select"
@@ -468,10 +503,10 @@ function TmCommStaging() {
             <select
               id="conversation-select"
               aria-label="Seleccionar conversación"
-              value={conversation?.id ?? ''}
+              value={visibleConversation?.id ?? ''}
               onChange={(e) => {
                 const targetId = e.target.value
-                const selected = conversations.find((c) => c.id === targetId) ?? null
+                const selected = visibleConversations.find((c) => c.id === targetId) ?? null
 
                 // Invalida cualquier request de historial anterior
                 messageAbortRef.current?.abort()
@@ -491,9 +526,9 @@ function TmCommStaging() {
                   void refreshMessages(selected.id, sessionGenerationRef.current)
                 }
               }}
-              disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
+              disabled={isBusy || !sessionCoherent}
             >
-              {conversations.map((c) => (
+              {visibleConversations.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.id} ({c.reservationId})
                 </option>
@@ -502,35 +537,35 @@ function TmCommStaging() {
           </div>
         )}
         <p className="muted">
-          Conversación: {conversation?.id ?? 'ninguna'} · Reserva: {conversation?.reservationId ?? '—'}
+          Conversación: {visibleConversation?.id ?? 'ninguna'} · Reserva: {visibleConversation?.reservationId ?? '—'}
         </p>
         <textarea
-          value={messageBody}
+          value={visibleMessageBody}
           onChange={(event) => setMessageBody(event.target.value)}
           rows={3}
           aria-label="Cuerpo del mensaje"
-          disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
+          disabled={isBusy || !sessionCoherent}
         />
         <div className="actions">
           <button
             className="cta"
             type="button"
             onClick={() => void send()}
-            disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
+            disabled={isBusy || !sessionCoherent}
           >
             Enviar al servidor
           </button>
           <button
             className="cta ghost"
             type="button"
-            onClick={() => void refreshMessages(conversation?.id, sessionGenerationRef.current)}
-            disabled={busy || !initialized || !address || authenticatedWalletAddress !== address}
+            onClick={() => void refreshMessages(visibleConversation?.id, sessionGenerationRef.current)}
+            disabled={isBusy || !sessionCoherent}
           >
             Recargar historial
           </button>
         </div>
         <ul>
-          {messages.map((message) => (
+          {visibleMessages.map((message) => (
             <li key={message.id}>
               <strong>{message.id}</strong> · {message.status} · {message.body}
             </li>
@@ -541,7 +576,7 @@ function TmCommStaging() {
       <div className="card">
         <h2>Registro local de evidencia</h2>
         <p className="muted">Esto no es el log canónico. Solo ayuda a demostrar el harness.</p>
-        <pre>{log.join('\n') || 'Sin eventos todavía.'}</pre>
+        <pre>{visibleLog.join('\n') || 'Sin eventos todavía.'}</pre>
       </div>
     </div>
   )

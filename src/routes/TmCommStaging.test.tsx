@@ -1478,3 +1478,596 @@ describe('P2-13: Wallet-session coherence and state containment', () => {
     expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletB\)/i)).toBeDefined()
   })
 })
+
+describe('P2-17 & P2-18: Pre-commit privacy gate and busy state invalidation', () => {
+  const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : 'http://127.0.0.1:5174'
+
+  const makeValidChallenge = (id = 'chlg_valid_123') =>
+    createTmCommAuthChallengeView({
+      challengeId: id,
+      nonce: 'nonce_secret_abc',
+      expiresAt: Date.now() + 600_000,
+      audience: origin,
+      origin: origin,
+      sessionContext: 'tm-comm-a0-staging:v1'
+    })
+
+  function createDeferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void
+    let reject!: (reason?: unknown) => void
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    walletListeners.clear()
+    setMockWallet({
+      address: 'ecash:qptest',
+      initialized: true,
+      balance: null,
+      loading: false,
+      error: null
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  test('immediate render gate: switching wallet A -> B hides private state immediately before effects', async () => {
+    setMockWallet({ address: 'ecash:walletA', initialized: true })
+
+    const convA1 = { id: 'conv-A-primary', reservationId: 'rsv-A-primary', createdAt: 1000 }
+    const convA2 = { id: 'conv-A-secondary', reservationId: 'rsv-A-secondary', createdAt: 1001 }
+    const msgA = {
+      id: 'msg-A-secret-1',
+      clientMessageId: 'cli-A-1',
+      body: 'CONFIDENTIAL_A_BODY_TEXT',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA1, convA2] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-A-secondary/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    // Wait until A is fully visible
+    await waitFor(() => {
+      expect(screen.getByText(/CONFIDENTIAL_A_BODY_TEXT/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-A-secondary/i)).toBeDefined()
+      expect(screen.getByText(/Reserva: rsv-A-secondary/i)).toBeDefined()
+      expect(screen.getByRole('combobox', { name: /Seleccionar conversación/i })).toBeDefined()
+    })
+
+    const logBefore = screen.getByText(/Registro local de evidencia/i).parentElement?.textContent ?? ''
+    expect(logBefore).toContain('conv-A-secondary')
+
+    // Synchronously switch wallet from A to B
+    setMockWallet({ address: 'ecash:walletB', initialized: true })
+
+    // In the immediate resulting render:
+    // 1. Text of message A is absent
+    expect(screen.queryByText(/CONFIDENTIAL_A_BODY_TEXT/i)).toBeNull()
+    // 2. Conversation ID A is absent
+    expect(screen.queryByText(/conv-A-primary/i)).toBeNull()
+    expect(screen.queryByText(/conv-A-secondary/i)).toBeNull()
+    // 3. Reservation ID A is absent
+    expect(screen.queryByText(/rsv-A-primary/i)).toBeNull()
+    expect(screen.queryByText(/rsv-A-secondary/i)).toBeNull()
+    // 4. Selector / options A are absent
+    expect(screen.queryByRole('combobox', { name: /Seleccionar conversación/i })).toBeNull()
+    // 5. Metadata of log A is absent
+    const logAfter = screen.getByText(/Registro local de evidencia/i).parentElement?.textContent ?? ''
+    expect(logAfter).not.toContain('conv-A-primary')
+    expect(logAfter).not.toContain('conv-A-secondary')
+    expect(logAfter).not.toContain('rsv-A-primary')
+    expect(logAfter).not.toContain('rsv-A-secondary')
+    expect(logAfter).not.toContain('CONFIDENTIAL_A_BODY_TEXT')
+    // 6. Sensitive input fields are blank in render
+    expect((screen.getByLabelText('Token de enrolamiento') as HTMLInputElement).value).toBe('')
+    expect((screen.getByLabelText('Cuerpo del mensaje') as HTMLTextAreaElement).value).toBe('')
+    // 7. Conversación summary is reset
+    expect(screen.getByText(/Conversación: ninguna · Reserva: —/i)).toBeDefined()
+    expect(screen.getByText(/Sesión TM-COMM: no autenticada/i)).toBeDefined()
+  })
+
+  test('auth A pending + switch B -> auth button on B is enabled (busy=false)', async () => {
+    setMockWallet({ address: 'ecash:walletA', initialized: true })
+
+    const deferredChallengeA = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({ ok: false, status: 401, data: null })
+      }
+      if (path === '/v1/tm-comm/challenges') {
+        return deferredChallengeA.promise
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    const signButtonA = screen.getByRole('button', { name: /Firmar challenge TM-COMM/i })
+    expect(signButtonA.hasAttribute('disabled')).toBe(false)
+
+    fireEvent.click(signButtonA)
+
+    // While challenge request for A is pending, button is disabled
+    expect(signButtonA.hasAttribute('disabled')).toBe(true)
+
+    // Switch wallet to B
+    setMockWallet({ address: 'ecash:walletB', initialized: true })
+
+    // Immediately on render of wallet B, auth button for B is enabled (busy=false)
+    const signButtonB = screen.getByRole('button', { name: /Firmar challenge TM-COMM/i })
+    expect(signButtonB.hasAttribute('disabled')).toBe(false)
+    expect(screen.getByText(/Wallet: ecash:walletB/i)).toBeDefined()
+
+    // Resolve deferred challenge for A
+    deferredChallengeA.resolve({ ok: true, status: 201, data: makeValidChallenge('chlg-stale-A') })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // Button B remains enabled and unaffected
+    expect(signButtonB.hasAttribute('disabled')).toBe(false)
+    expect(screen.getByText(/Sesión TM-COMM: no autenticada/i)).toBeDefined()
+  })
+
+  test('bind pending on A + switch B -> UI is not blocked, busy=false', async () => {
+    setMockWallet({ address: 'ecash:walletA', initialized: true })
+
+    const deferredBindA = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [] } })
+      }
+      if (path === '/v1/tm-comm/bindings') {
+        return deferredBindA.promise
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+    })
+
+    const bindButton = screen.getByRole('button', { name: /Consumir invitación/i })
+    expect(bindButton.hasAttribute('disabled')).toBe(false)
+
+    fireEvent.click(bindButton)
+
+    // In-flight binding on A makes UI busy
+    expect(bindButton.hasAttribute('disabled')).toBe(true)
+
+    // Switch wallet to B
+    setMockWallet({ address: 'ecash:walletB', initialized: true })
+
+    // Immediately on render of wallet B: auth button is enabled, UI is not locked
+    const signButtonB = screen.getByRole('button', { name: /Firmar challenge TM-COMM/i })
+    expect(signButtonB.hasAttribute('disabled')).toBe(false)
+
+    // Resolve deferred bind for A
+    const staleConv = { id: 'conv-stale-A', reservationId: 'rsv-stale-A', createdAt: 9999 }
+    deferredBindA.resolve({ ok: true, status: 201, data: { conversation: staleConv } })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // B remains clean and not blocked
+    expect(screen.queryByText(/conv-stale-A/i)).toBeNull()
+    expect(screen.queryByText(/rsv-stale-A/i)).toBeNull()
+    expect(signButtonB.hasAttribute('disabled')).toBe(false)
+  })
+
+  test('send pending on A + switch B -> UI is not blocked, busy=false', async () => {
+    setMockWallet({ address: 'ecash:walletA', initialized: true })
+
+    const convA = { id: 'conv-A-send', reservationId: 'rsv-A-send', createdAt: 1000 }
+    const deferredSendA = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-A-send/messages') {
+        return deferredSendA.promise
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Conversación: conv-A-send/i)).toBeDefined()
+    })
+
+    const sendButton = screen.getByRole('button', { name: /Enviar al servidor/i })
+    fireEvent.click(sendButton)
+
+    // Send is in-flight on A
+    expect(sendButton.hasAttribute('disabled')).toBe(true)
+
+    // Switch wallet to B
+    setMockWallet({ address: 'ecash:walletB', initialized: true })
+
+    // Immediately on render of B: auth button is enabled, UI not blocked
+    const signButtonB = screen.getByRole('button', { name: /Firmar challenge TM-COMM/i })
+    expect(signButtonB.hasAttribute('disabled')).toBe(false)
+
+    // Resolve deferred send for A
+    deferredSendA.resolve({
+      ok: true,
+      status: 201,
+      data: {
+        id: 'msg-stale-A',
+        clientMessageId: 'cli-stale',
+        body: 'Late message from A',
+        senderKind: 'customer',
+        serverCreatedAt: 9999,
+        status: 'delivered',
+        replyToId: null
+      }
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // B remains clean and not blocked
+    expect(screen.queryByText(/msg-stale-A/i)).toBeNull()
+    expect(screen.queryByText(/Late message from A/i)).toBeNull()
+    expect(signButtonB.hasAttribute('disabled')).toBe(false)
+  })
+
+  test('late completion of A cannot alter busy nor repopulate content', async () => {
+    setMockWallet({ address: 'ecash:walletA', initialized: true })
+
+    const deferredAuthA = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+    const deferredListA = createDeferred<{ ok: boolean; status: number; data: unknown }>()
+
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({ ok: false, status: 401, data: null })
+      }
+      if (path === '/v1/tm-comm/challenges') {
+        return deferredAuthA.promise
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return deferredListA.promise
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Firmar challenge TM-COMM/i }))
+
+    // Switch to wallet B
+    setMockWallet({ address: 'ecash:walletB', initialized: true })
+
+    // Authenticate B cleanly
+    const convB = { id: 'conv-B-valid', reservationId: 'rsv-B-valid', createdAt: 2000 }
+    const msgB = {
+      id: 'msg-B-valid',
+      clientMessageId: 'cli-B-valid',
+      body: 'Clean wallet B message',
+      senderKind: 'customer',
+      serverCreatedAt: 2010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    mockSignMessage.mockResolvedValue('signature_B')
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/challenges') {
+        return Promise.resolve({ ok: true, status: 201, data: makeValidChallenge('chlg_B_valid') })
+      }
+      if (path === '/v1/tm-comm/sessions') {
+        return Promise.resolve({
+          ok: true,
+          status: 201,
+          data: {
+            principal: { id: 'prn-B', kind: 'customer', walletAddress: 'ecash:walletB' },
+            expiresAt: Date.now() + 600_000
+          }
+        })
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-B', kind: 'customer', walletAddress: 'ecash:walletB' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convB] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-B-valid/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgB] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /Firmar challenge TM-COMM/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/Clean wallet B message/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-B-valid/i)).toBeDefined()
+    })
+
+    // Now resolve late responses from A
+    deferredAuthA.resolve({ ok: true, status: 201, data: makeValidChallenge('chlg_stale_A') })
+    deferredListA.resolve({
+      ok: true,
+      status: 200,
+      data: {
+        conversations: [{ id: 'conv-A-stale', reservationId: 'rsv-A-stale', createdAt: 999 }]
+      }
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // Only B's state remains visible, busy remains false
+    expect(screen.getByText(/Clean wallet B message/i)).toBeDefined()
+    expect(screen.queryByText(/conv-A-stale/i)).toBeNull()
+    expect(screen.queryByText(/rsv-A-stale/i)).toBeNull()
+    const signButton = screen.getByRole('button', { name: /Firmar challenge TM-COMM/i })
+    expect(signButton.hasAttribute('disabled')).toBe(false)
+  })
+
+  test('rapid A -> B -> C switch retains only visible state compatible with C', async () => {
+    setMockWallet({ address: 'ecash:walletA', initialized: true })
+
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: {
+            conversations: [{ id: 'conv-A-rapid', reservationId: 'rsv-A-rapid', createdAt: 1000 }]
+          }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-A-rapid/messages') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: {
+            messages: [
+              {
+                id: 'msg-A-rapid',
+                clientMessageId: 'cli-A-rapid',
+                body: 'Rapid A message',
+                senderKind: 'customer',
+                serverCreatedAt: 1010,
+                status: 'delivered',
+                replyToId: null
+              }
+            ]
+          }
+        })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Rapid A message/i)).toBeDefined()
+    })
+
+    // Rapid switch: A -> B -> C
+    setMockWallet({ address: 'ecash:walletB', initialized: true })
+    setMockWallet({ address: 'ecash:walletC', initialized: true })
+
+    // Immediately on render of C: neither A nor B data is visible
+    expect(screen.queryByText(/Rapid A message/i)).toBeNull()
+    expect(screen.queryByText(/conv-A-rapid/i)).toBeNull()
+    expect(screen.getByText(/Conversación: ninguna · Reserva: —/i)).toBeDefined()
+    expect(screen.getByText(/Wallet: ecash:walletC/i)).toBeDefined()
+
+    // Authenticate C
+    const convC = { id: 'conv-C-rapid', reservationId: 'rsv-C-rapid', createdAt: 3000 }
+    const msgC = {
+      id: 'msg-C-rapid',
+      clientMessageId: 'cli-C-rapid',
+      body: 'Legitimate C content',
+      senderKind: 'customer',
+      serverCreatedAt: 3010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    mockSignMessage.mockResolvedValue('signature_C')
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/challenges') {
+        return Promise.resolve({ ok: true, status: 201, data: makeValidChallenge('chlg_C_rapid') })
+      }
+      if (path === '/v1/tm-comm/sessions') {
+        return Promise.resolve({
+          ok: true,
+          status: 201,
+          data: {
+            principal: { id: 'prn-C', kind: 'customer', walletAddress: 'ecash:walletC' },
+            expiresAt: Date.now() + 600_000
+          }
+        })
+      }
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-C', kind: 'customer', walletAddress: 'ecash:walletC' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convC] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-C-rapid/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgC] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /Firmar challenge TM-COMM/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/Legitimate C content/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-C-rapid/i)).toBeDefined()
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletC\)/i)).toBeDefined()
+    })
+
+    expect(screen.queryByText(/Rapid A message/i)).toBeNull()
+    expect(screen.queryByText(/conv-A-rapid/i)).toBeNull()
+  })
+
+  test('initial mount with cookie A + wallet B fails closed and displays no private data', async () => {
+    setMockWallet({ address: 'ecash:walletB', initialized: true })
+
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/me') {
+        // Server cookie belongs to wallet A, but active client wallet is B
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM no coincide con la wallet activa/i)).toBeDefined()
+    })
+
+    expect(screen.getByText(/Sesión TM-COMM: no autenticada/i)).toBeDefined()
+    expect(screen.getByText(/Conversación: ninguna · Reserva: —/i)).toBeDefined()
+    expect(screen.queryByText(/conv-A/i)).toBeNull()
+  })
+
+  test('reload A + wallet A restores previous valid session correctly', async () => {
+    setMockWallet({ address: 'ecash:walletA', initialized: true })
+
+    const convA = { id: 'conv-A-reload', reservationId: 'rsv-A-reload', createdAt: 1000 }
+    const msgA = {
+      id: 'msg-A-reload',
+      clientMessageId: 'cli-A-reload',
+      body: 'Restored message on reload',
+      senderKind: 'customer',
+      serverCreatedAt: 1010,
+      status: 'delivered',
+      replyToId: null
+    }
+
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [convA] } })
+      }
+      if (path === '/v1/tm-comm/conversations/conv-A-reload/messages') {
+        return Promise.resolve({ ok: true, status: 200, data: { messages: [msgA] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Restored message on reload/i)).toBeDefined()
+      expect(screen.getByText(/Conversación: conv-A-reload/i)).toBeDefined()
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+    })
+  })
+
+  test('inputs enrollmentToken and messageBody typed under wallet A are purged upon switch to B', async () => {
+    setMockWallet({ address: 'ecash:walletA', initialized: true })
+
+    mockTmCommRequest.mockImplementation((path: string) => {
+      if (path === '/v1/tm-comm/me') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: { principal: { id: 'prn-A', kind: 'customer', walletAddress: 'ecash:walletA' } }
+        })
+      }
+      if (path === '/v1/tm-comm/conversations') {
+        return Promise.resolve({ ok: true, status: 200, data: { conversations: [] } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: {} })
+    })
+
+    render(<TmCommStaging />)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sesión TM-COMM: autenticada \(ecash:walletA\)/i)).toBeDefined()
+    })
+
+    // User types confidential token and draft under wallet A
+    const tokenInput = screen.getByLabelText('Token de enrolamiento') as HTMLInputElement
+    const messageInput = screen.getByLabelText('Cuerpo del mensaje') as HTMLTextAreaElement
+
+    fireEvent.change(tokenInput, { target: { value: 'secret-enrollment-token-A' } })
+    fireEvent.change(messageInput, { target: { value: 'secret-draft-body-A' } })
+
+    expect(tokenInput.value).toBe('secret-enrollment-token-A')
+    expect(messageInput.value).toBe('secret-draft-body-A')
+
+    // Switch wallet to B
+    setMockWallet({ address: 'ecash:walletB', initialized: true })
+
+    // Immediately on render of B: inputs are blank
+    expect((screen.getByLabelText('Token de enrolamiento') as HTMLInputElement).value).toBe('')
+    expect((screen.getByLabelText('Cuerpo del mensaje') as HTMLTextAreaElement).value).toBe('')
+
+    // After effects settle, verify underlying state was wiped and does not carry over
+    await waitFor(() => {
+      expect((screen.getByLabelText('Token de enrolamiento') as HTMLInputElement).value).toBe('')
+    })
+    expect((screen.getByLabelText('Token de enrolamiento') as HTMLInputElement).value).toBe('')
+  })
+})
