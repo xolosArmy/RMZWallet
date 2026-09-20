@@ -24,11 +24,52 @@ Scope: TM-COMM A0 only. **No se remedió el lint histórico de RMZWallet.** No m
 | **PASS 8 REVIEWED HEAD** | `97a45686a7c533f6c9867bc6ebd155140c61a3a2` |
 | **PASS 8 REMEDIATION SHA** | `6c06d481d1b43666a5ce8ee9578b580fdbb6f79c` |
 | **PASS 9 REVIEWED HEAD** | `6c06d481d1b43666a5ce8ee9578b580fdbb6f79c` |
-| **PASS 9 REMEDIATION SHA** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 Pass 9 closure) |
+| **PASS 9 REMEDIATION SHA** | `07bd04a99025fe9bf8aa6bebb2ec90d5e422d8ea` |
+| **PASS 10 REVIEWED HEAD** | `07bd04a99025fe9bf8aa6bebb2ec90d5e422d8ea` |
+| **PASS 10 REMEDIATION SHA** | Exact HEAD of `feat/tm-comm-a0-architecture-staging` (PR #98 Pass 10 closure) |
 | Staging API | http://127.0.0.1:4178/v1/tm-comm/health |
 | Staging UI | http://127.0.0.1:5174/tm-comm-staging |
-| Estado | **READY FOR FRESH CODEX REVIEW (PASS 9 CLOSURE)** |
+| Estado | **READY FOR FRESH CODEX REVIEW (PASS 10 CLOSURE)** |
 | Merge | **No** |
+
+---
+
+## Remediation Pass 10 (Codex Finding P2-19)
+
+El fresh Codex review ejecutado sobre el exact HEAD `07bd04a99025fe9bf8aa6bebb2ec90d5e422d8ea` identificó exactamente 1 finding P2 abierto:
+1. `Invalidate cached state when message refresh returns 401` (Thread `PRRT_kwDOQYWUus6kFthf`)
+
+El finding ha sido completamente remediado conservando todas las remediaciones e invariantes de arquitectura anteriores:
+
+### P2-19: Invalidate cached state when message refresh returns 401 (Thread `PRRT_kwDOQYWUus6kFthf`)
+- **Causa raíz**: En `src/routes/TmCommStaging.tsx`, cuando `refreshMessages()` recibía una respuesta no exitosa (`!listed.ok`), registraba un mensaje genérico `No se pudieron leer mensajes (${listed.status}).` y retornaba temprano sin alterar el estado local. Si la sesión HttpOnly del usuario había expirado o había sido revocada por el servidor (HTTP 401), el cliente continuaba mostrando la sesión como autenticada (`authenticatedWalletAddress`), reteniendo las conversaciones, el historial de mensajes confidenciales en caché y los identificadores de reserva en pantalla, y manteniendo los controles de mutación (`send`, `bind`) aparentemente activos en lugar de forzar una reautenticación limpia.
+- **Remediación**:
+  1. **Invalidación Fail-Closed ante 401 Vigente**: En `refreshMessages()`, después de verificar que la generación de sesión coincide (`targetSessionGen === sessionGenerationRef.current`), que la conversación sigue activa (`activeConversationIdRef.current === conversationId`) y que la solicitud de mensajes está vigente (`messageReqId === messageRequestGenRef.current`):
+     - Si `listed.status === 401`, la sesión local se invalida completamente de inmediato.
+     - Se abortan `hydrationAbortRef` y `messageAbortRef`.
+     - Se incrementan tanto `sessionGenerationRef` como `messageRequestGenRef` para volver obsoletas de forma irrevocable cualesquiera solicitudes pendientes de la sesión expirada, impidiendo que respuestas tardías repueblen el estado.
+     - Se invoca `setAuthWallet(null)` para mantener sincronizados en un solo paso reactivo tanto el estado React `authenticatedWalletAddress` como su ref interna `authenticatedWalletAddressRef.current`.
+     - Se restablecen a vacío/nulo: `setConversations([])`, `setConversation(null)`, `setMessages([])` y `activeConversationIdRef.current = null`.
+     - Se libera el estado de ocupado `setOperationBusy(false)` para garantizar que ningún botón o formulario quede bloqueado.
+     - Se registra en el log de evidencia: `Sesión TM-COMM expirada o no autorizada (401). Se requiere reautenticación.`
+  2. **Activación Inmediata del Render Gate Pre-Commit**: Al establecerse `authenticatedWalletAddress = null`, la condición canónica `sessionCoherent = initialized && Boolean(address) && authenticatedWalletAddress === address` evalúa a `false` inmediatamente en el siguiente ciclo de renderizado, ocultando conversaciones, reservas, mensajes confidenciales, tokens y borradores del Virtual DOM sin depender de timing asíncrono.
+  3. **Preservación de Semántica para Errores No-401**: Respuestas transitorias o de error de servidor (ej. HTTP 500) conservan su comportamiento previo registrando `No se pudieron leer mensajes (${listed.status}).` sin invalidar la sesión del usuario.
+  4. **Protección Contra Stale 401 de Generaciones Anteriores**: Los guards de generación (`targetSessionGen === sessionGenerationRef.current`) se evalúan antes de inspeccionar `listed.status`. Un 401 tardío perteneciente a una generación de sesión anterior se descarta silenciosamente y no destruye una nueva sesión legítima recién autenticada.
+
+- **Archivos modificados**:
+  - `src/routes/TmCommStaging.tsx`
+  - `src/routes/TmCommStaging.test.tsx`
+- **Tests agregados**:
+  - `src/routes/TmCommStaging.test.tsx`: 6 nuevos tests unitarios e integrados bajo `describe('P2-19: Session-expiry invalidation on 401 in refreshMessages')` verificando:
+    1. Sesión válida con mensajes visibles → `refreshMessages` recibe 401 → invalida sesión y oculta contenido de inmediato.
+    2. 401 vigente incrementa generación y respuestas antiguas posteriores no repueblan estado.
+    3. Stale 401 de una generación anterior se ignora y no destruye una sesión nueva válida.
+    4. Un 500 no debe cerrar la sesión: conserva la semántica actual y deja controles activos.
+    5. Reautenticación posterior a 401 permite restaurar estado normalmente.
+    6. 401 durante `refreshMessages` en `send()` libera `busy` state correctamente.
+  - Total suite de TM-COMM: 6 suites, 133/133 tests passing.
+  - Total suite del repositorio: 150 suites, 2781/2781 tests passing.
+  - Differential lint: 0 nuevos findings (328 problemas preexistentes idénticos a la línea base).
 
 ---
 

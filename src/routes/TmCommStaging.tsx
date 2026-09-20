@@ -125,6 +125,20 @@ function TmCommStaging() {
     if (activeConversationIdRef.current !== conversationId || messageReqId !== messageRequestGenRef.current) return
 
     if (!listed.ok) {
+      if (listed.status === 401) {
+        hydrationAbortRef.current?.abort()
+        messageAbortRef.current?.abort()
+        sessionGenerationRef.current++
+        messageRequestGenRef.current++
+        setAuthWallet(null)
+        setConversations([])
+        setConversation(null)
+        setMessages([])
+        activeConversationIdRef.current = null
+        setOperationBusy(false)
+        append('Sesión TM-COMM expirada o no autorizada (401). Se requiere reautenticación.')
+        return
+      }
       append(`No se pudieron leer mensajes (${listed.status}).`)
       return
     }
