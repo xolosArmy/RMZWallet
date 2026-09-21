@@ -756,11 +756,10 @@ export class XolosWalletService {
       }
       if (
         auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
-        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING ||
+        auth.status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED
       ) {
-        if (!this.pendingIdentityOwnerToken || auth.record.ownerToken !== this.pendingIdentityOwnerToken) {
-          throw new Error('PENDING_IDENTITY_EXISTS')
-        }
+        throw new Error('PENDING_IDENTITY_EXISTS')
       }
       if (!this.tryAcquireWalletActivation()) {
         throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
@@ -1190,11 +1189,10 @@ export class XolosWalletService {
       }
       if (
         auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
-        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING ||
+        auth.status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED
       ) {
-        if (!this.pendingIdentityOwnerToken || auth.record.ownerToken !== this.pendingIdentityOwnerToken) {
-          throw new Error('PENDING_IDENTITY_EXISTS')
-        }
+        throw new Error('PENDING_IDENTITY_EXISTS')
       }
       if (!this.tryAcquireWalletActivation()) {
         throw new Error('WALLET_ACTIVATION_IN_PROGRESS')

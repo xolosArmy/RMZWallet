@@ -1384,5 +1384,126 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
         expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBeNull()
       }, 30000)
     })
+
+    describe('reject owner-matching duplicate identity creation (discussion_r4065003840)', () => {
+      const MNEMONIC_B = 'legal winner thank year wave sausage worth useful legal winner thank yellow'
+
+      test('same-tab duplicate createNewWallet rejects with PENDING_IDENTITY_EXISTS without replacing identity', async () => {
+        const pinA = 'firstPin123'
+        const mnemonicA = await xolosWalletService.createNewWallet(pinA)
+        const addressA = xolosWalletService.getAddress()
+        const ownerTokenA = xolosWalletService.getPendingIdentityOwnerToken()
+        const pendingRawBefore = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
+        expect(ownerTokenA).toBeTruthy()
+        expect(pendingRawBefore).toBeTruthy()
+
+        // Second create call in the same tab/session with active ownerToken
+        await expect(
+          xolosWalletService.createNewWallet('secondPin456')
+        ).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+
+        // Identity A unchanged
+        expect(xolosWalletService.getMnemonic()).toBe(mnemonicA)
+        expect(xolosWalletService.getAddress()).toBe(addressA)
+        expect(xolosWalletService.getPendingIdentityOwnerToken()).toBe(ownerTokenA)
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe(pendingRawBefore)
+      }, 30000)
+
+      test('same-tab duplicate restoreFromMnemonic rejects with PENDING_IDENTITY_EXISTS without replacing identity', async () => {
+        const pinA = 'firstRestorePin123'
+        const resultA = await xolosWalletService.restoreFromMnemonic(TEST_MNEMONIC, undefined, pinA)
+        expect(resultA.status).toBe('restored')
+        const addressA = xolosWalletService.getAddress()
+        const ownerTokenA = xolosWalletService.getPendingIdentityOwnerToken()
+        const pendingRawBefore = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
+        expect(ownerTokenA).toBeTruthy()
+
+        // Second restore call in same tab
+        await expect(
+          xolosWalletService.restoreFromMnemonic(MNEMONIC_B, undefined, 'secondRestorePin456')
+        ).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+
+        // Identity A unchanged, B never replaces A
+        expect(xolosWalletService.getMnemonic()).toBe(TEST_MNEMONIC)
+        expect(xolosWalletService.getAddress()).toBe(addressA)
+        expect(xolosWalletService.getPendingIdentityOwnerToken()).toBe(ownerTokenA)
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe(pendingRawBefore)
+      }, 30000)
+
+      test('create -> restoreFromMnemonic in same tab rejects and preserves pending create', async () => {
+        const pinA = 'createPin123'
+        const mnemonicA = await xolosWalletService.createNewWallet(pinA)
+        const addressA = xolosWalletService.getAddress()
+        const ownerTokenA = xolosWalletService.getPendingIdentityOwnerToken()
+        const pendingRawBefore = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
+
+        await expect(
+          xolosWalletService.restoreFromMnemonic(MNEMONIC_B, undefined, 'restorePin456')
+        ).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+
+        expect(xolosWalletService.getMnemonic()).toBe(mnemonicA)
+        expect(xolosWalletService.getAddress()).toBe(addressA)
+        expect(xolosWalletService.getPendingIdentityOwnerToken()).toBe(ownerTokenA)
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe(pendingRawBefore)
+      }, 30000)
+
+      test('restore -> createNewWallet in same tab rejects and preserves pending restore', async () => {
+        const pinA = 'restorePin123'
+        const resultA = await xolosWalletService.restoreFromMnemonic(TEST_MNEMONIC, undefined, pinA)
+        expect(resultA.status).toBe('restored')
+        const addressA = xolosWalletService.getAddress()
+        const ownerTokenA = xolosWalletService.getPendingIdentityOwnerToken()
+        const pendingRawBefore = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
+
+        await expect(
+          xolosWalletService.createNewWallet('createPin456')
+        ).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+
+        expect(xolosWalletService.getMnemonic()).toBe(TEST_MNEMONIC)
+        expect(xolosWalletService.getAddress()).toBe(addressA)
+        expect(xolosWalletService.getPendingIdentityOwnerToken()).toBe(ownerTokenA)
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe(pendingRawBefore)
+      }, 30000)
+
+      test('matching ownerToken is not an exception: pending.ownerToken === this.pendingIdentityOwnerToken still rejects both', async () => {
+        const pin = 'ownerTokenPin123'
+        await xolosWalletService.createNewWallet(pin)
+        const ownerToken = xolosWalletService.getPendingIdentityOwnerToken()
+        const auth = inspectPendingIdentityAuthority()
+        expect(auth.status).toBe(PENDING_IDENTITY_STATE.RECOVERABLE_PENDING)
+        if (auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING) {
+          expect(auth.record.ownerToken).toBe(ownerToken)
+        }
+
+        // Both calls must reject even though pending.ownerToken === this.pendingIdentityOwnerToken
+        await expect(xolosWalletService.createNewWallet('anotherPin')).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+        await expect(
+          xolosWalletService.restoreFromMnemonic(MNEMONIC_B, undefined, 'anotherPin')
+        ).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+      }, 30000)
+
+      test('any valid pending exists -> createQuickStartWallet rejects with PENDING_IDENTITY_EXISTS', async () => {
+        await xolosWalletService.createNewWallet('quickStartBlockPin')
+        expect(inspectPendingIdentityAuthority().status).toBe(PENDING_IDENTITY_STATE.RECOVERABLE_PENDING)
+
+        await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+      }, 30000)
+
+      test('existing pending owner can successfully complete persistVerifiedBackup', async () => {
+        const pin = 'completePin123'
+        const mnemonic = await xolosWalletService.createNewWallet(pin)
+        const address = xolosWalletService.getAddress()
+        expect(xolosWalletService.getPendingIdentityOwnerToken()).toBeTruthy()
+
+        // Completing backup works smoothly
+        await xolosWalletService.persistVerifiedBackup(pin)
+
+        expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('true')
+        expect(inspectPendingIdentityAuthority().status).toBe(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
+        expect(xolosWalletService.getAddress()).toBe(address)
+        expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+      }, 30000)
+    })
   })
 })
