@@ -52,6 +52,7 @@ describe('Quick Start capability architecture', () => {
     expect(appSource).toContain('RequireCapability capability={WALLET_CAPABILITY.NFT_OPERATIONS}')
     expect(appSource).toContain('RequireCapability capability={WALLET_CAPABILITY.ARBITRARY_BROADCAST}')
     expect(appSource).toContain('RequireCapability capability={WALLET_CAPABILITY.X402}')
+    expect(appSource).toContain('RequireCapability capability={WALLET_CAPABILITY.TM_COMM}')
     expect(walletConnectSource).toContain('assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.WALLETCONNECT)')
     expect(walletConnectSource).toContain('CapabilityBlocked')
     expect(onboardingSource).toContain('createBlocked')

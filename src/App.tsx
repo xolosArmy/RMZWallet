@@ -130,7 +130,11 @@ function App() {
           {TM_COMM_STAGING_ENABLED && (
             <Route
               path="/tm-comm-staging"
-              element={<Suspense fallback={<div className="muted">Cargando staging TM-COMM...</div>}><TmCommStaging /></Suspense>}
+              element={(
+                <RequireCapability capability={WALLET_CAPABILITY.TM_COMM}>
+                  <Suspense fallback={<div className="muted">Cargando staging TM-COMM...</div>}><TmCommStaging /></Suspense>
+                </RequireCapability>
+              )}
             />
           )}
           {X402_H3B_ENABLED && (

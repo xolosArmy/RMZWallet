@@ -71,8 +71,12 @@ export function OnboardingHome() {
     }
     setResuming(true)
     try {
-      await resumePendingIdentity(pin)
-      navigate('/backup')
+      const result = await resumePendingIdentity(pin)
+      if (result?.reconciled) {
+        navigate('/')
+      } else {
+        navigate('/backup')
+      }
     } catch (err) {
       setError((err as Error).message || 'No se pudo recuperar la creación pendiente.')
     } finally {

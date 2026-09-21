@@ -950,5 +950,158 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       expect(newMnemonic).toBeTruthy()
       expect(xolosWalletService.getAddress()).toBeTruthy()
     }, 30000)
+
+    describe('PIN rotation & crash ordering atomicity during /backup', () => {
+      test('create with PIN A -> backup completed with PIN B -> pending re-encrypted to PIN B and final commit verified with PIN B', async () => {
+        const pinA = 'PIN_A_123456'
+        const pinB = 'PIN_B_654321'
+        const mnemonic = await xolosWalletService.createNewWallet(pinA)
+        const address = xolosWalletService.getAddress()!
+        expect(address).toBeTruthy()
+
+        const recordBefore = getPendingIdentityRecord()
+        expect(recordBefore).not.toBeNull()
+
+        await xolosWalletService.persistVerifiedBackup(pinB)
+
+        // Final ciphertext exists and can be decrypted with PIN B
+        expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+        expect(await xolosWalletService.verifyStoredMnemonic(pinB, mnemonic)).toBe(true)
+        expect(await xolosWalletService.verifyStoredMnemonic(pinA, mnemonic)).toBe(false)
+
+        // Pending record deleted on success
+        expect(getPendingIdentityRecord()).toBeNull()
+      }, 30000)
+
+      test('restoreFromMnemonic with PIN A -> backup completed with PIN B -> pending re-encrypted to PIN B and final commit verified with PIN B', async () => {
+        const pinA = 'importPIN_A_11'
+        const pinB = 'importPIN_B_22'
+        const testMnemonic = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
+        const result = await xolosWalletService.restoreFromMnemonic(testMnemonic, undefined, pinA)
+        expect(result.status).toBe('restored')
+
+        const recordBefore = getPendingIdentityRecord()
+        expect(recordBefore).not.toBeNull()
+
+        await xolosWalletService.persistVerifiedBackup(pinB)
+
+        expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+        expect(await xolosWalletService.verifyStoredMnemonic(pinB, testMnemonic)).toBe(true)
+        expect(await xolosWalletService.verifyStoredMnemonic(pinA, testMnemonic)).toBe(false)
+        expect(getPendingIdentityRecord()).toBeNull()
+      }, 30000)
+
+      test('simulate crash right after pending re-encrypt: pending recoverable with PIN B, PIN A rejected', async () => {
+        const pinA = 'PIN_A_111111'
+        const pinB = 'PIN_B_222222'
+        const mnemonic = await xolosWalletService.createNewWallet(pinA)
+        const address = xolosWalletService.getAddress()!
+
+        // Spy on encryptAndStoreMnemonic to simulate crash immediately after pending re-encryption
+        const storeSpy = vi.spyOn(xolosWalletService, 'encryptAndStoreMnemonic').mockRejectedValueOnce(
+          new Error('SIMULATED_CRASH_BEFORE_FINAL')
+        )
+
+        await expect(xolosWalletService.persistVerifiedBackup(pinB)).rejects.toThrow('SIMULATED_CRASH_BEFORE_FINAL')
+        storeSpy.mockRestore()
+
+        // Final ciphertext was not written
+        expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(false)
+
+        // Pending record exists and was re-encrypted with PIN B
+        const pending = getPendingIdentityRecord()
+        expect(pending).not.toBeNull()
+
+        // Simulate reload
+        simulateReload()
+        expect(xolosWalletService.getAddress()).toBeNull()
+
+        // PIN A rejected
+        await expect(xolosWalletService.resumePendingIdentity(pinA)).rejects.toThrow('INVALID_PIN')
+
+        // PIN B recovers pending
+        const resumed = await xolosWalletService.resumePendingIdentity(pinB)
+        expect(resumed.address).toBe(address)
+        expect(resumed.mnemonic).toBe(mnemonic)
+        expect(resumed.reconciled).toBe(false)
+        expect(xolosWalletService.getAddress()).toBe(address)
+      }, 30000)
+
+      test('simulate crash after final ciphertext but before pending cleanup: reload with PIN B recovers and reconciles without data loss', async () => {
+        const pinA = 'PIN_A_333333'
+        const pinB = 'PIN_B_444444'
+        const mnemonic = await xolosWalletService.createNewWallet(pinA)
+        const address = xolosWalletService.getAddress()!
+
+        // Simulate crash right before pending cleanup by throwing on removeItem of pending identity
+        const originalRemoveItem = Storage.prototype.removeItem
+        const deleteSpy = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function (this: Storage, key: string) {
+          if (key === PENDING_IDENTITY_STORAGE_KEY) {
+            throw new Error('SIMULATED_CRASH_BEFORE_PENDING_DELETE')
+          }
+          return originalRemoveItem.call(this, key)
+        })
+
+        await expect(xolosWalletService.persistVerifiedBackup(pinB)).rejects.toThrow('PENDING_IDENTITY_ABANDON_FAILED')
+        deleteSpy.mockRestore()
+
+        // Storage state: final ciphertext exists with PIN B, pending record exists with PIN B
+        expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+        expect(await xolosWalletService.verifyStoredMnemonic(pinB, mnemonic)).toBe(true)
+        expect(getPendingIdentityRecord()).not.toBeNull()
+
+        // Simulate reload
+        simulateReload()
+        expect(xolosWalletService.getAddress()).toBeNull()
+
+        // Reload with PIN B recovers and reconciles
+        const resumed = await xolosWalletService.resumePendingIdentity(pinB)
+        expect(resumed.address).toBe(address)
+        expect(resumed.mnemonic).toBe(mnemonic)
+        expect(resumed.reconciled).toBe(true)
+        expect(getPendingIdentityRecord()).toBeNull()
+        expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('true')
+      }, 30000)
+
+      test('fail-closed on corrupt or mismatched re-encryption: final ciphertext never written, previous pending not lost/destroyed silently', async () => {
+        const pinA = 'PIN_A_555555'
+        const pinB = 'PIN_B_666666'
+        await xolosWalletService.createNewWallet(pinA)
+
+        const pendingBefore = getPendingIdentityRecord()
+        expect(pendingBefore).not.toBeNull()
+
+        // Spy on setItem to simulate disk corruption during re-encryption write
+        const originalSetItem = Storage.prototype.setItem
+        const setSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+          if (key === PENDING_IDENTITY_STORAGE_KEY) {
+            return originalSetItem.call(this, key, 'CORRUPTED_JSON_DATA')
+          }
+          return originalSetItem.call(this, key, value)
+        })
+
+        await expect(xolosWalletService.persistVerifiedBackup(pinB)).rejects.toThrow()
+        setSpy.mockRestore()
+
+        // Final ciphertext was NEVER written
+        expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(false)
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBeNull()
+      }, 30000)
+
+      test('final ciphertext verification failure fails closed without deleting pending record or setting backup_verified', async () => {
+        const pinA = 'PIN_A_999999'
+        const pinB = 'PIN_B_000000'
+        await xolosWalletService.createNewWallet(pinA)
+
+        const verifySpy = vi.spyOn(xolosWalletService, 'verifyStoredMnemonic').mockResolvedValue(false)
+
+        await expect(xolosWalletService.persistVerifiedBackup(pinB)).rejects.toThrow('QUICK_START_BACKUP_VERIFY_FAILED')
+        verifySpy.mockRestore()
+
+        expect(getPendingIdentityRecord()).not.toBeNull()
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBeNull()
+      }, 30000)
+    })
   })
 })

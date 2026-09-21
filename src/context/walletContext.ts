@@ -42,7 +42,7 @@ export interface WalletContextValue {
   ) => Promise<WalletRestoreResult>
   pendingIdentityState: PendingIdentityState
   hasPendingIdentity: boolean
-  resumePendingIdentity: (password: string) => Promise<{ address: string }>
+  resumePendingIdentity: (password: string) => Promise<{ address: string; reconciled?: boolean }>
   abandonPendingIdentity: () => Promise<void>
   loadExistingWallet: (
     password: string,

@@ -396,7 +396,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   }, [initialized, quickStartBootstrap, syncAddressAndBalance])
 
   const resumePendingIdentity = useCallback(
-    async (password: string): Promise<{ address: string }> => {
+    async (password: string): Promise<{ address: string; reconciled?: boolean }> => {
       setLoading(true)
       setError(null)
       try {
@@ -408,14 +408,14 @@ export function WalletProvider({ children }: { children: ReactNode }) {
           localStorage.setItem(BACKUP_KEY, 'true')
           setPendingIdentityState(PENDING_IDENTITY_STATE.NONE)
           void syncAddressAndBalance({ optionalBalance: true })
-          return { address: result.address }
+          return { address: result.address, reconciled: true }
         }
         setBackupVerifiedState(false)
         localStorage.setItem(BACKUP_KEY, 'false')
         setPendingBackupPassword(password)
         setPendingIdentityState(PENDING_IDENTITY_STATE.NONE)
         void syncAddressAndBalance({ optionalBalance: true })
-        return { address: result.address }
+        return { address: result.address, reconciled: false }
       } catch (err) {
         const message =
           (err as Error).message === 'INVALID_PIN'

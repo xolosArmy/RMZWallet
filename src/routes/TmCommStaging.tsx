@@ -8,6 +8,8 @@ import {
 } from '../features/privateMessaging/authChallenge'
 import { xolosWalletService } from '../services/XolosWalletService'
 import { tmCommRequest } from './tmCommStagingClient'
+import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
+import { isWalletCapabilityEnabled } from '../domain/walletCapabilityGuard'
 
 type Conversation = {
   id: string
@@ -32,7 +34,14 @@ type LogEntry = {
 }
 
 function TmCommStaging() {
-  const { initialized, address } = useWallet()
+  const wallet = useWallet()
+  const { initialized, address, hasCapability } = wallet
+
+  const canUseTmComm = () =>
+    (typeof hasCapability === 'function'
+      ? hasCapability(WALLET_CAPABILITY.TM_COMM)
+      : isWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.TM_COMM)) === true
+
   const [enrollmentToken, setEnrollmentToken] = useState('')
   const [messageBody, setMessageBody] = useState('Mensaje privado de staging A0')
   const [conversations, setConversations] = useState<Conversation[]>([])
@@ -171,6 +180,7 @@ function TmCommStaging() {
     skipIdentityCheck = false
   ) => {
     if (targetSessionGen !== sessionGenerationRef.current) return
+    if (!canUseTmComm()) return
 
     if (!skipIdentityCheck) {
       const meRes = await tmCommRequest<{
@@ -317,6 +327,10 @@ function TmCommStaging() {
       append('La wallet debe estar desbloqueada en staging.')
       return
     }
+    if (!canUseTmComm()) {
+      append('Capability TM_COMM no autorizada para la identidad actual.')
+      return
+    }
     const publicKeyHex = xolosWalletService.getPublicKeyHex()
     if (!publicKeyHex) {
       append('No se pudo leer la clave pública.')
@@ -371,6 +385,11 @@ function TmCommStaging() {
         return
       }
 
+      if (!canUseTmComm()) {
+        append('Capability TM_COMM no autorizada para la identidad actual.')
+        return
+      }
+
       const signature = await xolosWalletService.signMessage(verified.canonicalMessage)
       if (nextGen !== sessionGenerationRef.current) return
 
@@ -409,6 +428,10 @@ function TmCommStaging() {
       append('Se requiere autenticación para la wallet activa antes de enlazar un expediente.')
       return
     }
+    if (!canUseTmComm()) {
+      append('Capability TM_COMM no autorizada para enlazar un expediente.')
+      return
+    }
     const currentAddress = address
     const currentGen = sessionGenerationRef.current
     setOperationBusy(true, currentAddress)
@@ -441,6 +464,10 @@ function TmCommStaging() {
   const send = async () => {
     if (!initialized || !address || authenticatedWalletAddressRef.current !== address) {
       append('Se requiere autenticación para la wallet activa antes de enviar.')
+      return
+    }
+    if (!canUseTmComm()) {
+      append('Capability TM_COMM no autorizada para enviar mensajes.')
       return
     }
     if (!conversation) {

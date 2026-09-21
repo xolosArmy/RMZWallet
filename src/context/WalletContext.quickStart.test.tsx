@@ -145,7 +145,8 @@ describe('WalletContext Quick Start lifecycle', () => {
     )
 
     await expect(wallet!.resumePendingIdentity('offline-pin')).resolves.toEqual({
-      address: 'ecash:qoffline-recovered'
+      address: 'ecash:qoffline-recovered',
+      reconciled: false
     })
     await waitFor(() => expect(wallet!.initialized).toBe(true))
     expect(wallet!.backupVerified).toBe(false)

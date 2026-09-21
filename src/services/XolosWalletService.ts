@@ -981,8 +981,12 @@ export class XolosWalletService {
       ? this.encryptedMnemonic
       : localStorage.getItem(STORAGE_KEY_MNEMONIC)
     if (!stored) return false
-    const { plainText } = await decryptWithPassword(stored, password)
-    return plainText.trim() === expectedMnemonic.trim()
+    try {
+      const { plainText } = await decryptWithPassword(stored, password)
+      return plainText.trim() === expectedMnemonic.trim()
+    } catch {
+      return false
+    }
   }
 
   async persistVerifiedBackup(password: string): Promise<void> {
@@ -1014,6 +1018,40 @@ export class XolosWalletService {
         if (!this.pendingIdentityOwnerToken || pendingRecord.ownerToken !== this.pendingIdentityOwnerToken) {
           throw new Error('PENDING_IDENTITY_OWNER_MISMATCH')
         }
+
+        const updatedCiphertext = await encryptWithPassword(mnemonic, password)
+        setPendingIdentityRecord({
+          version: 1,
+          ownerToken: pendingRecord.ownerToken,
+          commitment: pendingRecord.commitment,
+          address: pendingRecord.address,
+          derivationProfileId: pendingRecord.derivationProfileId,
+          ciphertext: updatedCiphertext,
+          encryptedMnemonic: updatedCiphertext,
+          state: 'PENDING_BACKUP',
+          createdAt: pendingRecord.createdAt
+        })
+
+        const readBack = getPendingIdentityRecord()
+        if (
+          !readBack ||
+          readBack.ownerToken !== pendingRecord.ownerToken ||
+          readBack.commitment !== pendingRecord.commitment ||
+          readBack.address !== pendingRecord.address ||
+          readBack.derivationProfileId !== pendingRecord.derivationProfileId ||
+          (readBack.ciphertext !== updatedCiphertext && readBack.encryptedMnemonic !== updatedCiphertext)
+        ) {
+          throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+        }
+
+        const readBackCipher = readBack.ciphertext || readBack.encryptedMnemonic
+        if (!readBackCipher) {
+          throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+        }
+        const decrypted = await decryptWithPassword(readBackCipher, password)
+        if (decrypted.plainText.trim() !== mnemonic.trim()) {
+          throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+        }
       }
 
       if (await hasQuickStartMnemonic()) {
@@ -1034,6 +1072,9 @@ export class XolosWalletService {
       }
       if (pendingRecord) {
         deletePendingIdentityRecordVerified()
+        if (getPendingIdentityRecord() !== null) {
+          throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
+        }
       }
       this.pendingIdentityOwnerToken = null
     })
@@ -1575,6 +1616,9 @@ export class XolosWalletService {
           throw new Error('PENDING_IDENTITY_RECONCILIATION_MISMATCH')
         }
         deletePendingIdentityRecordVerified()
+        if (getPendingIdentityRecord() !== null) {
+          throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
+        }
         try {
           localStorage.setItem('xoloswallet_backup_verified', 'true')
         } catch {

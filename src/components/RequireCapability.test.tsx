@@ -52,4 +52,24 @@ describe('RequireCapability route fail-closed', () => {
     )
     expect(screen.getByTestId('privileged').textContent).toBe('walletconnect live')
   })
+
+  test('direct navigation to TM_COMM staging is blocked for QUICK_START_UNBACKED', () => {
+    render(
+      <MemoryRouter>
+        <WalletContext.Provider
+          value={walletContextFixture({
+            initialized: true,
+            backupVerified: false,
+            lifecycle: WALLET_LIFECYCLE.QUICK_START_UNBACKED
+          })}
+        >
+          <RequireCapability capability={WALLET_CAPABILITY.TM_COMM}>
+            <div data-testid="tm-comm-staging-component">TmCommStaging component</div>
+          </RequireCapability>
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+    expect(screen.getByTestId('capability-blocked')).toBeTruthy()
+    expect(screen.queryByTestId('tm-comm-staging-component')).toBeNull()
+  })
 })
