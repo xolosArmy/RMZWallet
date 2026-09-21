@@ -4,7 +4,9 @@ import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
 import { xolosWalletService } from './XolosWalletService'
+import { encryptWithPassword } from './crypto'
 import {
+  PENDING_IDENTITY_STATE,
   PENDING_IDENTITY_STORAGE_KEY,
   QUICK_START_MARKER_STORAGE_KEY,
   QuickStartUnavailableError,
@@ -31,6 +33,7 @@ const MinimalXECWallet = (() => {
 
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
 const ORIGINAL_CIPHERTEXT = 'pin-backed-ciphertext-original'
+const TEST_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
 
 type QuickStartInternals = {
   encryptedMnemonic: string | null
@@ -46,6 +49,44 @@ type QuickStartInternals = {
 }
 
 const internals = xolosWalletService as unknown as QuickStartInternals
+
+function simulateReload(): void {
+  internals.encryptedMnemonic = null
+  internals.decryptedMnemonic = null
+  internals.wallet = null
+  internals.isReady = false
+  internals.activeAccountState = null
+  xolosWalletService.setPendingIdentityOwnerToken(null)
+}
+
+function setLegacyPendingIdentity(): void {
+  setPendingIdentityRecord({
+    ownerToken: 'legacy-owner-token',
+    commitment: 'legacy-commitment',
+    address: 'ecash:qlegacy-pending-address',
+    derivationProfileId: 'ecash-standard-1899',
+    createdAt: Date.now()
+  })
+}
+
+async function putCorruptQuickStartRecord(): Promise<void> {
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open('tonalli-quickstart-v1', 1)
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction('wallet', 'readwrite')
+      transaction.objectStore('wallet').put({ id: 'seed-ciphertext', version: 999 })
+      transaction.oncomplete = () => resolve()
+      transaction.onerror = () => reject(transaction.error)
+      transaction.onabort = () => reject(transaction.error)
+    })
+  } finally {
+    db.close()
+  }
+}
 
 describe('Quick Start backed-wallet and creation-lock boundaries', () => {
   beforeEach(async () => {
@@ -625,7 +666,7 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       expect(resumed.reconciled).toBe(false)
     }, 30000)
 
-    test('crash after final ciphertext but before pending cleanup -> reconcile to BACKUP_VERIFIED -> no duplicate identity', async () => {
+    test('matching final ciphertext reconciles only after PIN proves exact identity', async () => {
       const pin = 'crashAfterPIN'
       await xolosWalletService.createNewWallet(pin)
       const record = getPendingIdentityRecord()!
@@ -648,8 +689,14 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       internals.activeAccountState = null
       xolosWalletService.setPendingIdentityOwnerToken(null)
 
-      // Reconcile pending identity cleans up stale pending record because backed wallet is already verified on device
+      // Generic ciphertext existence is not proof of identity and must not clear the reservation.
       xolosWalletService.reconcilePendingIdentity()
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
+      expect(getPendingIdentityRecord()).not.toBeNull()
+
+      // The user's PIN decrypts both records and proves exact mnemonic equivalence.
+      const resumed = await xolosWalletService.resumePendingIdentity(pin)
+      expect(resumed.reconciled).toBe(true)
       expect(xolosWalletService.hasPendingIdentityRecord()).toBe(false)
       expect(getPendingIdentityRecord()).toBeNull()
     }, 30000)
@@ -725,6 +772,160 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       expect(internals.isReady).toBe(false)
     }, 30000)
 
+    test('pending commitment mismatch fails before exposing the local identity', async () => {
+      const pin = 'commitmentMismatchPIN'
+      await xolosWalletService.createNewWallet(pin)
+      const record = getPendingIdentityRecord()!
+      localStorage.setItem(
+        PENDING_IDENTITY_STORAGE_KEY,
+        JSON.stringify({ ...record, commitment: 'tampered-commitment' })
+      )
+      simulateReload()
+
+      await expect(xolosWalletService.resumePendingIdentity(pin)).rejects.toThrow(
+        'PENDING_IDENTITY_COMMITMENT_MISMATCH'
+      )
+      expect(getPendingIdentityRecord()).not.toBeNull()
+      expect(xolosWalletService.getAddress()).toBeNull()
+      expect(xolosWalletService.getMnemonic()).toBeNull()
+    }, 30000)
+
+    test('recoverable pending stays locally active and completes backup when Chronik initialize fails', async () => {
+      const pin = 'offlineRecoveryPIN'
+      const mnemonic = await xolosWalletService.createNewWallet(pin)
+      const address = xolosWalletService.getAddress()!
+      simulateReload()
+
+      vi.mocked(MinimalXECWallet!.prototype.initialize).mockRejectedValueOnce(new Error('CHRONIK_OFFLINE'))
+
+      const resumed = await xolosWalletService.resumePendingIdentity(pin)
+      expect(resumed).toMatchObject({ address, mnemonic, reconciled: false })
+      expect(xolosWalletService.getAddress()).toBe(address)
+      expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+      expect(internals.isReady).toBe(true)
+      expect(getPendingIdentityRecord()).not.toBeNull()
+
+      await xolosWalletService.persistVerifiedBackup(pin)
+      expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+      expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('true')
+      expect(getPendingIdentityRecord()).toBeNull()
+    }, 30000)
+
+    test('final ciphertext for another identity denies reconciliation and preserves pending', async () => {
+      const pin = 'reconcileMismatchPIN'
+      await xolosWalletService.createNewWallet(pin)
+      const pending = getPendingIdentityRecord()
+      expect(pending).not.toBeNull()
+      simulateReload()
+
+      localStorage.setItem(STORAGE_KEY_MNEMONIC, await encryptWithPassword(TEST_MNEMONIC, pin))
+
+      await expect(xolosWalletService.resumePendingIdentity(pin)).rejects.toThrow(
+        'PENDING_IDENTITY_RECONCILIATION_MISMATCH'
+      )
+      expect(getPendingIdentityRecord()).toEqual(pending)
+      expect(xolosWalletService.getAddress()).toBeNull()
+      expect(xolosWalletService.getMnemonic()).toBeNull()
+    }, 30000)
+
+    test('legacy pending is classified, blocks all onboarding mutations, and can be explicitly abandoned', async () => {
+      setLegacyPendingIdentity()
+      expect(xolosWalletService.getPendingIdentityState()).toBe(
+        PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+      )
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
+      expect(xolosWalletService.hasRecoverablePendingIdentity()).toBe(false)
+
+      await expect(xolosWalletService.createNewWallet('new-wallet-pin')).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+      await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+      await expect(xolosWalletService.restoreFromMnemonic(TEST_MNEMONIC)).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+
+      await xolosWalletService.abandonLegacyPendingIdentity()
+      expect(getPendingIdentityRecord()).toBeNull()
+      expect(xolosWalletService.getPendingIdentityState()).toBe(PENDING_IDENTITY_STATE.NONE)
+
+      await expect(xolosWalletService.createNewWallet()).resolves.toBeTruthy()
+    }, 30000)
+
+    test('legacy pending abandonment is denied when Quick Start is present', async () => {
+      await xolosWalletService.createQuickStartWallet()
+      setLegacyPendingIdentity()
+
+      await expect(xolosWalletService.abandonLegacyPendingIdentity()).rejects.toThrow(
+        'QUICK_START_RECORD_EXISTS'
+      )
+      expect(getPendingIdentityRecord()).not.toBeNull()
+    }, 30000)
+
+    test('pending abandonment is denied while the creating session still owns the workflow', async () => {
+      await xolosWalletService.createNewWallet('activeOwnerPIN')
+
+      await expect(xolosWalletService.abandonPendingIdentity()).rejects.toThrow(
+        'PENDING_IDENTITY_SESSION_ACTIVE'
+      )
+      expect(getPendingIdentityRecord()).not.toBeNull()
+    }, 30000)
+
+    test('legacy pending abandonment cannot replace an existing backed wallet', async () => {
+      setLegacyPendingIdentity()
+      localStorage.setItem(STORAGE_KEY_MNEMONIC, ORIGINAL_CIPHERTEXT)
+
+      await expect(xolosWalletService.abandonLegacyPendingIdentity()).rejects.toThrow(
+        'BACKED_WALLET_EXISTS'
+      )
+      expect(getPendingIdentityRecord()).not.toBeNull()
+      expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(ORIGINAL_CIPHERTEXT)
+    })
+
+    test('legacy pending abandonment fails closed when Quick Start storage is unavailable/unknown', async () => {
+      setLegacyPendingIdentity()
+      localStorage.setItem(
+        QUICK_START_MARKER_STORAGE_KEY,
+        JSON.stringify({ version: 1, createdAt: Date.now() })
+      )
+      const indexedDbDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB')
+      Object.defineProperty(globalThis, 'indexedDB', { configurable: true, value: undefined })
+
+      try {
+        await expect(xolosWalletService.abandonLegacyPendingIdentity()).rejects.toThrow(
+          'QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN'
+        )
+      } finally {
+        if (indexedDbDescriptor) {
+          Object.defineProperty(globalThis, 'indexedDB', indexedDbDescriptor)
+        }
+      }
+      expect(getPendingIdentityRecord()).not.toBeNull()
+    })
+
+    test('legacy pending abandonment fails closed when Quick Start recovery fails', async () => {
+      setLegacyPendingIdentity()
+      await putCorruptQuickStartRecord()
+
+      await expect(xolosWalletService.abandonLegacyPendingIdentity()).rejects.toThrow(
+        'QUICK_START_RECOVERY_FAILED'
+      )
+      expect(getPendingIdentityRecord()).not.toBeNull()
+    })
+
+    test('legacy pending delete must read back absent or report failure and preserve reservation', async () => {
+      setLegacyPendingIdentity()
+      const originalRemoveItem = Storage.prototype.removeItem
+      const removeSpy = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function (this: Storage, key: string) {
+        if (key === PENDING_IDENTITY_STORAGE_KEY) return
+        return originalRemoveItem.call(this, key)
+      })
+
+      try {
+        await expect(xolosWalletService.abandonLegacyPendingIdentity()).rejects.toThrow(
+          'PENDING_IDENTITY_ABANDON_FAILED'
+        )
+      } finally {
+        removeSpy.mockRestore()
+      }
+      expect(getPendingIdentityRecord()).not.toBeNull()
+    })
+
     test('explicit abandonment clears reservation and allows fresh start, never touches backed wallet or quickstart', async () => {
       const pin = 'abandonTestPin'
       await xolosWalletService.createNewWallet(pin)
@@ -740,7 +941,7 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
 
       // User explicitly abandons pending identity
-      xolosWalletService.abandonPendingIdentity()
+      await xolosWalletService.abandonPendingIdentity()
       expect(xolosWalletService.hasPendingIdentityRecord()).toBe(false)
       expect(getPendingIdentityRecord()).toBeNull()
 
@@ -751,5 +952,3 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
     }, 30000)
   })
 })
-
-

@@ -2,6 +2,7 @@ import { vi } from 'vitest'
 import { WALLET_LIFECYCLE } from '../domain/walletLifecycle'
 import { isCapabilityAllowed } from '../domain/walletCapabilities'
 import type { WalletContextValue } from '../context/walletContext'
+import { PENDING_IDENTITY_STATE } from '../services/quickStartStorage'
 
 export function walletContextFixture(
   overrides: Partial<WalletContextValue> = {}
@@ -14,6 +15,11 @@ export function walletContextFixture(
       : initialized
         ? WALLET_LIFECYCLE.QUICK_START_UNBACKED
         : WALLET_LIFECYCLE.UNINITIALIZED
+  )
+  const pendingIdentityState = overrides.pendingIdentityState ?? (
+    overrides.hasPendingIdentity
+      ? PENDING_IDENTITY_STATE.RECOVERABLE_PENDING
+      : PENDING_IDENTITY_STATE.NONE
   )
   return {
     address: null,
@@ -46,7 +52,8 @@ export function walletContextFixture(
     estimateXecSend: vi.fn(),
     getMnemonic: vi.fn(),
     unlockEncryptedWallet: vi.fn(),
-    hasPendingIdentity: overrides.hasPendingIdentity ?? false,
+    pendingIdentityState,
+    hasPendingIdentity: overrides.hasPendingIdentity ?? pendingIdentityState !== PENDING_IDENTITY_STATE.NONE,
     resumePendingIdentity: vi.fn(),
     abandonPendingIdentity: vi.fn(),
     ...overrides

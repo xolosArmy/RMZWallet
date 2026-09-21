@@ -14,6 +14,7 @@ import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import type { FirmaSendPreview } from '../services/firmaAlphaSend'
 import type { WalletCapability } from '../domain/walletCapabilities'
 import type { WalletLifecycle } from '../domain/walletLifecycle'
+import type { PendingIdentityState } from '../services/quickStartStorage'
 
 export type QuickStartBootstrapStatus = 'pending' | 'absent' | 'recovered' | 'failed'
 
@@ -39,9 +40,10 @@ export interface WalletContextValue {
     selectedProfileId?: DerivationProfileId,
     password?: string
   ) => Promise<WalletRestoreResult>
+  pendingIdentityState: PendingIdentityState
   hasPendingIdentity: boolean
   resumePendingIdentity: (password: string) => Promise<{ address: string }>
-  abandonPendingIdentity: () => void
+  abandonPendingIdentity: () => Promise<void>
   loadExistingWallet: (
     password: string,
     selectedProfileId?: DerivationProfileId

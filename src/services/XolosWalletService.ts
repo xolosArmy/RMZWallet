@@ -31,19 +31,23 @@ import type { DecryptPasswordResult } from './crypto'
 import {
   QuickStartUnavailableError,
   assertQuickStartStorageAvailable,
+  classifyPendingIdentityRecord,
   clearPendingIdentityRecord,
   clearQuickStartMnemonic,
   computeMnemonicCommitment,
+  deletePendingIdentityRecordVerified,
   getPendingIdentityRecord,
   getQuickStartRecordStatus,
   hasQuickStartMnemonic,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
+  PENDING_IDENTITY_STATE,
   setPendingIdentityRecord,
   storeQuickStartMnemonic,
+  withIdentityMutationLock,
   withQuickStartCreationLock
 } from './quickStartStorage'
-import type { QuickStartRecordStatus } from './quickStartStorage'
+import type { PendingIdentityState, QuickStartRecordStatus } from './quickStartStorage'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
 
 function generateOwnerToken(): string {
@@ -1001,6 +1005,12 @@ export class XolosWalletService {
         if (pendingRecord.commitment !== commitment) {
           throw new Error('PENDING_IDENTITY_MISMATCH')
         }
+        if (
+          pendingRecord.address !== this.getAddress() ||
+          pendingRecord.derivationProfileId !== this.activeProfileId
+        ) {
+          throw new Error('PENDING_IDENTITY_MISMATCH')
+        }
         if (!this.pendingIdentityOwnerToken || pendingRecord.ownerToken !== this.pendingIdentityOwnerToken) {
           throw new Error('PENDING_IDENTITY_OWNER_MISMATCH')
         }
@@ -1022,7 +1032,9 @@ export class XolosWalletService {
       } catch {
         // ignore
       }
-      clearPendingIdentityRecord()
+      if (pendingRecord) {
+        deletePendingIdentityRecordVerified()
+      }
       this.pendingIdentityOwnerToken = null
     })
   }
@@ -1497,21 +1509,31 @@ export class XolosWalletService {
     return true
   }
 
+  getPendingIdentityState(): PendingIdentityState {
+    return classifyPendingIdentityRecord()
+  }
+
   hasRecoverablePendingIdentity(): boolean {
     const pending = getPendingIdentityRecord()
     if (!pending) return false
-    const cipher = pending.ciphertext || pending.encryptedMnemonic
-    return Boolean(cipher && (!this.isReady || !this.pendingIdentityOwnerToken || pending.ownerToken !== this.pendingIdentityOwnerToken))
+    return Boolean(
+      classifyPendingIdentityRecord(pending) === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING &&
+      (!this.isReady || !this.pendingIdentityOwnerToken || pending.ownerToken !== this.pendingIdentityOwnerToken)
+    )
   }
 
   async resumePendingIdentity(password: string): Promise<{ address: string; mnemonic: string; reconciled: boolean }> {
-    return withQuickStartCreationLock(async () => {
+    return withIdentityMutationLock(async () => {
       const pending = getPendingIdentityRecord()
       if (!pending) {
         throw new Error('NO_PENDING_IDENTITY')
       }
+      if (classifyPendingIdentityRecord(pending) !== PENDING_IDENTITY_STATE.RECOVERABLE_PENDING) {
+        throw new Error('PENDING_IDENTITY_NOT_RECOVERABLE')
+      }
       const ciphertext = pending.ciphertext || pending.encryptedMnemonic
-      if (!ciphertext) {
+      const profileId = pending.derivationProfileId
+      if (!ciphertext || !profileId) {
         throw new Error('PENDING_IDENTITY_NOT_RECOVERABLE')
       }
 
@@ -1530,83 +1552,98 @@ export class XolosWalletService {
         throw new Error('PENDING_IDENTITY_COMMITMENT_MISMATCH')
       }
 
-      // Check crash reconciliation: if final ciphertext already exists and matches this mnemonic:
-      if (this.hasBackedWalletCiphertextOnDevice()) {
-        const matches = await this.verifyStoredMnemonic(password, mnemonic).catch(() => false)
-        if (matches) {
-          clearPendingIdentityRecord()
-          this.pendingIdentityOwnerToken = null
-          const profileId = pending.derivationProfileId || DEFAULT_NEW_WALLET_PROFILE_ID
-          await this.activateMnemonicLocalIdentity(mnemonic, profileId)
-          try {
-            await (this.wallet as MinimalXecWallet).initialize()
-          } catch (err) {
-            this.decryptedMnemonic = null
-            this.wallet = null
-            this.isReady = false
-            this.activeAccountState = null
-            throw err
-          }
-          return { address: this.getAddress() || pending.address, mnemonic, reconciled: true }
-        }
-      }
-
-      const profileId = pending.derivationProfileId || DEFAULT_NEW_WALLET_PROFILE_ID
       await this.activateMnemonicLocalIdentity(mnemonic, profileId)
-      try {
-        await (this.wallet as MinimalXecWallet).initialize()
-      } catch (err) {
-        this.decryptedMnemonic = null
-        this.wallet = null
-        this.isReady = false
-        this.activeAccountState = null
-        throw err
-      }
-
       const derivedAddress = this.getAddress() || ''
-      if (pending.address && derivedAddress !== pending.address) {
+      if (derivedAddress !== pending.address) {
         this.decryptedMnemonic = null
         this.wallet = null
         this.isReady = false
         this.activeAccountState = null
+        this.pendingIdentityOwnerToken = null
         throw new Error('PENDING_IDENTITY_ADDRESS_MISMATCH')
       }
 
-      this.pendingIdentityOwnerToken = pending.ownerToken
-      return { address: derivedAddress, mnemonic, reconciled: false }
-    })
-  }
-
-  abandonPendingIdentity(): void {
-    const pending = getPendingIdentityRecord()
-    if (!pending) return
-    clearPendingIdentityRecord()
-    this.pendingIdentityOwnerToken = null
-  }
-
-  reconcilePendingIdentity(): void {
-    if (typeof window === 'undefined') return
-    try {
+      let reconciled = false
       if (this.hasBackedWalletCiphertextOnDevice()) {
-        const pending = getPendingIdentityRecord()
-        if (pending) {
-          clearPendingIdentityRecord()
+        const matches = await this.verifyStoredMnemonic(password, mnemonic).catch(() => false)
+        if (!matches) {
+          this.decryptedMnemonic = null
+          this.wallet = null
+          this.isReady = false
+          this.activeAccountState = null
           this.pendingIdentityOwnerToken = null
+          throw new Error('PENDING_IDENTITY_RECONCILIATION_MISMATCH')
         }
+        deletePendingIdentityRecordVerified()
         try {
           localStorage.setItem('xoloswallet_backup_verified', 'true')
         } catch {
-          // ignore
+          // The exact final ciphertext remains authoritative even if the convenience marker cannot be refreshed.
         }
+        reconciled = true
       }
-    } catch {
-      // best-effort
-    }
+
+      this.pendingIdentityOwnerToken = reconciled ? null : pending.ownerToken
+
+      try {
+        await (this.wallet as MinimalXecWallet).initialize()
+      } catch {
+        // Network hydration is best-effort. The locally authenticated identity remains usable for backup.
+      }
+
+      return { address: derivedAddress, mnemonic, reconciled }
+    })
   }
 
-  clearPendingIdentity(): void {
+  private async abandonPendingIdentityWithExpectedState(expectedState: PendingIdentityState): Promise<void> {
+    const pending = getPendingIdentityRecord()
+    if (!pending) {
+      throw new Error('NO_PENDING_IDENTITY')
+    }
+    if (classifyPendingIdentityRecord(pending) !== expectedState) {
+      throw new Error('PENDING_IDENTITY_STATE_CHANGED')
+    }
+    if (this.pendingIdentityOwnerToken === pending.ownerToken) {
+      throw new Error('PENDING_IDENTITY_SESSION_ACTIVE')
+    }
+    if (this.hasBackedWalletCiphertextOnDevice()) {
+      throw new Error('BACKED_WALLET_EXISTS')
+    }
+
+    const quickStartStatus = await getQuickStartRecordStatus()
+    if (quickStartStatus === 'PRESENT') {
+      throw new Error('QUICK_START_RECORD_EXISTS')
+    }
+    if (quickStartStatus === 'STORAGE_UNAVAILABLE_UNKNOWN') {
+      throw new Error('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
+    }
+    if (quickStartStatus === 'RECOVERY_FAILED') {
+      throw new Error('QUICK_START_RECOVERY_FAILED')
+    }
+
+    deletePendingIdentityRecordVerified()
     this.pendingIdentityOwnerToken = null
-    clearPendingIdentityRecord()
+  }
+
+  async abandonLegacyPendingIdentity(): Promise<void> {
+    return withIdentityMutationLock(async () => {
+      await this.abandonPendingIdentityWithExpectedState(
+        PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+      )
+    })
+  }
+
+  async abandonPendingIdentity(): Promise<void> {
+    return withIdentityMutationLock(async () => {
+      await this.abandonPendingIdentityWithExpectedState(
+        PENDING_IDENTITY_STATE.RECOVERABLE_PENDING
+      )
+    })
+  }
+
+  reconcilePendingIdentity(): void {
+    // Reconciliation requires the user's PIN and exact mnemonic equivalence proof.
+    // It is performed by resumePendingIdentity(); generic ciphertext existence is insufficient.
   }
 
   getPendingIdentityOwnerToken(): string | null {

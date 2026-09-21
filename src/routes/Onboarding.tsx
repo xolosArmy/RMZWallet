@@ -11,12 +11,27 @@ import {
 } from '../services/derivationProfiles'
 import type { DerivationProfileId } from '../services/derivationProfiles'
 import type { DerivationDiscovery } from '../services/dualDerivationDiscovery'
-import { QuickStartUnavailableError, isWebLocksSupported } from '../services/quickStartStorage'
+import {
+  PENDING_IDENTITY_STATE,
+  QuickStartUnavailableError,
+  isWebLocksSupported,
+  type PendingIdentityState
+} from '../services/quickStartStorage'
 import { readTonalliIntent } from '../services/tonalliIntent'
 import { setPendingBackupPassword } from '../services/backupSession'
 
 const formatSatsAsXec = (sats: bigint) =>
   `${sats / 100n}.${(sats % 100n).toString().padStart(2, '0')}`
+
+const pendingIdentityBlockingMessage = (state: PendingIdentityState) =>
+  state === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+    ? 'Encontramos una creación anterior incompleta que esta versión no puede recuperar automáticamente.'
+    : 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+
+const pendingIdentityActionLabel = (state: PendingIdentityState) =>
+  state === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+    ? 'Resolver creación incompleta'
+    : 'Continuar respaldo'
 
 function OnboardingShell({ children, className = '' }: { children: ReactNode; className?: string }) {
   const { backupVerified, initialized } = useWallet()
@@ -32,6 +47,7 @@ function OnboardingShell({ children, className = '' }: { children: ReactNode; cl
 
 export function OnboardingHome() {
   const {
+    pendingIdentityState,
     hasPendingIdentity,
     resumePendingIdentity,
     abandonPendingIdentity,
@@ -42,6 +58,9 @@ export function OnboardingHome() {
   const [error, setError] = useState<string | null>(null)
   const [confirmAbandon, setConfirmAbandon] = useState(false)
   const [resuming, setResuming] = useState(false)
+  const [abandoning, setAbandoning] = useState(false)
+  const recoverablePending = pendingIdentityState === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING
+  const legacyPending = pendingIdentityState === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
 
   const handleResume = async (e: FormEvent) => {
     e.preventDefault()
@@ -61,15 +80,18 @@ export function OnboardingHome() {
     }
   }
 
-  const handleAbandon = () => {
-    if (!confirmAbandon) {
-      setConfirmAbandon(true)
-      return
-    }
-    abandonPendingIdentity()
-    setConfirmAbandon(false)
+  const handleAbandon = async () => {
+    setAbandoning(true)
     setError(null)
-    setPin('')
+    try {
+      await abandonPendingIdentity()
+      setConfirmAbandon(false)
+      setPin('')
+    } catch (err) {
+      setError((err as Error).message || 'No se pudo descartar la creación incompleta.')
+    } finally {
+      setAbandoning(false)
+    }
   }
 
   return (
@@ -95,39 +117,47 @@ export function OnboardingHome() {
             <p className="card-kicker" style={{ color: 'var(--color-warning, #f59e0b)', fontWeight: 'bold' }}>
               Creación pendiente detectada
             </p>
-            <h2 style={{ fontSize: '1.25rem', margin: '0.5rem 0' }}>Tienes una creación de Tonalli pendiente</h2>
-            <p className="muted" style={{ fontSize: '0.9rem', marginBottom: '1rem' }}>
-              Existe una identidad creada o importada pendiente de verificar su respaldo. Ingresa tu PIN local para continuar el respaldo de forma segura.
-            </p>
-            <form onSubmit={handleResume}>
-              <div className="field" style={{ marginBottom: '1rem' }}>
-                <label htmlFor="pending-pin" style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.875rem' }}>
-                  PIN o contraseña local:
-                </label>
-                <input
-                  id="pending-pin"
-                  type="password"
-                  className="input"
-                  data-testid="pending-pin-input"
-                  value={pin}
-                  onChange={(e) => setPin(e.target.value)}
-                  placeholder="Tu PIN local"
-                  disabled={resuming || loading}
-                  autoComplete="current-password"
-                  style={{ width: '100%' }}
-                />
-              </div>
-              <div className="actions" style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-                <button
-                  type="submit"
-                  className="cta primary"
-                  data-testid="resume-pending-backup-btn"
-                  disabled={resuming || loading || !pin}
-                >
-                  {resuming ? 'Verificando...' : 'Continuar respaldo'}
-                </button>
-              </div>
-            </form>
+            {recoverablePending ? (
+              <>
+                <h2 style={{ fontSize: '1.25rem', margin: '0.5rem 0' }}>Tienes una creación de Tonalli pendiente</h2>
+                <p className="muted" style={{ fontSize: '0.9rem', marginBottom: '1rem' }}>
+                  Existe una identidad creada o importada pendiente de verificar su respaldo. Ingresa tu PIN local para continuar el respaldo de forma segura.
+                </p>
+                <form onSubmit={handleResume}>
+                  <div className="field" style={{ marginBottom: '1rem' }}>
+                    <label htmlFor="pending-pin" style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.875rem' }}>
+                      PIN o contraseña local:
+                    </label>
+                    <input
+                      id="pending-pin"
+                      type="password"
+                      className="input"
+                      data-testid="pending-pin-input"
+                      value={pin}
+                      onChange={(e) => setPin(e.target.value)}
+                      placeholder="Tu PIN local"
+                      disabled={resuming || loading}
+                      autoComplete="current-password"
+                      style={{ width: '100%' }}
+                    />
+                  </div>
+                  <div className="actions" style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+                    <button
+                      type="submit"
+                      className="cta primary"
+                      data-testid="resume-pending-backup-btn"
+                      disabled={resuming || loading || !pin}
+                    >
+                      {resuming ? 'Verificando...' : 'Continuar respaldo'}
+                    </button>
+                  </div>
+                </form>
+              </>
+            ) : legacyPending ? (
+              <p className="muted" style={{ fontSize: '0.9rem', marginBottom: '1rem' }}>
+                Encontramos una creación anterior incompleta que esta versión no puede recuperar automáticamente.
+              </p>
+            ) : null}
             {error && (
               <div className="error" role="alert" data-testid="pending-identity-error" style={{ marginTop: '0.75rem' }}>
                 {error}
@@ -141,29 +171,34 @@ export function OnboardingHome() {
                   style={{ fontSize: '0.8rem', color: 'var(--text-muted, #888)' }}
                   onClick={() => setConfirmAbandon(true)}
                   data-testid="request-abandon-pending-btn"
+                  disabled={resuming || loading || abandoning}
                 >
-                  Descartar creación pendiente…
+                  {legacyPending
+                    ? 'Descartar creación incompleta y empezar de nuevo'
+                    : 'Descartar creación pendiente…'}
                 </button>
               ) : (
                 <div className="warning" style={{ fontSize: '0.85rem' }} data-testid="abandon-warning-box">
                   <p style={{ margin: '0 0 0.5rem 0', color: 'var(--color-danger, #ef4444)' }}>
-                    <strong>Advertencia de pérdida permanente:</strong> Si ya transferiste fondos a esta dirección, perderás el acceso de forma irreversible si no respaldaste la frase.
+                    La dirección creada anteriormente pudo haber recibido fondos. Si no conservas su frase de recuperación, descartarla puede hacer que esos fondos sean inaccesibles permanentemente.
                   </p>
                   <div style={{ display: 'flex', gap: '0.5rem' }}>
                     <button
                       type="button"
                       className="cta danger"
-                      onClick={handleAbandon}
+                      onClick={() => void handleAbandon()}
                       data-testid="confirm-abandon-pending-btn"
                       style={{ fontSize: '0.8rem' }}
+                      disabled={abandoning || loading}
                     >
-                      Sí, descartar definitivamente
+                      {abandoning ? 'Descartando…' : 'Sí, descartar definitivamente'}
                     </button>
                     <button
                       type="button"
                       className="cta ghost"
                       onClick={() => setConfirmAbandon(false)}
                       style={{ fontSize: '0.8rem' }}
+                      disabled={abandoning || loading}
                     >
                       Cancelar
                     </button>
@@ -322,6 +357,7 @@ export function CreateWallet() {
     initialized,
     quickStartBootstrap,
     hasBackedWalletOnDevice,
+    pendingIdentityState,
     hasPendingIdentity
   } = useWallet()
   const [localError, setLocalError] = useState<string | null>(null)
@@ -353,7 +389,7 @@ export function CreateWallet() {
     if (createBlocked && !initialized) {
       setLocalError(
         hasPendingIdentity
-          ? 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+          ? pendingIdentityBlockingMessage(pendingIdentityState)
           : recoveryFailed
             ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se creará otra wallet.'
             : 'Espera a que Tonalli termine de preparar este dispositivo.'
@@ -403,10 +439,10 @@ export function CreateWallet() {
           )}
           {hasPendingIdentity && (
             <div className="warning" role="alert" data-testid="pending-identity-alert">
-              Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.
+              {pendingIdentityBlockingMessage(pendingIdentityState)}
               <div style={{ marginTop: '0.75rem' }}>
                 <Link className="cta outline" to="/onboarding">
-                  Continuar respaldo
+                  {pendingIdentityActionLabel(pendingIdentityState)}
                 </Link>
               </div>
             </div>
@@ -452,7 +488,15 @@ export function CreateWallet() {
 
 export function CreateBackedWallet() {
   const navigate = useNavigate()
-  const { createNewWallet, loading, error, initialized, quickStartBootstrap, hasPendingIdentity } = useWallet()
+  const {
+    createNewWallet,
+    loading,
+    error,
+    initialized,
+    quickStartBootstrap,
+    pendingIdentityState,
+    hasPendingIdentity
+  } = useWallet()
   const [passwordNew, setPasswordNew] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
   const webLocksSupported = isWebLocksSupported()
@@ -478,7 +522,7 @@ export function CreateBackedWallet() {
     if (createBlocked) {
       setLocalError(
         hasPendingIdentity
-          ? 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+          ? pendingIdentityBlockingMessage(pendingIdentityState)
           : recoveryFailed
             ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se creará otra wallet.'
             : bootstrapPending
@@ -522,10 +566,10 @@ export function CreateBackedWallet() {
           )}
           {hasPendingIdentity && (
             <div className="warning" role="alert" data-testid="pending-identity-alert">
-              Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.
+              {pendingIdentityBlockingMessage(pendingIdentityState)}
               <div style={{ marginTop: '0.75rem' }}>
                 <Link className="cta outline" to="/onboarding">
-                  Continuar respaldo
+                  {pendingIdentityActionLabel(pendingIdentityState)}
                 </Link>
               </div>
             </div>
@@ -657,7 +701,15 @@ export function UnlockWallet() {
 
 export function ImportWallet() {
   const navigate = useNavigate()
-  const { restoreWallet, loading, error, initialized, quickStartBootstrap, hasPendingIdentity } = useWallet()
+  const {
+    restoreWallet,
+    loading,
+    error,
+    initialized,
+    quickStartBootstrap,
+    pendingIdentityState,
+    hasPendingIdentity
+  } = useWallet()
   const [seedPhrase, setSeedPhrase] = useState('')
   const [passwordImport, setPasswordImport] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
@@ -685,7 +737,7 @@ export function ImportWallet() {
       if (importBlocked) {
         setLocalError(
           hasPendingIdentity
-            ? 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+            ? pendingIdentityBlockingMessage(pendingIdentityState)
             : recoveryFailed
               ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se restaurará otra wallet.'
               : bootstrapPending
@@ -720,7 +772,7 @@ export function ImportWallet() {
     if (importBlocked) {
       setLocalError(
         hasPendingIdentity
-          ? 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+          ? pendingIdentityBlockingMessage(pendingIdentityState)
           : recoveryFailed
             ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se restaurará otra wallet.'
             : bootstrapPending
@@ -778,10 +830,10 @@ export function ImportWallet() {
           )}
           {hasPendingIdentity && (
             <div className="warning" role="alert" data-testid="pending-identity-alert">
-              Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.
+              {pendingIdentityBlockingMessage(pendingIdentityState)}
               <div style={{ marginTop: '0.75rem' }}>
                 <Link className="cta outline" to="/onboarding">
-                  Continuar respaldo
+                  {pendingIdentityActionLabel(pendingIdentityState)}
                 </Link>
               </div>
             </div>

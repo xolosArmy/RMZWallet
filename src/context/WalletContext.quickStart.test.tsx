@@ -6,7 +6,7 @@ import { WalletProvider } from './WalletContext'
 import { useWallet } from './useWallet'
 import { WALLET_LIFECYCLE } from '../domain/walletLifecycle'
 import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
-import { QuickStartUnavailableError } from '../services/quickStartStorage'
+import { QuickStartUnavailableError, type PendingIdentityState } from '../services/quickStartStorage'
 
 const serviceMocks = vi.hoisted(() => ({
   getAddress: vi.fn(() => 'ecash:qquickstart'),
@@ -50,10 +50,12 @@ const serviceMocks = vi.hoisted(() => ({
   prepareFirmaSend: vi.fn(),
   getMnemonic: vi.fn(() => 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'),
   hasBackedWalletCiphertextOnDevice: vi.fn(() => false),
+  getPendingIdentityState: vi.fn((): PendingIdentityState => 'NONE'),
   hasRecoverablePendingIdentity: vi.fn(() => false),
   hasPendingIdentityRecord: vi.fn(() => false),
   resumePendingIdentity: vi.fn(),
-  abandonPendingIdentity: vi.fn(),
+  abandonPendingIdentity: vi.fn(async () => undefined),
+  abandonLegacyPendingIdentity: vi.fn(async () => undefined),
   reconcilePendingIdentity: vi.fn()
 }))
 
@@ -119,6 +121,35 @@ describe('WalletContext Quick Start lifecycle', () => {
     })
     serviceMocks.hasBackedWalletCiphertextOnDevice.mockReset()
     serviceMocks.hasBackedWalletCiphertextOnDevice.mockReturnValue(false)
+    serviceMocks.getPendingIdentityState.mockReset()
+    serviceMocks.getPendingIdentityState.mockReturnValue('NONE')
+    serviceMocks.resumePendingIdentity.mockReset()
+    serviceMocks.abandonPendingIdentity.mockReset()
+    serviceMocks.abandonLegacyPendingIdentity.mockReset()
+  })
+
+  it('returns local pending recovery success without waiting for balance/network hydration', async () => {
+    serviceMocks.getPendingIdentityState.mockReturnValue('RECOVERABLE_PENDING')
+    serviceMocks.resumePendingIdentity.mockResolvedValue({
+      address: 'ecash:qoffline-recovered',
+      mnemonic: 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+      reconciled: false
+    })
+    serviceMocks.getBalances.mockImplementation(() => new Promise(() => undefined))
+
+    let wallet: ReturnType<typeof useWallet> | null = null
+    render(
+      <WalletProvider>
+        <Harness onReady={(value) => { wallet = value }} />
+      </WalletProvider>
+    )
+
+    await expect(wallet!.resumePendingIdentity('offline-pin')).resolves.toEqual({
+      address: 'ecash:qoffline-recovered'
+    })
+    await waitFor(() => expect(wallet!.initialized).toBe(true))
+    expect(wallet!.backupVerified).toBe(false)
+    expect(serviceMocks.getBalances).toHaveBeenCalled()
   })
 
   it('activates a limited wallet and blocks privileged sends until backup is verified', async () => {

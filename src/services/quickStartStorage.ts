@@ -563,6 +563,15 @@ export interface PendingIdentityRecord {
   state?: 'PENDING_BACKUP'
 }
 
+export const PENDING_IDENTITY_STATE = {
+  NONE: 'NONE',
+  RECOVERABLE_PENDING: 'RECOVERABLE_PENDING',
+  LEGACY_UNRECOVERABLE_PENDING: 'LEGACY_UNRECOVERABLE_PENDING'
+} as const
+
+export type PendingIdentityState =
+  (typeof PENDING_IDENTITY_STATE)[keyof typeof PENDING_IDENTITY_STATE]
+
 export const PENDING_IDENTITY_STORAGE_KEY = 'xoloswallet_pending_identity'
 
 export function getPendingIdentityRecord(): PendingIdentityRecord | null {
@@ -605,6 +614,27 @@ export function getPendingIdentityRecord(): PendingIdentityRecord | null {
   } catch {
     return null
   }
+}
+
+export function classifyPendingIdentityRecord(
+  pending: PendingIdentityRecord | null = getPendingIdentityRecord()
+): PendingIdentityState {
+  if (!pending) return PENDING_IDENTITY_STATE.NONE
+
+  const ciphertext = pending.ciphertext || pending.encryptedMnemonic
+  const hasRecoverableMetadata = Boolean(
+    ciphertext &&
+    pending.state === 'PENDING_BACKUP' &&
+    pending.ownerToken &&
+    pending.commitment &&
+    pending.address &&
+    pending.derivationProfileId &&
+    isDerivationProfileId(pending.derivationProfileId)
+  )
+
+  return hasRecoverableMetadata
+    ? PENDING_IDENTITY_STATE.RECOVERABLE_PENDING
+    : PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
 }
 
 export function setPendingIdentityRecord(record: {
@@ -691,6 +721,21 @@ export function clearPendingIdentityRecord(): void {
   }
 }
 
+export function deletePendingIdentityRecordVerified(): void {
+  if (typeof localStorage === 'undefined') {
+    throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
+  }
+
+  try {
+    localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
+    if (localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY) !== null) {
+      throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
+    }
+  } catch {
+    throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
+  }
+}
+
 export async function computeMnemonicCommitment(mnemonic: string): Promise<string> {
   const normalized = mnemonic.trim().toLowerCase().replace(/\s+/g, ' ')
   if (typeof crypto !== 'undefined' && crypto.subtle && typeof crypto.subtle.digest === 'function') {
@@ -704,4 +749,3 @@ export async function computeMnemonicCommitment(mnemonic: string): Promise<strin
   }
   return hash.toString(16)
 }
-
