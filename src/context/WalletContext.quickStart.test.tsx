@@ -49,7 +49,12 @@ const serviceMocks = vi.hoisted(() => ({
   sendFirma: vi.fn(),
   prepareFirmaSend: vi.fn(),
   getMnemonic: vi.fn(() => 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'),
-  hasBackedWalletCiphertextOnDevice: vi.fn(() => false)
+  hasBackedWalletCiphertextOnDevice: vi.fn(() => false),
+  hasRecoverablePendingIdentity: vi.fn(() => false),
+  hasPendingIdentityRecord: vi.fn(() => false),
+  resumePendingIdentity: vi.fn(),
+  abandonPendingIdentity: vi.fn(),
+  reconcilePendingIdentity: vi.fn()
 }))
 
 vi.mock('../services/XolosWalletService', () => ({

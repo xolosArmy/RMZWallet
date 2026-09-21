@@ -2,6 +2,7 @@
 
 import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import * as MinimalXecWalletModule from 'minimal-xec-wallet'
 import { xolosWalletService } from './XolosWalletService'
 import {
   PENDING_IDENTITY_STORAGE_KEY,
@@ -9,10 +10,24 @@ import {
   QuickStartUnavailableError,
   clearQuickStartMnemonic,
   getPendingIdentityRecord,
+  setPendingIdentityRecord,
   hasQuickStartMnemonic,
   loadQuickStartMnemonic,
   setQuickStartCreationLockForTests
 } from './quickStartStorage'
+
+const MinimalXECWallet = (() => {
+  const moduleExports = MinimalXecWalletModule as unknown as {
+    MinimalXECWallet?: { prototype: { initialize: () => Promise<void> } }
+    default?: { prototype: { initialize: () => Promise<void> } }
+  }
+  if (moduleExports.MinimalXECWallet) return moduleExports.MinimalXECWallet
+  if (moduleExports.default) return moduleExports.default
+  if (typeof window !== 'undefined') {
+    return (window as unknown as { MinimalXecWallet?: { prototype: { initialize: () => Promise<void> } } }).MinimalXecWallet
+  }
+  return undefined
+})()
 
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
 const ORIGINAL_CIPHERTEXT = 'pin-backed-ciphertext-original'
@@ -42,6 +57,9 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
     internals.activeAccountState = null
     setQuickStartCreationLockForTests(async (operation) => operation())
     await clearQuickStartMnemonic()
+    if (MinimalXECWallet?.prototype) {
+      vi.spyOn(MinimalXECWallet.prototype, 'initialize').mockResolvedValue(undefined as never)
+    }
     vi.spyOn(internals, 'fetchAddressScan').mockResolvedValue({
       address: '',
       utxos: [],
@@ -488,6 +506,249 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       expect(internals.isReady).toBe(false)
       expect(await hasQuickStartMnemonic()).toBe(false)
     })
+
+    test('create-backed -> pending persisted -> reload -> enter same PIN -> same mnemonic/address restored -> backup completes', async () => {
+      const pin = 'securePIN123'
+      const mnemonic = await xolosWalletService.createNewWallet(pin)
+      const address = xolosWalletService.getAddress()!
+      expect(mnemonic).toBeTruthy()
+      expect(address).toBeTruthy()
+
+      const record = getPendingIdentityRecord()
+      expect(record).not.toBeNull()
+      expect(record?.state).toBe('PENDING_BACKUP')
+      expect(record?.ciphertext).toBeTruthy()
+
+      // Simulate browser reload: clear in-memory state
+      internals.encryptedMnemonic = null
+      internals.decryptedMnemonic = null
+      internals.wallet = null
+      internals.isReady = false
+      internals.activeAccountState = null
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+
+      expect(xolosWalletService.getAddress()).toBeNull()
+      expect(xolosWalletService.getMnemonic()).toBeNull()
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
+      expect(xolosWalletService.hasRecoverablePendingIdentity()).toBe(true)
+
+      // Enter same PIN
+      const resumed = await xolosWalletService.resumePendingIdentity(pin)
+      expect(resumed.address).toBe(address)
+      expect(resumed.reconciled).toBe(false)
+      expect(xolosWalletService.getAddress()).toBe(address)
+      expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+
+      // Backup completes
+      await xolosWalletService.persistVerifiedBackup(pin)
+      expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+      expect(getPendingIdentityRecord()).toBeNull()
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(false)
+    }, 30000)
+
+    test('import -> pending persisted -> reload -> same PIN -> same imported identity restored', async () => {
+      const pin = 'importPIN456'
+      const testMnemonic = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
+      const result = await xolosWalletService.restoreFromMnemonic(testMnemonic, undefined, pin)
+      expect(result.status).toBe('restored')
+      const address = xolosWalletService.getAddress()!
+
+      const record = getPendingIdentityRecord()
+      expect(record).not.toBeNull()
+      expect(record?.state).toBe('PENDING_BACKUP')
+      expect(record?.ciphertext).toBeTruthy()
+
+      // Simulate reload
+      internals.encryptedMnemonic = null
+      internals.decryptedMnemonic = null
+      internals.wallet = null
+      internals.isReady = false
+      internals.activeAccountState = null
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+
+      // Enter same PIN
+      const resumed = await xolosWalletService.resumePendingIdentity(pin)
+      expect(resumed.address).toBe(address)
+      expect(xolosWalletService.getMnemonic()).toBe(testMnemonic)
+    }, 30000)
+
+    test('reload + wrong PIN -> pending remains -> no replacement identity', async () => {
+      const pin = 'correctPIN789'
+      const mnemonic = await xolosWalletService.createNewWallet(pin)
+      const address = xolosWalletService.getAddress()!
+
+      // Simulate reload
+      internals.encryptedMnemonic = null
+      internals.decryptedMnemonic = null
+      internals.wallet = null
+      internals.isReady = false
+      internals.activeAccountState = null
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+
+      // Enter wrong PIN
+      await expect(xolosWalletService.resumePendingIdentity('wrongPIN000')).rejects.toThrow('INVALID_PIN')
+
+      // Pending record remains untouched
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
+      expect(xolosWalletService.getAddress()).toBeNull()
+      expect(xolosWalletService.getMnemonic()).toBeNull()
+
+      // Cannot create replacement identity
+      await expect(xolosWalletService.createNewWallet()).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+      await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+
+      // Correct PIN still succeeds
+      const resumed = await xolosWalletService.resumePendingIdentity(pin)
+      expect(resumed.address).toBe(address)
+      expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+    }, 30000)
+
+    test('crash before final BACKUP_VERIFIED -> pending recoverable', async () => {
+      const pin = 'crashBeforePIN'
+      await xolosWalletService.createNewWallet(pin)
+      const address = xolosWalletService.getAddress()!
+
+      // Crash occurs before persistVerifiedBackup
+      internals.encryptedMnemonic = null
+      internals.decryptedMnemonic = null
+      internals.wallet = null
+      internals.isReady = false
+      internals.activeAccountState = null
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+
+      // Device still does not have backed ciphertext
+      expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(false)
+      expect(xolosWalletService.hasRecoverablePendingIdentity()).toBe(true)
+
+      const resumed = await xolosWalletService.resumePendingIdentity(pin)
+      expect(resumed.address).toBe(address)
+      expect(resumed.reconciled).toBe(false)
+    }, 30000)
+
+    test('crash after final ciphertext but before pending cleanup -> reconcile to BACKUP_VERIFIED -> no duplicate identity', async () => {
+      const pin = 'crashAfterPIN'
+      await xolosWalletService.createNewWallet(pin)
+      const record = getPendingIdentityRecord()!
+      expect(record).not.toBeNull()
+
+      // Tab completes backup commit
+      await xolosWalletService.persistVerifiedBackup(pin)
+      expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+      expect(getPendingIdentityRecord()).toBeNull()
+
+      // Simulate crash right after ciphertext commit but before pending cleanup:
+      setPendingIdentityRecord(record)
+      expect(getPendingIdentityRecord()).not.toBeNull()
+
+      // Reload occurs
+      internals.encryptedMnemonic = null
+      internals.decryptedMnemonic = null
+      internals.wallet = null
+      internals.isReady = false
+      internals.activeAccountState = null
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+
+      // Reconcile pending identity cleans up stale pending record because backed wallet is already verified on device
+      xolosWalletService.reconcilePendingIdentity()
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(false)
+      expect(getPendingIdentityRecord()).toBeNull()
+    }, 30000)
+
+    test('second tab while PENDING_BACKUP exists -> create/import/Quick Start blocked', async () => {
+      const pin = 'tabApin123'
+      await xolosWalletService.createNewWallet(pin)
+
+      // Second tab does not have ownership token in memory
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+
+      await expect(xolosWalletService.createNewWallet()).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+      await expect(xolosWalletService.createNewWallet('tabBpin456')).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+      await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+      const testMnemonic = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
+      await expect(xolosWalletService.restoreFromMnemonic(testMnemonic)).rejects.toThrow('PENDING_IDENTITY_EXISTS')
+    }, 30000)
+
+    test('pending ciphertext tampered -> fail closed -> no identity exposed', async () => {
+      const pin = 'tamperTestPin'
+      await xolosWalletService.createNewWallet(pin)
+
+      // Tamper ciphertext in storage
+      const record = getPendingIdentityRecord()!
+      localStorage.setItem(
+        PENDING_IDENTITY_STORAGE_KEY,
+        JSON.stringify({
+          ...record,
+          ciphertext: 'tampered-invalid-ciphertext'
+        })
+      )
+
+      // Reload
+      internals.encryptedMnemonic = null
+      internals.decryptedMnemonic = null
+      internals.wallet = null
+      internals.isReady = false
+      internals.activeAccountState = null
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+
+      // Attempt to resume fails closed
+      await expect(xolosWalletService.resumePendingIdentity(pin)).rejects.toThrow()
+      expect(xolosWalletService.getAddress()).toBeNull()
+      expect(xolosWalletService.getMnemonic()).toBeNull()
+      expect(internals.isReady).toBe(false)
+    }, 30000)
+
+    test('commitment/address mismatch -> fail closed', async () => {
+      const pin = 'mismatchTestPin'
+      await xolosWalletService.createNewWallet(pin)
+
+      // Tamper address in storage
+      const record = getPendingIdentityRecord()!
+      localStorage.setItem(
+        PENDING_IDENTITY_STORAGE_KEY,
+        JSON.stringify({
+          ...record,
+          address: 'ecash:qzfakeaddressmismatch0000000000000000000'
+        })
+      )
+
+      // Reload
+      internals.encryptedMnemonic = null
+      internals.decryptedMnemonic = null
+      internals.wallet = null
+      internals.isReady = false
+      internals.activeAccountState = null
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+
+      await expect(xolosWalletService.resumePendingIdentity(pin)).rejects.toThrow('ADDRESS_MISMATCH')
+      expect(xolosWalletService.getAddress()).toBeNull()
+      expect(xolosWalletService.getMnemonic()).toBeNull()
+      expect(internals.isReady).toBe(false)
+    }, 30000)
+
+    test('explicit abandonment clears reservation and allows fresh start, never touches backed wallet or quickstart', async () => {
+      const pin = 'abandonTestPin'
+      await xolosWalletService.createNewWallet(pin)
+      expect(getPendingIdentityRecord()).not.toBeNull()
+
+      // Tab reload
+      internals.encryptedMnemonic = null
+      internals.decryptedMnemonic = null
+      internals.wallet = null
+      internals.isReady = false
+      internals.activeAccountState = null
+      xolosWalletService.setPendingIdentityOwnerToken(null)
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
+
+      // User explicitly abandons pending identity
+      xolosWalletService.abandonPendingIdentity()
+      expect(xolosWalletService.hasPendingIdentityRecord()).toBe(false)
+      expect(getPendingIdentityRecord()).toBeNull()
+
+      // Now a new wallet can be created
+      const newMnemonic = await xolosWalletService.createNewWallet()
+      expect(newMnemonic).toBeTruthy()
+      expect(xolosWalletService.getAddress()).toBeTruthy()
+    }, 30000)
   })
 })
 

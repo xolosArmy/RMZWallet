@@ -15,6 +15,7 @@ import { discoverAliasForAddress } from '../services/aliasDiscovery'
 import { WALLET_CAPABILITY, assertCapability, isCapabilityAllowed, type WalletCapability } from '../domain/walletCapabilities'
 import { resolveWalletLifecycle } from '../domain/walletLifecycle'
 import { QuickStartUnavailableError } from '../services/quickStartStorage'
+import { setPendingBackupPassword } from '../services/backupSession'
 
 const BACKUP_KEY = 'xoloswallet_backup_verified'
 
@@ -163,6 +164,17 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const [backupVerified, setBackupVerifiedState] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false
     return localStorage.getItem(BACKUP_KEY) === 'true'
+  })
+  const [hasPendingIdentity, setHasPendingIdentity] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    if (typeof xolosWalletService.reconcilePendingIdentity === 'function') {
+      xolosWalletService.reconcilePendingIdentity()
+    }
+    return typeof xolosWalletService.hasRecoverablePendingIdentity === 'function'
+      ? xolosWalletService.hasRecoverablePendingIdentity()
+      : typeof xolosWalletService.hasPendingIdentityRecord === 'function'
+        ? Boolean(xolosWalletService.hasPendingIdentityRecord())
+        : false
   })
   const getAliasStorageKey = useCallback((addr: string | null) => {
     return addr ? `rmzwallet_alias_${addr}` : 'rmzwallet_alias'
@@ -327,7 +339,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener(WALLET_REFRESH_EVENT, handler as EventListener)
   }, [initialized, refreshBalances, rescanWallet])
 
-  const createNewWallet = useCallback(async (): Promise<string> => {
+  const createNewWallet = useCallback(async (password?: string): Promise<string> => {
     if (quickStartBootstrap === 'pending') {
       throw new Error('QUICK_START_BOOTSTRAP_PENDING')
     }
@@ -361,11 +373,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setLoading(true)
     setError(null)
     try {
-      const mnemonic = await xolosWalletService.createNewWallet()
+      const mnemonic = await xolosWalletService.createNewWallet(password)
       await syncAddressAndBalance()
       setInitialized(true)
       setBackupVerifiedState(false)
       localStorage.setItem(BACKUP_KEY, 'false')
+      setHasPendingIdentity(false)
       return mnemonic
     } catch (err) {
       const message = (err as Error).message || 'No se pudo crear la billetera.'
@@ -375,6 +388,48 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setLoading(false)
     }
   }, [initialized, quickStartBootstrap, syncAddressAndBalance])
+
+  const resumePendingIdentity = useCallback(
+    async (password: string): Promise<{ address: string }> => {
+      setLoading(true)
+      setError(null)
+      try {
+        const result = await xolosWalletService.resumePendingIdentity(password)
+        setAddress(result.address)
+        setInitialized(true)
+        if (result.reconciled) {
+          setBackupVerifiedState(true)
+          localStorage.setItem(BACKUP_KEY, 'true')
+          setHasPendingIdentity(false)
+          await syncAddressAndBalance({ optionalBalance: true })
+          return { address: result.address }
+        }
+        setBackupVerifiedState(false)
+        localStorage.setItem(BACKUP_KEY, 'false')
+        setPendingBackupPassword(password)
+        setHasPendingIdentity(false)
+        await syncAddressAndBalance({ optionalBalance: true })
+        return { address: result.address }
+      } catch (err) {
+        const message =
+          (err as Error).message === 'INVALID_PIN'
+            ? 'El PIN o password ingresado es incorrecto.'
+            : (err as Error).message || 'No se pudo recuperar la creación pendiente.'
+        setError(message)
+        throw new Error(message)
+      } finally {
+        setLoading(false)
+      }
+    },
+    [syncAddressAndBalance]
+  )
+
+  const abandonPendingIdentity = useCallback(() => {
+    if (typeof xolosWalletService.abandonPendingIdentity === 'function') {
+      xolosWalletService.abandonPendingIdentity()
+    }
+    setHasPendingIdentity(false)
+  }, [])
 
   const startQuickStartWallet = useCallback(async (): Promise<{ address: string }> => {
     if (quickStartBootstrap === 'pending') {
@@ -485,6 +540,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       await xolosWalletService.persistVerifiedBackup(password)
       setBackupVerifiedState(true)
       localStorage.setItem(BACKUP_KEY, 'true')
+      setHasPendingIdentity(false)
     } catch (e) {
       console.error(e)
       setError('No pudimos cifrar y verificar el respaldo en este dispositivo.')
@@ -500,7 +556,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
   const restoreWallet = useCallback(async (
     mnemonic: string,
-    selectedProfileId?: DerivationProfileId
+    selectedProfileId?: DerivationProfileId,
+    password?: string
   ) => {
     if (quickStartBootstrap === 'pending') {
       throw new Error('QUICK_START_BOOTSTRAP_PENDING')
@@ -535,12 +592,13 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setLoading(true)
     setError(null)
     try {
-      const result = await xolosWalletService.restoreFromMnemonic(mnemonic, selectedProfileId)
+      const result = await xolosWalletService.restoreFromMnemonic(mnemonic, selectedProfileId, password)
       if (result.status === 'choice-required') return result
       await syncAddressAndBalance()
       setInitialized(true)
       setBackupVerifiedState(false)
       localStorage.setItem(BACKUP_KEY, 'false')
+      setHasPendingIdentity(false)
       return result
     } catch (err) {
       const message = (err as Error).message || 'No se pudo restaurar la billetera.'
@@ -563,6 +621,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         const verified = localStorage.getItem(BACKUP_KEY) === 'true'
         setInitialized(true)
         setBackupVerifiedState(verified)
+        setHasPendingIdentity(false)
         if (verified && typeof xolosWalletService.discardQuickStartRecord === 'function') {
           try {
             await xolosWalletService.discardQuickStartRecord()
@@ -840,9 +899,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       backupVerified,
       lifecycle,
       quickStartBootstrap,
-      hasBackedWalletOnDevice: typeof xolosWalletService.hasBackedWalletCiphertextOnDevice === 'function'
+       hasBackedWalletOnDevice: typeof xolosWalletService.hasBackedWalletCiphertextOnDevice === 'function'
         ? xolosWalletService.hasBackedWalletCiphertextOnDevice()
         : false,
+      hasPendingIdentity,
+      resumePendingIdentity,
+      abandonPendingIdentity,
       hasCapability,
       startQuickStartWallet,
       activateQuickStartFromDevice,
@@ -875,6 +937,9 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       error,
       initialized,
       backupVerified,
+      hasPendingIdentity,
+      resumePendingIdentity,
+      abandonPendingIdentity,
       lifecycle,
       quickStartBootstrap,
       hasCapability,

@@ -734,7 +734,7 @@ export class XolosWalletService {
     return [...selectedTokenUtxos, ...selectedFeeUtxos]
   }
 
-  async createNewWallet(): Promise<string> {
+  async createNewWallet(password?: string): Promise<string> {
     return withQuickStartCreationLock(async () => {
       if (this.hasBackedWalletCiphertextOnDevice()) {
         throw new Error('BACKED_WALLET_EXISTS')
@@ -753,7 +753,13 @@ export class XolosWalletService {
       }
       try {
         const mnemonic = generateMnemonic(wordlist, 128)
-        await this.activateMnemonicLocalIdentity(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
+        const profileId = DEFAULT_NEW_WALLET_PROFILE_ID
+        let ciphertext: string | undefined
+        if (password) {
+          ciphertext = await encryptWithPassword(mnemonic, password)
+        }
+
+        await this.activateMnemonicLocalIdentity(mnemonic, profileId)
         this.encryptedMnemonic = null
         try {
           await (this.wallet as MinimalXecWallet).initialize()
@@ -773,8 +779,35 @@ export class XolosWalletService {
             ownerToken,
             commitment,
             address: candidateAddress,
+            derivationProfileId: profileId,
+            ciphertext,
+            encryptedMnemonic: ciphertext,
+            state: ciphertext ? 'PENDING_BACKUP' : undefined,
             createdAt: Date.now()
           })
+
+          const readBack = getPendingIdentityRecord()
+          if (
+            !readBack ||
+            readBack.ownerToken !== ownerToken ||
+            readBack.commitment !== commitment ||
+            readBack.address !== candidateAddress
+          ) {
+            throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+          }
+          if (ciphertext) {
+            if (readBack.ciphertext !== ciphertext && readBack.encryptedMnemonic !== ciphertext) {
+              throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+            }
+            const decrypted = await decryptWithPassword(
+              readBack.ciphertext || readBack.encryptedMnemonic!,
+              password!
+            )
+            if (decrypted.plainText.trim() !== mnemonic.trim()) {
+              throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+            }
+          }
+
           this.pendingIdentityOwnerToken = ownerToken
         } catch (error) {
           this.decryptedMnemonic = null
@@ -984,6 +1017,11 @@ export class XolosWalletService {
       if (!verified) {
         throw new Error('QUICK_START_BACKUP_VERIFY_FAILED')
       }
+      try {
+        localStorage.setItem('xoloswallet_backup_verified', 'true')
+      } catch {
+        // ignore
+      }
       clearPendingIdentityRecord()
       this.pendingIdentityOwnerToken = null
     })
@@ -1019,7 +1057,8 @@ export class XolosWalletService {
 
   async restoreFromMnemonic(
     mnemonic: string,
-    selectedProfileId?: DerivationProfileId
+    selectedProfileId?: DerivationProfileId,
+    password?: string
   ): Promise<WalletRestoreResult> {
     return withQuickStartCreationLock(async () => {
       if (this.hasBackedWalletCiphertextOnDevice()) {
@@ -1066,6 +1105,11 @@ export class XolosWalletService {
           throw new Error('El perfil solicitado no coincide con la actividad detectada para esta seed.')
         }
 
+        let ciphertext: string | undefined
+        if (password) {
+          ciphertext = await encryptWithPassword(normalizedMnemonic, password)
+        }
+
         await this.activateMnemonic(normalizedMnemonic, resolvedProfileId)
         const ownerToken = generateOwnerToken()
         const commitment = await computeMnemonicCommitment(normalizedMnemonic)
@@ -1076,8 +1120,35 @@ export class XolosWalletService {
             ownerToken,
             commitment,
             address: candidateAddress,
+            derivationProfileId: resolvedProfileId,
+            ciphertext,
+            encryptedMnemonic: ciphertext,
+            state: ciphertext ? 'PENDING_BACKUP' : undefined,
             createdAt: Date.now()
           })
+
+          const readBack = getPendingIdentityRecord()
+          if (
+            !readBack ||
+            readBack.ownerToken !== ownerToken ||
+            readBack.commitment !== commitment ||
+            readBack.address !== candidateAddress
+          ) {
+            throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+          }
+          if (ciphertext) {
+            if (readBack.ciphertext !== ciphertext && readBack.encryptedMnemonic !== ciphertext) {
+              throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+            }
+            const decrypted = await decryptWithPassword(
+              readBack.ciphertext || readBack.encryptedMnemonic!,
+              password!
+            )
+            if (decrypted.plainText.trim() !== normalizedMnemonic) {
+              throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+            }
+          }
+
           this.pendingIdentityOwnerToken = ownerToken
         } catch (error) {
           this.decryptedMnemonic = null
@@ -1424,6 +1495,113 @@ export class XolosWalletService {
       return false
     }
     return true
+  }
+
+  hasRecoverablePendingIdentity(): boolean {
+    const pending = getPendingIdentityRecord()
+    if (!pending) return false
+    const cipher = pending.ciphertext || pending.encryptedMnemonic
+    return Boolean(cipher && (!this.isReady || !this.pendingIdentityOwnerToken || pending.ownerToken !== this.pendingIdentityOwnerToken))
+  }
+
+  async resumePendingIdentity(password: string): Promise<{ address: string; mnemonic: string; reconciled: boolean }> {
+    return withQuickStartCreationLock(async () => {
+      const pending = getPendingIdentityRecord()
+      if (!pending) {
+        throw new Error('NO_PENDING_IDENTITY')
+      }
+      const ciphertext = pending.ciphertext || pending.encryptedMnemonic
+      if (!ciphertext) {
+        throw new Error('PENDING_IDENTITY_NOT_RECOVERABLE')
+      }
+
+      let decryptedPlainText = ''
+      try {
+        const decrypted = await decryptWithPassword(ciphertext, password)
+        decryptedPlainText = decrypted.plainText.trim()
+      } catch {
+        // PIN incorrecto: no alterar pending record, no generar nueva identity, no limpiar reservation
+        throw new Error('INVALID_PIN')
+      }
+
+      const mnemonic = decryptedPlainText
+      const commitment = await computeMnemonicCommitment(mnemonic)
+      if (commitment !== pending.commitment) {
+        throw new Error('PENDING_IDENTITY_COMMITMENT_MISMATCH')
+      }
+
+      // Check crash reconciliation: if final ciphertext already exists and matches this mnemonic:
+      if (this.hasBackedWalletCiphertextOnDevice()) {
+        const matches = await this.verifyStoredMnemonic(password, mnemonic).catch(() => false)
+        if (matches) {
+          clearPendingIdentityRecord()
+          this.pendingIdentityOwnerToken = null
+          const profileId = pending.derivationProfileId || DEFAULT_NEW_WALLET_PROFILE_ID
+          await this.activateMnemonicLocalIdentity(mnemonic, profileId)
+          try {
+            await (this.wallet as MinimalXecWallet).initialize()
+          } catch (err) {
+            this.decryptedMnemonic = null
+            this.wallet = null
+            this.isReady = false
+            this.activeAccountState = null
+            throw err
+          }
+          return { address: this.getAddress() || pending.address, mnemonic, reconciled: true }
+        }
+      }
+
+      const profileId = pending.derivationProfileId || DEFAULT_NEW_WALLET_PROFILE_ID
+      await this.activateMnemonicLocalIdentity(mnemonic, profileId)
+      try {
+        await (this.wallet as MinimalXecWallet).initialize()
+      } catch (err) {
+        this.decryptedMnemonic = null
+        this.wallet = null
+        this.isReady = false
+        this.activeAccountState = null
+        throw err
+      }
+
+      const derivedAddress = this.getAddress() || ''
+      if (pending.address && derivedAddress !== pending.address) {
+        this.decryptedMnemonic = null
+        this.wallet = null
+        this.isReady = false
+        this.activeAccountState = null
+        throw new Error('PENDING_IDENTITY_ADDRESS_MISMATCH')
+      }
+
+      this.pendingIdentityOwnerToken = pending.ownerToken
+      return { address: derivedAddress, mnemonic, reconciled: false }
+    })
+  }
+
+  abandonPendingIdentity(): void {
+    const pending = getPendingIdentityRecord()
+    if (!pending) return
+    clearPendingIdentityRecord()
+    this.pendingIdentityOwnerToken = null
+  }
+
+  reconcilePendingIdentity(): void {
+    if (typeof window === 'undefined') return
+    try {
+      if (this.hasBackedWalletCiphertextOnDevice()) {
+        const pending = getPendingIdentityRecord()
+        if (pending) {
+          clearPendingIdentityRecord()
+          this.pendingIdentityOwnerToken = null
+        }
+        try {
+          localStorage.setItem('xoloswallet_backup_verified', 'true')
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      // best-effort
+    }
   }
 
   clearPendingIdentity(): void {

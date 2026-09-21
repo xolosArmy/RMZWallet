@@ -556,7 +556,11 @@ export interface PendingIdentityRecord {
   ownerToken: string
   commitment: string
   address: string
+  derivationProfileId?: DerivationProfileId
+  ciphertext?: string
+  encryptedMnemonic?: string
   createdAt: number
+  state?: 'PENDING_BACKUP'
 }
 
 export const PENDING_IDENTITY_STORAGE_KEY = 'xoloswallet_pending_identity'
@@ -577,13 +581,25 @@ export function getPendingIdentityRecord(): PendingIdentityRecord | null {
       typeof parsed.address === 'string' &&
       typeof parsed.createdAt === 'number'
     ) {
-      return {
+      const rec: PendingIdentityRecord = {
         version: 1,
         ownerToken: parsed.ownerToken,
         commitment: parsed.commitment,
         address: parsed.address,
         createdAt: parsed.createdAt
       }
+      if (parsed.derivationProfileId && isDerivationProfileId(parsed.derivationProfileId)) {
+        rec.derivationProfileId = parsed.derivationProfileId
+      }
+      const cipher = parsed.ciphertext || parsed.encryptedMnemonic
+      if (typeof cipher === 'string' && cipher.length > 0) {
+        rec.ciphertext = cipher
+        rec.encryptedMnemonic = cipher
+      }
+      if (parsed.state === 'PENDING_BACKUP') {
+        rec.state = 'PENDING_BACKUP'
+      }
+      return rec
     }
     return null
   } catch {
@@ -596,17 +612,32 @@ export function setPendingIdentityRecord(record: {
   ownerToken: string
   commitment: string
   address: string
+  derivationProfileId?: DerivationProfileId
+  ciphertext?: string
+  encryptedMnemonic?: string
   createdAt?: number
+  state?: 'PENDING_BACKUP'
 }): void {
   if (typeof localStorage === 'undefined') {
     throw new Error('PENDING_IDENTITY_STORAGE_UNAVAILABLE')
   }
+  const cipher = record.ciphertext || record.encryptedMnemonic
   const fullRecord: PendingIdentityRecord = {
     version: 1,
     ownerToken: record.ownerToken,
     commitment: record.commitment,
     address: record.address,
     createdAt: typeof record.createdAt === 'number' ? record.createdAt : Date.now()
+  }
+  if (record.derivationProfileId) {
+    fullRecord.derivationProfileId = record.derivationProfileId
+  }
+  if (cipher) {
+    fullRecord.ciphertext = cipher
+    fullRecord.encryptedMnemonic = cipher
+  }
+  if (record.state) {
+    fullRecord.state = record.state
   }
   const payload = JSON.stringify(fullRecord)
   localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, payload)
@@ -636,7 +667,10 @@ export function setPendingIdentityRecord(record: {
     parsed.ownerToken !== fullRecord.ownerToken ||
     parsed.commitment !== fullRecord.commitment ||
     parsed.address !== fullRecord.address ||
-    typeof parsed.createdAt !== 'number'
+    typeof parsed.createdAt !== 'number' ||
+    (fullRecord.derivationProfileId && parsed.derivationProfileId !== fullRecord.derivationProfileId) ||
+    (fullRecord.ciphertext && (parsed.ciphertext !== fullRecord.ciphertext && parsed.encryptedMnemonic !== fullRecord.ciphertext)) ||
+    (fullRecord.state && parsed.state !== fullRecord.state)
   ) {
     try {
       localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)

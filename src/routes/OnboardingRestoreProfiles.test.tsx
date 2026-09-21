@@ -99,14 +99,15 @@ describe('dual-profile restore resolution UI', () => {
     expect(await screen.findByText('Actividad encontrada en varios perfiles')).toBeTruthy()
     expect(screen.getByText(/Tonalli no combinará sus UTXOs/)).toBeTruthy()
     expect(restoreWallet).toHaveBeenCalledTimes(1)
-    expect(restoreWallet).toHaveBeenNthCalledWith(1, PUBLIC_TEST_MNEMONIC)
+    expect(restoreWallet).toHaveBeenNthCalledWith(1, PUBLIC_TEST_MNEMONIC, undefined, '123456')
 
     fireEvent.click(screen.getByRole('button', { name: 'Abrir eCash / Cashtab' }))
     await waitFor(() => expect(restoreWallet).toHaveBeenCalledTimes(2))
     expect(restoreWallet).toHaveBeenNthCalledWith(
       2,
       PUBLIC_TEST_MNEMONIC,
-      ECASH_STANDARD_PROFILE_ID
+      ECASH_STANDARD_PROFILE_ID,
+      '123456'
     )
   })
 

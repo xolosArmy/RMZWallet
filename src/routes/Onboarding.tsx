@@ -31,6 +31,47 @@ function OnboardingShell({ children, className = '' }: { children: ReactNode; cl
 }
 
 export function OnboardingHome() {
+  const {
+    hasPendingIdentity,
+    resumePendingIdentity,
+    abandonPendingIdentity,
+    loading
+  } = useWallet()
+  const navigate = useNavigate()
+  const [pin, setPin] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [confirmAbandon, setConfirmAbandon] = useState(false)
+  const [resuming, setResuming] = useState(false)
+
+  const handleResume = async (e: FormEvent) => {
+    e.preventDefault()
+    setError(null)
+    if (!pin) {
+      setError('Ingresa el PIN o contraseña con el que iniciaste la creación.')
+      return
+    }
+    setResuming(true)
+    try {
+      await resumePendingIdentity(pin)
+      navigate('/backup')
+    } catch (err) {
+      setError((err as Error).message || 'No se pudo recuperar la creación pendiente.')
+    } finally {
+      setResuming(false)
+    }
+  }
+
+  const handleAbandon = () => {
+    if (!confirmAbandon) {
+      setConfirmAbandon(true)
+      return
+    }
+    abandonPendingIdentity()
+    setConfirmAbandon(false)
+    setError(null)
+    setPin('')
+  }
+
   return (
     <OnboardingShell className="onboarding-selector-page">
       <section className="onboarding-selector" aria-labelledby="onboarding-title">
@@ -45,14 +86,102 @@ export function OnboardingHome() {
           <p className="onboarding-claim">Verifica. Autocustodia. Libérate.</p>
         </div>
 
-        <div className="onboarding-hero-actions">
-          <Link className="cta primary onboarding-primary-cta" to="/onboarding/create">
-            Crear mi Tonalli
-          </Link>
-          <Link className="cta outline onboarding-secondary-cta" to="/onboarding/existing">
-            Ya tengo una wallet
-          </Link>
-        </div>
+        {hasPendingIdentity ? (
+          <div
+            className="card pending-identity-card"
+            data-testid="pending-identity-recovery-card"
+            style={{ maxWidth: '480px', margin: '1.5rem auto', textAlign: 'left' }}
+          >
+            <p className="card-kicker" style={{ color: 'var(--color-warning, #f59e0b)', fontWeight: 'bold' }}>
+              Creación pendiente detectada
+            </p>
+            <h2 style={{ fontSize: '1.25rem', margin: '0.5rem 0' }}>Tienes una creación de Tonalli pendiente</h2>
+            <p className="muted" style={{ fontSize: '0.9rem', marginBottom: '1rem' }}>
+              Existe una identidad creada o importada pendiente de verificar su respaldo. Ingresa tu PIN local para continuar el respaldo de forma segura.
+            </p>
+            <form onSubmit={handleResume}>
+              <div className="field" style={{ marginBottom: '1rem' }}>
+                <label htmlFor="pending-pin" style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.875rem' }}>
+                  PIN o contraseña local:
+                </label>
+                <input
+                  id="pending-pin"
+                  type="password"
+                  className="input"
+                  data-testid="pending-pin-input"
+                  value={pin}
+                  onChange={(e) => setPin(e.target.value)}
+                  placeholder="Tu PIN local"
+                  disabled={resuming || loading}
+                  autoComplete="current-password"
+                  style={{ width: '100%' }}
+                />
+              </div>
+              <div className="actions" style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+                <button
+                  type="submit"
+                  className="cta primary"
+                  data-testid="resume-pending-backup-btn"
+                  disabled={resuming || loading || !pin}
+                >
+                  {resuming ? 'Verificando...' : 'Continuar respaldo'}
+                </button>
+              </div>
+            </form>
+            {error && (
+              <div className="error" role="alert" data-testid="pending-identity-error" style={{ marginTop: '0.75rem' }}>
+                {error}
+              </div>
+            )}
+            <div style={{ marginTop: '1.5rem', paddingTop: '1rem', borderTop: '1px solid var(--border-color, #333)' }}>
+              {!confirmAbandon ? (
+                <button
+                  type="button"
+                  className="cta ghost"
+                  style={{ fontSize: '0.8rem', color: 'var(--text-muted, #888)' }}
+                  onClick={() => setConfirmAbandon(true)}
+                  data-testid="request-abandon-pending-btn"
+                >
+                  Descartar creación pendiente…
+                </button>
+              ) : (
+                <div className="warning" style={{ fontSize: '0.85rem' }} data-testid="abandon-warning-box">
+                  <p style={{ margin: '0 0 0.5rem 0', color: 'var(--color-danger, #ef4444)' }}>
+                    <strong>Advertencia de pérdida permanente:</strong> Si ya transferiste fondos a esta dirección, perderás el acceso de forma irreversible si no respaldaste la frase.
+                  </p>
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    <button
+                      type="button"
+                      className="cta danger"
+                      onClick={handleAbandon}
+                      data-testid="confirm-abandon-pending-btn"
+                      style={{ fontSize: '0.8rem' }}
+                    >
+                      Sí, descartar definitivamente
+                    </button>
+                    <button
+                      type="button"
+                      className="cta ghost"
+                      onClick={() => setConfirmAbandon(false)}
+                      style={{ fontSize: '0.8rem' }}
+                    >
+                      Cancelar
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="onboarding-hero-actions">
+            <Link className="cta primary onboarding-primary-cta" to="/onboarding/create">
+              Crear mi Tonalli
+            </Link>
+            <Link className="cta outline onboarding-secondary-cta" to="/onboarding/existing">
+              Ya tengo una wallet
+            </Link>
+          </div>
+        )}
 
         <p className="security-note">
           Tonalli Wallet no custodia tus fondos. Verifica el sitio antes de ingresar información sensible.
@@ -192,7 +321,8 @@ export function CreateWallet() {
     error,
     initialized,
     quickStartBootstrap,
-    hasBackedWalletOnDevice
+    hasBackedWalletOnDevice,
+    hasPendingIdentity
   } = useWallet()
   const [localError, setLocalError] = useState<string | null>(null)
   const [needsPinFallback, setNeedsPinFallback] = useState(false)
@@ -201,7 +331,13 @@ export function CreateWallet() {
   const bootstrapPending = quickStartBootstrap === 'pending'
   const recoveryFailed = quickStartBootstrap === 'failed'
   const backedWalletExists = hasBackedWalletOnDevice && !initialized
-  const createBlocked = !webLocksSupported || bootstrapPending || recoveryFailed || initialized || backedWalletExists
+  const createBlocked =
+    !webLocksSupported ||
+    bootstrapPending ||
+    recoveryFailed ||
+    initialized ||
+    backedWalletExists ||
+    hasPendingIdentity
 
   useEffect(() => {
     if (initialized) resumeAfterQuickStart(navigate)
@@ -216,9 +352,11 @@ export function CreateWallet() {
     }
     if (createBlocked && !initialized) {
       setLocalError(
-        recoveryFailed
-          ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se creará otra wallet.'
-          : 'Espera a que Tonalli termine de preparar este dispositivo.'
+        hasPendingIdentity
+          ? 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+          : recoveryFailed
+            ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se creará otra wallet.'
+            : 'Espera a que Tonalli termine de preparar este dispositivo.'
       )
       return
     }
@@ -263,6 +401,16 @@ export function CreateWallet() {
               Tu navegador no cuenta con soporte de Web Locks para coordinar operaciones de forma segura entre pestañas. Actualiza tu navegador para usar Tonalli de forma segura.
             </div>
           )}
+          {hasPendingIdentity && (
+            <div className="warning" role="alert" data-testid="pending-identity-alert">
+              Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.
+              <div style={{ marginTop: '0.75rem' }}>
+                <Link className="cta outline" to="/onboarding">
+                  Continuar respaldo
+                </Link>
+              </div>
+            </div>
+          )}
           {bootstrapPending && <p className="muted">Preparando este dispositivo…</p>}
           {recoveryFailed && (
             <div className="error" role="alert">
@@ -304,7 +452,7 @@ export function CreateWallet() {
 
 export function CreateBackedWallet() {
   const navigate = useNavigate()
-  const { createNewWallet, loading, error, initialized, quickStartBootstrap } = useWallet()
+  const { createNewWallet, loading, error, initialized, quickStartBootstrap, hasPendingIdentity } = useWallet()
   const [passwordNew, setPasswordNew] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
   const webLocksSupported = isWebLocksSupported()
@@ -312,7 +460,13 @@ export function CreateBackedWallet() {
   const bootstrapPending = quickStartBootstrap === 'pending'
   const recoveryFailed = quickStartBootstrap === 'failed'
   const existingQuickStart = quickStartBootstrap === 'recovered'
-  const createBlocked = !webLocksSupported || bootstrapPending || recoveryFailed || existingQuickStart || initialized
+  const createBlocked =
+    !webLocksSupported ||
+    bootstrapPending ||
+    recoveryFailed ||
+    existingQuickStart ||
+    initialized ||
+    hasPendingIdentity
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault()
@@ -323,11 +477,13 @@ export function CreateBackedWallet() {
     }
     if (createBlocked) {
       setLocalError(
-        recoveryFailed
-          ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se creará otra wallet.'
-          : bootstrapPending
-            ? 'Espera a que Tonalli termine de preparar este dispositivo.'
-            : 'Ya hay una Tonalli en este dispositivo. No se creará otra wallet.'
+        hasPendingIdentity
+          ? 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+          : recoveryFailed
+            ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se creará otra wallet.'
+            : bootstrapPending
+              ? 'Espera a que Tonalli termine de preparar este dispositivo.'
+              : 'Ya hay una Tonalli en este dispositivo. No se creará otra wallet.'
       )
       return
     }
@@ -338,7 +494,7 @@ export function CreateBackedWallet() {
     }
 
     try {
-      await createNewWallet()
+      await createNewWallet(passwordNew)
       setPendingBackupPassword(passwordNew)
       navigate('/backup')
     } catch (err) {
@@ -362,6 +518,16 @@ export function CreateBackedWallet() {
           {!webLocksSupported && (
             <div className="error" role="alert" data-testid="unsupported-browser-state">
               Tu navegador no cuenta con soporte de Web Locks para coordinar operaciones de forma segura entre pestañas. Actualiza tu navegador para usar Tonalli de forma segura.
+            </div>
+          )}
+          {hasPendingIdentity && (
+            <div className="warning" role="alert" data-testid="pending-identity-alert">
+              Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.
+              <div style={{ marginTop: '0.75rem' }}>
+                <Link className="cta outline" to="/onboarding">
+                  Continuar respaldo
+                </Link>
+              </div>
             </div>
           )}
           {bootstrapPending && <p className="muted">Preparando este dispositivo…</p>}
@@ -491,7 +657,7 @@ export function UnlockWallet() {
 
 export function ImportWallet() {
   const navigate = useNavigate()
-  const { restoreWallet, loading, error, initialized, quickStartBootstrap } = useWallet()
+  const { restoreWallet, loading, error, initialized, quickStartBootstrap, hasPendingIdentity } = useWallet()
   const [seedPhrase, setSeedPhrase] = useState('')
   const [passwordImport, setPasswordImport] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
@@ -501,7 +667,13 @@ export function ImportWallet() {
   const bootstrapPending = quickStartBootstrap === 'pending'
   const recoveryFailed = quickStartBootstrap === 'failed'
   const existingQuickStart = quickStartBootstrap === 'recovered'
-  const importBlocked = !webLocksSupported || bootstrapPending || recoveryFailed || existingQuickStart || initialized
+  const importBlocked =
+    !webLocksSupported ||
+    bootstrapPending ||
+    recoveryFailed ||
+    existingQuickStart ||
+    initialized ||
+    hasPendingIdentity
 
   const continueWithProfile = async (profileId: DerivationProfileId) => {
     try {
@@ -512,16 +684,18 @@ export function ImportWallet() {
       }
       if (importBlocked) {
         setLocalError(
-          recoveryFailed
-            ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se restaurará otra wallet.'
-            : bootstrapPending
-              ? 'Espera a que Tonalli termine de preparar este dispositivo.'
-              : 'Ya hay una Tonalli en este dispositivo. No se restaurará otra wallet.'
+          hasPendingIdentity
+            ? 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+            : recoveryFailed
+              ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se restaurará otra wallet.'
+              : bootstrapPending
+                ? 'Espera a que Tonalli termine de preparar este dispositivo.'
+                : 'Ya hay una Tonalli en este dispositivo. No se restaurará otra wallet.'
         )
         return
       }
       const phrase = seedPhrase.trim()
-      const result = await restoreWallet(phrase, profileId)
+      const result = await restoreWallet(phrase, profileId, passwordImport)
       if (result.status !== 'restored') {
         throw new Error('No se pudo fijar el perfil de derivación elegido.')
       }
@@ -545,11 +719,13 @@ export function ImportWallet() {
     }
     if (importBlocked) {
       setLocalError(
-        recoveryFailed
-          ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se restaurará otra wallet.'
-          : bootstrapPending
-            ? 'Espera a que Tonalli termine de preparar este dispositivo.'
-            : 'Ya hay una Tonalli en este dispositivo. No se restaurará otra wallet.'
+        hasPendingIdentity
+          ? 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+          : recoveryFailed
+            ? 'Hay una Tonalli en este dispositivo que no se pudo recuperar. No se restaurará otra wallet.'
+            : bootstrapPending
+              ? 'Espera a que Tonalli termine de preparar este dispositivo.'
+              : 'Ya hay una Tonalli en este dispositivo. No se restaurará otra wallet.'
       )
       return
     }
@@ -567,7 +743,7 @@ export function ImportWallet() {
     }
 
     try {
-      const result = await restoreWallet(phrase)
+      const result = await restoreWallet(phrase, undefined, passwordImport)
       if (result.status === 'choice-required') {
         setProfileChoice(result.detection)
         return
@@ -598,6 +774,16 @@ export function ImportWallet() {
           {!webLocksSupported && (
             <div className="error" role="alert" data-testid="unsupported-browser-state">
               Tu navegador no cuenta con soporte de Web Locks para coordinar operaciones de forma segura entre pestañas. Actualiza tu navegador para usar Tonalli de forma segura.
+            </div>
+          )}
+          {hasPendingIdentity && (
+            <div className="warning" role="alert" data-testid="pending-identity-alert">
+              Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.
+              <div style={{ marginTop: '0.75rem' }}>
+                <Link className="cta outline" to="/onboarding">
+                  Continuar respaldo
+                </Link>
+              </div>
             </div>
           )}
           {bootstrapPending && <p className="muted">Preparando este dispositivo…</p>}

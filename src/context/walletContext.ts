@@ -33,11 +33,15 @@ export interface WalletContextValue {
   startQuickStartWallet: () => Promise<{ address: string }>
   activateQuickStartFromDevice: () => Promise<{ address: string } | null>
   completeProgressiveBackup: (password: string) => Promise<void>
-  createNewWallet: () => Promise<string>
+  createNewWallet: (password?: string) => Promise<string>
   restoreWallet: (
     mnemonic: string,
-    selectedProfileId?: DerivationProfileId
+    selectedProfileId?: DerivationProfileId,
+    password?: string
   ) => Promise<WalletRestoreResult>
+  hasPendingIdentity: boolean
+  resumePendingIdentity: (password: string) => Promise<{ address: string }>
+  abandonPendingIdentity: () => void
   loadExistingWallet: (
     password: string,
     selectedProfileId?: DerivationProfileId

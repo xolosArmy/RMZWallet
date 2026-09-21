@@ -46,6 +46,9 @@ export function walletContextFixture(
     estimateXecSend: vi.fn(),
     getMnemonic: vi.fn(),
     unlockEncryptedWallet: vi.fn(),
+    hasPendingIdentity: overrides.hasPendingIdentity ?? false,
+    resumePendingIdentity: vi.fn(),
+    abandonPendingIdentity: vi.fn(),
     ...overrides
   }
 }
