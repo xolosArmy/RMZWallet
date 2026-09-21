@@ -67,6 +67,10 @@ function BackupSeed() {
         (err as Error).message === 'PENDING_IDENTITY_OWNER_MISMATCH'
       ) {
         setError('La identidad pendiente no coincide con esta sesión.')
+      } else if ((err as Error).message === 'PENDING_IDENTITY_CORRUPT_DURING_BACKUP') {
+        setError('Encontramos datos de una creación anterior que no pueden leerse correctamente. La reserva está protegida.')
+      } else if ((err as Error).message === 'PENDING_IDENTITY_STORAGE_UNAVAILABLE') {
+        setError('El almacenamiento local no está disponible para verificar el respaldo.')
       } else {
         setError('No pudimos cifrar y verificar el respaldo en este dispositivo. Tu Tonalli temporal se conserva.')
       }

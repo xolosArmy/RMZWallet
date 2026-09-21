@@ -14,6 +14,7 @@ import {
   clearQuickStartMnemonic,
   getPendingIdentityRecord,
   hasQuickStartMnemonic,
+  inspectPendingIdentityAuthority,
   loadQuickStartMnemonic,
   setPendingIdentityRecord,
   setQuickStartCreationLockForTests,
@@ -99,6 +100,7 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
     internals.wallet = null
     internals.isReady = false
     internals.activeAccountState = null
+    xolosWalletService.setPendingIdentityOwnerToken(null)
     setQuickStartCreationLockForTests(async (operation) => operation())
     await clearQuickStartMnemonic()
     if (MinimalXECWallet?.prototype) {
@@ -120,6 +122,7 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
     internals.wallet = null
     internals.isReady = false
     internals.activeAccountState = null
+    xolosWalletService.setPendingIdentityOwnerToken(null)
     await clearQuickStartMnemonic()
   })
 
@@ -1245,6 +1248,141 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
         expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
         await expect(xolosWalletService.createNewWallet('freshpin123')).rejects.toThrow('CORRUPT_OR_UNKNOWN_PENDING')
       })
+    })
+
+    describe('backup authority gate on pending reservations (discussion_r4064380256)', () => {
+      test('create-backed successfully -> corrupt raw pending -> persistVerifiedBackup rejects fail-closed with zero final writes', async () => {
+        const pin = 'createPin123'
+        const mnemonic = await xolosWalletService.createNewWallet(pin)
+        const address = xolosWalletService.getAddress()
+        expect(xolosWalletService.getPendingIdentityState()).toBe(PENDING_IDENTITY_STATE.RECOVERABLE_PENDING)
+        const originalPendingRaw = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
+        expect(originalPendingRaw).toBeTruthy()
+
+        // Manually corrupt the raw storage before backup
+        const corruptedRaw = '{"version":1,"damagedJson'
+        localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, corruptedRaw)
+
+        expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
+        expect(xolosWalletService.getPendingIdentityState()).toBe(PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING)
+
+        // persistVerifiedBackup must fail closed
+        await expect(
+          xolosWalletService.persistVerifiedBackup(pin)
+        ).rejects.toThrow('PENDING_IDENTITY_CORRUPT_DURING_BACKUP')
+
+        // Verify zero final writes
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBeNull()
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBeNull()
+
+        // Corrupt raw value preserved byte-for-byte
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe(corruptedRaw)
+
+        // Active wallet in memory is not silently replaced
+        expect(xolosWalletService.getAddress()).toBe(address)
+        expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+      }, 30000)
+
+      test('valid recoverable pending + commitment mismatch -> backup rejected before final write', async () => {
+        const pin = 'commitPin123'
+        await xolosWalletService.createNewWallet(pin)
+        const originalPending = JSON.parse(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)!)
+        originalPending.commitment = 'tampered_commitment_value'
+        localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, JSON.stringify(originalPending))
+
+        await expect(
+          xolosWalletService.persistVerifiedBackup(pin)
+        ).rejects.toThrow('PENDING_IDENTITY_MISMATCH')
+
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBeNull()
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBeNull()
+      }, 30000)
+
+      test('valid pending + ownerToken mismatch -> backup rejected', async () => {
+        const pin = 'ownerPin123'
+        await xolosWalletService.createNewWallet(pin)
+        const originalPending = JSON.parse(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)!)
+        originalPending.ownerToken = 'competing_owner_token'
+        localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, JSON.stringify(originalPending))
+
+        await expect(
+          xolosWalletService.persistVerifiedBackup(pin)
+        ).rejects.toThrow('PENDING_IDENTITY_OWNER_MISMATCH')
+
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBeNull()
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBeNull()
+      }, 30000)
+
+      test('legacy valid pending belonging to active session -> expected backup behavior preserved', async () => {
+        const pin = 'legacyPin123'
+        const mnemonic = await xolosWalletService.createNewWallet()
+        const address = xolosWalletService.getAddress()!
+        const ownerToken = xolosWalletService.getPendingIdentityOwnerToken()!
+        expect(ownerToken).toBeTruthy()
+
+        const authBefore = inspectPendingIdentityAuthority()
+        expect(authBefore.status).toBe(PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING)
+
+        await xolosWalletService.persistVerifiedBackup(pin)
+
+        // Final ciphertext written and verified
+        expect(xolosWalletService.hasBackedWalletCiphertextOnDevice()).toBe(true)
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('true')
+        expect(inspectPendingIdentityAuthority().status).toBe(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
+        expect(xolosWalletService.getAddress()).toBe(address)
+        expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+      }, 30000)
+
+      test('STORAGE_UNAVAILABLE during authority inspection -> backup rejected with zero final writes', async () => {
+        const pin = 'storageErrPin123'
+        await xolosWalletService.createNewWallet(pin)
+
+        const originalGetItem = Storage.prototype.getItem
+        const getSpy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation((key) => {
+          if (key === PENDING_IDENTITY_STORAGE_KEY) {
+            throw new Error('SECURITY_ERROR_DENIED')
+          }
+          return originalGetItem.call(localStorage, key)
+        })
+
+        try {
+          await expect(
+            xolosWalletService.persistVerifiedBackup(pin)
+          ).rejects.toThrow('PENDING_IDENTITY_STORAGE_UNAVAILABLE')
+        } finally {
+          getSpy.mockRestore()
+        }
+
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBeNull()
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBeNull()
+      }, 30000)
+
+      test('ABSENT_CONFIRMED on workflow that requires reservation -> backup rejected', async () => {
+        const pin = 'missingPendingPin123'
+        await xolosWalletService.createNewWallet(pin)
+
+        // Pending reservation is manually removed while active session required a reservation
+        localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
+        expect(inspectPendingIdentityAuthority().status).toBe(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
+
+        await expect(
+          xolosWalletService.persistVerifiedBackup(pin)
+        ).rejects.toThrow('PENDING_IDENTITY_MISSING')
+
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBeNull()
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBeNull()
+      }, 30000)
+
+      test('ABSENT_CONFIRMED without Quick Start or existing backed wallet -> backup rejected', async () => {
+        internals.decryptedMnemonic = TEST_MNEMONIC
+        internals.isReady = true
+
+        await expect(
+          xolosWalletService.persistVerifiedBackup('pin1234')
+        ).rejects.toThrow('PENDING_IDENTITY_RESERVATION_REQUIRED')
+
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBeNull()
+      }, 30000)
     })
   })
 })

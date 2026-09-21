@@ -1019,34 +1019,57 @@ export class XolosWalletService {
         }
       }
 
-      const pendingRecord = getPendingIdentityRecord()
-      if (pendingRecord) {
+      // Step 1: Inspect authoritative pending identity state BEFORE any modification
+      const auth = inspectPendingIdentityAuthority()
+
+      if (auth.status === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
+        throw new Error('PENDING_IDENTITY_STORAGE_UNAVAILABLE')
+      }
+
+      if (auth.status === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+        throw new Error('PENDING_IDENTITY_CORRUPT_DURING_BACKUP')
+      }
+
+      let activePendingRecord: PendingIdentityRecord | null = null
+
+      if (
+        auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
+        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+      ) {
+        const pendingRecord = auth.record
         const commitment = await computeMnemonicCommitment(mnemonic)
         if (pendingRecord.commitment !== commitment) {
-          throw new Error('PENDING_IDENTITY_MISMATCH')
-        }
-        if (
-          pendingRecord.address !== this.getAddress() ||
-          pendingRecord.derivationProfileId !== this.activeProfileId
-        ) {
           throw new Error('PENDING_IDENTITY_MISMATCH')
         }
         if (!this.pendingIdentityOwnerToken || pendingRecord.ownerToken !== this.pendingIdentityOwnerToken) {
           throw new Error('PENDING_IDENTITY_OWNER_MISMATCH')
         }
+        const activeAddress = this.getAddress()
+        if (pendingRecord.address && (!activeAddress || pendingRecord.address !== activeAddress)) {
+          throw new Error('PENDING_IDENTITY_MISMATCH')
+        }
+        if (
+          pendingRecord.derivationProfileId &&
+          (!this.activeProfileId || pendingRecord.derivationProfileId !== this.activeProfileId)
+        ) {
+          throw new Error('PENDING_IDENTITY_MISMATCH')
+        }
 
         const updatedCiphertext = await encryptWithPassword(mnemonic, password)
-        setPendingIdentityRecord({
+        const updatePayload: Parameters<typeof setPendingIdentityRecord>[0] = {
           version: 1,
           ownerToken: pendingRecord.ownerToken,
           commitment: pendingRecord.commitment,
           address: pendingRecord.address,
-          derivationProfileId: pendingRecord.derivationProfileId,
           ciphertext: updatedCiphertext,
           encryptedMnemonic: updatedCiphertext,
           state: 'PENDING_BACKUP',
           createdAt: pendingRecord.createdAt
-        })
+        }
+        if (pendingRecord.derivationProfileId) {
+          updatePayload.derivationProfileId = pendingRecord.derivationProfileId
+        }
+        setPendingIdentityRecord(updatePayload)
 
         const readBack = getPendingIdentityRecord()
         if (
@@ -1054,7 +1077,7 @@ export class XolosWalletService {
           readBack.ownerToken !== pendingRecord.ownerToken ||
           readBack.commitment !== pendingRecord.commitment ||
           readBack.address !== pendingRecord.address ||
-          readBack.derivationProfileId !== pendingRecord.derivationProfileId ||
+          (pendingRecord.derivationProfileId && readBack.derivationProfileId !== pendingRecord.derivationProfileId) ||
           (readBack.ciphertext !== updatedCiphertext && readBack.encryptedMnemonic !== updatedCiphertext)
         ) {
           throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
@@ -1068,6 +1091,28 @@ export class XolosWalletService {
         if (decrypted.plainText.trim() !== mnemonic.trim()) {
           throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
         }
+
+        activePendingRecord = pendingRecord
+      } else if (auth.status === PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
+        // Documented legitimate workflows for completing backup when pending reservation is ABSENT_CONFIRMED:
+        // 1. Quick Start progressive backup: unbacked Quick Start identities are stored in Quick Start storage
+        //    (loadQuickStartMnemonic / hasQuickStartRecord) and intentionally do NOT register a pending identity reservation.
+        // 2. Existing backed wallet re-encryption/verification: device already holds verified backed ciphertext matching active mnemonic.
+        //
+        // In contrast, fresh create-backed and import workflows MUST hold an active pending reservation
+        // matching this.pendingIdentityOwnerToken. If missing or absent during those workflows, fail closed.
+        if (this.pendingIdentityOwnerToken !== null) {
+          throw new Error('PENDING_IDENTITY_MISSING')
+        }
+
+        const isQuickStart = (await hasQuickStartMnemonic()) || (await this.hasQuickStartRecord().catch(() => false))
+        const isExistingBacked = this.hasBackedWalletCiphertextOnDevice()
+
+        if (!isQuickStart && !isExistingBacked) {
+          throw new Error('PENDING_IDENTITY_RESERVATION_REQUIRED')
+        }
+      } else {
+        throw new Error('PENDING_IDENTITY_CORRUPT_DURING_BACKUP')
       }
 
       if (await hasQuickStartMnemonic()) {
@@ -1086,7 +1131,7 @@ export class XolosWalletService {
       } catch {
         // ignore
       }
-      if (pendingRecord) {
+      if (activePendingRecord) {
         deletePendingIdentityRecordVerified()
         if (inspectPendingIdentityAuthority().status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
           throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
