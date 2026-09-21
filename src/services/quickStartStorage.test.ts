@@ -4,6 +4,7 @@ import 'fake-indexeddb/auto'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { ECASH_STANDARD_PROFILE_ID } from './derivationProfiles'
 import {
+  PENDING_IDENTITY_STATE,
   PENDING_IDENTITY_STORAGE_KEY,
   QUICK_START_MARKER_STORAGE_KEY,
   QuickStartUnavailableError,
@@ -14,6 +15,7 @@ import {
   getQuickStartRecordStatus,
   hasQuickStartMarker,
   hasQuickStartMnemonic,
+  inspectPendingIdentityAuthority,
   isWebLocksSupported,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
@@ -577,8 +579,92 @@ describe('Quick Start encrypted storage', () => {
       }
       expect(getPendingIdentityRecord()).toBeNull()
     })
-  })
 
+    test('inspectPendingIdentityAuthority: absent key returns ABSENT_CONFIRMED', () => {
+      localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
+      const auth = inspectPendingIdentityAuthority()
+      expect(auth.status).toBe(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
+    })
+
+    test('inspectPendingIdentityAuthority: truncated or malformed JSON returns CORRUPT_OR_UNKNOWN_PENDING without deleting', () => {
+      const removeSpy = vi.spyOn(Storage.prototype, 'removeItem')
+      localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, '{"version":1,"ownerToken":"tok')
+      try {
+        const auth = inspectPendingIdentityAuthority()
+        expect(auth.status).toBe(PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING)
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe('{"version":1,"ownerToken":"tok')
+        expect(removeSpy).not.toHaveBeenCalled()
+        expect(getPendingIdentityRecord()).toBeNull()
+      } finally {
+        removeSpy.mockRestore()
+      }
+    })
+
+    test('inspectPendingIdentityAuthority: missing required fields returns CORRUPT_OR_UNKNOWN_PENDING without deleting', () => {
+      const removeSpy = vi.spyOn(Storage.prototype, 'removeItem')
+      // missing address and commitment
+      localStorage.setItem(
+        PENDING_IDENTITY_STORAGE_KEY,
+        JSON.stringify({ version: 1, ownerToken: 'tok1', createdAt: Date.now() })
+      )
+      try {
+        const auth = inspectPendingIdentityAuthority()
+        expect(auth.status).toBe(PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING)
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).not.toBeNull()
+        expect(removeSpy).not.toHaveBeenCalled()
+        expect(getPendingIdentityRecord()).toBeNull()
+      } finally {
+        removeSpy.mockRestore()
+      }
+    })
+
+    test('inspectPendingIdentityAuthority: storage getItem throwing returns STORAGE_UNAVAILABLE without destroying data', () => {
+      const originalGetItem = Storage.prototype.getItem
+      const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation((key) => {
+        if (key === PENDING_IDENTITY_STORAGE_KEY) {
+          throw new DOMException('Access denied', 'SecurityError')
+        }
+        return originalGetItem.call(localStorage, key)
+      })
+      try {
+        const auth = inspectPendingIdentityAuthority()
+        expect(auth.status).toBe(PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE)
+        if (auth.status === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
+          expect(auth.error).toBeDefined()
+        }
+      } finally {
+        spy.mockRestore()
+      }
+    })
+
+    test('inspectPendingIdentityAuthority: valid record classifies into RECOVERABLE_PENDING', () => {
+      setPendingIdentityRecord({
+        ownerToken: 'tok1',
+        commitment: 'com1',
+        address: 'ecash:qtest',
+        derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+        state: 'PENDING_BACKUP',
+        ciphertext: 'ct1'
+      })
+      const auth = inspectPendingIdentityAuthority()
+      expect(auth.status).toBe(PENDING_IDENTITY_STATE.RECOVERABLE_PENDING)
+      if (auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING) {
+        expect(auth.record.ownerToken).toBe('tok1')
+      }
+    })
+
+    test('inspectPendingIdentityAuthority: valid record without derivationProfileId classifies into LEGACY_UNRECOVERABLE_PENDING', () => {
+      setPendingIdentityRecord({
+        ownerToken: 'tok2',
+        commitment: 'com2',
+        address: 'ecash:qtest',
+        state: 'PENDING_BACKUP',
+        ciphertext: 'ct2'
+      })
+      const auth = inspectPendingIdentityAuthority()
+      expect(auth.status).toBe(PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING)
+    })
+  })
 })
 
 

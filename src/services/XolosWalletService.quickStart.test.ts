@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import * as MinimalXecWalletModule from 'minimal-xec-wallet'
 import { xolosWalletService } from './XolosWalletService'
 import { encryptWithPassword } from './crypto'
+import { ECASH_STANDARD_PROFILE_ID } from './derivationProfiles'
 import {
   PENDING_IDENTITY_STATE,
   PENDING_IDENTITY_STORAGE_KEY,
@@ -12,10 +13,12 @@ import {
   QuickStartUnavailableError,
   clearQuickStartMnemonic,
   getPendingIdentityRecord,
-  setPendingIdentityRecord,
   hasQuickStartMnemonic,
   loadQuickStartMnemonic,
-  setQuickStartCreationLockForTests
+  setPendingIdentityRecord,
+  setQuickStartCreationLockForTests,
+  setQuickStartMarker,
+  storeQuickStartMnemonic
 } from './quickStartStorage'
 
 const MinimalXECWallet = (() => {
@@ -1102,6 +1105,146 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
         expect(getPendingIdentityRecord()).not.toBeNull()
         expect(localStorage.getItem('xoloswallet_backup_verified')).toBeNull()
       }, 30000)
+    })
+
+    describe('Fail closed on corrupt or malformed pending reservations', () => {
+      test('raw truncated -> CORRUPT_OR_UNKNOWN_PENDING -> create/import/quickstart blocked and raw preserved', async () => {
+        const corruptPayload = '{"version":1,"ownerToken":"partial_tok'
+        localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, corruptPayload)
+
+        expect(xolosWalletService.getPendingIdentityState()).toBe(PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING)
+        expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
+
+        await expect(xolosWalletService.createNewWallet('pin123456')).rejects.toThrow('CORRUPT_OR_UNKNOWN_PENDING')
+        await expect(
+          xolosWalletService.restoreFromMnemonic(TEST_MNEMONIC, undefined, 'pin123456')
+        ).rejects.toThrow('CORRUPT_OR_UNKNOWN_PENDING')
+        await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow('CORRUPT_OR_UNKNOWN_PENDING')
+
+        // Raw value must never be overwritten or deleted
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe(corruptPayload)
+      })
+
+      test('raw missing required field -> CORRUPT_OR_UNKNOWN_PENDING -> no overwrite', async () => {
+        const missingFieldPayload = JSON.stringify({
+          version: 1,
+          ownerToken: 'tok_missing_address',
+          createdAt: Date.now()
+        })
+        localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, missingFieldPayload)
+
+        expect(xolosWalletService.getPendingIdentityState()).toBe(PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING)
+        await expect(xolosWalletService.createNewWallet('pin123456')).rejects.toThrow('CORRUPT_OR_UNKNOWN_PENDING')
+
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe(missingFieldPayload)
+      })
+
+      test('getItem throws -> STORAGE_UNAVAILABLE -> create blocked', async () => {
+        const originalGetItem = Storage.prototype.getItem
+        const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation((key) => {
+          if (key === PENDING_IDENTITY_STORAGE_KEY) {
+            throw new DOMException('Storage access denied', 'SecurityError')
+          }
+          return originalGetItem.call(localStorage, key)
+        })
+
+        try {
+          expect(xolosWalletService.getPendingIdentityState()).toBe(PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE)
+          await expect(xolosWalletService.createNewWallet('pin123456')).rejects.toThrow('STORAGE_UNAVAILABLE')
+          await expect(
+            xolosWalletService.restoreFromMnemonic(TEST_MNEMONIC, undefined, 'pin123456')
+          ).rejects.toThrow('STORAGE_UNAVAILABLE')
+          await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow('STORAGE_UNAVAILABLE')
+        } finally {
+          spy.mockRestore()
+        }
+      })
+
+      test('abandonCorruptPendingIdentity rejects if Quick Start is PRESENT', async () => {
+        localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, '{"version":1,"corrupt')
+        await storeQuickStartMnemonic(TEST_MNEMONIC, {
+          derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+          address: 'ecash:qquicktest'
+        })
+
+        await expect(xolosWalletService.abandonCorruptPendingIdentity()).rejects.toThrow('QUICK_START_RECORD_EXISTS')
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe('{"version":1,"corrupt')
+      })
+
+      test('abandonCorruptPendingIdentity rejects if Quick Start is STORAGE_UNAVAILABLE_UNKNOWN', async () => {
+        localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, '{"version":1,"corrupt')
+        // Valid marker present but IndexedDB fails: status is STORAGE_UNAVAILABLE_UNKNOWN
+        setQuickStartMarker()
+        const openSpy = vi.spyOn(indexedDB, 'open').mockImplementation(() => {
+          throw new DOMException('Database blocked', 'SecurityError')
+        })
+
+        try {
+          await expect(xolosWalletService.abandonCorruptPendingIdentity()).rejects.toThrow('STORAGE_UNAVAILABLE')
+        } finally {
+          openSpy.mockRestore()
+        }
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe('{"version":1,"corrupt')
+      })
+
+      test('abandonCorruptPendingIdentity rejects if pending identity is recoverable or absent', async () => {
+        // Absent
+        localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
+        await expect(xolosWalletService.abandonCorruptPendingIdentity()).rejects.toThrow('NO_PENDING_IDENTITY')
+
+        // Valid recoverable pending
+        setPendingIdentityRecord({
+          ownerToken: 'valid_tok',
+          commitment: 'valid_com',
+          address: 'ecash:qvalid',
+          derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+          state: 'PENDING_BACKUP',
+          ciphertext: 'valid_cipher'
+        })
+        await expect(xolosWalletService.abandonCorruptPendingIdentity()).rejects.toThrow('PENDING_IDENTITY_STATE_CHANGED')
+      })
+
+      test('confirmed abandonment deletes corrupt record, verifies read-back, and permits fresh onboarding', async () => {
+        localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, '{"version":1,"malformed')
+
+        expect(xolosWalletService.getPendingIdentityState()).toBe(PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING)
+
+        await xolosWalletService.abandonCorruptPendingIdentity()
+
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBeNull()
+        expect(xolosWalletService.getPendingIdentityState()).toBe(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
+        expect(xolosWalletService.hasPendingIdentityRecord()).toBe(false)
+
+        // Fresh creation now succeeds
+        const mnemonic = await xolosWalletService.createNewWallet('freshpin123')
+        expect(mnemonic).toBeTruthy()
+        expect(xolosWalletService.getAddress()).toBeTruthy()
+      }, 30000)
+
+      test('corrupt pending delete failure leaves record and blocks onboarding', async () => {
+        localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, '{"version":1,"bad')
+
+        // Spy on removeItem to fail
+        const originalRemoveItem = Storage.prototype.removeItem
+        const removeSpy = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation((key) => {
+          if (key === PENDING_IDENTITY_STORAGE_KEY) {
+            // No-op or throw
+            return
+          }
+          return originalRemoveItem.call(localStorage, key)
+        })
+
+        try {
+          await expect(xolosWalletService.abandonCorruptPendingIdentity()).rejects.toThrow('PENDING_IDENTITY_ABANDON_FAILED')
+        } finally {
+          removeSpy.mockRestore()
+        }
+
+        // Record still present
+        expect(localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)).toBe('{"version":1,"bad')
+        expect(xolosWalletService.hasPendingIdentityRecord()).toBe(true)
+        await expect(xolosWalletService.createNewWallet('freshpin123')).rejects.toThrow('CORRUPT_OR_UNKNOWN_PENDING')
+      })
     })
   })
 })

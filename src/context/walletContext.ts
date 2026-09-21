@@ -44,6 +44,7 @@ export interface WalletContextValue {
   hasPendingIdentity: boolean
   resumePendingIdentity: (password: string) => Promise<{ address: string; reconciled?: boolean }>
   abandonPendingIdentity: () => Promise<void>
+  abandonCorruptPendingIdentity?: () => Promise<void>
   loadExistingWallet: (
     password: string,
     selectedProfileId?: DerivationProfileId

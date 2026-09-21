@@ -19,7 +19,7 @@ export function walletContextFixture(
   const pendingIdentityState = overrides.pendingIdentityState ?? (
     overrides.hasPendingIdentity
       ? PENDING_IDENTITY_STATE.RECOVERABLE_PENDING
-      : PENDING_IDENTITY_STATE.NONE
+      : PENDING_IDENTITY_STATE.ABSENT_CONFIRMED
   )
   return {
     address: null,
@@ -53,9 +53,13 @@ export function walletContextFixture(
     getMnemonic: vi.fn(),
     unlockEncryptedWallet: vi.fn(),
     pendingIdentityState,
-    hasPendingIdentity: overrides.hasPendingIdentity ?? pendingIdentityState !== PENDING_IDENTITY_STATE.NONE,
+    hasPendingIdentity: overrides.hasPendingIdentity ?? (
+      pendingIdentityState !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED &&
+      (pendingIdentityState as string) !== 'NONE'
+    ),
     resumePendingIdentity: vi.fn(),
     abandonPendingIdentity: vi.fn(),
+    abandonCorruptPendingIdentity: vi.fn(),
     ...overrides
   }
 }

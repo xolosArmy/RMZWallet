@@ -23,15 +23,31 @@ import { setPendingBackupPassword } from '../services/backupSession'
 const formatSatsAsXec = (sats: bigint) =>
   `${sats / 100n}.${(sats % 100n).toString().padStart(2, '0')}`
 
-const pendingIdentityBlockingMessage = (state: PendingIdentityState) =>
-  state === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
-    ? 'Encontramos una creación anterior incompleta que esta versión no puede recuperar automáticamente.'
-    : 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+const pendingIdentityBlockingMessage = (state: PendingIdentityState) => {
+  if (state === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+    return 'Encontramos datos de una creación anterior que no pueden leerse correctamente.'
+  }
+  if (state === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
+    return 'El almacenamiento local no está disponible para verificar el estado de la billetera.'
+  }
+  if (state === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING) {
+    return 'Encontramos una creación anterior incompleta que esta versión no puede recuperar automáticamente.'
+  }
+  return 'Tienes una creación de Tonalli pendiente de respaldo. Continúa con el respaldo para protegerla.'
+}
 
-const pendingIdentityActionLabel = (state: PendingIdentityState) =>
-  state === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
-    ? 'Resolver creación incompleta'
-    : 'Continuar respaldo'
+const pendingIdentityActionLabel = (state: PendingIdentityState) => {
+  if (state === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+    return 'Resolver datos de creación dañados'
+  }
+  if (state === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
+    return 'Reintentar almacenamiento'
+  }
+  if (state === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING) {
+    return 'Resolver creación incompleta'
+  }
+  return 'Continuar respaldo'
+}
 
 function OnboardingShell({ children, className = '' }: { children: ReactNode; className?: string }) {
   const { backupVerified, initialized } = useWallet()
@@ -61,6 +77,8 @@ export function OnboardingHome() {
   const [abandoning, setAbandoning] = useState(false)
   const recoverablePending = pendingIdentityState === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING
   const legacyPending = pendingIdentityState === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+  const corruptPending = pendingIdentityState === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING
+  const storageUnavailable = pendingIdentityState === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE
 
   const handleResume = async (e: FormEvent) => {
     e.preventDefault()
@@ -121,7 +139,17 @@ export function OnboardingHome() {
             <p className="card-kicker" style={{ color: 'var(--color-warning, #f59e0b)', fontWeight: 'bold' }}>
               Creación pendiente detectada
             </p>
-            {recoverablePending ? (
+            {corruptPending ? (
+              <>
+                <h2 style={{ fontSize: '1.25rem', margin: '0.5rem 0' }}>Datos de creación dañados detectados</h2>
+                <p className="muted" style={{ fontSize: '0.9rem', marginBottom: '0.5rem' }}>
+                  Encontramos datos de una creación anterior que no pueden leerse correctamente.
+                </p>
+                <p className="muted" style={{ fontSize: '0.9rem', marginBottom: '1rem' }}>
+                  Tonalli no creará otra identidad automáticamente porque la información dañada podría corresponder a una wallet que ya recibió fondos.
+                </p>
+              </>
+            ) : recoverablePending ? (
               <>
                 <h2 style={{ fontSize: '1.25rem', margin: '0.5rem 0' }}>Tienes una creación de Tonalli pendiente</h2>
                 <p className="muted" style={{ fontSize: '0.9rem', marginBottom: '1rem' }}>
@@ -161,55 +189,66 @@ export function OnboardingHome() {
               <p className="muted" style={{ fontSize: '0.9rem', marginBottom: '1rem' }}>
                 Encontramos una creación anterior incompleta que esta versión no puede recuperar automáticamente.
               </p>
+            ) : storageUnavailable ? (
+              <p className="muted" style={{ fontSize: '0.9rem', marginBottom: '1rem' }}>
+                El almacenamiento local no está disponible para verificar el estado de la billetera.
+              </p>
             ) : null}
             {error && (
               <div className="error" role="alert" data-testid="pending-identity-error" style={{ marginTop: '0.75rem' }}>
                 {error}
               </div>
             )}
-            <div style={{ marginTop: '1.5rem', paddingTop: '1rem', borderTop: '1px solid var(--border-color, #333)' }}>
-              {!confirmAbandon ? (
-                <button
-                  type="button"
-                  className="cta ghost"
-                  style={{ fontSize: '0.8rem', color: 'var(--text-muted, #888)' }}
-                  onClick={() => setConfirmAbandon(true)}
-                  data-testid="request-abandon-pending-btn"
-                  disabled={resuming || loading || abandoning}
-                >
-                  {legacyPending
-                    ? 'Descartar creación incompleta y empezar de nuevo'
-                    : 'Descartar creación pendiente…'}
-                </button>
-              ) : (
-                <div className="warning" style={{ fontSize: '0.85rem' }} data-testid="abandon-warning-box">
-                  <p style={{ margin: '0 0 0.5rem 0', color: 'var(--color-danger, #ef4444)' }}>
-                    La dirección creada anteriormente pudo haber recibido fondos. Si no conservas su frase de recuperación, descartarla puede hacer que esos fondos sean inaccesibles permanentemente.
-                  </p>
-                  <div style={{ display: 'flex', gap: '0.5rem' }}>
-                    <button
-                      type="button"
-                      className="cta danger"
-                      onClick={() => void handleAbandon()}
-                      data-testid="confirm-abandon-pending-btn"
-                      style={{ fontSize: '0.8rem' }}
-                      disabled={abandoning || loading}
-                    >
-                      {abandoning ? 'Descartando…' : 'Sí, descartar definitivamente'}
-                    </button>
-                    <button
-                      type="button"
-                      className="cta ghost"
-                      onClick={() => setConfirmAbandon(false)}
-                      style={{ fontSize: '0.8rem' }}
-                      disabled={abandoning || loading}
-                    >
-                      Cancelar
-                    </button>
+            {!storageUnavailable && (
+              <div style={{ marginTop: '1.5rem', paddingTop: '1rem', borderTop: '1px solid var(--border-color, #333)' }}>
+                {!confirmAbandon ? (
+                  <button
+                    type="button"
+                    className="cta ghost"
+                    style={{ fontSize: '0.8rem', color: 'var(--text-muted, #888)' }}
+                    onClick={() => setConfirmAbandon(true)}
+                    data-testid="request-abandon-pending-btn"
+                    disabled={resuming || loading || abandoning}
+                  >
+                    {corruptPending
+                      ? 'Descartar datos de creación dañados y empezar de nuevo'
+                      : legacyPending
+                      ? 'Descartar creación incompleta y empezar de nuevo'
+                      : 'Descartar creación pendiente…'}
+                  </button>
+                ) : (
+                  <div className="warning" style={{ fontSize: '0.85rem' }} data-testid="abandon-warning-box">
+                    <p style={{ margin: '0 0 0.5rem 0', color: 'var(--color-danger, #ef4444)' }}>
+                      {corruptPending
+                        ? 'Si esta creación anterior correspondía a una dirección que recibió fondos y no conservas su frase de recuperación, descartarla puede hacer que esos fondos sean inaccesibles permanentemente.'
+                        : 'La dirección creada anteriormente pudo haber recibido fondos. Si no conservas su frase de recuperación, descartarla puede hacer que esos fondos sean inaccesibles permanentemente.'}
+                    </p>
+                    <div style={{ display: 'flex', gap: '0.5rem' }}>
+                      <button
+                        type="button"
+                        className="cta danger"
+                        onClick={() => void handleAbandon()}
+                        data-testid="confirm-abandon-pending-btn"
+                        style={{ fontSize: '0.8rem' }}
+                        disabled={abandoning || loading}
+                      >
+                        {abandoning ? 'Descartando…' : 'Sí, descartar definitivamente'}
+                      </button>
+                      <button
+                        type="button"
+                        className="cta ghost"
+                        onClick={() => setConfirmAbandon(false)}
+                        data-testid="cancel-abandon-pending-btn"
+                        style={{ fontSize: '0.8rem' }}
+                        disabled={abandoning || loading}
+                      >
+                        Cancelar
+                      </button>
+                    </div>
                   </div>
-                </div>
-              )}
-            </div>
+                )}
+              </div>
+            )}
           </div>
         ) : (
           <div className="onboarding-hero-actions">
@@ -421,6 +460,14 @@ export function CreateWallet() {
         setLocalError('Hay otra operación de creación de wallet pendiente en otra pestaña.')
         return
       }
+      if ((err as Error).message === 'CORRUPT_OR_UNKNOWN_PENDING') {
+        setLocalError('Encontramos datos de una creación anterior que no pueden leerse correctamente.')
+        return
+      }
+      if ((err as Error).message === 'STORAGE_UNAVAILABLE') {
+        setLocalError('El almacenamiento local no está disponible para verificar el estado de la billetera.')
+        return
+      }
       setLocalError((err as Error).message)
     }
   }
@@ -548,6 +595,14 @@ export function CreateBackedWallet() {
     } catch (err) {
       if ((err as Error).message === 'PENDING_IDENTITY_EXISTS') {
         setLocalError('Hay otra operación de creación de wallet pendiente en otra pestaña.')
+        return
+      }
+      if ((err as Error).message === 'CORRUPT_OR_UNKNOWN_PENDING') {
+        setLocalError('Encontramos datos de una creación anterior que no pueden leerse correctamente.')
+        return
+      }
+      if ((err as Error).message === 'STORAGE_UNAVAILABLE') {
+        setLocalError('El almacenamiento local no está disponible para verificar el estado de la billetera.')
         return
       }
       setLocalError((err as Error).message)
@@ -762,6 +817,14 @@ export function ImportWallet() {
         setLocalError('Hay otra operación de creación o restauración de wallet pendiente en otra pestaña.')
         return
       }
+      if ((err as Error).message === 'CORRUPT_OR_UNKNOWN_PENDING') {
+        setLocalError('Encontramos datos de una creación anterior que no pueden leerse correctamente.')
+        return
+      }
+      if ((err as Error).message === 'STORAGE_UNAVAILABLE') {
+        setLocalError('El almacenamiento local no está disponible para verificar el estado de la billetera.')
+        return
+      }
       setLocalError((err as Error).message)
     }
   }
@@ -809,6 +872,14 @@ export function ImportWallet() {
     } catch (err) {
       if ((err as Error).message === 'PENDING_IDENTITY_EXISTS') {
         setLocalError('Hay otra operación de creación o restauración de wallet pendiente en otra pestaña.')
+        return
+      }
+      if ((err as Error).message === 'CORRUPT_OR_UNKNOWN_PENDING') {
+        setLocalError('Encontramos datos de una creación anterior que no pueden leerse correctamente.')
+        return
+      }
+      if ((err as Error).message === 'STORAGE_UNAVAILABLE') {
+        setLocalError('El almacenamiento local no está disponible para verificar el estado de la billetera.')
         return
       }
       setLocalError((err as Error).message)

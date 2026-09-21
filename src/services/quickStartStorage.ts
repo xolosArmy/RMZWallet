@@ -564,32 +564,75 @@ export interface PendingIdentityRecord {
 }
 
 export const PENDING_IDENTITY_STATE = {
-  NONE: 'NONE',
+  ABSENT_CONFIRMED: 'ABSENT_CONFIRMED',
+  NONE: 'ABSENT_CONFIRMED',
   RECOVERABLE_PENDING: 'RECOVERABLE_PENDING',
-  LEGACY_UNRECOVERABLE_PENDING: 'LEGACY_UNRECOVERABLE_PENDING'
+  LEGACY_UNRECOVERABLE_PENDING: 'LEGACY_UNRECOVERABLE_PENDING',
+  CORRUPT_OR_UNKNOWN_PENDING: 'CORRUPT_OR_UNKNOWN_PENDING',
+  STORAGE_UNAVAILABLE: 'STORAGE_UNAVAILABLE'
 } as const
 
 export type PendingIdentityState =
-  (typeof PENDING_IDENTITY_STATE)[keyof typeof PENDING_IDENTITY_STATE]
+  | 'ABSENT_CONFIRMED'
+  | 'NONE'
+  | 'RECOVERABLE_PENDING'
+  | 'LEGACY_UNRECOVERABLE_PENDING'
+  | 'CORRUPT_OR_UNKNOWN_PENDING'
+  | 'STORAGE_UNAVAILABLE'
 
 export const PENDING_IDENTITY_STORAGE_KEY = 'xoloswallet_pending_identity'
 
-export function getPendingIdentityRecord(): PendingIdentityRecord | null {
-  if (typeof localStorage === 'undefined') return null
+export type PendingIdentityAuthority =
+  | { status: typeof PENDING_IDENTITY_STATE.ABSENT_CONFIRMED }
+  | { status: typeof PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE; error?: unknown }
+  | { status: typeof PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING; raw: string }
+  | { status: typeof PENDING_IDENTITY_STATE.RECOVERABLE_PENDING; record: PendingIdentityRecord }
+  | { status: typeof PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING; record: PendingIdentityRecord }
+
+export function inspectPendingIdentityAuthority(): PendingIdentityAuthority {
+  if (typeof localStorage === 'undefined') {
+    return { status: PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE }
+  }
+
+  let raw: string | null
   try {
-    const raw = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
-    if (!raw) return null
+    raw = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
+  } catch (err) {
+    return { status: PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE, error: err }
+  }
+
+  if (raw === null) {
+    return { status: PENDING_IDENTITY_STATE.ABSENT_CONFIRMED }
+  }
+
+  try {
     const parsed = JSON.parse(raw) as Partial<PendingIdentityRecord>
     if (
       parsed &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
       parsed.version === 1 &&
       typeof parsed.commitment === 'string' &&
-      parsed.commitment.length > 0 &&
+      parsed.commitment.trim().length > 0 &&
       typeof parsed.ownerToken === 'string' &&
-      parsed.ownerToken.length > 0 &&
+      parsed.ownerToken.trim().length > 0 &&
       typeof parsed.address === 'string' &&
-      typeof parsed.createdAt === 'number'
+      parsed.address.trim().length > 0 &&
+      typeof parsed.createdAt === 'number' &&
+      !isNaN(parsed.createdAt) &&
+      parsed.createdAt > 0
     ) {
+      if (parsed.derivationProfileId !== undefined && !isDerivationProfileId(parsed.derivationProfileId)) {
+        return { status: PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING, raw }
+      }
+      const cipher = parsed.ciphertext || parsed.encryptedMnemonic
+      if (cipher !== undefined && (typeof cipher !== 'string' || cipher.length === 0)) {
+        return { status: PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING, raw }
+      }
+      if (parsed.state !== undefined && parsed.state !== 'PENDING_BACKUP') {
+        return { status: PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING, raw }
+      }
+
       const rec: PendingIdentityRecord = {
         version: 1,
         ownerToken: parsed.ownerToken,
@@ -597,44 +640,73 @@ export function getPendingIdentityRecord(): PendingIdentityRecord | null {
         address: parsed.address,
         createdAt: parsed.createdAt
       }
-      if (parsed.derivationProfileId && isDerivationProfileId(parsed.derivationProfileId)) {
+      if (parsed.derivationProfileId) {
         rec.derivationProfileId = parsed.derivationProfileId
       }
-      const cipher = parsed.ciphertext || parsed.encryptedMnemonic
-      if (typeof cipher === 'string' && cipher.length > 0) {
+      if (cipher) {
         rec.ciphertext = cipher
         rec.encryptedMnemonic = cipher
       }
-      if (parsed.state === 'PENDING_BACKUP') {
-        rec.state = 'PENDING_BACKUP'
+      if (parsed.state) {
+        rec.state = parsed.state
       }
-      return rec
+
+      const hasRecoverableMetadata = Boolean(
+        cipher &&
+        rec.state === 'PENDING_BACKUP' &&
+        rec.ownerToken &&
+        rec.commitment &&
+        rec.address &&
+        rec.derivationProfileId &&
+        isDerivationProfileId(rec.derivationProfileId)
+      )
+
+      return {
+        status: hasRecoverableMetadata
+          ? PENDING_IDENTITY_STATE.RECOVERABLE_PENDING
+          : PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING,
+        record: rec
+      }
     }
-    return null
   } catch {
-    return null
+    return { status: PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING, raw }
   }
+
+  return { status: PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING, raw }
+}
+
+export function getPendingIdentityRecord(): PendingIdentityRecord | null {
+  const auth = inspectPendingIdentityAuthority()
+  if (
+    auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
+    auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+  ) {
+    return auth.record
+  }
+  return null
 }
 
 export function classifyPendingIdentityRecord(
-  pending: PendingIdentityRecord | null = getPendingIdentityRecord()
+  pending?: PendingIdentityRecord | null
 ): PendingIdentityState {
-  if (!pending) return PENDING_IDENTITY_STATE.NONE
+  if (pending !== undefined) {
+    if (!pending) return PENDING_IDENTITY_STATE.ABSENT_CONFIRMED
+    const ciphertext = pending.ciphertext || pending.encryptedMnemonic
+    const hasRecoverableMetadata = Boolean(
+      ciphertext &&
+      pending.state === 'PENDING_BACKUP' &&
+      pending.ownerToken &&
+      pending.commitment &&
+      pending.address &&
+      pending.derivationProfileId &&
+      isDerivationProfileId(pending.derivationProfileId)
+    )
 
-  const ciphertext = pending.ciphertext || pending.encryptedMnemonic
-  const hasRecoverableMetadata = Boolean(
-    ciphertext &&
-    pending.state === 'PENDING_BACKUP' &&
-    pending.ownerToken &&
-    pending.commitment &&
-    pending.address &&
-    pending.derivationProfileId &&
-    isDerivationProfileId(pending.derivationProfileId)
-  )
-
-  return hasRecoverableMetadata
-    ? PENDING_IDENTITY_STATE.RECOVERABLE_PENDING
-    : PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+    return hasRecoverableMetadata
+      ? PENDING_IDENTITY_STATE.RECOVERABLE_PENDING
+      : PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+  }
+  return inspectPendingIdentityAuthority().status
 }
 
 export function setPendingIdentityRecord(record: {
@@ -671,18 +743,10 @@ export function setPendingIdentityRecord(record: {
   }
   const payload = JSON.stringify(fullRecord)
   localStorage.setItem(PENDING_IDENTITY_STORAGE_KEY, payload)
-  const readBack = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
-  if (!readBack) {
-    try {
-      localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
-    } catch {
-      // best-effort
-    }
-    throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
-  }
-  let parsed: Partial<PendingIdentityRecord> | null = null
+
+  let readBack: string | null = null
   try {
-    parsed = JSON.parse(readBack) as Partial<PendingIdentityRecord>
+    readBack = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
   } catch {
     try {
       localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
@@ -691,17 +755,29 @@ export function setPendingIdentityRecord(record: {
     }
     throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
   }
-  if (
-    !parsed ||
-    parsed.version !== 1 ||
-    parsed.ownerToken !== fullRecord.ownerToken ||
-    parsed.commitment !== fullRecord.commitment ||
-    parsed.address !== fullRecord.address ||
-    typeof parsed.createdAt !== 'number' ||
-    (fullRecord.derivationProfileId && parsed.derivationProfileId !== fullRecord.derivationProfileId) ||
-    (fullRecord.ciphertext && (parsed.ciphertext !== fullRecord.ciphertext && parsed.encryptedMnemonic !== fullRecord.ciphertext)) ||
-    (fullRecord.state && parsed.state !== fullRecord.state)
-  ) {
+
+  if (!readBack) {
+    try {
+      localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
+    } catch {
+      // best-effort
+    }
+    throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+  }
+
+  let parsed: unknown = null
+  try {
+    parsed = JSON.parse(readBack)
+  } catch {
+    try {
+      localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
+    } catch {
+      // best-effort
+    }
+    throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
+  }
+
+  if (!parsed || typeof parsed !== 'object' || (parsed as PendingIdentityRecord).ownerToken !== record.ownerToken) {
     try {
       localStorage.removeItem(PENDING_IDENTITY_STORAGE_KEY)
     } catch {

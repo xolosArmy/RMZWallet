@@ -31,7 +31,6 @@ import type { DecryptPasswordResult } from './crypto'
 import {
   QuickStartUnavailableError,
   assertQuickStartStorageAvailable,
-  classifyPendingIdentityRecord,
   clearPendingIdentityRecord,
   clearQuickStartMnemonic,
   computeMnemonicCommitment,
@@ -39,15 +38,17 @@ import {
   getPendingIdentityRecord,
   getQuickStartRecordStatus,
   hasQuickStartMnemonic,
+  inspectPendingIdentityAuthority,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
   PENDING_IDENTITY_STATE,
+  PENDING_IDENTITY_STORAGE_KEY,
   setPendingIdentityRecord,
   storeQuickStartMnemonic,
   withIdentityMutationLock,
   withQuickStartCreationLock
 } from './quickStartStorage'
-import type { PendingIdentityState, QuickStartRecordStatus } from './quickStartStorage'
+import type { PendingIdentityRecord, PendingIdentityState, QuickStartRecordStatus } from './quickStartStorage'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
 
 function generateOwnerToken(): string {
@@ -746,9 +747,18 @@ export class XolosWalletService {
       if (await hasQuickStartMnemonic()) {
         throw new Error('QUICK_START_RECORD_EXISTS')
       }
-      const pending = getPendingIdentityRecord()
-      if (pending) {
-        if (!this.pendingIdentityOwnerToken || pending.ownerToken !== this.pendingIdentityOwnerToken) {
+      const auth = inspectPendingIdentityAuthority()
+      if (auth.status === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
+        throw new Error('STORAGE_UNAVAILABLE')
+      }
+      if (auth.status === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+        throw new Error('CORRUPT_OR_UNKNOWN_PENDING')
+      }
+      if (
+        auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
+        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+      ) {
+        if (!this.pendingIdentityOwnerToken || auth.record.ownerToken !== this.pendingIdentityOwnerToken) {
           throw new Error('PENDING_IDENTITY_EXISTS')
         }
       }
@@ -857,8 +867,14 @@ export class XolosWalletService {
         }
         return recovered
       }
-      const pending = getPendingIdentityRecord()
-      if (pending) {
+      const auth = inspectPendingIdentityAuthority()
+      if (auth.status === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
+        throw new Error('STORAGE_UNAVAILABLE')
+      }
+      if (auth.status === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+        throw new Error('CORRUPT_OR_UNKNOWN_PENDING')
+      }
+      if (auth.status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
         throw new Error('PENDING_IDENTITY_EXISTS')
       }
 
@@ -1072,7 +1088,7 @@ export class XolosWalletService {
       }
       if (pendingRecord) {
         deletePendingIdentityRecordVerified()
-        if (getPendingIdentityRecord() !== null) {
+        if (inspectPendingIdentityAuthority().status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
           throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
         }
       }
@@ -1120,9 +1136,18 @@ export class XolosWalletService {
       if (await hasQuickStartMnemonic()) {
         throw new Error('QUICK_START_RECORD_EXISTS')
       }
-      const pending = getPendingIdentityRecord()
-      if (pending) {
-        if (!this.pendingIdentityOwnerToken || pending.ownerToken !== this.pendingIdentityOwnerToken) {
+      const auth = inspectPendingIdentityAuthority()
+      if (auth.status === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
+        throw new Error('STORAGE_UNAVAILABLE')
+      }
+      if (auth.status === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+        throw new Error('CORRUPT_OR_UNKNOWN_PENDING')
+      }
+      if (
+        auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
+        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
+      ) {
+        if (!this.pendingIdentityOwnerToken || auth.record.ownerToken !== this.pendingIdentityOwnerToken) {
           throw new Error('PENDING_IDENTITY_EXISTS')
         }
       }
@@ -1542,36 +1567,42 @@ export class XolosWalletService {
   }
 
   hasPendingIdentityRecord(): boolean {
-    const pending = getPendingIdentityRecord()
-    if (!pending) return false
-    if (this.pendingIdentityOwnerToken && pending.ownerToken === this.pendingIdentityOwnerToken) {
+    const auth = inspectPendingIdentityAuthority()
+    if (auth.status === PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) return false
+    if (
+      this.pendingIdentityOwnerToken &&
+      (auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
+        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING) &&
+      auth.record.ownerToken === this.pendingIdentityOwnerToken
+    ) {
       return false
     }
     return true
   }
 
   getPendingIdentityState(): PendingIdentityState {
-    return classifyPendingIdentityRecord()
+    return inspectPendingIdentityAuthority().status
   }
 
   hasRecoverablePendingIdentity(): boolean {
-    const pending = getPendingIdentityRecord()
-    if (!pending) return false
+    const auth = inspectPendingIdentityAuthority()
+    if (auth.status !== PENDING_IDENTITY_STATE.RECOVERABLE_PENDING) return false
     return Boolean(
-      classifyPendingIdentityRecord(pending) === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING &&
-      (!this.isReady || !this.pendingIdentityOwnerToken || pending.ownerToken !== this.pendingIdentityOwnerToken)
+      !this.hasBackedWalletCiphertextOnDevice() &&
+      (!this.isReady || !this.pendingIdentityOwnerToken || auth.record.ownerToken !== this.pendingIdentityOwnerToken)
     )
   }
 
   async resumePendingIdentity(password: string): Promise<{ address: string; mnemonic: string; reconciled: boolean }> {
     return withIdentityMutationLock(async () => {
-      const pending = getPendingIdentityRecord()
-      if (!pending) {
+      const auth = inspectPendingIdentityAuthority()
+      if (auth.status === PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
         throw new Error('NO_PENDING_IDENTITY')
       }
-      if (classifyPendingIdentityRecord(pending) !== PENDING_IDENTITY_STATE.RECOVERABLE_PENDING) {
+      if (auth.status !== PENDING_IDENTITY_STATE.RECOVERABLE_PENDING) {
         throw new Error('PENDING_IDENTITY_NOT_RECOVERABLE')
       }
+      const pending = auth.record
       const ciphertext = pending.ciphertext || pending.encryptedMnemonic
       const profileId = pending.derivationProfileId
       if (!ciphertext || !profileId) {
@@ -1616,7 +1647,7 @@ export class XolosWalletService {
           throw new Error('PENDING_IDENTITY_RECONCILIATION_MISMATCH')
         }
         deletePendingIdentityRecordVerified()
-        if (getPendingIdentityRecord() !== null) {
+        if (inspectPendingIdentityAuthority().status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
           throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
         }
         try {
@@ -1640,13 +1671,14 @@ export class XolosWalletService {
   }
 
   private async abandonPendingIdentityWithExpectedState(expectedState: PendingIdentityState): Promise<void> {
-    const pending = getPendingIdentityRecord()
-    if (!pending) {
+    const auth = inspectPendingIdentityAuthority()
+    if (auth.status === PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
       throw new Error('NO_PENDING_IDENTITY')
     }
-    if (classifyPendingIdentityRecord(pending) !== expectedState) {
+    if (auth.status !== expectedState) {
       throw new Error('PENDING_IDENTITY_STATE_CHANGED')
     }
+    const pending = (auth as { record: PendingIdentityRecord }).record
     if (this.pendingIdentityOwnerToken === pending.ownerToken) {
       throw new Error('PENDING_IDENTITY_SESSION_ACTIVE')
     }
@@ -1667,6 +1699,49 @@ export class XolosWalletService {
 
     deletePendingIdentityRecordVerified()
     this.pendingIdentityOwnerToken = null
+  }
+
+  async abandonCorruptPendingIdentity(): Promise<void> {
+    return withIdentityMutationLock(async () => {
+      if (typeof localStorage === 'undefined') {
+        throw new Error('PENDING_IDENTITY_STORAGE_UNAVAILABLE')
+      }
+      let raw: string | null
+      try {
+        raw = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
+      } catch {
+        throw new Error('PENDING_IDENTITY_STORAGE_UNAVAILABLE')
+      }
+      if (raw === null) {
+        throw new Error('NO_PENDING_IDENTITY')
+      }
+
+      const auth = inspectPendingIdentityAuthority()
+      if (auth.status !== PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+        throw new Error('PENDING_IDENTITY_STATE_CHANGED')
+      }
+
+      if (this.hasBackedWalletCiphertextOnDevice()) {
+        throw new Error('BACKED_WALLET_EXISTS')
+      }
+
+      const quickStartStatus = await getQuickStartRecordStatus()
+      if (quickStartStatus === 'PRESENT') {
+        throw new Error('QUICK_START_RECORD_EXISTS')
+      }
+      if (quickStartStatus === 'STORAGE_UNAVAILABLE_UNKNOWN') {
+        throw new Error('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
+      }
+      if (quickStartStatus === 'RECOVERY_FAILED') {
+        throw new Error('QUICK_START_RECOVERY_FAILED')
+      }
+
+      deletePendingIdentityRecordVerified()
+      if (localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY) !== null) {
+        throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
+      }
+      this.pendingIdentityOwnerToken = null
+    })
   }
 
   async abandonLegacyPendingIdentity(): Promise<void> {

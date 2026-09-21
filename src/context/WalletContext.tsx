@@ -170,7 +170,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     return localStorage.getItem(BACKUP_KEY) === 'true'
   })
   const [pendingIdentityState, setPendingIdentityState] = useState<PendingIdentityState>(() => {
-    if (typeof window === 'undefined') return PENDING_IDENTITY_STATE.NONE
+    if (typeof window === 'undefined') return PENDING_IDENTITY_STATE.ABSENT_CONFIRMED
     if (typeof xolosWalletService.getPendingIdentityState === 'function') {
       return xolosWalletService.getPendingIdentityState()
     }
@@ -179,9 +179,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
     return typeof xolosWalletService.hasPendingIdentityRecord === 'function' && xolosWalletService.hasPendingIdentityRecord()
       ? PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
-      : PENDING_IDENTITY_STATE.NONE
+      : PENDING_IDENTITY_STATE.ABSENT_CONFIRMED
   })
-  const hasPendingIdentity = pendingIdentityState !== PENDING_IDENTITY_STATE.NONE
+  const hasPendingIdentity =
+    pendingIdentityState !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED &&
+    (pendingIdentityState as string) !== 'NONE'
   const getAliasStorageKey = useCallback((addr: string | null) => {
     return addr ? `rmzwallet_alias_${addr}` : 'rmzwallet_alias'
   }, [])
@@ -371,6 +373,20 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       throw new Error('QUICK_START_RECORD_EXISTS')
     }
     if (
+      typeof xolosWalletService.getPendingIdentityState === 'function' &&
+      xolosWalletService.getPendingIdentityState() !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED &&
+      (xolosWalletService.getPendingIdentityState() as string) !== 'NONE'
+    ) {
+      const state = xolosWalletService.getPendingIdentityState()
+      if (state === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+        throw new Error('CORRUPT_OR_UNKNOWN_PENDING')
+      }
+      if (state === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
+        throw new Error('STORAGE_UNAVAILABLE')
+      }
+      throw new Error('PENDING_IDENTITY_EXISTS')
+    }
+    if (
       typeof xolosWalletService.hasPendingIdentityRecord === 'function' &&
       xolosWalletService.hasPendingIdentityRecord()
     ) {
@@ -384,7 +400,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setInitialized(true)
       setBackupVerifiedState(false)
       localStorage.setItem(BACKUP_KEY, 'false')
-      setPendingIdentityState(PENDING_IDENTITY_STATE.NONE)
+      setPendingIdentityState(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
       return mnemonic
     } catch (err) {
       const message = (err as Error).message || 'No se pudo crear la billetera.'
@@ -435,11 +451,18 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       await xolosWalletService.abandonLegacyPendingIdentity()
     } else if (pendingIdentityState === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING) {
       await xolosWalletService.abandonPendingIdentity()
+    } else if (pendingIdentityState === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+      await xolosWalletService.abandonCorruptPendingIdentity()
     } else {
       return
     }
-    setPendingIdentityState(PENDING_IDENTITY_STATE.NONE)
+    setPendingIdentityState(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
   }, [pendingIdentityState])
+
+  const abandonCorruptPendingIdentity = useCallback(async () => {
+    await xolosWalletService.abandonCorruptPendingIdentity()
+    setPendingIdentityState(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
+  }, [])
 
   const startQuickStartWallet = useCallback(async (): Promise<{ address: string }> => {
     if (quickStartBootstrap === 'pending') {
@@ -457,6 +480,20 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       && xolosWalletService.hasBackedWalletCiphertextOnDevice()
     ) {
       throw new Error('BACKED_WALLET_EXISTS')
+    }
+    if (
+      typeof xolosWalletService.getPendingIdentityState === 'function' &&
+      xolosWalletService.getPendingIdentityState() !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED &&
+      (xolosWalletService.getPendingIdentityState() as string) !== 'NONE'
+    ) {
+      const state = xolosWalletService.getPendingIdentityState()
+      if (state === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+        throw new Error('CORRUPT_OR_UNKNOWN_PENDING')
+      }
+      if (state === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
+        throw new Error('STORAGE_UNAVAILABLE')
+      }
+      throw new Error('PENDING_IDENTITY_EXISTS')
     }
     if (
       typeof xolosWalletService.hasPendingIdentityRecord === 'function' &&
@@ -550,7 +587,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       await xolosWalletService.persistVerifiedBackup(password)
       setBackupVerifiedState(true)
       localStorage.setItem(BACKUP_KEY, 'true')
-      setPendingIdentityState(PENDING_IDENTITY_STATE.NONE)
+      setPendingIdentityState(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
     } catch (e) {
       console.error(e)
       setError('No pudimos cifrar y verificar el respaldo en este dispositivo.')
@@ -594,6 +631,20 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       throw new Error('QUICK_START_RECORD_EXISTS')
     }
     if (
+      typeof xolosWalletService.getPendingIdentityState === 'function' &&
+      xolosWalletService.getPendingIdentityState() !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED &&
+      (xolosWalletService.getPendingIdentityState() as string) !== 'NONE'
+    ) {
+      const state = xolosWalletService.getPendingIdentityState()
+      if (state === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
+        throw new Error('CORRUPT_OR_UNKNOWN_PENDING')
+      }
+      if (state === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
+        throw new Error('STORAGE_UNAVAILABLE')
+      }
+      throw new Error('PENDING_IDENTITY_EXISTS')
+    }
+    if (
       typeof xolosWalletService.hasPendingIdentityRecord === 'function' &&
       xolosWalletService.hasPendingIdentityRecord()
     ) {
@@ -608,7 +659,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setInitialized(true)
       setBackupVerifiedState(false)
       localStorage.setItem(BACKUP_KEY, 'false')
-      setPendingIdentityState(PENDING_IDENTITY_STATE.NONE)
+      setPendingIdentityState(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
       return result
     } catch (err) {
       const message = (err as Error).message || 'No se pudo restaurar la billetera.'
@@ -631,7 +682,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         const verified = localStorage.getItem(BACKUP_KEY) === 'true'
         setInitialized(true)
         setBackupVerifiedState(verified)
-        setPendingIdentityState(PENDING_IDENTITY_STATE.NONE)
+        setPendingIdentityState(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
         if (verified && typeof xolosWalletService.discardQuickStartRecord === 'function') {
           try {
             await xolosWalletService.discardQuickStartRecord()
@@ -916,6 +967,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       hasPendingIdentity,
       resumePendingIdentity,
       abandonPendingIdentity,
+      abandonCorruptPendingIdentity,
       hasCapability,
       startQuickStartWallet,
       activateQuickStartFromDevice,
@@ -952,6 +1004,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       hasPendingIdentity,
       resumePendingIdentity,
       abandonPendingIdentity,
+      abandonCorruptPendingIdentity,
       lifecycle,
       quickStartBootstrap,
       hasCapability,
