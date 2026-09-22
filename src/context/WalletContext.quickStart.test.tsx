@@ -42,9 +42,9 @@ const serviceMocks = vi.hoisted(() => ({
   })),
   resolveQuickStartLifecycleAfterActivation: vi.fn(async () => {
     localStorage.setItem('xoloswallet_backup_verified', 'false')
-    return { lifecycle: 'QUICK_START_UNBACKED' as 'QUICK_START_UNBACKED' | 'BACKUP_VERIFIED', backupVerified: false }
+    return { lifecycle: 'QUICK_START_UNBACKED' as 'QUICK_START_UNBACKED' | 'BACKUP_VERIFIED', backupVerified: false, recoveryState: 'NORMAL_UNBACKED' }
   }),
-  persistVerifiedBackup: vi.fn(async () => undefined),
+  persistVerifiedBackup: vi.fn(async () => { localStorage.setItem('xoloswallet_backup_verified', 'true') }),
   discardQuickStartRecord: vi.fn(async () => undefined),
   hasQuickStartRecord: vi.fn(async () => false),
   loadFromStorage: vi.fn(async () => ({
@@ -101,7 +101,9 @@ describe('WalletContext Quick Start lifecycle', () => {
     serviceMocks.sendRMZ.mockReset()
     serviceMocks.persistVerifiedBackup.mockReset()
     serviceMocks.discardQuickStartRecord.mockReset()
-    serviceMocks.persistVerifiedBackup.mockResolvedValue(undefined)
+    serviceMocks.persistVerifiedBackup.mockImplementation(async () => {
+      localStorage.setItem('xoloswallet_backup_verified', 'true')
+    })
     serviceMocks.discardQuickStartRecord.mockResolvedValue(undefined)
     serviceMocks.hasQuickStartRecord.mockReset()
     serviceMocks.hasQuickStartRecord.mockResolvedValue(false)
@@ -112,7 +114,7 @@ describe('WalletContext Quick Start lifecycle', () => {
     serviceMocks.resolveQuickStartLifecycleAfterActivation.mockReset()
     serviceMocks.resolveQuickStartLifecycleAfterActivation.mockImplementation(async () => {
       localStorage.setItem('xoloswallet_backup_verified', 'false')
-      return { lifecycle: 'QUICK_START_UNBACKED', backupVerified: false }
+      return { lifecycle: 'QUICK_START_UNBACKED', backupVerified: false, recoveryState: 'NORMAL_UNBACKED' }
     })
     serviceMocks.loadFromStorage.mockReset()
     serviceMocks.loadFromStorage.mockResolvedValue({
@@ -228,7 +230,7 @@ describe('WalletContext Quick Start lifecycle', () => {
     serviceMocks.resolveQuickStartLifecycleAfterActivation.mockImplementation(async () => {
       expect(localStorage.getItem('xoloswallet_encrypted_mnemonic')).toBe('verified-ciphertext')
       expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('true')
-      return { lifecycle: 'BACKUP_VERIFIED', backupVerified: true }
+      return { lifecycle: 'BACKUP_VERIFIED', backupVerified: true, recoveryState: 'BACKUP_VERIFIED' }
     })
     const writes = vi.spyOn(Storage.prototype, 'setItem')
 
@@ -289,8 +291,45 @@ describe('WalletContext Quick Start lifecycle', () => {
     expect(serviceMocks.discardQuickStartRecord).not.toHaveBeenCalled()
   })
 
+  it('restores an interrupted backup as a limited wallet and exposes recovery without bootstrap failure', async () => {
+    serviceMocks.hasQuickStartRecord.mockResolvedValue(true)
+    serviceMocks.resolveQuickStartLifecycleAfterActivation.mockResolvedValue({
+      lifecycle: 'QUICK_START_UNBACKED', backupVerified: false, recoveryState: 'INTERRUPTED_BACKUP'
+    })
+    localStorage.setItem('xoloswallet_backup_verified', 'false')
+    localStorage.setItem('xoloswallet_encrypted_mnemonic', 'committed-ciphertext')
+    let wallet: ReturnType<typeof useWallet> | null = null
+    render(
+      <WalletProvider>
+        <Harness onReady={(value) => { wallet = value }} />
+      </WalletProvider>
+    )
+
+    await waitFor(() => expect(wallet!.quickStartBootstrap).toBe('recovered'))
+    expect(wallet!.initialized).toBe(true)
+    expect(wallet!.address).toBe('ecash:qquickstart')
+    expect(wallet!.lifecycle).toBe(WALLET_LIFECYCLE.QUICK_START_UNBACKED)
+    expect(wallet!.backupVerified).toBe(false)
+    expect(wallet!.quickStartRecoveryState).toBe('INTERRUPTED_BACKUP')
+    expect(wallet!.hasCapability(WALLET_CAPABILITY.SEND_XEC)).toBe(false)
+    expect(localStorage.getItem('xoloswallet_encrypted_mnemonic')).toBe('committed-ciphertext')
+    expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('false')
+
+    serviceMocks.persistVerifiedBackup.mockRejectedValueOnce(new Error('INTERRUPTED_BACKUP_VERIFICATION_FAILED'))
+    await expect(wallet!.completeProgressiveBackup('wrong-pin')).rejects.toThrow('INTERRUPTED_BACKUP_VERIFICATION_FAILED')
+    expect(wallet!.quickStartRecoveryState).toBe('INTERRUPTED_BACKUP')
+    expect(wallet!.backupVerified).toBe(false)
+    expect(serviceMocks.discardQuickStartRecord).not.toHaveBeenCalled()
+
+    await wallet!.completeProgressiveBackup('correct-pin')
+    await waitFor(() => expect(wallet!.lifecycle).toBe(WALLET_LIFECYCLE.BACKUP_VERIFIED))
+    expect(wallet!.quickStartRecoveryState).toBe('BACKUP_VERIFIED')
+    expect(wallet!.hasCapability(WALLET_CAPABILITY.SEND_XEC)).toBe(true)
+    expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('true')
+    expect(serviceMocks.discardQuickStartRecord).toHaveBeenCalledTimes(1)
+  })
+
   it('IndexedDB unavailable -> PIN backup completes -> BACKUP_VERIFIED -> UI success -> no destructive replacement', async () => {
-    serviceMocks.persistVerifiedBackup.mockResolvedValueOnce(undefined)
     serviceMocks.discardQuickStartRecord.mockRejectedValueOnce(
       new QuickStartUnavailableError('QUICK_START_STORAGE_UNAVAILABLE')
     )

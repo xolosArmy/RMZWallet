@@ -15,7 +15,7 @@ interface BackupLocationState {
 function BackupSeed() {
   const navigate = useNavigate()
   const { state } = useLocation() as { state?: BackupLocationState }
-  const { completeProgressiveBackup, getMnemonic, hasCapability } = useWallet()
+  const { completeProgressiveBackup, getMnemonic, hasCapability, quickStartRecoveryState } = useWallet()
   const [answers, setAnswers] = useState({ w3: '', w7: '', w11: '' })
   const [password, setPassword] = useState(() => takePendingBackupPassword() ?? '')
   const [error, setError] = useState<string | null>(null)
@@ -62,6 +62,8 @@ function BackupSeed() {
     } catch (err) {
       if ((err as Error).message === 'BACKUP_OVERWRITE_PREVENTED') {
         setError('Ya existe otra wallet cifrada respaldada en este dispositivo. No se sobrescribirá.')
+      } else if ((err as Error).message === 'INTERRUPTED_BACKUP_VERIFICATION_FAILED') {
+        setError('No pudimos comprobar el respaldo existente con ese PIN. Tu Tonalli temporal sigue intacta; puedes intentarlo de nuevo.')
       } else if (
         (err as Error).message === 'PENDING_IDENTITY_MISMATCH' ||
         (err as Error).message === 'PENDING_IDENTITY_OWNER_MISMATCH'
@@ -124,6 +126,9 @@ function BackupSeed() {
           onChange={(e) => setAnswers((prev) => ({ ...prev, w11: e.target.value }))}
         />
         <label htmlFor="backup-password">Password/PIN local</label>
+        {quickStartRecoveryState === 'INTERRUPTED_BACKUP' && (
+          <p className="muted">Usa el mismo PIN con el que empezaste este respaldo.</p>
+        )}
         <input
           id="backup-password"
           type="password"
@@ -134,7 +139,11 @@ function BackupSeed() {
         />
         <div className="actions">
           <button className="cta" type="submit" disabled={saving}>
-            {saving ? 'Cifrando y verificando...' : 'Marcar respaldo como listo'}
+            {saving
+              ? 'Cifrando y verificando...'
+              : quickStartRecoveryState === 'INTERRUPTED_BACKUP'
+                ? 'Continuar respaldo interrumpido'
+                : 'Marcar respaldo como listo'}
           </button>
         </div>
         {error && <div className="error">{error}</div>}

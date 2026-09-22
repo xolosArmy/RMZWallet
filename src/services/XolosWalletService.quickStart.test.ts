@@ -239,7 +239,7 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       expect(await hasQuickStartMnemonic()).toBe(false)
 
       resumeCommit()
-      await expect(tabB).resolves.toEqual({ lifecycle: 'BACKUP_VERIFIED', backupVerified: true })
+      await expect(tabB).resolves.toEqual({ lifecycle: 'BACKUP_VERIFIED', backupVerified: true, recoveryState: 'BACKUP_VERIFIED' })
       expect(localStorage.getItem(BACKUP_KEY)).toBe('true')
       expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(finalCiphertext)
       expect(await hasQuickStartMnemonic()).toBe(false)
@@ -270,8 +270,8 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       const finalCiphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
       await xolosWalletService.discardQuickStartRecord()
       expect(resolved).toEqual(first === 'B'
-        ? { lifecycle: 'QUICK_START_UNBACKED', backupVerified: false }
-        : { lifecycle: 'BACKUP_VERIFIED', backupVerified: true })
+        ? { lifecycle: 'QUICK_START_UNBACKED', backupVerified: false, recoveryState: 'NORMAL_UNBACKED' }
+        : { lifecycle: 'BACKUP_VERIFIED', backupVerified: true, recoveryState: 'BACKUP_VERIFIED' })
 
       expect(localStorage.getItem(BACKUP_KEY)).toBe('true')
       expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(finalCiphertext)
@@ -284,7 +284,7 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       setupCrossTabFifoLock()
       await xolosWalletService.createQuickStartWallet()
       await expect(xolosWalletService.resolveQuickStartLifecycleAfterActivation()).resolves.toEqual({
-        lifecycle: 'QUICK_START_UNBACKED', backupVerified: false
+        lifecycle: 'QUICK_START_UNBACKED', backupVerified: false, recoveryState: 'NORMAL_UNBACKED'
       })
       expect(localStorage.getItem(BACKUP_KEY)).toBe('false')
 
@@ -294,12 +294,160 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
       )
       expect(localStorage.getItem(BACKUP_KEY)).toBe('true')
 
+      await clearQuickStartMnemonic()
       localStorage.setItem(STORAGE_KEY_MNEMONIC, ORIGINAL_CIPHERTEXT)
       localStorage.setItem(BACKUP_KEY, 'false')
       await expect(xolosWalletService.resolveQuickStartLifecycleAfterActivation()).rejects.toThrow(
         'QUICK_START_LIFECYCLE_INCONSISTENT'
       )
       expect(localStorage.getItem(BACKUP_KEY)).toBe('false')
+    })
+
+    describe('interrupted Quick Start backup recovery', () => {
+      const pin = 'interruptedPIN123'
+
+      async function interruptAfterFinalCiphertext() {
+        setupCrossTabFifoLock()
+        const created = await xolosWalletService.createQuickStartWallet()
+        const mnemonic = xolosWalletService.getMnemonic()
+        expect(mnemonic).toBeTruthy()
+        await xolosWalletService.resolveQuickStartLifecycleAfterActivation()
+        const originalSetItem = Storage.prototype.setItem
+        const markerSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+          if (key === BACKUP_KEY && value === 'true') throw new Error('MARKER_WRITE_DENIED')
+          return originalSetItem.call(this, key, value)
+        })
+        try {
+          await expect(xolosWalletService.persistVerifiedBackup(pin)).rejects.toThrow(
+            'BACKUP_VERIFIED_MARKER_PERSIST_FAILED'
+          )
+        } finally {
+          markerSpy.mockRestore()
+        }
+        const ciphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
+        expect(ciphertext).toBeTruthy()
+        expect(localStorage.getItem(BACKUP_KEY)).toBe('false')
+        expect(await hasQuickStartMnemonic()).toBe(true)
+
+        simulateReload()
+        const restored = await xolosWalletService.activateQuickStartFromDevice()
+        expect(restored?.address).toBe(created.address)
+        const writesDuringReconciliation = vi.spyOn(Storage.prototype, 'setItem')
+        try {
+          expect(await xolosWalletService.resolveQuickStartLifecycleAfterActivation()).toEqual({
+            lifecycle: 'QUICK_START_UNBACKED', backupVerified: false, recoveryState: 'INTERRUPTED_BACKUP'
+          })
+          expect(writesDuringReconciliation.mock.calls.filter(([key]) => key === BACKUP_KEY)).toEqual([])
+        } finally {
+          writesDuringReconciliation.mockRestore()
+        }
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(ciphertext)
+        expect(localStorage.getItem(BACKUP_KEY)).toBe('false')
+        return { address: created.address, mnemonic, ciphertext }
+      }
+
+      test('crash after final ciphertext restores the same limited Quick Start identity', async () => {
+        const { address, mnemonic, ciphertext } = await interruptAfterFinalCiphertext()
+        expect(xolosWalletService.getAddress()).toBe(address)
+        expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(ciphertext)
+      }, 30000)
+
+      test('correct PIN verifies the existing ciphertext, then commits marker before cleanup', async () => {
+        const { address, mnemonic, ciphertext } = await interruptAfterFinalCiphertext()
+        await xolosWalletService.persistVerifiedBackup(pin)
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(ciphertext)
+        expect(await xolosWalletService.verifyStoredMnemonic(pin, mnemonic!)).toBe(true)
+        expect(localStorage.getItem(BACKUP_KEY)).toBe('true')
+        expect(await hasQuickStartMnemonic()).toBe(true)
+        await xolosWalletService.discardQuickStartRecord()
+        expect(await hasQuickStartMnemonic()).toBe(false)
+        expect(xolosWalletService.getAddress()).toBe(address)
+        expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+        expect(await xolosWalletService.resolveQuickStartLifecycleAfterActivation()).toEqual({
+          lifecycle: 'BACKUP_VERIFIED', backupVerified: true, recoveryState: 'BACKUP_VERIFIED'
+        })
+      }, 30000)
+
+      test('wrong PIN cannot change marker, final ciphertext, Quick Start, or identity', async () => {
+        const { address, mnemonic, ciphertext } = await interruptAfterFinalCiphertext()
+        await expect(xolosWalletService.persistVerifiedBackup('wrongPIN123')).rejects.toThrow(
+          'INTERRUPTED_BACKUP_VERIFICATION_FAILED'
+        )
+        expect(localStorage.getItem(BACKUP_KEY)).toBe('false')
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(ciphertext)
+        expect(await hasQuickStartMnemonic()).toBe(true)
+        expect(xolosWalletService.getAddress()).toBe(address)
+        expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+      }, 30000)
+
+      test('marker read-back failure leaves final ciphertext and Quick Start recoverable', async () => {
+        const { ciphertext } = await interruptAfterFinalCiphertext()
+        const originalSetItem = Storage.prototype.setItem
+        const markerSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+          if (key === BACKUP_KEY && value === 'true') return
+          return originalSetItem.call(this, key, value)
+        })
+        try {
+          await expect(xolosWalletService.persistVerifiedBackup(pin)).rejects.toThrow(
+            'BACKUP_VERIFIED_MARKER_PERSIST_FAILED'
+          )
+        } finally {
+          markerSpy.mockRestore()
+        }
+        expect(localStorage.getItem(BACKUP_KEY)).toBe('false')
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(ciphertext)
+        expect(await hasQuickStartMnemonic()).toBe(true)
+        simulateReload()
+        await xolosWalletService.activateQuickStartFromDevice()
+        expect((await xolosWalletService.resolveQuickStartLifecycleAfterActivation()).recoveryState).toBe('INTERRUPTED_BACKUP')
+      }, 30000)
+
+      test('crash after verified marker but before Quick Start cleanup reloads as verified', async () => {
+        setupCrossTabFifoLock()
+        const created = await xolosWalletService.createQuickStartWallet()
+        await xolosWalletService.resolveQuickStartLifecycleAfterActivation()
+        await xolosWalletService.persistVerifiedBackup(pin)
+        expect(localStorage.getItem(BACKUP_KEY)).toBe('true')
+        expect(await hasQuickStartMnemonic()).toBe(true)
+        simulateReload()
+        const restored = await xolosWalletService.activateQuickStartFromDevice()
+        expect(restored?.address).toBe(created.address)
+        expect(await xolosWalletService.resolveQuickStartLifecycleAfterActivation()).toEqual({
+          lifecycle: 'BACKUP_VERIFIED', backupVerified: true, recoveryState: 'BACKUP_VERIFIED'
+        })
+      }, 30000)
+
+      test('a foreign final ciphertext fails PIN reconciliation without overwrite', async () => {
+        setupCrossTabFifoLock()
+        await xolosWalletService.createQuickStartWallet()
+        const mnemonic = xolosWalletService.getMnemonic()
+        await xolosWalletService.resolveQuickStartLifecycleAfterActivation()
+        const foreignCiphertext = await encryptWithPassword('different mnemonic', pin)
+        localStorage.setItem(STORAGE_KEY_MNEMONIC, foreignCiphertext)
+        expect((await xolosWalletService.resolveQuickStartLifecycleAfterActivation()).recoveryState).toBe('INTERRUPTED_BACKUP')
+        await expect(xolosWalletService.persistVerifiedBackup(pin)).rejects.toThrow(
+          'INTERRUPTED_BACKUP_VERIFICATION_FAILED'
+        )
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(foreignCiphertext)
+        expect(localStorage.getItem(BACKUP_KEY)).toBe('false')
+        expect(await hasQuickStartMnemonic()).toBe(true)
+        expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+      }, 30000)
+
+      test('active identity mismatch cannot be classified as interrupted', async () => {
+        setupCrossTabFifoLock()
+        await xolosWalletService.createQuickStartWallet()
+        await xolosWalletService.resolveQuickStartLifecycleAfterActivation()
+        localStorage.setItem(STORAGE_KEY_MNEMONIC, ORIGINAL_CIPHERTEXT)
+        internals.decryptedMnemonic = 'different mnemonic'
+        await expect(xolosWalletService.resolveQuickStartLifecycleAfterActivation()).rejects.toThrow(
+          'QUICK_START_LIFECYCLE_INCONSISTENT'
+        )
+        expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(ORIGINAL_CIPHERTEXT)
+        expect(localStorage.getItem(BACKUP_KEY)).toBe('false')
+        expect(await hasQuickStartMnemonic()).toBe(true)
+      }, 30000)
     })
 
     test('Quick Start vs create-backed: loser fails closed, winner seed never deleted, never two fundable addresses', async () => {

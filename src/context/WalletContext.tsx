@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { EXTENDED_GAP_LIMIT, xolosWalletService } from '../services/XolosWalletService'
 import type { AliasReservedUtxo, WalletBalance, WalletRescanOptions } from '../services/XolosWalletService'
+import type { QuickStartRecoveryState } from '../services/XolosWalletService'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import { getChronik } from '../services/ChronikClient'
 import { computeNetworkFeeSats, MIN_NETWORK_FEE_SATS, TONALLI_SERVICE_FEE_SATS, XEC_DUST_SATS } from '../config/xecFees'
@@ -165,6 +166,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null)
   const [initialized, setInitialized] = useState<boolean>(false)
   const [quickStartBootstrap, setQuickStartBootstrap] = useState<QuickStartBootstrapStatus>('pending')
+  const [quickStartRecoveryState, setQuickStartRecoveryState] = useState<QuickStartRecoveryState | null>(null)
   const [backupVerified, setBackupVerifiedState] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false
     return localStorage.getItem(BACKUP_KEY) === 'true'
@@ -510,6 +512,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setAddress(created.address)
       setInitialized(true)
       setBackupVerifiedState(resolved.backupVerified)
+      setQuickStartRecoveryState(resolved.recoveryState)
       setQuickStartBootstrap('recovered')
       await syncAddressAndBalance({ optionalBalance: true })
       return { address: created.address }
@@ -532,6 +535,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setAddress(restored.address)
       setInitialized(true)
       setBackupVerifiedState(resolved.backupVerified)
+      setQuickStartRecoveryState(resolved.recoveryState)
       setQuickStartBootstrap('recovered')
       await syncAddressAndBalance({ optionalBalance: true })
       return { address: restored.address }
@@ -587,9 +591,19 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     try {
       await xolosWalletService.persistVerifiedBackup(password)
       setBackupVerifiedState(true)
-      localStorage.setItem(BACKUP_KEY, 'true')
+      if (quickStartBootstrap === 'recovered') setQuickStartRecoveryState('BACKUP_VERIFIED')
       setPendingIdentityState(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
     } catch (e) {
+      if (quickStartBootstrap === 'recovered') {
+        try {
+          const resolved = await xolosWalletService.resolveQuickStartLifecycleAfterActivation()
+          if (resolved.recoveryState === 'INTERRUPTED_BACKUP') {
+            setQuickStartRecoveryState('INTERRUPTED_BACKUP')
+          }
+        } catch {
+          // Preserve the original backup failure; no recovery state is inferred.
+        }
+      }
       console.error(e)
       setError('No pudimos cifrar y verificar el respaldo en este dispositivo.')
       throw e
@@ -600,7 +614,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     } catch (cleanupError) {
       console.warn('Quick Start cleanup after verified backup commit encountered an error:', cleanupError)
     }
-  }, [])
+  }, [quickStartBootstrap])
 
   const restoreWallet = useCallback(async (
     mnemonic: string,
@@ -729,7 +743,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       try {
         await xolosWalletService.persistVerifiedBackup(password)
         setBackupVerifiedState(true)
-        localStorage.setItem(BACKUP_KEY, 'true')
+        if (quickStartBootstrap === 'recovered') setQuickStartRecoveryState('BACKUP_VERIFIED')
       } catch (e) {
         console.error(e)
         setError('No pudimos acceder a tu seed para cifrarla. Vuelve a iniciar el proceso de onboarding y respaldo.')
@@ -742,7 +756,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         console.warn('Quick Start cleanup after encryptAndStore encountered an error:', cleanupError)
       }
     },
-    []
+    [quickStartBootstrap]
   )
 
   const sendRMZ = useCallback(
@@ -967,6 +981,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       backupVerified,
       lifecycle,
       quickStartBootstrap,
+      quickStartRecoveryState,
       hasBackedWalletOnDevice: typeof xolosWalletService.hasBackedWalletCiphertextOnDevice === 'function'
         ? xolosWalletService.hasBackedWalletCiphertextOnDevice()
         : false,
@@ -1014,6 +1029,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       abandonCorruptPendingIdentity,
       lifecycle,
       quickStartBootstrap,
+      quickStartRecoveryState,
       hasCapability,
       startQuickStartWallet,
       activateQuickStartFromDevice,

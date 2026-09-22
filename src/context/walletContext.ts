@@ -9,6 +9,7 @@ import type {
   WalletRescanOptions,
   WalletRestoreResult
 } from '../services/XolosWalletService'
+import type { QuickStartRecoveryState } from '../services/XolosWalletService'
 import type { DerivationProfileId } from '../services/derivationProfiles'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import type { FirmaSendPreview } from '../services/firmaAlphaSend'
@@ -28,6 +29,7 @@ export interface WalletContextValue {
   backupVerified: boolean
   lifecycle: WalletLifecycle
   quickStartBootstrap: QuickStartBootstrapStatus
+  quickStartRecoveryState: QuickStartRecoveryState | null
   hasBackedWalletOnDevice: boolean
   hasCapability: (capability: WalletCapability) => boolean
   setAlias?: (alias: string | null) => void

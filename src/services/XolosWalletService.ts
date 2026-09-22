@@ -141,6 +141,7 @@ const CHRONIK_ENDPOINTS = [
 ]
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
 const BACKUP_KEY = 'xoloswallet_backup_verified'
+export type QuickStartRecoveryState = 'NORMAL_UNBACKED' | 'INTERRUPTED_BACKUP' | 'BACKUP_VERIFIED'
 const STORAGE_KEY_GAP_LIMIT = 'xoloswallet_gap_limit'
 const SCAN_CACHE_TTL_MS = 30000
 const CHRONIK_CONCURRENCY_LIMIT = 4
@@ -977,37 +978,45 @@ export class XolosWalletService {
     return this.activateQuickStartWallet(mnemonic, metadata.derivationProfileId)
   }
 
+  private async activeQuickStartIdentityMatches(): Promise<boolean> {
+    const metadata = await loadQuickStartMetadata()
+    const quickStartMnemonic = await loadQuickStartMnemonic()
+    const activeMnemonic = this.getMnemonic()
+    const activeAddress = this.getAddress()
+    return Boolean(
+      metadata && quickStartMnemonic && activeMnemonic && activeAddress
+      && quickStartMnemonic === activeMnemonic
+      && metadata.address === activeAddress
+      && metadata.derivationProfileId === this.activeProfileId
+    )
+  }
+
   async resolveQuickStartLifecycleAfterActivation(): Promise<{
     lifecycle: typeof WALLET_LIFECYCLE.BACKUP_VERIFIED | typeof WALLET_LIFECYCLE.QUICK_START_UNBACKED
     backupVerified: boolean
+    recoveryState: QuickStartRecoveryState
   }> {
     return withIdentityMutationLock(async () => {
       // Read both authorities only after acquiring the same lock used by backup commit.
       const ciphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
       const marker = localStorage.getItem(BACKUP_KEY)
       if (ciphertext && marker === 'true') {
-        return { lifecycle: WALLET_LIFECYCLE.BACKUP_VERIFIED, backupVerified: true }
+        return { lifecycle: WALLET_LIFECYCLE.BACKUP_VERIFIED, backupVerified: true, recoveryState: 'BACKUP_VERIFIED' }
       }
-      if (ciphertext !== null || marker === 'true' || (marker !== null && marker !== 'false')) {
+      if (ciphertext === '' || marker === 'true' || (marker !== null && marker !== 'false')) {
         throw new Error('QUICK_START_LIFECYCLE_INCONSISTENT')
       }
 
       const status = await getQuickStartRecordStatus()
-      if (status !== 'PRESENT') {
+      if (status !== 'PRESENT' || !(await this.activeQuickStartIdentityMatches().catch(() => false))) {
         throw new Error('QUICK_START_LIFECYCLE_INCONSISTENT')
       }
-      const metadata = await loadQuickStartMetadata()
-      const mnemonic = await loadQuickStartMnemonic()
-      if (
-        !metadata || !mnemonic || mnemonic !== this.getMnemonic()
-        || !this.getAddress() || metadata.address !== this.getAddress()
-        || metadata.derivationProfileId !== this.activeProfileId
-      ) {
-        throw new Error('QUICK_START_LIFECYCLE_INCONSISTENT')
+      if (ciphertext !== null) {
+        return { lifecycle: WALLET_LIFECYCLE.QUICK_START_UNBACKED, backupVerified: false, recoveryState: 'INTERRUPTED_BACKUP' }
       }
 
       localStorage.setItem(BACKUP_KEY, 'false')
-      return { lifecycle: WALLET_LIFECYCLE.QUICK_START_UNBACKED, backupVerified: false }
+      return { lifecycle: WALLET_LIFECYCLE.QUICK_START_UNBACKED, backupVerified: false, recoveryState: 'NORMAL_UNBACKED' }
     })
   }
 
@@ -1047,7 +1056,25 @@ export class XolosWalletService {
         throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
       }
 
-      if (this.hasBackedWalletCiphertextOnDevice()) {
+      const existingFinalCiphertext = typeof window === 'undefined'
+        ? this.encryptedMnemonic
+        : localStorage.getItem(STORAGE_KEY_MNEMONIC)
+      let reuseExistingFinalCiphertext = false
+      if (existingFinalCiphertext !== null && await getQuickStartRecordStatus() === 'PRESENT') {
+        const identityMatches = await this.activeQuickStartIdentityMatches().catch(() => false)
+        if (!identityMatches) {
+          throw new Error('INTERRUPTED_BACKUP_VERIFICATION_FAILED')
+        }
+        try {
+          const decrypted = await decryptWithPassword(existingFinalCiphertext, password)
+          if (decrypted.plainText.trim() !== mnemonic.trim()) {
+            throw new Error('INTERRUPTED_BACKUP_VERIFICATION_FAILED')
+          }
+        } catch {
+          throw new Error('INTERRUPTED_BACKUP_VERIFICATION_FAILED')
+        }
+        reuseExistingFinalCiphertext = true
+      } else if (this.hasBackedWalletCiphertextOnDevice()) {
         const matches = await this.verifyStoredMnemonic(password, mnemonic).catch(() => false)
         if (!matches) {
           throw new Error('BACKUP_OVERWRITE_PREVENTED')
@@ -1156,16 +1183,24 @@ export class XolosWalletService {
           throw new Error('QUICK_START_WALLET_EXISTS')
         }
       }
-      await this.encryptAndStoreMnemonic(password)
+      if (!reuseExistingFinalCiphertext) {
+        await this.encryptAndStoreMnemonic(password)
+      }
       const verified = await this.verifyStoredMnemonic(password, mnemonic)
       if (!verified) {
-        throw new Error('QUICK_START_BACKUP_VERIFY_FAILED')
+        throw new Error(reuseExistingFinalCiphertext
+          ? 'INTERRUPTED_BACKUP_VERIFICATION_FAILED'
+          : 'QUICK_START_BACKUP_VERIFY_FAILED')
       }
       try {
-        localStorage.setItem('xoloswallet_backup_verified', 'true')
+        localStorage.setItem(BACKUP_KEY, 'true')
+        if (localStorage.getItem(BACKUP_KEY) !== 'true') {
+          throw new Error('BACKUP_VERIFIED_MARKER_PERSIST_FAILED')
+        }
       } catch {
-        // ignore
+        throw new Error('BACKUP_VERIFIED_MARKER_PERSIST_FAILED')
       }
+      if (reuseExistingFinalCiphertext) this.encryptedMnemonic = existingFinalCiphertext
       if (activePendingRecord) {
         deletePendingIdentityRecordVerified()
         if (inspectPendingIdentityAuthority().status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
