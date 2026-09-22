@@ -50,6 +50,7 @@ import {
 } from './quickStartStorage'
 import type { PendingIdentityRecord, PendingIdentityState, QuickStartRecordStatus } from './quickStartStorage'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
+import { WALLET_LIFECYCLE } from '../domain/walletLifecycle'
 
 function generateOwnerToken(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -139,6 +140,7 @@ const CHRONIK_ENDPOINTS = [
   'https://chronik.xolosarmy.xyz'
 ]
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
+const BACKUP_KEY = 'xoloswallet_backup_verified'
 const STORAGE_KEY_GAP_LIMIT = 'xoloswallet_gap_limit'
 const SCAN_CACHE_TTL_MS = 30000
 const CHRONIK_CONCURRENCY_LIMIT = 4
@@ -973,6 +975,40 @@ export class XolosWalletService {
     const mnemonic = await loadQuickStartMnemonic()
     if (!mnemonic) return null
     return this.activateQuickStartWallet(mnemonic, metadata.derivationProfileId)
+  }
+
+  async resolveQuickStartLifecycleAfterActivation(): Promise<{
+    lifecycle: typeof WALLET_LIFECYCLE.BACKUP_VERIFIED | typeof WALLET_LIFECYCLE.QUICK_START_UNBACKED
+    backupVerified: boolean
+  }> {
+    return withIdentityMutationLock(async () => {
+      // Read both authorities only after acquiring the same lock used by backup commit.
+      const ciphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
+      const marker = localStorage.getItem(BACKUP_KEY)
+      if (ciphertext && marker === 'true') {
+        return { lifecycle: WALLET_LIFECYCLE.BACKUP_VERIFIED, backupVerified: true }
+      }
+      if (ciphertext !== null || marker === 'true' || (marker !== null && marker !== 'false')) {
+        throw new Error('QUICK_START_LIFECYCLE_INCONSISTENT')
+      }
+
+      const status = await getQuickStartRecordStatus()
+      if (status !== 'PRESENT') {
+        throw new Error('QUICK_START_LIFECYCLE_INCONSISTENT')
+      }
+      const metadata = await loadQuickStartMetadata()
+      const mnemonic = await loadQuickStartMnemonic()
+      if (
+        !metadata || !mnemonic || mnemonic !== this.getMnemonic()
+        || !this.getAddress() || metadata.address !== this.getAddress()
+        || metadata.derivationProfileId !== this.activeProfileId
+      ) {
+        throw new Error('QUICK_START_LIFECYCLE_INCONSISTENT')
+      }
+
+      localStorage.setItem(BACKUP_KEY, 'false')
+      return { lifecycle: WALLET_LIFECYCLE.QUICK_START_UNBACKED, backupVerified: false }
+    })
   }
 
   async hasQuickStartRecord(): Promise<boolean> {

@@ -36,6 +36,7 @@ const MinimalXECWallet = (() => {
 })()
 
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
+const BACKUP_KEY = 'xoloswallet_backup_verified'
 const ORIGINAL_CIPHERTEXT = 'pin-backed-ciphertext-original'
 const TEST_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
 
@@ -180,6 +181,95 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
         }
       })
     }
+
+    test('lagging activation adopts a backup committed after identity derivation, without reverting the marker', async () => {
+      setupCrossTabFifoLock()
+      const created = await xolosWalletService.createQuickStartWallet()
+      const writes = vi.spyOn(Storage.prototype, 'setItem')
+      let signalActivated!: () => void
+      const activated = new Promise<void>((resolve) => { signalActivated = resolve })
+      let resumeCommit!: () => void
+      const beforeCommit = new Promise<void>((resolve) => { resumeCommit = resolve })
+
+      const tabB = (async () => {
+        const restored = await xolosWalletService.activateQuickStartFromDevice()
+        expect(restored?.address).toBe(created.address)
+        signalActivated()
+        await beforeCommit
+        return xolosWalletService.resolveQuickStartLifecycleAfterActivation()
+      })()
+      await activated
+
+      await xolosWalletService.persistVerifiedBackup('pin1234')
+      const finalCiphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
+      expect(finalCiphertext).toBeTruthy()
+      expect(localStorage.getItem(BACKUP_KEY)).toBe('true')
+      await xolosWalletService.discardQuickStartRecord()
+      expect(await hasQuickStartMnemonic()).toBe(false)
+
+      resumeCommit()
+      await expect(tabB).resolves.toEqual({ lifecycle: 'BACKUP_VERIFIED', backupVerified: true })
+      expect(localStorage.getItem(BACKUP_KEY)).toBe('true')
+      expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(finalCiphertext)
+      expect(await hasQuickStartMnemonic()).toBe(false)
+      expect(xolosWalletService.getAddress()).toBe(created.address)
+      expect(writes.mock.calls.filter(([key]) => key === BACKUP_KEY).map(([, value]) => value)).toEqual(['true'])
+
+      simulateReload()
+      internals.encryptedMnemonic = finalCiphertext
+      await xolosWalletService.loadFromStorage('pin1234')
+      expect(xolosWalletService.getAddress()).toBe(created.address)
+      expect(localStorage.getItem(BACKUP_KEY)).toBe('true')
+    }, 30000)
+
+    test.each(['B', 'A'] as const)('%s wins the lifecycle lock first; final marker stays verified', async (first) => {
+      setupCrossTabFifoLock()
+      const created = await xolosWalletService.createQuickStartWallet()
+      const restored = await xolosWalletService.activateQuickStartFromDevice()
+      expect(restored?.address).toBe(created.address)
+      const writes = vi.spyOn(Storage.prototype, 'setItem')
+      const reconcile = () => xolosWalletService.resolveQuickStartLifecycleAfterActivation()
+      const backup = () => xolosWalletService.persistVerifiedBackup('pin1234')
+      let resolved: Awaited<ReturnType<typeof reconcile>>
+      if (first === 'B') {
+        [resolved] = await Promise.all([reconcile(), backup()])
+      } else {
+        [, resolved] = await Promise.all([backup(), reconcile()])
+      }
+      const finalCiphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
+      await xolosWalletService.discardQuickStartRecord()
+      expect(resolved).toEqual(first === 'B'
+        ? { lifecycle: 'QUICK_START_UNBACKED', backupVerified: false }
+        : { lifecycle: 'BACKUP_VERIFIED', backupVerified: true })
+
+      expect(localStorage.getItem(BACKUP_KEY)).toBe('true')
+      expect(localStorage.getItem(STORAGE_KEY_MNEMONIC)).toBe(finalCiphertext)
+      expect(await hasQuickStartMnemonic()).toBe(false)
+      const markerWrites = writes.mock.calls.filter(([key]) => key === BACKUP_KEY).map(([, value]) => value)
+      expect(markerWrites).toEqual(first === 'B' ? ['false', 'true'] : ['true'])
+    }, 30000)
+
+    test('fresh Quick Start commits unbacked, while inconsistent storage never writes false', async () => {
+      setupCrossTabFifoLock()
+      await xolosWalletService.createQuickStartWallet()
+      await expect(xolosWalletService.resolveQuickStartLifecycleAfterActivation()).resolves.toEqual({
+        lifecycle: 'QUICK_START_UNBACKED', backupVerified: false
+      })
+      expect(localStorage.getItem(BACKUP_KEY)).toBe('false')
+
+      localStorage.setItem(BACKUP_KEY, 'true')
+      await expect(xolosWalletService.resolveQuickStartLifecycleAfterActivation()).rejects.toThrow(
+        'QUICK_START_LIFECYCLE_INCONSISTENT'
+      )
+      expect(localStorage.getItem(BACKUP_KEY)).toBe('true')
+
+      localStorage.setItem(STORAGE_KEY_MNEMONIC, ORIGINAL_CIPHERTEXT)
+      localStorage.setItem(BACKUP_KEY, 'false')
+      await expect(xolosWalletService.resolveQuickStartLifecycleAfterActivation()).rejects.toThrow(
+        'QUICK_START_LIFECYCLE_INCONSISTENT'
+      )
+      expect(localStorage.getItem(BACKUP_KEY)).toBe('false')
+    })
 
     test('Quick Start vs create-backed: loser fails closed, winner seed never deleted, never two fundable addresses', async () => {
       setupCrossTabFifoLock()

@@ -261,11 +261,6 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
   }, [address, getAliasStorageKey, updateAlias])
 
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    localStorage.setItem(BACKUP_KEY, backupVerified ? 'true' : 'false')
-  }, [backupVerified])
-
   const syncAddressAndBalance = useCallback(async (options?: { optionalBalance?: boolean }) => {
     const addr = xolosWalletService.getAddress()
     setAddress(addr)
@@ -511,11 +506,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setError(null)
     try {
       const created = await xolosWalletService.createQuickStartWallet()
+      const resolved = await xolosWalletService.resolveQuickStartLifecycleAfterActivation()
       setAddress(created.address)
       setInitialized(true)
-      setBackupVerifiedState(false)
+      setBackupVerifiedState(resolved.backupVerified)
       setQuickStartBootstrap('recovered')
-      localStorage.setItem(BACKUP_KEY, 'false')
       await syncAddressAndBalance({ optionalBalance: true })
       return { address: created.address }
     } catch (err) {
@@ -533,11 +528,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     try {
       const restored = await xolosWalletService.activateQuickStartFromDevice()
       if (!restored) return null
+      const resolved = await xolosWalletService.resolveQuickStartLifecycleAfterActivation()
       setAddress(restored.address)
       setInitialized(true)
-      setBackupVerifiedState(false)
+      setBackupVerifiedState(resolved.backupVerified)
       setQuickStartBootstrap('recovered')
-      localStorage.setItem(BACKUP_KEY, 'false')
       await syncAddressAndBalance({ optionalBalance: true })
       return { address: restored.address }
     } catch (err) {

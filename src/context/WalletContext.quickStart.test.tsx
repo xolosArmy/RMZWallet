@@ -40,6 +40,10 @@ const serviceMocks = vi.hoisted(() => ({
     address: 'ecash:qquickstart',
     profileId: 'ecash-standard-1899'
   })),
+  resolveQuickStartLifecycleAfterActivation: vi.fn(async () => {
+    localStorage.setItem('xoloswallet_backup_verified', 'false')
+    return { lifecycle: 'QUICK_START_UNBACKED' as 'QUICK_START_UNBACKED' | 'BACKUP_VERIFIED', backupVerified: false }
+  }),
   persistVerifiedBackup: vi.fn(async () => undefined),
   discardQuickStartRecord: vi.fn(async () => undefined),
   hasQuickStartRecord: vi.fn(async () => false),
@@ -87,6 +91,7 @@ function Harness({ onReady }: { onReady: (wallet: ReturnType<typeof useWallet>) 
 describe('WalletContext Quick Start lifecycle', () => {
   afterEach(() => {
     cleanup()
+    vi.restoreAllMocks()
     localStorage.clear()
   })
 
@@ -104,6 +109,11 @@ describe('WalletContext Quick Start lifecycle', () => {
     serviceMocks.createNewWallet.mockClear()
     serviceMocks.restoreFromMnemonic.mockClear()
     serviceMocks.activateQuickStartFromDevice.mockClear()
+    serviceMocks.resolveQuickStartLifecycleAfterActivation.mockReset()
+    serviceMocks.resolveQuickStartLifecycleAfterActivation.mockImplementation(async () => {
+      localStorage.setItem('xoloswallet_backup_verified', 'false')
+      return { lifecycle: 'QUICK_START_UNBACKED', backupVerified: false }
+    })
     serviceMocks.loadFromStorage.mockReset()
     serviceMocks.loadFromStorage.mockResolvedValue({
       status: 'loaded',
@@ -197,6 +207,66 @@ describe('WalletContext Quick Start lifecycle', () => {
     expect(wallet!.hasCapability(WALLET_CAPABILITY.TM_COMM)).toBe(false)
     expect(serviceMocks.persistVerifiedBackup).toHaveBeenCalledWith('123456')
     expect(serviceMocks.discardQuickStartRecord).toHaveBeenCalled()
+  })
+
+  it.each(['start', 'activate'] as const)('%s adopts a cross-tab verified backup after delayed activation', async (entrypoint) => {
+    let releaseIdentity!: () => void
+    const beforeIdentityReturns = new Promise<void>((resolve) => { releaseIdentity = resolve })
+    let signalIdentityStarted!: () => void
+    const identityStarted = new Promise<void>((resolve) => { signalIdentityStarted = resolve })
+    const activate = async () => {
+      signalIdentityStarted()
+      await beforeIdentityReturns
+      return { address: 'ecash:qquickstart', profileId: 'ecash-standard-1899' }
+    }
+    if (entrypoint === 'activate') {
+      serviceMocks.hasQuickStartRecord.mockResolvedValue(true)
+      serviceMocks.activateQuickStartFromDevice.mockImplementation(activate)
+    } else {
+      serviceMocks.createQuickStartWallet.mockImplementation(activate)
+    }
+    serviceMocks.resolveQuickStartLifecycleAfterActivation.mockImplementation(async () => {
+      expect(localStorage.getItem('xoloswallet_encrypted_mnemonic')).toBe('verified-ciphertext')
+      expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('true')
+      return { lifecycle: 'BACKUP_VERIFIED', backupVerified: true }
+    })
+    const writes = vi.spyOn(Storage.prototype, 'setItem')
+
+    let wallet: ReturnType<typeof useWallet> | null = null
+    render(
+      <WalletProvider>
+        <Harness onReady={(value) => { wallet = value }} />
+      </WalletProvider>
+    )
+    if (entrypoint === 'start') {
+      await waitFor(() => expect(wallet!.quickStartBootstrap).toBe('absent'))
+    }
+    const pending = entrypoint === 'start' ? wallet!.startQuickStartWallet() : null
+    await identityStarted
+
+    // Tab A commits while Tab B has already loaded the same local identity.
+    localStorage.setItem('xoloswallet_encrypted_mnemonic', 'verified-ciphertext')
+    localStorage.setItem('xoloswallet_backup_verified', 'true')
+    releaseIdentity()
+    if (pending) await pending
+    await waitFor(() => expect(wallet!.lifecycle).toBe(WALLET_LIFECYCLE.BACKUP_VERIFIED))
+    expect(wallet!.backupVerified).toBe(true)
+    expect(wallet!.address).toBe('ecash:qquickstart')
+    expect(wallet!.hasCapability(WALLET_CAPABILITY.SEND_XEC)).toBe(true)
+    expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('true')
+    expect(writes.mock.calls.filter(([key]) => key === 'xoloswallet_backup_verified').map(([, value]) => value)).toEqual(['true'])
+
+    cleanup()
+    serviceMocks.hasBackedWalletCiphertextOnDevice.mockReturnValue(true)
+    wallet = null
+    render(
+      <WalletProvider>
+        <Harness onReady={(value) => { wallet = value }} />
+      </WalletProvider>
+    )
+    await wallet!.loadExistingWallet('pin1234')
+    await waitFor(() => expect(wallet!.lifecycle).toBe(WALLET_LIFECYCLE.BACKUP_VERIFIED))
+    expect(wallet!.hasCapability(WALLET_CAPABILITY.SEND_XEC)).toBe(true)
   })
 
   it('keeps the Quick Start copy if backup verification fails', async () => {
