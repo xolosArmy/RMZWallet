@@ -12,6 +12,7 @@ import {
   QUICK_START_MARKER_STORAGE_KEY,
   QuickStartUnavailableError,
   clearQuickStartMnemonic,
+  getQuickStartRecordStatus,
   getPendingIdentityRecord,
   hasQuickStartMnemonic,
   inspectPendingIdentityAuthority,
@@ -159,6 +160,36 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
     })
     await expect(xolosWalletService.createQuickStartWallet()).rejects.toBeInstanceOf(QuickStartUnavailableError)
     expect(await hasQuickStartMnemonic()).toBe(false)
+  })
+
+  test('malformed marker plus temporary IndexedDB denial blocks Quick Start create and import', async () => {
+    await storeQuickStartMnemonic(TEST_MNEMONIC, {
+      derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+      address: 'ecash:qoriginalquickstart'
+    })
+    const raw = '{"version":1,"created'
+    localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, raw)
+    const openSpy = vi.spyOn(indexedDB, 'open').mockImplementation(() => {
+      throw new DOMException('IndexedDB denied', 'SecurityError')
+    })
+    try {
+      expect(await getQuickStartRecordStatus()).toBe('STORAGE_UNAVAILABLE_UNKNOWN')
+      await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow(
+        'QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN'
+      )
+      await expect(xolosWalletService.createNewWallet('pin1234')).rejects.toThrow(
+        'QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN'
+      )
+      await expect(xolosWalletService.restoreFromMnemonic(TEST_MNEMONIC)).rejects.toThrow(
+        'QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN'
+      )
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(raw)
+      expect(internals.isReady).toBe(false)
+    } finally {
+      openSpy.mockRestore()
+    }
+    expect(await getQuickStartRecordStatus()).toBe('PRESENT')
+    expect(await loadQuickStartMnemonic()).toBe(TEST_MNEMONIC)
   })
 
   describe('cross-tab identity mutation races under exclusive origin lock', () => {
@@ -633,7 +664,7 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
         return originalSetItem.call(localStorage, key, val)
       })
       try {
-        await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow('QuotaExceeded')
+        await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow('QUICK_START_MARKER_PERSIST_FAILED')
       } finally {
         spy.mockRestore()
       }

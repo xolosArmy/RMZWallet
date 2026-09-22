@@ -89,4 +89,57 @@ describe('Tonalli safe intent adapter', () => {
     expect(consumeTonalliIntent(store)).toBeNull()
     expect(store.getItem(TONALLI_INTENT_STORAGE_KEY)).toBeNull()
   })
+
+  test('setItem denial drops the optional intent without throwing', () => {
+    const store = {
+      getItem: () => null,
+      setItem: () => { throw new DOMException('Denied', 'SecurityError') },
+      removeItem: () => {}
+    }
+    expect(() => persistTonalliIntent({ kind: 'conversation', peer: 'teyolia' }, store)).not.toThrow()
+    expect(readTonalliIntent(store)).toBeNull()
+  })
+
+  test('getItem denial returns null without throwing', () => {
+    const store = {
+      getItem: () => { throw new DOMException('Denied', 'SecurityError') },
+      setItem: () => {},
+      removeItem: () => {}
+    }
+    expect(readTonalliIntent(store)).toBeNull()
+  })
+
+  test('malformed stored intent remains harmless when cleanup removeItem throws', () => {
+    const store = {
+      getItem: () => '{"kind":"conversation",',
+      setItem: () => {},
+      removeItem: () => { throw new DOMException('Denied', 'SecurityError') }
+    }
+    expect(readTonalliIntent(store)).toBeNull()
+  })
+
+  test('consume returns a valid intent when removeItem throws', () => {
+    const store = {
+      getItem: () => '{"kind":"conversation","peer":"teyolia"}',
+      setItem: () => {},
+      removeItem: () => { throw new DOMException('Denied', 'SecurityError') }
+    }
+    expect(consumeTonalliIntent(store)).toEqual({ kind: 'conversation', peer: 'teyolia' })
+  })
+
+  test('capture parses a valid URL even when acquiring sessionStorage throws', () => {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage')
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      configurable: true,
+      get: () => { throw new DOMException('Denied', 'SecurityError') }
+    })
+    try {
+      expect(captureTonalliIntentFromLocation(
+        '?intent=conversation&peer=teyolia&source=xolosramirez'
+      )).toEqual({ kind: 'conversation', peer: 'teyolia', source: 'xolosramirez' })
+    } finally {
+      if (previous) Object.defineProperty(globalThis, 'sessionStorage', previous)
+      else Reflect.deleteProperty(globalThis, 'sessionStorage')
+    }
+  })
 })

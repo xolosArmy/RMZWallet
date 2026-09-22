@@ -13,8 +13,8 @@ import {
   clearQuickStartMnemonic,
   getPendingIdentityRecord,
   getQuickStartRecordStatus,
-  hasQuickStartMarker,
   hasQuickStartMnemonic,
+  inspectQuickStartMarker,
   inspectPendingIdentityAuthority,
   isWebLocksSupported,
   loadQuickStartMetadata,
@@ -323,6 +323,111 @@ describe('Quick Start encrypted storage', () => {
   })
 
   describe('Quick Start record status and fail-closed storage unavailable policy', () => {
+    test.each([
+      '{"version":1,"created',
+      '{"version":2,"createdAt":1}',
+      '{"version":1,"createdAt":null}',
+      '{"version":1,"createdAt":1,"extra":true}'
+    ])('malformed marker is CORRUPT_OR_UNKNOWN without read-time deletion: %s', (raw) => {
+      localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, raw)
+      expect(inspectQuickStartMarker()).toBe('CORRUPT_OR_UNKNOWN')
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(raw)
+    })
+
+    test('marker read denial is STORAGE_UNAVAILABLE, not absence', () => {
+      const raw = JSON.stringify({ version: 1, createdAt: Date.now() })
+      localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, raw)
+      const originalGetItem = Storage.prototype.getItem
+      const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+        if (key === QUICK_START_MARKER_STORAGE_KEY) throw new DOMException('Denied', 'SecurityError')
+        return originalGetItem.call(this, key)
+      })
+      try {
+        expect(inspectQuickStartMarker()).toBe('STORAGE_UNAVAILABLE')
+      } finally {
+        spy.mockRestore()
+      }
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(raw)
+    })
+
+    test('marker storage denial plus inaccessible IndexedDB remains unknown', async () => {
+      const originalGetItem = Storage.prototype.getItem
+      const getSpy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+        if (key === QUICK_START_MARKER_STORAGE_KEY) throw new DOMException('Denied', 'SecurityError')
+        return originalGetItem.call(this, key)
+      })
+      const openSpy = vi.spyOn(indexedDB, 'open').mockImplementation(() => {
+        throw new DOMException('IndexedDB denied', 'SecurityError')
+      })
+      try {
+        expect(await getQuickStartRecordStatus()).toBe('STORAGE_UNAVAILABLE_UNKNOWN')
+      } finally {
+        openSpy.mockRestore()
+        getSpy.mockRestore()
+      }
+    })
+
+    test('IndexedDB empty cannot prove absence while marker storage is unreadable', async () => {
+      const originalGetItem = Storage.prototype.getItem
+      const getSpy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+        if (key === QUICK_START_MARKER_STORAGE_KEY) throw new DOMException('Denied', 'SecurityError')
+        return originalGetItem.call(this, key)
+      })
+      try {
+        expect(await loadQuickStartMetadata()).toBeNull()
+        expect(await getQuickStartRecordStatus()).toBe('STORAGE_UNAVAILABLE_UNKNOWN')
+      } finally {
+        getSpy.mockRestore()
+      }
+    })
+
+    test('valid IndexedDB metadata wins over a malformed marker without deleting evidence', async () => {
+      await storeQuickStartMnemonic(MNEMONIC, { derivationProfileId: ECASH_STANDARD_PROFILE_ID })
+      const raw = '{"version":1,"created'
+      localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, raw)
+      expect(await getQuickStartRecordStatus()).toBe('PRESENT')
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(raw)
+      expect(await loadQuickStartMnemonic()).toBe(MNEMONIC)
+    })
+
+    test('malformed marker is reconciled only after IndexedDB positively confirms empty', async () => {
+      const raw = '{"version":1,"created'
+      localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, raw)
+      expect(await loadQuickStartMetadata()).toBeNull()
+      expect(await getQuickStartRecordStatus()).toBe('ABSENT_CONFIRMED')
+      expect(inspectQuickStartMarker()).toBe('ABSENT_CONFIRMED')
+    })
+
+    test('failed stale-marker deletion cannot claim ABSENT_CONFIRMED', async () => {
+      const raw = '{"version":1,"created'
+      localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, raw)
+      const originalRemoveItem = Storage.prototype.removeItem
+      const spy = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function (this: Storage, key: string) {
+        if (key === QUICK_START_MARKER_STORAGE_KEY) return
+        return originalRemoveItem.call(this, key)
+      })
+      try {
+        expect(await getQuickStartRecordStatus()).toBe('STORAGE_UNAVAILABLE_UNKNOWN')
+      } finally {
+        spy.mockRestore()
+      }
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(raw)
+    })
+
+    test('marker write read-back failure preserves the written evidence', () => {
+      const originalGetItem = Storage.prototype.getItem
+      const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+        if (key === QUICK_START_MARKER_STORAGE_KEY && originalGetItem.call(this, key) !== null) return null
+        return originalGetItem.call(this, key)
+      })
+      try {
+        expect(() => setQuickStartMarker()).toThrow('QUICK_START_MARKER_PERSIST_FAILED')
+      } finally {
+        spy.mockRestore()
+      }
+      expect(inspectQuickStartMarker()).toBe('PRESENT_VALID')
+    })
+
     test('fresh profile + IndexedDB unavailable: status is ABSENT_CONFIRMED and hasQuickStartMnemonic is false', async () => {
       clearQuickStartMarker()
       const originalOpen = indexedDB.open
@@ -351,7 +456,7 @@ describe('Quick Start encrypted storage', () => {
 
     test('marker/evidence exists + DB unavailable: fails closed with STORAGE_UNAVAILABLE_UNKNOWN', async () => {
       setQuickStartMarker()
-      expect(hasQuickStartMarker()).toBe(true)
+      expect(inspectQuickStartMarker()).toBe('PRESENT_VALID')
 
       const originalOpen = indexedDB.open
       indexedDB.open = () => {
@@ -383,7 +488,7 @@ describe('Quick Start encrypted storage', () => {
         derivationProfileId: ECASH_STANDARD_PROFILE_ID,
         address: 'ecash:qoriginalrecover'
       })
-      expect(hasQuickStartMarker()).toBe(true)
+      expect(inspectQuickStartMarker()).toBe('PRESENT_VALID')
 
       // Break IDB
       const originalOpen = indexedDB.open
@@ -451,7 +556,7 @@ describe('Quick Start encrypted storage', () => {
       try {
         await expect(
           storeQuickStartMnemonic(MNEMONIC, { derivationProfileId: ECASH_STANDARD_PROFILE_ID })
-        ).rejects.toThrow('QuotaExceeded')
+        ).rejects.toThrow('QUICK_START_MARKER_PERSIST_FAILED')
       } finally {
         spy.mockRestore()
       }
@@ -497,12 +602,12 @@ describe('Quick Start encrypted storage', () => {
 
     test('stale marker + IndexedDB accessible and positively empty -> safe reconciliation to ABSENT_CONFIRMED', async () => {
       setQuickStartMarker()
-      expect(hasQuickStartMarker()).toBe(true)
+      expect(inspectQuickStartMarker()).toBe('PRESENT_VALID')
       expect(await loadQuickStartMetadata()).toBeNull()
 
       const status = await getQuickStartRecordStatus()
       expect(status).toBe('ABSENT_CONFIRMED')
-      expect(hasQuickStartMarker()).toBe(false)
+      expect(inspectQuickStartMarker()).toBe('ABSENT_CONFIRMED')
       expect(await hasQuickStartMnemonic()).toBe(false)
     })
   })
@@ -666,5 +771,3 @@ describe('Quick Start encrypted storage', () => {
     })
   })
 })
-
-

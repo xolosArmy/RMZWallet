@@ -86,8 +86,8 @@ function transactionDone(transaction: IDBTransaction): Promise<void> {
 }
 
 async function openDb(): Promise<IDBDatabase> {
-  assertAvailable()
   try {
+    assertAvailable()
     const request = indexedDB.open(DB_NAME, DB_VERSION)
     request.onupgradeneeded = () => {
       const db = request.result
@@ -364,8 +364,8 @@ export async function storeQuickStartMnemonic(
   if (metadata.address && parsed.address && parsed.address !== metadata.address) {
     throw new Error('QUICK_START_IDENTITY_MISMATCH')
   }
-  if (!hasQuickStartMarker()) {
-    setQuickStartMarker()
+  if (inspectQuickStartMarker() !== 'PRESENT_VALID') {
+    throw new Error('QUICK_START_MARKER_PERSIST_FAILED')
   }
   return {
     version: parsed.version,
@@ -412,57 +412,62 @@ export async function loadQuickStartMnemonic(): Promise<string | null> {
 
 export const QUICK_START_MARKER_STORAGE_KEY = 'tonalli_quickstart_marker'
 
-export function setQuickStartMarker(): void {
-  if (typeof localStorage === 'undefined') {
-    throw new Error('QUICK_START_MARKER_STORAGE_UNAVAILABLE')
-  }
-  const payload = JSON.stringify({ version: 1, createdAt: Date.now() })
-  localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, payload)
-  const readBack = localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)
-  if (!readBack) {
-    try {
-      localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
-    } catch {
-      // best-effort
-    }
-    throw new Error('QUICK_START_MARKER_PERSIST_FAILED')
-  }
-  let parsed: { version?: unknown; createdAt?: unknown } | null = null
+export type QuickStartMarkerStatus =
+  | 'ABSENT_CONFIRMED'
+  | 'PRESENT_VALID'
+  | 'CORRUPT_OR_UNKNOWN'
+  | 'STORAGE_UNAVAILABLE'
+
+export function inspectQuickStartMarker(): QuickStartMarkerStatus {
+  let raw: string | null
   try {
-    parsed = JSON.parse(readBack) as { version?: unknown; createdAt?: unknown }
+    if (typeof localStorage === 'undefined') return 'STORAGE_UNAVAILABLE'
+    raw = localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)
   } catch {
-    try {
-      localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
-    } catch {
-      // best-effort
-    }
-    throw new Error('QUICK_START_MARKER_PERSIST_FAILED')
+    return 'STORAGE_UNAVAILABLE'
   }
-  if (!parsed || parsed.version !== 1 || typeof parsed.createdAt !== 'number') {
-    try {
-      localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
-    } catch {
-      // best-effort
+  if (raw === null) return 'ABSENT_CONFIRMED'
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (
+      !parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || Object.keys(parsed).length !== 2
+      || !('version' in parsed) || parsed.version !== 1
+      || !('createdAt' in parsed) || typeof parsed.createdAt !== 'number'
+      || !Number.isSafeInteger(parsed.createdAt) || parsed.createdAt <= 0
+    ) {
+      return 'CORRUPT_OR_UNKNOWN'
     }
-    throw new Error('QUICK_START_MARKER_PERSIST_FAILED')
+    return 'PRESENT_VALID'
+  } catch {
+    return 'CORRUPT_OR_UNKNOWN'
   }
 }
 
-export function hasQuickStartMarker(): boolean {
-  if (typeof localStorage === 'undefined') return false
+export function setQuickStartMarker(): void {
+  const previous = inspectQuickStartMarker()
+  if (previous === 'PRESENT_VALID') return
+  if (previous !== 'ABSENT_CONFIRMED') {
+    throw new Error('QUICK_START_MARKER_PERSIST_FAILED')
+  }
+  const payload = JSON.stringify({ version: 1, createdAt: Date.now() })
   try {
-    const raw = localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)
-    if (!raw) return false
-    const parsed = JSON.parse(raw) as { version?: unknown; createdAt?: unknown }
-    return Boolean(parsed && parsed.version === 1 && typeof parsed.createdAt === 'number')
+    localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, payload)
+    if (
+      localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY) !== payload
+      || inspectQuickStartMarker() !== 'PRESENT_VALID'
+    ) {
+      throw new Error('QUICK_START_MARKER_PERSIST_FAILED')
+    }
   } catch {
-    return false
+    // Preserve any marker evidence when the write or read-back cannot be proved.
+    throw new Error('QUICK_START_MARKER_PERSIST_FAILED')
   }
 }
 
 export function clearQuickStartMarker(): void {
-  if (typeof localStorage === 'undefined') return
   try {
+    if (typeof localStorage === 'undefined') return
     localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
   } catch {
     // best-effort
@@ -476,32 +481,35 @@ export type QuickStartRecordStatus =
   | 'RECOVERY_FAILED'
 
 export async function getQuickStartRecordStatus(): Promise<QuickStartRecordStatus> {
-  const marker = hasQuickStartMarker()
-
-  if (typeof indexedDB === 'undefined') {
-    return marker ? 'STORAGE_UNAVAILABLE_UNKNOWN' : 'ABSENT_CONFIRMED'
-  }
+  const marker = inspectQuickStartMarker()
 
   try {
     const metadata = await loadQuickStartMetadata()
     if (metadata) {
-      try {
-        setQuickStartMarker()
-      } catch {
-        // best-effort refresh during status check, status is PRESENT
+      if (marker === 'ABSENT_CONFIRMED') {
+        try {
+          setQuickStartMarker()
+        } catch {
+          // IndexedDB metadata confirms the identity even if marker refresh fails.
+        }
       }
       return 'PRESENT'
     }
-    if (marker) {
-      clearQuickStartMarker()
+    if (marker !== 'ABSENT_CONFIRMED') {
+      if (marker === 'STORAGE_UNAVAILABLE') return 'STORAGE_UNAVAILABLE_UNKNOWN'
+      try {
+        localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
+      } catch {
+        return 'STORAGE_UNAVAILABLE_UNKNOWN'
+      }
+      if (inspectQuickStartMarker() !== 'ABSENT_CONFIRMED') {
+        return 'STORAGE_UNAVAILABLE_UNKNOWN'
+      }
     }
     return 'ABSENT_CONFIRMED'
   } catch (error) {
     if (error instanceof QuickStartUnavailableError) {
-      if (marker) {
-        return 'STORAGE_UNAVAILABLE_UNKNOWN'
-      }
-      return 'ABSENT_CONFIRMED'
+      return marker === 'ABSENT_CONFIRMED' ? 'ABSENT_CONFIRMED' : 'STORAGE_UNAVAILABLE_UNKNOWN'
     }
     return 'RECOVERY_FAILED'
   }
