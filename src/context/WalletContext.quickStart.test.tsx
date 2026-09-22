@@ -6,7 +6,11 @@ import { WalletProvider } from './WalletContext'
 import { useWallet } from './useWallet'
 import { WALLET_LIFECYCLE } from '../domain/walletLifecycle'
 import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
-import { QuickStartUnavailableError, type PendingIdentityState } from '../services/quickStartStorage'
+import {
+  PENDING_IDENTITY_STATE,
+  QuickStartUnavailableError,
+  type PendingIdentityState
+} from '../services/quickStartStorage'
 
 const serviceMocks = vi.hoisted(() => ({
   getAddress: vi.fn(() => 'ecash:qquickstart'),
@@ -123,6 +127,8 @@ describe('WalletContext Quick Start lifecycle', () => {
     serviceMocks.hasBackedWalletCiphertextOnDevice.mockReturnValue(false)
     serviceMocks.getPendingIdentityState.mockReset()
     serviceMocks.getPendingIdentityState.mockReturnValue('NONE')
+    serviceMocks.hasPendingIdentityRecord.mockReset()
+    serviceMocks.hasPendingIdentityRecord.mockReturnValue(false)
     serviceMocks.resumePendingIdentity.mockReset()
     serviceMocks.abandonPendingIdentity.mockReset()
     serviceMocks.abandonLegacyPendingIdentity.mockReset()
@@ -443,6 +449,107 @@ describe('WalletContext Quick Start lifecycle', () => {
       expect(wallet!.address).toBe('ecash:qbacked')
       expect(wallet!.backupVerified).toBe(true)
       expect(wallet!.lifecycle).toBe(WALLET_LIFECYCLE.BACKUP_VERIFIED)
+    })
+  })
+
+  describe('local-first onboarding completion before balance hydration (discussion_r4066507409)', () => {
+    it('createNewWallet completes local onboarding, sets initialized, and blocks duplicates when balance hydration fails', async () => {
+      serviceMocks.getAddress.mockReturnValue('ecash:qcreatedlocal')
+      serviceMocks.createNewWallet.mockImplementation(async () => {
+        // The service owns this authoritative reservation for the active session.
+        serviceMocks.getPendingIdentityState.mockReturnValue(PENDING_IDENTITY_STATE.RECOVERABLE_PENDING)
+        return 'test seed phrase returned from service'
+      })
+      serviceMocks.getBalances
+        .mockRejectedValueOnce(new Error('CHRONIK_NETWORK_TIMEOUT'))
+        .mockResolvedValue({
+          xec: 100n,
+          xecFormatted: '1.00',
+          tokenUtxoSats: 0n,
+          tokenUtxoXecFormatted: '0.00',
+          rmzAtoms: 0n,
+          rmzFormatted: '0',
+          rmzDecimals: 0,
+          firmaAtoms: 0n,
+          firmaFormatted: '0',
+          firmaDecimals: 4
+        })
+
+      let wallet: ReturnType<typeof useWallet> | null = null
+      render(
+        <WalletProvider>
+          <Harness onReady={(value) => { wallet = value }} />
+        </WalletProvider>
+      )
+
+      await waitFor(() => {
+        expect(wallet!.initialized).toBe(false)
+      })
+
+      const mnemonic = await wallet!.createNewWallet('pin123456')
+      expect(mnemonic).toBe('test seed phrase returned from service')
+
+      await waitFor(() => {
+        expect(wallet!.initialized).toBe(true)
+        expect(wallet!.address).toBe('ecash:qcreatedlocal')
+        expect(wallet!.backupVerified).toBe(false)
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('false')
+        // The active tab hides its own pending workflow while the service reservation remains authoritative.
+        expect(wallet!.hasPendingIdentity).toBe(false)
+      })
+      expect(serviceMocks.getPendingIdentityState()).toBe(PENDING_IDENTITY_STATE.RECOVERABLE_PENDING)
+
+      // Duplicate creation attempt in same tab is blocked by initialized state
+      await expect(wallet!.createNewWallet('secondPin')).rejects.toThrow('WALLET_ALREADY_INITIALIZED')
+      expect(serviceMocks.createNewWallet).toHaveBeenCalledTimes(1)
+
+      // A later normal refresh hydrates balance without recreating/reactivating identity.
+      await wallet!.refreshBalances()
+      await waitFor(() => expect(wallet!.balance?.xec).toBe(100n))
+      expect(serviceMocks.createNewWallet).toHaveBeenCalledTimes(1)
+    })
+
+    it('restoreWallet completes local onboarding, sets initialized, and blocks duplicates when balance hydration fails', async () => {
+      serviceMocks.getAddress.mockReturnValue('ecash:qrestoredlocal')
+      const restoredResult = {
+        status: 'restored',
+        selectedProfileId: 'ecash-standard-1899',
+        notice: 'restored'
+      } as const
+      serviceMocks.restoreFromMnemonic.mockImplementation(async () => {
+        serviceMocks.getPendingIdentityState.mockReturnValue(PENDING_IDENTITY_STATE.RECOVERABLE_PENDING)
+        return restoredResult
+      })
+      serviceMocks.getBalances.mockRejectedValueOnce(new Error('CHRONIK_NETWORK_TIMEOUT'))
+
+      let wallet: ReturnType<typeof useWallet> | null = null
+      render(
+        <WalletProvider>
+          <Harness onReady={(value) => { wallet = value }} />
+        </WalletProvider>
+      )
+
+      await waitFor(() => {
+        expect(wallet!.initialized).toBe(false)
+      })
+
+      const result = await wallet!.restoreWallet('abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about', undefined, 'pin123456')
+      expect(result).toBe(restoredResult)
+
+      await waitFor(() => {
+        expect(wallet!.initialized).toBe(true)
+        expect(wallet!.address).toBe('ecash:qrestoredlocal')
+        expect(wallet!.backupVerified).toBe(false)
+        expect(localStorage.getItem('xoloswallet_backup_verified')).toBe('false')
+        expect(wallet!.hasPendingIdentity).toBe(false)
+      })
+      expect(serviceMocks.getPendingIdentityState()).toBe(PENDING_IDENTITY_STATE.RECOVERABLE_PENDING)
+
+      // Duplicate restore attempt in same tab is blocked by initialized state
+      await expect(
+        wallet!.restoreWallet('another phrase words', undefined, 'secondPin')
+      ).rejects.toThrow('WALLET_ALREADY_INITIALIZED')
+      expect(serviceMocks.restoreFromMnemonic).toHaveBeenCalledTimes(1)
     })
   })
 })

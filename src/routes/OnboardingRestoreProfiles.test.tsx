@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { WalletContext } from '../context/walletContext'
 import type { WalletContextValue } from '../context/walletContext'
@@ -172,5 +172,35 @@ describe('dual-profile restore resolution UI', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Restaurar wallet' }))
     expect(restoreWallet).not.toHaveBeenCalled()
     expect(localStorage.getItem('xoloswallet_encrypted_mnemonic')).toBeNull()
+  })
+
+  test('import wallet flow navigates to /backup when restoreWallet returns restored (discussion_r4066507409)', async () => {
+    const restoreWallet = vi.fn<WalletContextValue['restoreWallet']>().mockResolvedValue({
+      status: 'restored',
+      detection: dualDetection,
+      selectedProfileId: ECASH_STANDARD_PROFILE_ID,
+      notice: 'restored'
+    })
+    render(
+      <MemoryRouter initialEntries={['/onboarding/import']}>
+        <WalletContext.Provider value={walletValue(restoreWallet)}>
+          <Routes>
+            <Route path="/onboarding/import" element={<ImportWallet />} />
+            <Route path="/backup" element={<div data-testid="backup-route-screen">Backup route screen</div>} />
+          </Routes>
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+
+    fireEvent.change(screen.getByLabelText('Frase seed'), {
+      target: { value: PUBLIC_TEST_MNEMONIC }
+    })
+    fireEvent.change(screen.getByLabelText('Nuevo Password/PIN local'), {
+      target: { value: '123456' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Restaurar wallet' }))
+
+    expect(await screen.findByTestId('backup-route-screen')).toBeTruthy()
+    expect(restoreWallet).toHaveBeenCalledWith(PUBLIC_TEST_MNEMONIC, undefined, '123456')
   })
 })

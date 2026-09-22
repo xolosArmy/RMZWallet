@@ -396,11 +396,17 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setError(null)
     try {
       const mnemonic = await xolosWalletService.createNewWallet(password)
-      await syncAddressAndBalance()
+      const localAddress = xolosWalletService.getAddress()
+      if (localAddress) {
+        setAddress(localAddress)
+      }
       setInitialized(true)
       setBackupVerifiedState(false)
       localStorage.setItem(BACKUP_KEY, 'false')
       setPendingIdentityState(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
+      void syncAddressAndBalance({ optionalBalance: true }).catch((err) => {
+        console.warn('Optional balance hydration failed after local onboarding commit:', err)
+      })
       return mnemonic
     } catch (err) {
       const message = (err as Error).message || 'No se pudo crear la billetera.'
@@ -655,11 +661,17 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     try {
       const result = await xolosWalletService.restoreFromMnemonic(mnemonic, selectedProfileId, password)
       if (result.status === 'choice-required') return result
-      await syncAddressAndBalance()
+      const localAddress = xolosWalletService.getAddress()
+      if (localAddress) {
+        setAddress(localAddress)
+      }
       setInitialized(true)
       setBackupVerifiedState(false)
       localStorage.setItem(BACKUP_KEY, 'false')
       setPendingIdentityState(PENDING_IDENTITY_STATE.ABSENT_CONFIRMED)
+      void syncAddressAndBalance({ optionalBalance: true }).catch((err) => {
+        console.warn('Optional balance hydration failed after local onboarding commit:', err)
+      })
       return result
     } catch (err) {
       const message = (err as Error).message || 'No se pudo restaurar la billetera.'

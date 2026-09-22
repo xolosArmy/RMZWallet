@@ -2,7 +2,7 @@
 
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { WalletContext } from '../context/walletContext'
 import { walletContextFixture } from '../test/walletContextFixture'
 import { CreateBackedWallet } from './Onboarding'
@@ -75,5 +75,29 @@ describe('/onboarding/create-backed refuse overwrite', () => {
     fireEvent.submit(screen.getByTestId('create-backed-tonalli').closest('form')!)
     expect(wallet.createNewWallet).not.toHaveBeenCalled()
     expect(localStorage.getItem('xoloswallet_encrypted_mnemonic')).toBeNull()
+  })
+
+  test('create-backed flow navigates to /backup when createNewWallet succeeds (discussion_r4066507409)', async () => {
+    const wallet = walletContextFixture({
+      initialized: false,
+      createNewWallet: vi.fn(async () => 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about')
+    })
+    render(
+      <MemoryRouter initialEntries={['/onboarding/create-backed']}>
+        <WalletContext.Provider value={wallet}>
+          <Routes>
+            <Route path="/onboarding/create-backed" element={<CreateBackedWallet />} />
+            <Route path="/backup" element={<div data-testid="backup-route-screen">Backup route screen</div>} />
+          </Routes>
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+
+    fireEvent.change(screen.getByLabelText('Password/PIN local'), { target: { value: '123456' } })
+    fireEvent.submit(screen.getByTestId('create-backed-tonalli').closest('form')!)
+
+    expect(await screen.findByTestId('backup-route-screen')).toBeTruthy()
+    expect(wallet.createNewWallet).toHaveBeenCalledWith('123456')
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 })
