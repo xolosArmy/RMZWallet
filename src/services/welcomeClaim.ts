@@ -41,3 +41,12 @@ export async function requestWelcomeClaim(
   }
   return claimWelcomeXec(address)
 }
+
+/** Status reconciliation is GET-only; it must never retry the initial claim POST. */
+export async function reconcileWelcomeClaim(
+  address: string,
+  signal?: AbortSignal
+): Promise<WelcomeClaimResponse> {
+  if (!address) throw new Error('WELCOME_CLAIM_ADDRESS_REQUIRED')
+  return getWelcomeClaimStatus(address, signal)
+}
