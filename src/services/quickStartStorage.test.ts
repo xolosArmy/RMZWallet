@@ -15,6 +15,7 @@ import {
   getQuickStartRecordStatus,
   hasQuickStartMnemonic,
   inspectQuickStartMarker,
+  inspectQuickStartRecordState,
   inspectPendingIdentityAuthority,
   isWebLocksSupported,
   loadQuickStartMetadata,
@@ -209,6 +210,7 @@ describe('Quick Start encrypted storage', () => {
     } finally {
       IDBObjectStore.prototype.put = originalPut
     }
+    setQuickStartCreationLockForTests(async (operation) => operation())
     expect(await hasQuickStartMnemonic()).toBe(false)
   })
 
@@ -315,6 +317,7 @@ describe('Quick Start encrypted storage', () => {
     } finally {
       IDBObjectStore.prototype.put = originalPut
     }
+    setQuickStartCreationLockForTests(async (operation) => operation())
     expect(await hasQuickStartMnemonic()).toBe(false)
     const records = await allStoreRecords()
     expect(records.some((record) => (
@@ -390,10 +393,31 @@ describe('Quick Start encrypted storage', () => {
       expect(await loadQuickStartMnemonic()).toBe(MNEMONIC)
     })
 
+    test('confirmed metadata remains PRESENT if marker refresh cannot lock, then repairs under lock', async () => {
+      await storeQuickStartMnemonic(MNEMONIC, { derivationProfileId: ECASH_STANDARD_PROFILE_ID })
+      clearQuickStartMarker()
+      expect(await inspectQuickStartRecordState()).toBe('PRESENT_MARKER_ABSENT')
+      const previousLocks = navigator.locks
+      Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined })
+      try {
+        expect(await getQuickStartRecordStatus()).toBe('PRESENT')
+        expect(inspectQuickStartMarker()).toBe('ABSENT_CONFIRMED')
+      } finally {
+        Object.defineProperty(navigator, 'locks', { configurable: true, value: previousLocks })
+      }
+      setQuickStartCreationLockForTests(async (operation) => operation())
+      expect(await getQuickStartRecordStatus()).toBe('PRESENT')
+      expect(inspectQuickStartMarker()).toBe('PRESENT_VALID')
+      expect(await loadQuickStartMnemonic()).toBe(MNEMONIC)
+    })
+
     test('malformed marker is reconciled only after IndexedDB positively confirms empty', async () => {
       const raw = '{"version":1,"created'
       localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, raw)
       expect(await loadQuickStartMetadata()).toBeNull()
+      expect(await inspectQuickStartRecordState()).toBe('POSSIBLE_STALE_MARKER')
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(raw)
+      setQuickStartCreationLockForTests(async (operation) => operation())
       expect(await getQuickStartRecordStatus()).toBe('ABSENT_CONFIRMED')
       expect(inspectQuickStartMarker()).toBe('ABSENT_CONFIRMED')
     })
@@ -401,6 +425,7 @@ describe('Quick Start encrypted storage', () => {
     test('failed stale-marker deletion cannot claim ABSENT_CONFIRMED', async () => {
       const raw = '{"version":1,"created'
       localStorage.setItem(QUICK_START_MARKER_STORAGE_KEY, raw)
+      setQuickStartCreationLockForTests(async (operation) => operation())
       const originalRemoveItem = Storage.prototype.removeItem
       const spy = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function (this: Storage, key: string) {
         if (key === QUICK_START_MARKER_STORAGE_KEY) return
@@ -413,6 +438,88 @@ describe('Quick Start encrypted storage', () => {
       }
       expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(raw)
     })
+
+    test('throwing stale-marker deletion fails closed under the identity lock', async () => {
+      setQuickStartMarker()
+      setQuickStartCreationLockForTests(async (operation) => operation())
+      const raw = localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)
+      const originalRemoveItem = Storage.prototype.removeItem
+      const spy = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function (this: Storage, key: string) {
+        if (key === QUICK_START_MARKER_STORAGE_KEY) throw new DOMException('Denied', 'SecurityError')
+        return originalRemoveItem.call(this, key)
+      })
+      try {
+        expect(await getQuickStartRecordStatus()).toBe('STORAGE_UNAVAILABLE_UNKNOWN')
+      } finally {
+        spy.mockRestore()
+      }
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(raw)
+    })
+
+    test('stale evidence remains unknown when the identity lock is unavailable', async () => {
+      setQuickStartMarker()
+      const raw = localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)
+      const previousLocks = navigator.locks
+      Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined })
+      try {
+        expect(await inspectQuickStartRecordState()).toBe('POSSIBLE_STALE_MARKER')
+        expect(await getQuickStartRecordStatus()).toBe('STORAGE_UNAVAILABLE_UNKNOWN')
+      } finally {
+        Object.defineProperty(navigator, 'locks', { configurable: true, value: previousLocks })
+      }
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(raw)
+    })
+
+    test('creator marker cannot be cleaned while its seed write owns the identity lock', async () => {
+      let next = Promise.resolve()
+      let requests = 0
+      let secondRequested!: () => void
+      const secondRequest = new Promise<void>((resolve) => { secondRequested = resolve })
+      setQuickStartCreationLockForTests(async (operation) => {
+        requests += 1
+        if (requests === 2) secondRequested()
+        const previous = next
+        let release!: () => void
+        next = new Promise<void>((resolve) => { release = resolve })
+        await previous
+        try {
+          return await operation()
+        } finally {
+          release()
+        }
+      })
+
+      let markerReady!: () => void
+      const markerPersisted = new Promise<void>((resolve) => { markerReady = resolve })
+      let resumeCreator!: () => void
+      const creatorMayWrite = new Promise<void>((resolve) => { resumeCreator = resolve })
+      const creator = withQuickStartCreationLock(async () => {
+        setQuickStartMarker()
+        markerReady()
+        await creatorMayWrite
+        return storeQuickStartMnemonic(MNEMONIC, {
+          derivationProfileId: ECASH_STANDARD_PROFILE_ID,
+          address: 'ecash:qfundedquickstart'
+        })
+      })
+      await markerPersisted
+      expect(await inspectQuickStartRecordState()).toBe('POSSIBLE_STALE_MARKER')
+      const originalMarker = localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)
+      const laggingReconciliation = getQuickStartRecordStatus()
+      await secondRequest
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(originalMarker)
+
+      resumeCreator()
+      await creator
+      expect(await laggingReconciliation).toBe('PRESENT')
+      expect(requests).toBe(2)
+      expect(inspectQuickStartMarker()).toBe('PRESENT_VALID')
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(originalMarker)
+      expect(await loadQuickStartMnemonic()).toBe(MNEMONIC)
+      const records = await allStoreRecords()
+      expect(records.some((record) => record && typeof record === 'object' && 'id' in record && record.id === 'device-key')).toBe(true)
+      expect(records.some((record) => record && typeof record === 'object' && 'id' in record && record.id === 'seed-ciphertext')).toBe(true)
+    }, 30000)
 
     test('marker write read-back failure preserves the written evidence', () => {
       const originalGetItem = Storage.prototype.getItem
@@ -579,6 +686,7 @@ describe('Quick Start encrypted storage', () => {
       } finally {
         spy.mockRestore()
       }
+      setQuickStartCreationLockForTests(async (operation) => operation())
       expect(await hasQuickStartMnemonic()).toBe(false)
     })
 
@@ -604,6 +712,7 @@ describe('Quick Start encrypted storage', () => {
       setQuickStartMarker()
       expect(inspectQuickStartMarker()).toBe('PRESENT_VALID')
       expect(await loadQuickStartMetadata()).toBeNull()
+      setQuickStartCreationLockForTests(async (operation) => operation())
 
       const status = await getQuickStartRecordStatus()
       expect(status).toBe('ABSENT_CONFIRMED')

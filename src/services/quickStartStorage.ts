@@ -480,10 +480,30 @@ export type QuickStartRecordStatus =
   | 'STORAGE_UNAVAILABLE_UNKNOWN'
   | 'RECOVERY_FAILED'
 
-export async function getQuickStartRecordStatus(): Promise<QuickStartRecordStatus> {
-  const marker = inspectQuickStartMarker()
+export type QuickStartRecordInspection = QuickStartRecordStatus | 'POSSIBLE_STALE_MARKER' | 'PRESENT_MARKER_ABSENT'
 
+/** Read-only: an absent IndexedDB record cannot authorize marker deletion without the identity lock. */
+export async function inspectQuickStartRecordState(): Promise<QuickStartRecordInspection> {
+  const marker = inspectQuickStartMarker()
   try {
+    const metadata = await loadQuickStartMetadata()
+    if (metadata) return marker === 'ABSENT_CONFIRMED' ? 'PRESENT_MARKER_ABSENT' : 'PRESENT'
+    if (marker === 'ABSENT_CONFIRMED') return 'ABSENT_CONFIRMED'
+    if (marker === 'STORAGE_UNAVAILABLE') return 'STORAGE_UNAVAILABLE_UNKNOWN'
+    return 'POSSIBLE_STALE_MARKER'
+  } catch (error) {
+    if (error instanceof QuickStartUnavailableError) {
+      return marker === 'ABSENT_CONFIRMED' ? 'ABSENT_CONFIRMED' : 'STORAGE_UNAVAILABLE_UNKNOWN'
+    }
+    return 'RECOVERY_FAILED'
+  }
+}
+
+/** Caller already owns withIdentityMutationLock / withQuickStartCreationLock. Never reacquire it here. */
+export async function reconcileStaleQuickStartMarkerUnderLock(): Promise<QuickStartRecordStatus> {
+  const marker = inspectQuickStartMarker()
+  try {
+    // Re-read IndexedDB after lock acquisition; the pre-lock observation is not authority.
     const metadata = await loadQuickStartMetadata()
     if (metadata) {
       if (marker === 'ABSENT_CONFIRMED') {
@@ -495,23 +515,33 @@ export async function getQuickStartRecordStatus(): Promise<QuickStartRecordStatu
       }
       return 'PRESENT'
     }
-    if (marker !== 'ABSENT_CONFIRMED') {
-      if (marker === 'STORAGE_UNAVAILABLE') return 'STORAGE_UNAVAILABLE_UNKNOWN'
-      try {
-        localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
-      } catch {
-        return 'STORAGE_UNAVAILABLE_UNKNOWN'
-      }
-      if (inspectQuickStartMarker() !== 'ABSENT_CONFIRMED') {
-        return 'STORAGE_UNAVAILABLE_UNKNOWN'
-      }
+    if (marker === 'ABSENT_CONFIRMED') return 'ABSENT_CONFIRMED'
+    if (marker === 'STORAGE_UNAVAILABLE') return 'STORAGE_UNAVAILABLE_UNKNOWN'
+    try {
+      localStorage.removeItem(QUICK_START_MARKER_STORAGE_KEY)
+    } catch {
+      return 'STORAGE_UNAVAILABLE_UNKNOWN'
     }
-    return 'ABSENT_CONFIRMED'
+    return inspectQuickStartMarker() === 'ABSENT_CONFIRMED'
+      ? 'ABSENT_CONFIRMED'
+      : 'STORAGE_UNAVAILABLE_UNKNOWN'
   } catch (error) {
     if (error instanceof QuickStartUnavailableError) {
       return marker === 'ABSENT_CONFIRMED' ? 'ABSENT_CONFIRMED' : 'STORAGE_UNAVAILABLE_UNKNOWN'
     }
     return 'RECOVERY_FAILED'
+  }
+}
+
+/** Public wrapper for callers that do not already own the identity lock. */
+export async function getQuickStartRecordStatus(): Promise<QuickStartRecordStatus> {
+  const inspection = await inspectQuickStartRecordState()
+  if (inspection !== 'POSSIBLE_STALE_MARKER' && inspection !== 'PRESENT_MARKER_ABSENT') return inspection
+  try {
+    return await withIdentityMutationLock(reconcileStaleQuickStartMarkerUnderLock)
+  } catch {
+    // Positive IndexedDB metadata remains evidence of presence if marker refresh cannot acquire the lock.
+    return inspection === 'PRESENT_MARKER_ABSENT' ? 'PRESENT' : 'STORAGE_UNAVAILABLE_UNKNOWN'
   }
 }
 
@@ -537,17 +567,25 @@ export async function clearQuickStartMnemonic(): Promise<void> {
   }
 }
 
+function statusHasQuickStartMnemonic(status: QuickStartRecordStatus): boolean {
+  if (status === 'PRESENT') return true
+  if (status === 'STORAGE_UNAVAILABLE_UNKNOWN') {
+    throw new QuickStartUnavailableError('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
+  }
+  if (status === 'RECOVERY_FAILED') {
+    throw new Error('QUICK_START_RECOVERY_FAILED')
+  }
+  return false
+}
+
+/** Use only while already holding the identity lock. */
+export async function hasQuickStartMnemonicUnderLock(): Promise<boolean> {
+  return statusHasQuickStartMnemonic(await reconcileStaleQuickStartMarkerUnderLock())
+}
+
 export async function hasQuickStartMnemonic(): Promise<boolean> {
   try {
-    const status = await getQuickStartRecordStatus()
-    if (status === 'PRESENT') return true
-    if (status === 'STORAGE_UNAVAILABLE_UNKNOWN') {
-      throw new QuickStartUnavailableError('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
-    }
-    if (status === 'RECOVERY_FAILED') {
-      throw new Error('QUICK_START_RECOVERY_FAILED')
-    }
-    return false
+    return statusHasQuickStartMnemonic(await getQuickStartRecordStatus())
   } catch (error) {
     if (error instanceof QuickStartUnavailableError) {
       if (error.message === 'QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN') {

@@ -15,6 +15,7 @@ import {
   getQuickStartRecordStatus,
   getPendingIdentityRecord,
   hasQuickStartMnemonic,
+  inspectQuickStartMarker,
   inspectPendingIdentityAuthority,
   loadQuickStartMnemonic,
   setPendingIdentityRecord,
@@ -191,6 +192,49 @@ describe('Quick Start backed-wallet and creation-lock boundaries', () => {
     expect(await getQuickStartRecordStatus()).toBe('PRESENT')
     expect(await loadQuickStartMnemonic()).toBe(TEST_MNEMONIC)
   })
+
+  test.each(['fresh', 'stale marker'] as const)('%s Quick Start creation uses one identity-lock acquisition', async (state) => {
+    if (state === 'stale marker') setQuickStartMarker()
+    let acquisitions = 0
+    let held = false
+    setQuickStartCreationLockForTests(async (operation) => {
+      if (held) throw new Error('NESTED_IDENTITY_LOCK')
+      acquisitions += 1
+      held = true
+      try {
+        return await operation()
+      } finally {
+        held = false
+      }
+    })
+
+    const created = await xolosWalletService.createQuickStartWallet()
+    expect(acquisitions).toBe(1)
+    expect(created.address).toBe(xolosWalletService.getAddress())
+    expect(await loadQuickStartMnemonic()).toBe(xolosWalletService.getMnemonic())
+    expect(inspectQuickStartMarker()).toBe('PRESENT_VALID')
+  }, 30000)
+
+  test('persisted Quick Start marker blocks identity replacement if IndexedDB later becomes unavailable', async () => {
+    const created = await xolosWalletService.createQuickStartWallet()
+    const mnemonic = xolosWalletService.getMnemonic()
+    const marker = localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)
+    const openSpy = vi.spyOn(indexedDB, 'open').mockImplementation(() => {
+      throw new DOMException('IndexedDB denied', 'SecurityError')
+    })
+    try {
+      expect(await getQuickStartRecordStatus()).toBe('STORAGE_UNAVAILABLE_UNKNOWN')
+      await expect(xolosWalletService.createQuickStartWallet()).rejects.toThrow('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
+      await expect(xolosWalletService.createNewWallet('pin1234')).rejects.toThrow('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
+      await expect(xolosWalletService.restoreFromMnemonic(TEST_MNEMONIC)).rejects.toThrow('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
+      expect(xolosWalletService.getAddress()).toBe(created.address)
+      expect(xolosWalletService.getMnemonic()).toBe(mnemonic)
+      expect(localStorage.getItem(QUICK_START_MARKER_STORAGE_KEY)).toBe(marker)
+    } finally {
+      openSpy.mockRestore()
+    }
+    expect(await loadQuickStartMnemonic()).toBe(mnemonic)
+  }, 30000)
 
   describe('cross-tab identity mutation races under exclusive origin lock', () => {
     const TEST_RESTORE_MNEMONIC =

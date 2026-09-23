@@ -85,7 +85,8 @@ describe('Quick Start seed and frozen-boundary architecture', () => {
       walletService.indexOf('async createQuickStartWallet()'),
       walletService.indexOf('async activateQuickStartWallet(')
     )
-    expect(createQuickStart.indexOf('hasQuickStartMnemonic()')).toBeGreaterThanOrEqual(0)
+    expect(createQuickStart.indexOf('hasQuickStartMnemonicUnderLock()')).toBeGreaterThanOrEqual(0)
+    expect(createQuickStart).not.toContain('getQuickStartRecordStatus()')
     expect(createQuickStart).not.toContain('createNewWallet()')
     expect(createQuickStart).toContain('activateMnemonicLocalIdentity')
     expect(createQuickStart).toContain('storeQuickStartMnemonic')
@@ -97,7 +98,7 @@ describe('Quick Start seed and frozen-boundary architecture', () => {
     expect(createQuickStart.indexOf('withQuickStartCreationLock'))
       .toBeLessThan(createQuickStart.indexOf('hasBackedWalletCiphertextOnDevice'))
     expect(createQuickStart.indexOf('hasBackedWalletCiphertextOnDevice'))
-      .toBeLessThan(createQuickStart.indexOf('hasQuickStartMnemonic()'))
+      .toBeLessThan(createQuickStart.indexOf('hasQuickStartMnemonicUnderLock()'))
     expect(createQuickStart).toContain('BACKED_WALLET_EXISTS')
     expect(createQuickStart).toContain('QUICK_START_IDENTITY_MISMATCH')
     expect(createQuickStart).not.toContain("throw new QuickStartUnavailableError(\n          error instanceof Error ? error.message")

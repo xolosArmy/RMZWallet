@@ -37,12 +37,13 @@ import {
   deletePendingIdentityRecordVerified,
   getPendingIdentityRecord,
   getQuickStartRecordStatus,
-  hasQuickStartMnemonic,
+  hasQuickStartMnemonicUnderLock,
   inspectPendingIdentityAuthority,
   loadQuickStartMetadata,
   loadQuickStartMnemonic,
   PENDING_IDENTITY_STATE,
   PENDING_IDENTITY_STORAGE_KEY,
+  reconcileStaleQuickStartMarkerUnderLock,
   setPendingIdentityRecord,
   storeQuickStartMnemonic,
   withIdentityMutationLock,
@@ -747,7 +748,7 @@ export class XolosWalletService {
       if (this.hasBackedWalletCiphertextOnDevice()) {
         throw new Error('BACKED_WALLET_EXISTS')
       }
-      if (await hasQuickStartMnemonic()) {
+      if (await hasQuickStartMnemonicUnderLock()) {
         throw new Error('QUICK_START_RECORD_EXISTS')
       }
       const auth = inspectPendingIdentityAuthority()
@@ -862,7 +863,7 @@ export class XolosWalletService {
       if (this.hasBackedWalletCiphertextOnDevice()) {
         throw new Error('BACKED_WALLET_EXISTS')
       }
-      if (await hasQuickStartMnemonic()) {
+      if (await hasQuickStartMnemonicUnderLock()) {
         const recovered = await this.activateQuickStartFromDevice()
         if (!recovered) {
           throw new Error('QUICK_START_RECOVERY_FAILED')
@@ -1007,7 +1008,7 @@ export class XolosWalletService {
         throw new Error('QUICK_START_LIFECYCLE_INCONSISTENT')
       }
 
-      const status = await getQuickStartRecordStatus()
+      const status = await reconcileStaleQuickStartMarkerUnderLock()
       if (status !== 'PRESENT' || !(await this.activeQuickStartIdentityMatches().catch(() => false))) {
         throw new Error('QUICK_START_LIFECYCLE_INCONSISTENT')
       }
@@ -1060,7 +1061,7 @@ export class XolosWalletService {
         ? this.encryptedMnemonic
         : localStorage.getItem(STORAGE_KEY_MNEMONIC)
       let reuseExistingFinalCiphertext = false
-      if (existingFinalCiphertext !== null && await getQuickStartRecordStatus() === 'PRESENT') {
+      if (existingFinalCiphertext !== null && await reconcileStaleQuickStartMarkerUnderLock() === 'PRESENT') {
         const identityMatches = await this.activeQuickStartIdentityMatches().catch(() => false)
         if (!identityMatches) {
           throw new Error('INTERRUPTED_BACKUP_VERIFICATION_FAILED')
@@ -1167,7 +1168,7 @@ export class XolosWalletService {
           throw new Error('PENDING_IDENTITY_MISSING')
         }
 
-        const isQuickStart = (await hasQuickStartMnemonic()) || (await this.hasQuickStartRecord().catch(() => false))
+        const isQuickStart = await hasQuickStartMnemonicUnderLock()
         const isExistingBacked = this.hasBackedWalletCiphertextOnDevice()
 
         if (!isQuickStart && !isExistingBacked) {
@@ -1177,7 +1178,7 @@ export class XolosWalletService {
         throw new Error('PENDING_IDENTITY_CORRUPT_DURING_BACKUP')
       }
 
-      if (await hasQuickStartMnemonic()) {
+      if (await hasQuickStartMnemonicUnderLock()) {
         const storedMnemonic = await loadQuickStartMnemonic().catch(() => null)
         if (storedMnemonic && storedMnemonic !== mnemonic) {
           throw new Error('QUICK_START_WALLET_EXISTS')
@@ -1248,7 +1249,7 @@ export class XolosWalletService {
       if (this.hasBackedWalletCiphertextOnDevice()) {
         throw new Error('BACKED_WALLET_EXISTS')
       }
-      if (await hasQuickStartMnemonic()) {
+      if (await hasQuickStartMnemonicUnderLock()) {
         throw new Error('QUICK_START_RECORD_EXISTS')
       }
       const auth = inspectPendingIdentityAuthority()
@@ -1836,7 +1837,7 @@ export class XolosWalletService {
       throw new Error('BACKED_WALLET_EXISTS')
     }
 
-    const quickStartStatus = await getQuickStartRecordStatus()
+    const quickStartStatus = await reconcileStaleQuickStartMarkerUnderLock()
     if (quickStartStatus === 'PRESENT') {
       throw new Error('QUICK_START_RECORD_EXISTS')
     }
@@ -1875,7 +1876,7 @@ export class XolosWalletService {
         throw new Error('BACKED_WALLET_EXISTS')
       }
 
-      const quickStartStatus = await getQuickStartRecordStatus()
+      const quickStartStatus = await reconcileStaleQuickStartMarkerUnderLock()
       if (quickStartStatus === 'PRESENT') {
         throw new Error('QUICK_START_RECORD_EXISTS')
       }
