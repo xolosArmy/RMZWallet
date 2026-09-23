@@ -52,7 +52,7 @@ type ActivationInternals = {
   activeAccountState: unknown
   walletActivationInFlight: boolean
   decryptStoredMnemonic(password: string): Promise<DecryptPasswordResult>
-  persistMigratedStoredMnemonic(migratedCipherText: string | null): void
+  persistMigratedStoredMnemonic(migratedCipherText: string | null, expectedCiphertext: string): void
   activateDecryptedStoredMnemonic(plainText: string): Promise<WalletLoadResult>
 }
 
@@ -118,7 +118,7 @@ describe('X402 stored-wallet activation boundary', () => {
     })
     expect(decrypt).toHaveBeenCalledTimes(1)
     expect(decrypt).toHaveBeenCalledWith('local-password')
-    expect(migrate).toHaveBeenCalledWith(null)
+    expect(migrate).toHaveBeenCalledWith(null, DEFAULT_CIPHERTEXT)
     expect(activate).toHaveBeenCalledTimes(1)
     expect(activate).toHaveBeenCalledWith('decrypted mnemonic')
   })

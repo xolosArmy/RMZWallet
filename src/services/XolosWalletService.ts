@@ -1378,24 +1378,62 @@ export class XolosWalletService {
       throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
     }
     try {
-      const { plainText, migratedCipherText } = await this.decryptStoredMnemonic(password)
-      this.persistMigratedStoredMnemonic(migratedCipherText)
+      const plainText = await this.decryptCurrentStoredWallet(password)
       return await this.activateDecryptedStoredMnemonic(plainText, selectedProfileId)
     } finally {
       this.releaseWalletActivation()
     }
   }
 
-  private async decryptStoredMnemonic(password: string): Promise<DecryptPasswordResult> {
-    if (!this.encryptedMnemonic) {
+  private async decryptCurrentStoredWallet(password: string): Promise<string> {
+    const snapshot = typeof window === 'undefined'
+      ? this.encryptedMnemonic
+      : localStorage.getItem(STORAGE_KEY_MNEMONIC)
+    if (!snapshot) {
       throw new Error('No existe una semilla cifrada en este dispositivo.')
     }
-    return decryptWithPassword(this.encryptedMnemonic, password)
+    const { plainText, migratedCipherText } = await this.decryptStoredMnemonic(password, snapshot)
+    const current = typeof window === 'undefined'
+      ? this.encryptedMnemonic
+      : localStorage.getItem(STORAGE_KEY_MNEMONIC)
+    if (current !== snapshot) {
+      throw new Error('STORED_WALLET_CHANGED')
+    }
+    if (typeof window === 'undefined') {
+      this.encryptedMnemonic = migratedCipherText ?? snapshot
+    } else if (migratedCipherText) {
+      this.persistMigratedStoredMnemonic(migratedCipherText, snapshot)
+    } else {
+      this.encryptedMnemonic = snapshot
+    }
+    return plainText
   }
 
-  private persistMigratedStoredMnemonic(migratedCipherText: string | null): void {
+  private async decryptStoredMnemonic(password: string, ciphertext = this.encryptedMnemonic): Promise<DecryptPasswordResult> {
+    if (!ciphertext) {
+      throw new Error('No existe una semilla cifrada en este dispositivo.')
+    }
+    return decryptWithPassword(ciphertext, password)
+  }
+
+  private persistMigratedStoredMnemonic(migratedCipherText: string | null, expectedCiphertext: string): void {
     if (!migratedCipherText) return
-    localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
+    if (typeof window === 'undefined') {
+      if (this.encryptedMnemonic !== expectedCiphertext) throw new Error('STORED_WALLET_CHANGED')
+      this.encryptedMnemonic = migratedCipherText
+      return
+    }
+    if (localStorage.getItem(STORAGE_KEY_MNEMONIC) !== expectedCiphertext) {
+      throw new Error('STORED_WALLET_CHANGED')
+    }
+    try {
+      localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
+      if (localStorage.getItem(STORAGE_KEY_MNEMONIC) !== migratedCipherText) {
+        throw new Error('STORED_WALLET_MIGRATION_PERSIST_FAILED')
+      }
+    } catch {
+      throw new Error('STORED_WALLET_MIGRATION_PERSIST_FAILED')
+    }
     this.encryptedMnemonic = migratedCipherText
   }
 
@@ -1445,9 +1483,7 @@ export class XolosWalletService {
       throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
     }
     try {
-      const { plainText, migratedCipherText } = await this.decryptStoredMnemonic(password)
-      this.persistMigratedStoredMnemonic(migratedCipherText)
-      this.decryptedMnemonic = plainText
+      this.decryptedMnemonic = await this.decryptCurrentStoredWallet(password)
     } finally {
       this.releaseWalletActivation()
     }
@@ -1542,7 +1578,7 @@ export class XolosWalletService {
         }
         expectedStoredCiphertextAfterActivation =
           decrypted.migratedCipherText ?? previousStoredCiphertext
-        this.persistMigratedStoredMnemonic(decrypted.migratedCipherText)
+        this.persistMigratedStoredMnemonic(decrypted.migratedCipherText, previousStoredCiphertext)
         result = await this.activateDecryptedStoredMnemonic(decrypted.plainText)
 
         expectedProfileMetadataAfterActivation =
