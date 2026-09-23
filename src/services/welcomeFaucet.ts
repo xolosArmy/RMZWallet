@@ -21,7 +21,36 @@ export type WelcomeClaimResponse = Readonly<{
   dryRun?: boolean
   message?: string
   error?: string
+  retryAfterMs?: number
 }>
+
+// The faucet's longest Welcome limiter is one hour. This is a local safety fallback,
+// not a claim that the server exposed a cooldown to this cross-origin client.
+export const WELCOME_RATE_LIMIT_FALLBACK_MS = 60 * 60 * 1000
+const MAX_TIMEOUT_MS = 2_147_483_647
+
+export function parseWelcomeRetryAfterMs(value: string | null, nowMs = Date.now()): number | null {
+  const raw = value?.trim()
+  if (!raw) return null
+  if (/^\d+$/.test(raw)) {
+    const seconds = Number(raw)
+    if (!Number.isSafeInteger(seconds)) return null
+    return Math.min(seconds * 1000, MAX_TIMEOUT_MS)
+  }
+  if (/^[+-]?\d+(?:\.\d+)?$/.test(raw)) return null
+  if (!/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(raw)) return null
+  const retryTime = Date.parse(raw)
+  if (!Number.isFinite(retryTime) || new Date(retryTime).toUTCString() !== raw) return null
+  return Math.min(Math.max(0, retryTime - nowMs), MAX_TIMEOUT_MS)
+}
+
+function rateLimitRetryAfterMs(response: Response): number {
+  try {
+    return parseWelcomeRetryAfterMs(response.headers.get('Retry-After')) ?? WELCOME_RATE_LIMIT_FALLBACK_MS
+  } catch {
+    return WELCOME_RATE_LIMIT_FALLBACK_MS
+  }
+}
 
 export type WelcomeFaucetConfig = Readonly<{
   ok: boolean
@@ -65,20 +94,26 @@ function asClaimStatus(value: unknown): WelcomeClaimStatus | null {
 }
 
 async function parseResponse(response: Response): Promise<WelcomeClaimResponse> {
-  let body: Partial<WelcomeClaimResponse> = {}
+  const retryAfterMs = response.status === 429 ? rateLimitRetryAfterMs(response) : undefined
+  let parsed: unknown
   try {
-    body = await response.json() as Partial<WelcomeClaimResponse>
+    parsed = await response.json()
   } catch {
     if (response.status === 429) {
-      return { ok: false, status: 'rate_limited', error: 'WELCOME_FAUCET_RATE_LIMITED' }
+      return { ok: false, status: 'rate_limited', error: 'WELCOME_FAUCET_RATE_LIMITED', retryAfterMs }
     }
     throw new Error('WELCOME_FAUCET_INVALID_RESPONSE')
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    if (response.status === 429) {
+      return { ok: false, status: 'rate_limited', error: 'WELCOME_FAUCET_RATE_LIMITED', retryAfterMs }
+    }
+    throw new Error('WELCOME_FAUCET_INVALID_RESPONSE')
+  }
+  const body = parsed as Partial<WelcomeClaimResponse>
 
-  const status = asClaimStatus(body.status) ?? (
-    response.status === 429
-      ? 'rate_limited'
-      : response.status === 202
+  const status = response.status === 429 ? 'rate_limited' : asClaimStatus(body.status) ?? (
+    response.status === 202
         ? 'pending_review'
         : !response.ok
           ? 'error'
@@ -96,7 +131,8 @@ async function parseResponse(response: Response): Promise<WelcomeClaimResponse> 
     txid: body.txid,
     dryRun: body.dryRun,
     message: body.message,
-    error: body.error
+    error: body.error,
+    retryAfterMs
   }
 }
 

@@ -26,6 +26,7 @@ describe('Welcome XEC claim policy', () => {
     expect(shouldAttemptWelcomeClaim('already_claimed')).toBe(false)
     expect(shouldAttemptWelcomeClaim('completed')).toBe(false)
     expect(nextWelcomeClaimAction('pending_review')).toBe('reconcile')
+    expect(nextWelcomeClaimAction('rate_limited')).toBe('idle')
   })
 
   test('pending_review never fires another transfer', async () => {
