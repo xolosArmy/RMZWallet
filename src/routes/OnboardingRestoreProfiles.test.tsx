@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { WalletContext } from '../context/walletContext'
 import type { WalletContextValue } from '../context/walletContext'
+import { walletContextFixture } from '../test/walletContextFixture'
 import {
   ECASH_STANDARD_899_PROFILE_ID,
   ECASH_STANDARD_PROFILE_ID,
@@ -45,35 +46,25 @@ function walletValue(
   restoreWallet: WalletContextValue['restoreWallet'],
   loadExistingWallet: WalletContextValue['loadExistingWallet'] = vi.fn()
 ): WalletContextValue {
-  return {
-    address: null,
-    balance: null,
-    loading: false,
-    error: null,
-    initialized: false,
-    backupVerified: false,
-    createNewWallet: vi.fn(),
+  return walletContextFixture({
     restoreWallet,
-    loadExistingWallet,
-    encryptAndStore: vi.fn(),
-    refreshBalances: vi.fn(),
-    rescanWallet: vi.fn(),
-    sendRMZ: vi.fn(),
-    prepareFirmaSend: vi.fn(),
-    sendFirma: vi.fn(),
-    sendXEC: vi.fn(),
-    estimateAliasRegistration: vi.fn(),
-    reserveAliasRegistrationUtxos: vi.fn(),
-    buildAliasRegistrationRawTx: vi.fn(),
-    registerAliasOnChain: vi.fn(),
-    estimateXecSend: vi.fn(),
-    getMnemonic: vi.fn(),
-    unlockEncryptedWallet: vi.fn()
-  }
+    loadExistingWallet
+  })
+}
+
+const mockLocks = {
+  request: vi.fn(async (_name: string, _opts: unknown, callback: (lock: unknown) => Promise<unknown>) => callback({}))
 }
 
 describe('dual-profile restore resolution UI', () => {
-  afterEach(cleanup)
+  beforeEach(() => {
+    Object.defineProperty(navigator, 'locks', { configurable: true, value: mockLocks })
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
 
   test('requires and forwards an explicit profile choice when both profiles are active', async () => {
     const restoreWallet = vi.fn<WalletContextValue['restoreWallet']>()
@@ -108,14 +99,15 @@ describe('dual-profile restore resolution UI', () => {
     expect(await screen.findByText('Actividad encontrada en varios perfiles')).toBeTruthy()
     expect(screen.getByText(/Tonalli no combinará sus UTXOs/)).toBeTruthy()
     expect(restoreWallet).toHaveBeenCalledTimes(1)
-    expect(restoreWallet).toHaveBeenNthCalledWith(1, PUBLIC_TEST_MNEMONIC)
+    expect(restoreWallet).toHaveBeenNthCalledWith(1, PUBLIC_TEST_MNEMONIC, undefined, '123456')
 
     fireEvent.click(screen.getByRole('button', { name: 'Abrir eCash / Cashtab' }))
     await waitFor(() => expect(restoreWallet).toHaveBeenCalledTimes(2))
     expect(restoreWallet).toHaveBeenNthCalledWith(
       2,
       PUBLIC_TEST_MNEMONIC,
-      ECASH_STANDARD_PROFILE_ID
+      ECASH_STANDARD_PROFILE_ID,
+      '123456'
     )
   })
 
@@ -156,5 +148,59 @@ describe('dual-profile restore resolution UI', () => {
       '123456',
       ECASH_STANDARD_PROFILE_ID
     )
+  })
+
+  test('navigator.locks absent renders unsupported-browser state, blocks restore, zero seed persistence', () => {
+    Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined })
+    const restoreWallet = vi.fn()
+    render(
+      <MemoryRouter initialEntries={['/onboarding/import']}>
+        <WalletContext.Provider value={walletValue(restoreWallet)}>
+          <ImportWallet />
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+
+    expect(screen.getByTestId('import-tonalli')).toHaveProperty('disabled', true)
+    expect(screen.getByTestId('unsupported-browser-state')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Frase seed'), {
+      target: { value: PUBLIC_TEST_MNEMONIC }
+    })
+    fireEvent.change(screen.getByLabelText('Nuevo Password/PIN local'), {
+      target: { value: '123456' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Restaurar wallet' }))
+    expect(restoreWallet).not.toHaveBeenCalled()
+    expect(localStorage.getItem('xoloswallet_encrypted_mnemonic')).toBeNull()
+  })
+
+  test('import wallet flow navigates to /backup when restoreWallet returns restored (discussion_r4066507409)', async () => {
+    const restoreWallet = vi.fn<WalletContextValue['restoreWallet']>().mockResolvedValue({
+      status: 'restored',
+      detection: dualDetection,
+      selectedProfileId: ECASH_STANDARD_PROFILE_ID,
+      notice: 'restored'
+    })
+    render(
+      <MemoryRouter initialEntries={['/onboarding/import']}>
+        <WalletContext.Provider value={walletValue(restoreWallet)}>
+          <Routes>
+            <Route path="/onboarding/import" element={<ImportWallet />} />
+            <Route path="/backup" element={<div data-testid="backup-route-screen">Backup route screen</div>} />
+          </Routes>
+        </WalletContext.Provider>
+      </MemoryRouter>
+    )
+
+    fireEvent.change(screen.getByLabelText('Frase seed'), {
+      target: { value: PUBLIC_TEST_MNEMONIC }
+    })
+    fireEvent.change(screen.getByLabelText('Nuevo Password/PIN local'), {
+      target: { value: '123456' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Restaurar wallet' }))
+
+    expect(await screen.findByTestId('backup-route-screen')).toBeTruthy()
+    expect(restoreWallet).toHaveBeenCalledWith(PUBLIC_TEST_MNEMONIC, undefined, '123456')
   })
 })

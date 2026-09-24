@@ -9,9 +9,15 @@ import type {
   WalletRescanOptions,
   WalletRestoreResult
 } from '../services/XolosWalletService'
+import type { QuickStartRecoveryState } from '../services/XolosWalletService'
 import type { DerivationProfileId } from '../services/derivationProfiles'
 import type { AliasRegistrationData } from '@xolosarmy/tonalli-core'
 import type { FirmaSendPreview } from '../services/firmaAlphaSend'
+import type { WalletCapability } from '../domain/walletCapabilities'
+import type { WalletLifecycle } from '../domain/walletLifecycle'
+import type { PendingIdentityState } from '../services/quickStartStorage'
+
+export type QuickStartBootstrapStatus = 'pending' | 'absent' | 'recovered' | 'failed'
 
 export interface WalletContextValue {
   address: string | null
@@ -21,12 +27,26 @@ export interface WalletContextValue {
   error: string | null
   initialized: boolean
   backupVerified: boolean
+  lifecycle: WalletLifecycle
+  quickStartBootstrap: QuickStartBootstrapStatus
+  quickStartRecoveryState: QuickStartRecoveryState | null
+  hasBackedWalletOnDevice: boolean
+  hasCapability: (capability: WalletCapability) => boolean
   setAlias?: (alias: string | null) => void
-  createNewWallet: () => Promise<string>
+  startQuickStartWallet: () => Promise<{ address: string }>
+  activateQuickStartFromDevice: () => Promise<{ address: string } | null>
+  completeProgressiveBackup: (password: string) => Promise<void>
+  createNewWallet: (password?: string) => Promise<string>
   restoreWallet: (
     mnemonic: string,
-    selectedProfileId?: DerivationProfileId
+    selectedProfileId?: DerivationProfileId,
+    password?: string
   ) => Promise<WalletRestoreResult>
+  pendingIdentityState: PendingIdentityState
+  hasPendingIdentity: boolean
+  resumePendingIdentity: (password: string) => Promise<{ address: string; reconciled?: boolean }>
+  abandonPendingIdentity: () => Promise<void>
+  abandonCorruptPendingIdentity?: () => Promise<void>
   loadExistingWallet: (
     password: string,
     selectedProfileId?: DerivationProfileId

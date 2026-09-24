@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useLocation } from 'react-router-dom'
 import TopBar from '../components/TopBar'
+import { useWallet } from '../context/useWallet'
+import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
+import { assertWalletCapabilityEnabled } from '../domain/walletCapabilityGuard'
 import {
   createRejectedH3BCallbackUrl,
   createSignedH3BCallbackUrl,
@@ -109,6 +112,9 @@ export default function X402AuthorizeRequest({
   wallet = xolosWalletService,
   nowSeconds
 }: X402AuthorizeRequestProps) {
+  const walletSession = useWallet()
+  const walletSessionRef = useRef(walletSession)
+  walletSessionRef.current = walletSession
   const location = useLocation()
   const transportKey = JSON.stringify([location.pathname, location.search, location.hash])
   const [view, setView] = useState<ViewState>({ status: 'loading', transportKey })
@@ -150,6 +156,12 @@ export default function X402AuthorizeRequest({
     }
 
     const prepare = async () => {
+      try {
+        assertWalletCapabilityEnabled(walletSessionRef.current, WALLET_CAPABILITY.X402)
+      } catch {
+        fail('wallet-unavailable')
+        return
+      }
       let request: TonalliH3BRequest
       try {
         request = parseTonalliH3BRequest({
@@ -412,6 +424,12 @@ export default function X402AuthorizeRequest({
       ready.status !== 'ready' ||
       ready.generation !== activeGeneration.current
     ) return
+    try {
+      assertWalletCapabilityEnabled(walletSessionRef.current, WALLET_CAPABILITY.X402)
+    } catch {
+      fail(ready.generation, ready.transportKey, 'wallet-unavailable')
+      return
+    }
     actionLocked.current = true
     setView({ ...ready, status: 'signing' })
     try {

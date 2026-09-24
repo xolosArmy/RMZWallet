@@ -18,6 +18,7 @@ import TmCommStaging from './TmCommStaging'
 import {
   createTmCommAuthChallengeView
 } from '../features/privateMessaging/authChallenge'
+import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
 
 const mockSignMessage = vi.fn()
 const mockGetPublicKeyHex = vi.fn(() => '02' + '11'.repeat(32))
@@ -37,6 +38,7 @@ type MockWalletState = {
   balance: null
   loading: boolean
   error: null
+  hasCapability?: (capability: string) => boolean
 }
 
 const mockWalletState: MockWalletState = {
@@ -44,14 +46,18 @@ const mockWalletState: MockWalletState = {
   initialized: true,
   balance: null,
   loading: false,
-  error: null
+  error: null,
+  hasCapability: (cap: string) => cap === WALLET_CAPABILITY.TM_COMM
 }
 
 const walletListeners = new Set<() => void>()
 
 function setMockWallet(update: Partial<MockWalletState>) {
   act(() => {
-    Object.assign(mockWalletState, update)
+    Object.assign(mockWalletState, {
+      hasCapability: (cap: string) => cap === WALLET_CAPABILITY.TM_COMM,
+      ...update
+    })
     walletListeners.forEach((listener) => listener())
   })
 }
@@ -3325,6 +3331,68 @@ describe('P2-20: Centralized 401 session invalidation across refresh, bind, and 
     expect(screen.queryByText(/EARLY_INITIAL_MSG/i)).toBeNull()
     expect(screen.getByText(/Conversación: ninguna/i)).toBeDefined()
     expect(screen.getByText(/Sesión TM-COMM: no autenticada/i)).toBeDefined()
+  })
+})
+
+describe('TM-COMM capability boundary enforcement', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    walletListeners.clear()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  test('attempt TM-COMM authenticate with capability denied -> fail closed, signMessage called 0 times', async () => {
+    setMockWallet({
+      address: 'ecash:walletUnbacked',
+      initialized: true,
+      hasCapability: () => false
+    })
+
+    render(<TmCommStaging />)
+
+    const authBtn = screen.getByRole('button', { name: /Firmar challenge TM-COMM/i })
+    fireEvent.click(authBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText(/Capability TM_COMM no autorizada para la identidad actual/i)).toBeDefined()
+    })
+
+    expect(mockSignMessage).toHaveBeenCalledTimes(0)
+    expect(mockTmCommRequest).toHaveBeenCalledTimes(0)
+    expect(screen.getByText(/Sesión TM-COMM:\s*no autenticada/i)).toBeDefined()
+  })
+
+  test('capability denied -> zero binding mutation', async () => {
+    setMockWallet({
+      address: 'ecash:walletUnbacked',
+      initialized: true,
+      hasCapability: () => false
+    })
+
+    render(<TmCommStaging />)
+
+    const bindBtn = screen.getByRole('button', { name: /Consumir invitación/i })
+    fireEvent.click(bindBtn)
+
+    expect(mockTmCommRequest).toHaveBeenCalledTimes(0)
+  })
+
+  test('capability denied -> zero message send', async () => {
+    setMockWallet({
+      address: 'ecash:walletUnbacked',
+      initialized: true,
+      hasCapability: () => false
+    })
+
+    render(<TmCommStaging />)
+
+    const sendBtn = screen.getByRole('button', { name: /Enviar al servidor/i })
+    fireEvent.click(sendBtn)
+
+    expect(mockTmCommRequest).toHaveBeenCalledTimes(0)
   })
 })
 

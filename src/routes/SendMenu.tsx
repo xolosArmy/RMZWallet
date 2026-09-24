@@ -1,5 +1,7 @@
 import { Link } from 'react-router-dom'
 import TopBar from '../components/TopBar'
+import { useWallet } from '../context/useWallet'
+import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
 
 const sendOptions = [
   {
@@ -30,6 +32,20 @@ const sendOptions = [
 ]
 
 function SendMenu() {
+  const { hasCapability } = useWallet()
+  if (!(hasCapability?.(WALLET_CAPABILITY.SEND_XEC) ?? true)) {
+    return (
+      <div className="page">
+        <TopBar />
+        <h1 className="section-title">Protege tu Tonalli para enviar</h1>
+        <p className="muted">El envío se activa después de guardar tu frase de recuperación.</p>
+        <div className="actions">
+          <Link className="cta primary" to="/backup">Proteger ahora</Link>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="page">
       <TopBar />

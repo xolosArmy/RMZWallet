@@ -2,6 +2,9 @@ import { useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
+import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
+import { isWalletCapabilityEnabled } from '../domain/walletCapabilityGuard'
+import { CapabilityBlocked } from '../components/RequireCapability'
 import TonalliMemoComposer from '../components/tonalliMemo/TonalliMemoComposer'
 import {
   ChronikNetworkTransport,
@@ -26,7 +29,9 @@ export function MemoCompose({
   recoveryStore: customRecoveryStore,
   indexingClient = tonalliMemoIndexingClient
 }: MemoComposeProps = {}) {
-  const { address, alias } = useWallet()
+  const wallet = useWallet()
+  const { address, alias } = wallet
+  const canPublishMemo = isWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.ARBITRARY_BROADCAST)
 
   const productionRecoveryStore = useMemo(() => {
     return customRecoveryStore ?? new Tm1ProductionRecoveryStore({ address })
@@ -46,8 +51,12 @@ export function MemoCompose({
   const executor = customExecutor ?? productionExecutor
   const effectiveRecoveryStore =
     customRecoveryStore ??
-    (customExecutor as any)?.recoveryStore ??
+    (customExecutor as { recoveryStore?: typeof productionRecoveryStore } | null | undefined)?.recoveryStore ??
     productionRecoveryStore
+
+  if (!canPublishMemo) {
+    return <CapabilityBlocked title="Protege tu Tonalli para publicar memos" />
+  }
 
   return (
     <div className="page memo-compose-page">
