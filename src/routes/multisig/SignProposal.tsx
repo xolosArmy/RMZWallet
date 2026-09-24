@@ -2,9 +2,6 @@ import type { FormEvent } from 'react'
 import { useMemo, useState } from 'react'
 import { Link, Navigate, useParams } from 'react-router-dom'
 import TopBar from '../../components/TopBar'
-import { useWallet } from '../../context/useWallet'
-import { WALLET_CAPABILITY } from '../../domain/walletCapabilities'
-import { assertWalletCapabilityEnabled } from '../../domain/walletCapabilityGuard'
 import { XEC_SATS_PER_XEC } from '../../config/xecFees'
 import type { EcashMultisigProposalInspection } from '../../services/EcashMultisigService'
 import { ecashMultisigService } from '../../services/EcashMultisigService'
@@ -20,7 +17,6 @@ const roleLabel: Record<EcashMultisigProposalInspection['outputs'][number]['role
 }
 
 function SignProposal() {
-  const wallet = useWallet()
   const { vaultId } = useParams()
   const vault = useMemo(() => (vaultId ? ecashMultisigService.getVault(vaultId) : null), [vaultId])
   const [partialTxHex, setPartialTxHex] = useState('')
@@ -52,12 +48,6 @@ function SignProposal() {
 
   const handleSign = async (event: FormEvent) => {
     event.preventDefault()
-    try {
-      assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.ARBITRARY_BROADCAST)
-    } catch (err) {
-      setError((err as Error).message)
-      return
-    }
     if (!summary) {
       setError('Revisa el resumen seguro antes de firmar.')
       return
@@ -81,12 +71,6 @@ function SignProposal() {
     setError(null)
     setTxid(null)
     setBroadcasted(false)
-    try {
-      assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.ARBITRARY_BROADCAST)
-    } catch (err) {
-      setError((err as Error).message)
-      return
-    }
     setLoading(true)
     try {
       const nextTxid = await ecashMultisigService.broadcast({ vault, partialTxHex })

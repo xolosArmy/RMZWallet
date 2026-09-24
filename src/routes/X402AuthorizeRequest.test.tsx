@@ -12,14 +12,6 @@ import { X402StoredWalletActivationError } from '../services/XolosWalletService'
 import type { X402StoredWalletActivationResult } from '../services/XolosWalletService'
 import X402AuthorizeRequest from './X402AuthorizeRequest'
 
-vi.mock('../context/useWallet', () => ({
-  useWallet: () => ({
-    initialized: true,
-    backupVerified: true,
-    hasCapability: () => true
-  })
-}))
-
 vi.mock('../components/TopBar', () => ({ default: () => <div>Tonalli Wallet</div> }))
 
 const NOW = 1_800_000_000

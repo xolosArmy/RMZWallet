@@ -30,12 +30,10 @@ vi.mock('../context/useWallet', () => ({
     address: 'ecash:qptest',
     balance: null,
     initialized: true,
-    backupVerified: true,
     refreshBalances: vi.fn(),
     rescanWallet: vi.fn(),
     loading: false,
-    error: null,
-    hasCapability: () => true
+    error: null
   })
 }))
 

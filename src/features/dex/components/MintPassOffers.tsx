@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useWallet } from '../../../context/useWallet'
-import { WALLET_CAPABILITY } from '../../../domain/walletCapabilities'
-import { assertWalletCapabilityEnabled } from '../../../domain/walletCapabilityGuard'
 import { type CollectionId } from '../../../domain/nftCollections'
 import { parseDecimalToAtoms, parseXecToSats } from '../../../dex/agoraPhase1'
 import {
@@ -21,8 +19,7 @@ const COLLECTION_LABELS: Readonly<Record<CollectionId, string>> = Object.freeze(
 const sleep = (ms: number) => new Promise((resolve) => globalThis.setTimeout(resolve, ms))
 
 export default function MintPassOffers() {
-  const wallet = useWallet()
-  const { initialized, backupVerified, refreshBalances } = wallet
+  const { initialized, backupVerified, refreshBalances } = useWallet()
   const [offers, setOffers] = useState<MintPassPublicOffer[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -71,12 +68,6 @@ export default function MintPassOffers() {
   )
 
   const handleBuy = async (offer: MintPassPublicOffer) => {
-    try {
-      assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.AGORA_TRADING)
-    } catch {
-      setError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
-      return
-    }
     if (!initialized || !backupVerified) {
       setError('Debes completar el onboarding y respaldar tu seed antes de comprar.')
       return

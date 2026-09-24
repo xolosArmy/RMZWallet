@@ -62,8 +62,3 @@ export function isWalletNavigationActive(item: WalletNavigationItemId, pathname:
 export function shouldShowWalletNavigation(initialized: boolean, pathname: string) {
   return initialized && !isWalletNavigationHidden(pathname)
 }
-
-export function walletNavigationItemsForCapabilities(canSend: boolean): WalletNavigationItem[] {
-  if (canSend) return walletNavigationItems
-  return walletNavigationItems.filter((item) => item.id !== 'send')
-}

@@ -4,14 +4,11 @@ import { Link, useSearchParams } from 'react-router-dom'
 import TopBar from '../components/TopBar'
 import AliasResolutionStatus from '../components/AliasResolutionStatus'
 import { useWallet } from '../context/useWallet'
-import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
-import { assertWalletCapabilityEnabled } from '../domain/walletCapabilityGuard'
 import { useAliasResolution } from '../hooks/useAliasResolution'
 import { fetchNftDetails, sendNft } from '../services/nftService'
 
 function SendNft() {
-  const wallet = useWallet()
-  const { initialized, backupVerified, loading, error, refreshBalances } = wallet
+  const { initialized, backupVerified, loading, error, refreshBalances } = useWallet()
   const [searchParams] = useSearchParams()
   const tokenId = searchParams.get('tokenId') || ''
   const [destination, setDestination] = useState('')
@@ -52,13 +49,6 @@ function SendNft() {
     e.preventDefault()
     setLocalError(null)
     setTxid(null)
-
-    try {
-      assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.NFT_OPERATIONS)
-    } catch {
-      setLocalError('Debes completar el onboarding y el respaldo de tu seed antes de enviar NFTs.')
-      return
-    }
 
     if (!initialized || !backupVerified) {
       setLocalError('Debes completar el onboarding y el respaldo de tu seed antes de enviar NFTs.')

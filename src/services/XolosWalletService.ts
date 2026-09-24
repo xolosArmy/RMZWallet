@@ -28,44 +28,7 @@ import { getChronik } from './ChronikClient'
 import { extractAliasFromOutputScript } from './aliasDiscovery'
 import { decryptWithPassword, encryptWithPassword } from './crypto'
 import type { DecryptPasswordResult } from './crypto'
-import {
-  QuickStartUnavailableError,
-  assertQuickStartStorageAvailable,
-  clearPendingIdentityRecord,
-  clearQuickStartMnemonic,
-  computeMnemonicCommitment,
-  deletePendingIdentityRecordVerified,
-  getPendingIdentityRecord,
-  getQuickStartRecordStatus,
-  hasQuickStartMnemonicUnderLock,
-  inspectPendingIdentityAuthority,
-  loadQuickStartMetadata,
-  loadQuickStartMnemonic,
-  PENDING_IDENTITY_STATE,
-  PENDING_IDENTITY_STORAGE_KEY,
-  reconcileStaleQuickStartMarkerUnderLock,
-  setPendingIdentityRecord,
-  storeQuickStartMnemonic,
-  withIdentityMutationLock,
-  withQuickStartCreationLock
-} from './quickStartStorage'
-import type { PendingIdentityRecord, PendingIdentityState, QuickStartRecordStatus } from './quickStartStorage'
 import { formatTokenAmount, parseTokenAmount } from '../utils/tokenFormat'
-import { WALLET_LIFECYCLE } from '../domain/walletLifecycle'
-
-function generateOwnerToken(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
-  }
-  const bytes = new Uint8Array(16)
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    crypto.getRandomValues(bytes)
-  } else {
-    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256)
-  }
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
-}
-
 import type {
   MinimalXecWallet,
   MinimalXECWalletConstructor,
@@ -141,8 +104,6 @@ const CHRONIK_ENDPOINTS = [
   'https://chronik.xolosarmy.xyz'
 ]
 const STORAGE_KEY_MNEMONIC = 'xoloswallet_encrypted_mnemonic'
-const BACKUP_KEY = 'xoloswallet_backup_verified'
-export type QuickStartRecoveryState = 'NORMAL_UNBACKED' | 'INTERRUPTED_BACKUP' | 'BACKUP_VERIFIED'
 const STORAGE_KEY_GAP_LIMIT = 'xoloswallet_gap_limit'
 const SCAN_CACHE_TTL_MS = 30000
 const CHRONIK_CONCURRENCY_LIMIT = 4
@@ -450,7 +411,6 @@ export class XolosWalletService {
   private rmzDecimals: number | null = null
   private rmzDecimalsPromise: Promise<number> | null = null
   private pendingAliasReservationExcludedTxids: string[] = []
-  private pendingIdentityOwnerToken: string | null = null
 
   private constructor() {
     this.encryptedMnemonic = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_MNEMONIC) : null
@@ -573,13 +533,19 @@ export class XolosWalletService {
     profileId: DerivationProfileId,
     persistProfile = false
   ): Promise<void> {
-    await this.activateMnemonicLocalIdentity(mnemonic, profileId)
+    this.buildWallet(profileId)
+    const wallet = this.wallet as MinimalXecWallet
+    await wallet.walletInfoPromise
+    this.decryptedMnemonic = mnemonic
+    this.activeAccountState = deriveAccountPublicState(mnemonic, profileId)
+    this.bindMinimalWalletToCanonicalProfile(mnemonic)
+    await wallet.initialize()
+    this.isReady = true
+    this.scanCache = null
+    this.scanPromise = null
+    this.scanPromiseGapLimit = null
+    this.ensureHdAddressCache(this.getEffectiveGapLimit())
     if (persistProfile) this.persistActiveProfile()
-    const wallet = this.wallet as MinimalXecWallet | null
-    if (!wallet) return
-    void wallet.initialize().catch(() => {
-      // Chronik/network failure must not block a recoverable local identity.
-    })
   }
 
   private ensureReady() {
@@ -743,490 +709,30 @@ export class XolosWalletService {
     return [...selectedTokenUtxos, ...selectedFeeUtxos]
   }
 
-  async createNewWallet(password?: string): Promise<string> {
-    return withQuickStartCreationLock(async () => {
-      if (this.hasBackedWalletCiphertextOnDevice()) {
-        throw new Error('BACKED_WALLET_EXISTS')
-      }
-      if (await hasQuickStartMnemonicUnderLock()) {
-        throw new Error('QUICK_START_RECORD_EXISTS')
-      }
-      const auth = inspectPendingIdentityAuthority()
-      if (auth.status === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
-        throw new Error('STORAGE_UNAVAILABLE')
-      }
-      if (auth.status === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
-        throw new Error('CORRUPT_OR_UNKNOWN_PENDING')
-      }
-      if (
-        auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
-        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING ||
-        auth.status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED
-      ) {
-        throw new Error('PENDING_IDENTITY_EXISTS')
-      }
-      if (!this.tryAcquireWalletActivation()) {
-        throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
-      }
-      try {
-        const mnemonic = generateMnemonic(wordlist, 128)
-        const profileId = DEFAULT_NEW_WALLET_PROFILE_ID
-        let ciphertext: string | undefined
-        if (password) {
-          ciphertext = await encryptWithPassword(mnemonic, password)
-        }
-
-        await this.activateMnemonicLocalIdentity(mnemonic, profileId)
-        this.encryptedMnemonic = null
-        try {
-          await (this.wallet as MinimalXecWallet).initialize()
-        } catch (error) {
-          this.decryptedMnemonic = null
-          this.wallet = null
-          this.isReady = false
-          this.activeAccountState = null
-          throw error
-        }
-        const ownerToken = generateOwnerToken()
-        const commitment = await computeMnemonicCommitment(mnemonic)
-        const candidateAddress = this.getAddress() || ''
-        try {
-          setPendingIdentityRecord({
-            version: 1,
-            ownerToken,
-            commitment,
-            address: candidateAddress,
-            derivationProfileId: profileId,
-            ciphertext,
-            encryptedMnemonic: ciphertext,
-            state: ciphertext ? 'PENDING_BACKUP' : undefined,
-            createdAt: Date.now()
-          })
-
-          const readBack = getPendingIdentityRecord()
-          if (
-            !readBack ||
-            readBack.ownerToken !== ownerToken ||
-            readBack.commitment !== commitment ||
-            readBack.address !== candidateAddress
-          ) {
-            throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
-          }
-          if (ciphertext) {
-            if (readBack.ciphertext !== ciphertext && readBack.encryptedMnemonic !== ciphertext) {
-              throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
-            }
-            const decrypted = await decryptWithPassword(
-              readBack.ciphertext || readBack.encryptedMnemonic!,
-              password!
-            )
-            if (decrypted.plainText.trim() !== mnemonic.trim()) {
-              throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
-            }
-          }
-
-          this.pendingIdentityOwnerToken = ownerToken
-        } catch (error) {
-          this.decryptedMnemonic = null
-          this.wallet = null
-          this.isReady = false
-          this.activeAccountState = null
-          this.pendingIdentityOwnerToken = null
-          throw error
-        }
-        return this.decryptedMnemonic || ''
-      } finally {
-        this.releaseWalletActivation()
-      }
-    })
-  }
-
-  private async activateMnemonicLocalIdentity(
-    mnemonic: string,
-    profileId: DerivationProfileId
-  ): Promise<void> {
-    this.buildWallet(profileId)
-    const wallet = this.wallet as MinimalXecWallet
-    await wallet.walletInfoPromise
-    this.decryptedMnemonic = mnemonic
-    this.activeAccountState = deriveAccountPublicState(mnemonic, profileId)
-    this.bindMinimalWalletToCanonicalProfile(mnemonic)
-    this.isReady = true
-    this.scanCache = null
-    this.scanPromise = null
-    this.scanPromiseGapLimit = null
-    this.ensureHdAddressCache(this.getEffectiveGapLimit())
-  }
-
-  async createQuickStartWallet(): Promise<{ address: string; profileId: DerivationProfileId }> {
-    return withQuickStartCreationLock(async () => {
-      if (this.hasBackedWalletCiphertextOnDevice()) {
-        throw new Error('BACKED_WALLET_EXISTS')
-      }
-      if (await hasQuickStartMnemonicUnderLock()) {
-        const recovered = await this.activateQuickStartFromDevice()
-        if (!recovered) {
-          throw new Error('QUICK_START_RECOVERY_FAILED')
-        }
-        return recovered
-      }
-      const auth = inspectPendingIdentityAuthority()
-      if (auth.status === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
-        throw new Error('STORAGE_UNAVAILABLE')
-      }
-      if (auth.status === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
-        throw new Error('CORRUPT_OR_UNKNOWN_PENDING')
-      }
-      if (auth.status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
-        throw new Error('PENDING_IDENTITY_EXISTS')
-      }
-
-      await assertQuickStartStorageAvailable()
-      if (!this.tryAcquireWalletActivation()) {
-        throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
-      }
-      try {
-        const mnemonic = generateMnemonic(wordlist, 128)
-        await this.activateMnemonicLocalIdentity(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
-        const profileId = this.activeProfileId
-        const address = this.getAddress()
-        if (!mnemonic || !address) {
-          throw new Error('QUICK_START_WALLET_IDENTITY_MISSING')
-        }
-        try {
-          await storeQuickStartMnemonic(mnemonic, {
-            derivationProfileId: profileId,
-            address
-          })
-        } catch (error) {
-          this.decryptedMnemonic = null
-          this.wallet = null
-          this.isReady = false
-          this.activeAccountState = null
-          if (
-            error instanceof Error
-            && error.message === 'QUICK_START_RECORD_EXISTS'
-          ) {
-            const recovered = await this.activateQuickStartFromDevice()
-            if (!recovered) {
-              throw new Error('QUICK_START_RECOVERY_FAILED')
-            }
-            return recovered
-          }
-          throw error
-        }
-        const persistedMnemonic = await loadQuickStartMnemonic()
-        const persistedMetadata = await loadQuickStartMetadata()
-        if (
-          persistedMnemonic !== mnemonic
-          || !persistedMetadata
-          || (persistedMetadata.address && persistedMetadata.address !== address)
-        ) {
-          this.decryptedMnemonic = null
-          this.wallet = null
-          this.isReady = false
-          this.activeAccountState = null
-          throw new Error('QUICK_START_IDENTITY_MISMATCH')
-        }
-        try {
-          await (this.wallet as MinimalXecWallet).initialize()
-        } catch {
-          // Chronik/network failure must not prevent first-create persistence.
-        }
-        return { address, profileId }
-      } finally {
-        this.releaseWalletActivation()
-      }
-    })
-  }
-
-  async activateQuickStartWallet(
-    mnemonic: string,
-    profileId: DerivationProfileId
-  ): Promise<{ address: string; profileId: DerivationProfileId }> {
+  async createNewWallet(): Promise<string> {
     if (!this.tryAcquireWalletActivation()) {
       throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
     }
     try {
-      const normalizedMnemonic = mnemonic.trim()
-      if (!normalizedMnemonic) {
-        throw new Error('QUICK_START_MNEMONIC_REQUIRED')
-      }
-      if (!isDerivationProfileId(profileId)) {
-        throw new Error('QUICK_START_DERIVATION_PROFILE_REQUIRED')
-      }
-      await this.activateMnemonicLocalIdentity(normalizedMnemonic, profileId)
-      try {
-        await (this.wallet as MinimalXecWallet).initialize()
-      } catch {
-        // Chronik/network failure must not destroy a recoverable local identity.
-      }
-      const address = this.getAddress()
-      if (!address) {
-        throw new Error('QUICK_START_WALLET_IDENTITY_MISSING')
-      }
-      return { address, profileId }
+      const mnemonic = generateMnemonic(wordlist, 128)
+      this.buildWallet(DEFAULT_NEW_WALLET_PROFILE_ID)
+      const wallet = this.wallet as MinimalXecWallet
+      await wallet.walletInfoPromise
+      this.decryptedMnemonic = mnemonic
+      this.activeAccountState = deriveAccountPublicState(mnemonic, DEFAULT_NEW_WALLET_PROFILE_ID)
+      this.bindMinimalWalletToCanonicalProfile(mnemonic)
+      await wallet.initialize()
+      this.isReady = true
+      this.encryptedMnemonic = null
+      this.scanCache = null
+      this.scanPromise = null
+      this.scanPromiseGapLimit = null
+      this.ensureHdAddressCache(this.getEffectiveGapLimit())
+      return this.decryptedMnemonic || ''
     } finally {
       this.releaseWalletActivation()
     }
   }
-
-  async activateQuickStartFromDevice(): Promise<{ address: string; profileId: DerivationProfileId } | null> {
-    const metadata = await loadQuickStartMetadata()
-    if (!metadata) return null
-    const mnemonic = await loadQuickStartMnemonic()
-    if (!mnemonic) return null
-    return this.activateQuickStartWallet(mnemonic, metadata.derivationProfileId)
-  }
-
-  private async activeQuickStartIdentityMatches(): Promise<boolean> {
-    const metadata = await loadQuickStartMetadata()
-    const quickStartMnemonic = await loadQuickStartMnemonic()
-    const activeMnemonic = this.getMnemonic()
-    const activeAddress = this.getAddress()
-    return Boolean(
-      metadata && quickStartMnemonic && activeMnemonic && activeAddress
-      && quickStartMnemonic === activeMnemonic
-      && metadata.address === activeAddress
-      && metadata.derivationProfileId === this.activeProfileId
-    )
-  }
-
-  async resolveQuickStartLifecycleAfterActivation(): Promise<{
-    lifecycle: typeof WALLET_LIFECYCLE.BACKUP_VERIFIED | typeof WALLET_LIFECYCLE.QUICK_START_UNBACKED
-    backupVerified: boolean
-    recoveryState: QuickStartRecoveryState
-  }> {
-    return withIdentityMutationLock(async () => {
-      // Read both authorities only after acquiring the same lock used by backup commit.
-      const ciphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
-      const marker = localStorage.getItem(BACKUP_KEY)
-      if (ciphertext && marker === 'true') {
-        return { lifecycle: WALLET_LIFECYCLE.BACKUP_VERIFIED, backupVerified: true, recoveryState: 'BACKUP_VERIFIED' }
-      }
-      if (ciphertext === '' || marker === 'true' || (marker !== null && marker !== 'false')) {
-        throw new Error('QUICK_START_LIFECYCLE_INCONSISTENT')
-      }
-
-      const status = await reconcileStaleQuickStartMarkerUnderLock()
-      if (status !== 'PRESENT' || !(await this.activeQuickStartIdentityMatches().catch(() => false))) {
-        throw new Error('QUICK_START_LIFECYCLE_INCONSISTENT')
-      }
-      if (ciphertext !== null) {
-        return { lifecycle: WALLET_LIFECYCLE.QUICK_START_UNBACKED, backupVerified: false, recoveryState: 'INTERRUPTED_BACKUP' }
-      }
-
-      localStorage.setItem(BACKUP_KEY, 'false')
-      return { lifecycle: WALLET_LIFECYCLE.QUICK_START_UNBACKED, backupVerified: false, recoveryState: 'NORMAL_UNBACKED' }
-    })
-  }
-
-  async hasQuickStartRecord(): Promise<boolean> {
-    const status = await getQuickStartRecordStatus()
-    if (status === 'PRESENT') return true
-    if (status === 'STORAGE_UNAVAILABLE_UNKNOWN') {
-      throw new QuickStartUnavailableError('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
-    }
-    if (status === 'RECOVERY_FAILED') {
-      throw new Error('QUICK_START_RECOVERY_FAILED')
-    }
-    return false
-  }
-
-  async getQuickStartRecordStatus(): Promise<QuickStartRecordStatus> {
-    return getQuickStartRecordStatus()
-  }
-
-  async verifyStoredMnemonic(password: string, expectedMnemonic: string): Promise<boolean> {
-    const stored = typeof window === 'undefined'
-      ? this.encryptedMnemonic
-      : localStorage.getItem(STORAGE_KEY_MNEMONIC)
-    if (!stored) return false
-    try {
-      const { plainText } = await decryptWithPassword(stored, password)
-      return plainText.trim() === expectedMnemonic.trim()
-    } catch {
-      return false
-    }
-  }
-
-  async persistVerifiedBackup(password: string): Promise<void> {
-    return withQuickStartCreationLock(async () => {
-      const mnemonic = this.getMnemonic()
-      if (!mnemonic) {
-        throw new Error('No hay semilla en memoria para cifrar. Vuelve a iniciar el onboarding y el respaldo.')
-      }
-
-      const existingFinalCiphertext = typeof window === 'undefined'
-        ? this.encryptedMnemonic
-        : localStorage.getItem(STORAGE_KEY_MNEMONIC)
-      let reuseExistingFinalCiphertext = false
-      if (existingFinalCiphertext !== null && await reconcileStaleQuickStartMarkerUnderLock() === 'PRESENT') {
-        const identityMatches = await this.activeQuickStartIdentityMatches().catch(() => false)
-        if (!identityMatches) {
-          throw new Error('INTERRUPTED_BACKUP_VERIFICATION_FAILED')
-        }
-        try {
-          const decrypted = await decryptWithPassword(existingFinalCiphertext, password)
-          if (decrypted.plainText.trim() !== mnemonic.trim()) {
-            throw new Error('INTERRUPTED_BACKUP_VERIFICATION_FAILED')
-          }
-        } catch {
-          throw new Error('INTERRUPTED_BACKUP_VERIFICATION_FAILED')
-        }
-        reuseExistingFinalCiphertext = true
-      } else if (this.hasBackedWalletCiphertextOnDevice()) {
-        const matches = await this.verifyStoredMnemonic(password, mnemonic).catch(() => false)
-        if (!matches) {
-          throw new Error('BACKUP_OVERWRITE_PREVENTED')
-        }
-      }
-
-      // Step 1: Inspect authoritative pending identity state BEFORE any modification
-      const auth = inspectPendingIdentityAuthority()
-
-      if (auth.status === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
-        throw new Error('PENDING_IDENTITY_STORAGE_UNAVAILABLE')
-      }
-
-      if (auth.status === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
-        throw new Error('PENDING_IDENTITY_CORRUPT_DURING_BACKUP')
-      }
-
-      let activePendingRecord: PendingIdentityRecord | null = null
-
-      if (
-        auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
-        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
-      ) {
-        const pendingRecord = auth.record
-        const commitment = await computeMnemonicCommitment(mnemonic)
-        if (pendingRecord.commitment !== commitment) {
-          throw new Error('PENDING_IDENTITY_MISMATCH')
-        }
-        if (!this.pendingIdentityOwnerToken || pendingRecord.ownerToken !== this.pendingIdentityOwnerToken) {
-          throw new Error('PENDING_IDENTITY_OWNER_MISMATCH')
-        }
-        const activeAddress = this.getAddress()
-        if (pendingRecord.address && (!activeAddress || pendingRecord.address !== activeAddress)) {
-          throw new Error('PENDING_IDENTITY_MISMATCH')
-        }
-        if (
-          pendingRecord.derivationProfileId &&
-          (!this.activeProfileId || pendingRecord.derivationProfileId !== this.activeProfileId)
-        ) {
-          throw new Error('PENDING_IDENTITY_MISMATCH')
-        }
-
-        const updatedCiphertext = await encryptWithPassword(mnemonic, password)
-        const updatePayload: Parameters<typeof setPendingIdentityRecord>[0] = {
-          version: 1,
-          ownerToken: pendingRecord.ownerToken,
-          commitment: pendingRecord.commitment,
-          address: pendingRecord.address,
-          ciphertext: updatedCiphertext,
-          encryptedMnemonic: updatedCiphertext,
-          state: 'PENDING_BACKUP',
-          createdAt: pendingRecord.createdAt
-        }
-        if (pendingRecord.derivationProfileId) {
-          updatePayload.derivationProfileId = pendingRecord.derivationProfileId
-        }
-        setPendingIdentityRecord(updatePayload)
-
-        const readBack = getPendingIdentityRecord()
-        if (
-          !readBack ||
-          readBack.ownerToken !== pendingRecord.ownerToken ||
-          readBack.commitment !== pendingRecord.commitment ||
-          readBack.address !== pendingRecord.address ||
-          (pendingRecord.derivationProfileId && readBack.derivationProfileId !== pendingRecord.derivationProfileId) ||
-          (readBack.ciphertext !== updatedCiphertext && readBack.encryptedMnemonic !== updatedCiphertext)
-        ) {
-          throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
-        }
-
-        const readBackCipher = readBack.ciphertext || readBack.encryptedMnemonic
-        if (!readBackCipher) {
-          throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
-        }
-        const decrypted = await decryptWithPassword(readBackCipher, password)
-        if (decrypted.plainText.trim() !== mnemonic.trim()) {
-          throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
-        }
-
-        activePendingRecord = pendingRecord
-      } else if (auth.status === PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
-        // Documented legitimate workflows for completing backup when pending reservation is ABSENT_CONFIRMED:
-        // 1. Quick Start progressive backup: unbacked Quick Start identities are stored in Quick Start storage
-        //    (loadQuickStartMnemonic / hasQuickStartRecord) and intentionally do NOT register a pending identity reservation.
-        // 2. Existing backed wallet re-encryption/verification: device already holds verified backed ciphertext matching active mnemonic.
-        //
-        // In contrast, fresh create-backed and import workflows MUST hold an active pending reservation
-        // matching this.pendingIdentityOwnerToken. If missing or absent during those workflows, fail closed.
-        if (this.pendingIdentityOwnerToken !== null) {
-          throw new Error('PENDING_IDENTITY_MISSING')
-        }
-
-        const isQuickStart = await hasQuickStartMnemonicUnderLock()
-        const isExistingBacked = this.hasBackedWalletCiphertextOnDevice()
-
-        if (!isQuickStart && !isExistingBacked) {
-          throw new Error('PENDING_IDENTITY_RESERVATION_REQUIRED')
-        }
-      } else {
-        throw new Error('PENDING_IDENTITY_CORRUPT_DURING_BACKUP')
-      }
-
-      if (await hasQuickStartMnemonicUnderLock()) {
-        const storedMnemonic = await loadQuickStartMnemonic().catch(() => null)
-        if (storedMnemonic && storedMnemonic !== mnemonic) {
-          throw new Error('QUICK_START_WALLET_EXISTS')
-        }
-      }
-      if (!reuseExistingFinalCiphertext) {
-        await this.encryptAndStoreMnemonic(password)
-      }
-      const verified = await this.verifyStoredMnemonic(password, mnemonic)
-      if (!verified) {
-        throw new Error(reuseExistingFinalCiphertext
-          ? 'INTERRUPTED_BACKUP_VERIFICATION_FAILED'
-          : 'QUICK_START_BACKUP_VERIFY_FAILED')
-      }
-      try {
-        localStorage.setItem(BACKUP_KEY, 'true')
-        if (localStorage.getItem(BACKUP_KEY) !== 'true') {
-          throw new Error('BACKUP_VERIFIED_MARKER_PERSIST_FAILED')
-        }
-      } catch {
-        throw new Error('BACKUP_VERIFIED_MARKER_PERSIST_FAILED')
-      }
-      if (reuseExistingFinalCiphertext) this.encryptedMnemonic = existingFinalCiphertext
-      if (activePendingRecord) {
-        deletePendingIdentityRecordVerified()
-        if (inspectPendingIdentityAuthority().status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
-          throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
-        }
-      }
-      this.pendingIdentityOwnerToken = null
-    })
-  }
-
-  async discardQuickStartRecord(): Promise<void> {
-    const currentMnemonic = this.getMnemonic()
-    if (currentMnemonic) {
-      try {
-        const storedMnemonic = await loadQuickStartMnemonic()
-        if (storedMnemonic && storedMnemonic !== currentMnemonic) {
-          return
-        }
-      } catch {
-        // If loading fails due to unavailable storage or corrupt record, proceed
-      }
-    }
-    await clearQuickStartMnemonic()
-  }
-
 
   async detectDerivationProfiles(mnemonic: string): Promise<DerivationDiscovery> {
     if (!mnemonic || mnemonic.trim().split(' ').length < 12) {
@@ -1242,133 +748,58 @@ export class XolosWalletService {
 
   async restoreFromMnemonic(
     mnemonic: string,
-    selectedProfileId?: DerivationProfileId,
-    password?: string
+    selectedProfileId?: DerivationProfileId
   ): Promise<WalletRestoreResult> {
-    return withQuickStartCreationLock(async () => {
-      if (this.hasBackedWalletCiphertextOnDevice()) {
-        throw new Error('BACKED_WALLET_EXISTS')
+    if (!this.tryAcquireWalletActivation()) {
+      throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
+    }
+    try {
+      const normalizedMnemonic = mnemonic.trim()
+      const detection = await this.detectDerivationProfiles(normalizedMnemonic)
+
+      if (detection.kind === 'choice-required' && selectedProfileId === undefined) {
+        return Object.freeze({
+          status: 'choice-required',
+          detection,
+          notice: 'Encontramos actividad en varios engines asociados a esta seed. Elige cuál quieres abrir.'
+        })
       }
-      if (await hasQuickStartMnemonicUnderLock()) {
-        throw new Error('QUICK_START_RECORD_EXISTS')
-      }
-      const auth = inspectPendingIdentityAuthority()
-      if (auth.status === PENDING_IDENTITY_STATE.STORAGE_UNAVAILABLE) {
-        throw new Error('STORAGE_UNAVAILABLE')
-      }
-      if (auth.status === PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
-        throw new Error('CORRUPT_OR_UNKNOWN_PENDING')
+
+      const resolvedProfileId = selectedProfileId ?? detection.selectedProfileId
+      if (!isDerivationProfileId(resolvedProfileId)) {
+        throw new Error('No se pudo resolver un perfil de derivación válido.')
       }
       if (
-        auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
-        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING ||
-        auth.status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED
+        detection.kind === 'choice-required' &&
+        !detection.profiles[resolvedProfileId].hasActivity
       ) {
-        throw new Error('PENDING_IDENTITY_EXISTS')
+        throw new Error('El perfil solicitado no contiene actividad detectada para esta seed.')
       }
-      if (!this.tryAcquireWalletActivation()) {
-        throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
+      if (
+        detection.kind === 'selected' &&
+        detection.selectedProfileId !== resolvedProfileId
+      ) {
+        throw new Error('El perfil solicitado no coincide con la actividad detectada para esta seed.')
       }
-      try {
-        const normalizedMnemonic = mnemonic.trim()
-        const detection = await this.detectDerivationProfiles(normalizedMnemonic)
 
-        if (detection.kind === 'choice-required' && selectedProfileId === undefined) {
-          return Object.freeze({
-            status: 'choice-required',
-            detection,
-            notice: 'Encontramos actividad en varios engines asociados a esta seed. Elige cuál quieres abrir.'
-          })
-        }
+      await this.activateMnemonic(normalizedMnemonic, resolvedProfileId)
+      const notice = resolvedProfileId === ECASH_STANDARD_PROFILE_ID
+        ? detection.reason === 'empty'
+          ? 'No se encontró actividad previa. Se utilizará el perfil compatible con eCash/Cashtab.'
+          : 'Se encontró una wallet compatible con eCash/Cashtab.'
+        : resolvedProfileId === TONALLI_LEGACY_PROFILE_ID
+          ? 'Se encontró una wallet Tonalli con derivación criptográfica histórica.'
+          : 'Se encontró una wallet de la ventana transitoria eCash Standard 899.'
 
-        const resolvedProfileId = selectedProfileId ?? detection.selectedProfileId
-        if (!isDerivationProfileId(resolvedProfileId)) {
-          throw new Error('No se pudo resolver un perfil de derivación válido.')
-        }
-        if (
-          detection.kind === 'choice-required' &&
-          !detection.profiles[resolvedProfileId].hasActivity
-        ) {
-          throw new Error('El perfil solicitado no contiene actividad detectada para esta seed.')
-        }
-        if (
-          detection.kind === 'selected' &&
-          detection.selectedProfileId !== resolvedProfileId
-        ) {
-          throw new Error('El perfil solicitado no coincide con la actividad detectada para esta seed.')
-        }
-
-        let ciphertext: string | undefined
-        if (password) {
-          ciphertext = await encryptWithPassword(normalizedMnemonic, password)
-        }
-
-        await this.activateMnemonic(normalizedMnemonic, resolvedProfileId)
-        const ownerToken = generateOwnerToken()
-        const commitment = await computeMnemonicCommitment(normalizedMnemonic)
-        const candidateAddress = this.getAddress() || ''
-        try {
-          setPendingIdentityRecord({
-            version: 1,
-            ownerToken,
-            commitment,
-            address: candidateAddress,
-            derivationProfileId: resolvedProfileId,
-            ciphertext,
-            encryptedMnemonic: ciphertext,
-            state: ciphertext ? 'PENDING_BACKUP' : undefined,
-            createdAt: Date.now()
-          })
-
-          const readBack = getPendingIdentityRecord()
-          if (
-            !readBack ||
-            readBack.ownerToken !== ownerToken ||
-            readBack.commitment !== commitment ||
-            readBack.address !== candidateAddress
-          ) {
-            throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
-          }
-          if (ciphertext) {
-            if (readBack.ciphertext !== ciphertext && readBack.encryptedMnemonic !== ciphertext) {
-              throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
-            }
-            const decrypted = await decryptWithPassword(
-              readBack.ciphertext || readBack.encryptedMnemonic!,
-              password!
-            )
-            if (decrypted.plainText.trim() !== normalizedMnemonic) {
-              throw new Error('PENDING_IDENTITY_PERSIST_FAILED')
-            }
-          }
-
-          this.pendingIdentityOwnerToken = ownerToken
-        } catch (error) {
-          this.decryptedMnemonic = null
-          this.wallet = null
-          this.isReady = false
-          this.activeAccountState = null
-          this.pendingIdentityOwnerToken = null
-          throw error
-        }
-        const notice = resolvedProfileId === ECASH_STANDARD_PROFILE_ID
-          ? detection.reason === 'empty'
-            ? 'No se encontró actividad previa. Se utilizará el perfil compatible con eCash/Cashtab.'
-            : 'Se encontró una wallet compatible con eCash/Cashtab.'
-          : resolvedProfileId === TONALLI_LEGACY_PROFILE_ID
-            ? 'Se encontró una wallet Tonalli con derivación criptográfica histórica.'
-            : 'Se encontró una wallet de la ventana transitoria eCash Standard 899.'
-
-        return Object.freeze({
-          status: 'restored',
-          detection,
-          selectedProfileId: resolvedProfileId,
-          notice
-        })
-      } finally {
-        this.releaseWalletActivation()
-      }
-    })
+      return Object.freeze({
+        status: 'restored',
+        detection,
+        selectedProfileId: resolvedProfileId,
+        notice
+      })
+    } finally {
+      this.releaseWalletActivation()
+    }
   }
 
   async loadFromStorage(
@@ -1379,62 +810,24 @@ export class XolosWalletService {
       throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
     }
     try {
-      const plainText = await this.decryptCurrentStoredWallet(password)
+      const { plainText, migratedCipherText } = await this.decryptStoredMnemonic(password)
+      this.persistMigratedStoredMnemonic(migratedCipherText)
       return await this.activateDecryptedStoredMnemonic(plainText, selectedProfileId)
     } finally {
       this.releaseWalletActivation()
     }
   }
 
-  private async decryptCurrentStoredWallet(password: string): Promise<string> {
-    const snapshot = typeof window === 'undefined'
-      ? this.encryptedMnemonic
-      : localStorage.getItem(STORAGE_KEY_MNEMONIC)
-    if (!snapshot) {
+  private async decryptStoredMnemonic(password: string): Promise<DecryptPasswordResult> {
+    if (!this.encryptedMnemonic) {
       throw new Error('No existe una semilla cifrada en este dispositivo.')
     }
-    const { plainText, migratedCipherText } = await this.decryptStoredMnemonic(password, snapshot)
-    const current = typeof window === 'undefined'
-      ? this.encryptedMnemonic
-      : localStorage.getItem(STORAGE_KEY_MNEMONIC)
-    if (current !== snapshot) {
-      throw new Error('STORED_WALLET_CHANGED')
-    }
-    if (typeof window === 'undefined') {
-      this.encryptedMnemonic = migratedCipherText ?? snapshot
-    } else if (migratedCipherText) {
-      this.persistMigratedStoredMnemonic(migratedCipherText, snapshot)
-    } else {
-      this.encryptedMnemonic = snapshot
-    }
-    return plainText
+    return decryptWithPassword(this.encryptedMnemonic, password)
   }
 
-  private async decryptStoredMnemonic(password: string, ciphertext = this.encryptedMnemonic): Promise<DecryptPasswordResult> {
-    if (!ciphertext) {
-      throw new Error('No existe una semilla cifrada en este dispositivo.')
-    }
-    return decryptWithPassword(ciphertext, password)
-  }
-
-  private persistMigratedStoredMnemonic(migratedCipherText: string | null, expectedCiphertext: string): void {
+  private persistMigratedStoredMnemonic(migratedCipherText: string | null): void {
     if (!migratedCipherText) return
-    if (typeof window === 'undefined') {
-      if (this.encryptedMnemonic !== expectedCiphertext) throw new Error('STORED_WALLET_CHANGED')
-      this.encryptedMnemonic = migratedCipherText
-      return
-    }
-    if (localStorage.getItem(STORAGE_KEY_MNEMONIC) !== expectedCiphertext) {
-      throw new Error('STORED_WALLET_CHANGED')
-    }
-    try {
-      localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
-      if (localStorage.getItem(STORAGE_KEY_MNEMONIC) !== migratedCipherText) {
-        throw new Error('STORED_WALLET_MIGRATION_PERSIST_FAILED')
-      }
-    } catch {
-      throw new Error('STORED_WALLET_MIGRATION_PERSIST_FAILED')
-    }
+    localStorage.setItem(STORAGE_KEY_MNEMONIC, migratedCipherText)
     this.encryptedMnemonic = migratedCipherText
   }
 
@@ -1484,7 +877,9 @@ export class XolosWalletService {
       throw new Error('WALLET_ACTIVATION_IN_PROGRESS')
     }
     try {
-      this.decryptedMnemonic = await this.decryptCurrentStoredWallet(password)
+      const { plainText, migratedCipherText } = await this.decryptStoredMnemonic(password)
+      this.persistMigratedStoredMnemonic(migratedCipherText)
+      this.decryptedMnemonic = plainText
     } finally {
       this.releaseWalletActivation()
     }
@@ -1498,21 +893,6 @@ export class XolosWalletService {
       return storedCiphertext !== null && storedCiphertext === this.encryptedMnemonic
     } catch {
       return false
-    }
-  }
-
-  hasBackedWalletCiphertextOnDevice(): boolean {
-    try {
-      if (typeof window === 'undefined') {
-        return Boolean(this.encryptedMnemonic)
-      }
-      const storedCiphertext = localStorage.getItem(STORAGE_KEY_MNEMONIC)
-      if (typeof storedCiphertext === 'string' && storedCiphertext.length > 0) {
-        return true
-      }
-      return Boolean(this.encryptedMnemonic)
-    } catch {
-      return true
     }
   }
 
@@ -1579,7 +959,7 @@ export class XolosWalletService {
         }
         expectedStoredCiphertextAfterActivation =
           decrypted.migratedCipherText ?? previousStoredCiphertext
-        this.persistMigratedStoredMnemonic(decrypted.migratedCipherText, previousStoredCiphertext)
+        this.persistMigratedStoredMnemonic(decrypted.migratedCipherText)
         result = await this.activateDecryptedStoredMnemonic(decrypted.plainText)
 
         expectedProfileMetadataAfterActivation =
@@ -1698,8 +1078,6 @@ export class XolosWalletService {
     try {
       localStorage.removeItem(STORAGE_KEY_MNEMONIC)
       localStorage.removeItem(DERIVATION_PROFILE_STORAGE_KEY)
-      clearPendingIdentityRecord()
-      this.pendingIdentityOwnerToken = null
       this.encryptedMnemonic = null
       this.decryptedMnemonic = null
       this.wallet = null
@@ -1715,213 +1093,6 @@ export class XolosWalletService {
     } finally {
       this.releaseWalletActivation()
     }
-  }
-
-  hasPendingIdentityRecord(): boolean {
-    const auth = inspectPendingIdentityAuthority()
-    if (auth.status === PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) return false
-    if (
-      this.pendingIdentityOwnerToken &&
-      (auth.status === PENDING_IDENTITY_STATE.RECOVERABLE_PENDING ||
-        auth.status === PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING) &&
-      auth.record.ownerToken === this.pendingIdentityOwnerToken
-    ) {
-      return false
-    }
-    return true
-  }
-
-  getPendingIdentityState(): PendingIdentityState {
-    return inspectPendingIdentityAuthority().status
-  }
-
-  hasRecoverablePendingIdentity(): boolean {
-    const auth = inspectPendingIdentityAuthority()
-    if (auth.status !== PENDING_IDENTITY_STATE.RECOVERABLE_PENDING) return false
-    return Boolean(
-      !this.hasBackedWalletCiphertextOnDevice() &&
-      (!this.isReady || !this.pendingIdentityOwnerToken || auth.record.ownerToken !== this.pendingIdentityOwnerToken)
-    )
-  }
-
-  async resumePendingIdentity(password: string): Promise<{ address: string; mnemonic: string; reconciled: boolean }> {
-    return withIdentityMutationLock(async () => {
-      const auth = inspectPendingIdentityAuthority()
-      if (auth.status === PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
-        throw new Error('NO_PENDING_IDENTITY')
-      }
-      if (auth.status !== PENDING_IDENTITY_STATE.RECOVERABLE_PENDING) {
-        throw new Error('PENDING_IDENTITY_NOT_RECOVERABLE')
-      }
-      const pending = auth.record
-      const ciphertext = pending.ciphertext || pending.encryptedMnemonic
-      const profileId = pending.derivationProfileId
-      if (!ciphertext || !profileId) {
-        throw new Error('PENDING_IDENTITY_NOT_RECOVERABLE')
-      }
-
-      let decryptedPlainText = ''
-      try {
-        const decrypted = await decryptWithPassword(ciphertext, password)
-        decryptedPlainText = decrypted.plainText.trim()
-      } catch {
-        // PIN incorrecto: no alterar pending record, no generar nueva identity, no limpiar reservation
-        throw new Error('INVALID_PIN')
-      }
-
-      const mnemonic = decryptedPlainText
-      const commitment = await computeMnemonicCommitment(mnemonic)
-      if (commitment !== pending.commitment) {
-        throw new Error('PENDING_IDENTITY_COMMITMENT_MISMATCH')
-      }
-
-      await this.activateMnemonicLocalIdentity(mnemonic, profileId)
-      const derivedAddress = this.getAddress() || ''
-      if (derivedAddress !== pending.address) {
-        this.decryptedMnemonic = null
-        this.wallet = null
-        this.isReady = false
-        this.activeAccountState = null
-        this.pendingIdentityOwnerToken = null
-        throw new Error('PENDING_IDENTITY_ADDRESS_MISMATCH')
-      }
-
-      let reconciled = false
-      if (this.hasBackedWalletCiphertextOnDevice()) {
-        const matches = await this.verifyStoredMnemonic(password, mnemonic).catch(() => false)
-        if (!matches) {
-          this.decryptedMnemonic = null
-          this.wallet = null
-          this.isReady = false
-          this.activeAccountState = null
-          this.pendingIdentityOwnerToken = null
-          throw new Error('PENDING_IDENTITY_RECONCILIATION_MISMATCH')
-        }
-        deletePendingIdentityRecordVerified()
-        if (inspectPendingIdentityAuthority().status !== PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
-          throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
-        }
-        try {
-          localStorage.setItem('xoloswallet_backup_verified', 'true')
-        } catch {
-          // The exact final ciphertext remains authoritative even if the convenience marker cannot be refreshed.
-        }
-        reconciled = true
-      }
-
-      this.pendingIdentityOwnerToken = reconciled ? null : pending.ownerToken
-
-      try {
-        await (this.wallet as MinimalXecWallet).initialize()
-      } catch {
-        // Network hydration is best-effort. The locally authenticated identity remains usable for backup.
-      }
-
-      return { address: derivedAddress, mnemonic, reconciled }
-    })
-  }
-
-  private async abandonPendingIdentityWithExpectedState(expectedState: PendingIdentityState): Promise<void> {
-    const auth = inspectPendingIdentityAuthority()
-    if (auth.status === PENDING_IDENTITY_STATE.ABSENT_CONFIRMED) {
-      throw new Error('NO_PENDING_IDENTITY')
-    }
-    if (auth.status !== expectedState) {
-      throw new Error('PENDING_IDENTITY_STATE_CHANGED')
-    }
-    const pending = (auth as { record: PendingIdentityRecord }).record
-    if (this.pendingIdentityOwnerToken === pending.ownerToken) {
-      throw new Error('PENDING_IDENTITY_SESSION_ACTIVE')
-    }
-    if (this.hasBackedWalletCiphertextOnDevice()) {
-      throw new Error('BACKED_WALLET_EXISTS')
-    }
-
-    const quickStartStatus = await reconcileStaleQuickStartMarkerUnderLock()
-    if (quickStartStatus === 'PRESENT') {
-      throw new Error('QUICK_START_RECORD_EXISTS')
-    }
-    if (quickStartStatus === 'STORAGE_UNAVAILABLE_UNKNOWN') {
-      throw new Error('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
-    }
-    if (quickStartStatus === 'RECOVERY_FAILED') {
-      throw new Error('QUICK_START_RECOVERY_FAILED')
-    }
-
-    deletePendingIdentityRecordVerified()
-    this.pendingIdentityOwnerToken = null
-  }
-
-  async abandonCorruptPendingIdentity(): Promise<void> {
-    return withIdentityMutationLock(async () => {
-      if (typeof localStorage === 'undefined') {
-        throw new Error('PENDING_IDENTITY_STORAGE_UNAVAILABLE')
-      }
-      let raw: string | null
-      try {
-        raw = localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY)
-      } catch {
-        throw new Error('PENDING_IDENTITY_STORAGE_UNAVAILABLE')
-      }
-      if (raw === null) {
-        throw new Error('NO_PENDING_IDENTITY')
-      }
-
-      const auth = inspectPendingIdentityAuthority()
-      if (auth.status !== PENDING_IDENTITY_STATE.CORRUPT_OR_UNKNOWN_PENDING) {
-        throw new Error('PENDING_IDENTITY_STATE_CHANGED')
-      }
-
-      if (this.hasBackedWalletCiphertextOnDevice()) {
-        throw new Error('BACKED_WALLET_EXISTS')
-      }
-
-      const quickStartStatus = await reconcileStaleQuickStartMarkerUnderLock()
-      if (quickStartStatus === 'PRESENT') {
-        throw new Error('QUICK_START_RECORD_EXISTS')
-      }
-      if (quickStartStatus === 'STORAGE_UNAVAILABLE_UNKNOWN') {
-        throw new Error('QUICK_START_STORAGE_UNAVAILABLE_UNKNOWN')
-      }
-      if (quickStartStatus === 'RECOVERY_FAILED') {
-        throw new Error('QUICK_START_RECOVERY_FAILED')
-      }
-
-      deletePendingIdentityRecordVerified()
-      if (localStorage.getItem(PENDING_IDENTITY_STORAGE_KEY) !== null) {
-        throw new Error('PENDING_IDENTITY_ABANDON_FAILED')
-      }
-      this.pendingIdentityOwnerToken = null
-    })
-  }
-
-  async abandonLegacyPendingIdentity(): Promise<void> {
-    return withIdentityMutationLock(async () => {
-      await this.abandonPendingIdentityWithExpectedState(
-        PENDING_IDENTITY_STATE.LEGACY_UNRECOVERABLE_PENDING
-      )
-    })
-  }
-
-  async abandonPendingIdentity(): Promise<void> {
-    return withIdentityMutationLock(async () => {
-      await this.abandonPendingIdentityWithExpectedState(
-        PENDING_IDENTITY_STATE.RECOVERABLE_PENDING
-      )
-    })
-  }
-
-  reconcilePendingIdentity(): void {
-    // Reconciliation requires the user's PIN and exact mnemonic equivalence proof.
-    // It is performed by resumePendingIdentity(); generic ciphertext existence is insufficient.
-  }
-
-  getPendingIdentityOwnerToken(): string | null {
-    return this.pendingIdentityOwnerToken
-  }
-
-  setPendingIdentityOwnerToken(token: string | null): void {
-    this.pendingIdentityOwnerToken = token
   }
 
   private getEffectiveGapLimit(): number {

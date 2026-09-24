@@ -3,10 +3,7 @@ import { Link } from 'react-router-dom'
 import { Html5Qrcode } from 'html5-qrcode'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
-import { CapabilityBlocked } from '../components/RequireCapability'
 import ApproveSessionModal, { type ProposalLike } from '../components/walletconnect/ApproveSessionModal'
-import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
-import { assertWalletCapabilityEnabled, isWalletCapabilityEnabled } from '../domain/walletCapabilityGuard'
 import { wcWallet } from '../lib/walletconnect/WcWallet'
 import {
   canPairWalletConnectUri,
@@ -19,9 +16,7 @@ import {
 type Tab = 'scan' | 'paste'
 
 function WalletConnect() {
-  const wallet = useWallet()
-  const { address } = wallet
-  const walletConnectAllowed = isWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.WALLETCONNECT)
+  const { address } = useWallet()
   const [tab, setTab] = useState<Tab>('scan')
   const [uri, setUri] = useState<string>('')
   const [wcReady, setWcReady] = useState(false)
@@ -87,10 +82,6 @@ function WalletConnect() {
   }, [])
 
   useEffect(() => {
-    if (!walletConnectAllowed) {
-      setWcReady(false)
-      return
-    }
     if (!projectId) {
       setError('Falta WalletConnect Project ID (VITE_WALLETCONNECT_PROJECT_ID o VITE_WC_PROJECT_ID).')
       return
@@ -106,10 +97,10 @@ function WalletConnect() {
       .catch((err) => {
         setError((err as Error).message || 'No se pudo iniciar WalletConnect.')
       })
-  }, [projectId, walletConnectAllowed])
+  }, [projectId])
 
   useEffect(() => {
-    if (!walletConnectAllowed || tab !== 'scan') return
+    if (tab !== 'scan') return
 
     const qr = new Html5Qrcode('wc-qr-reader')
     scannerRef.current = qr
@@ -158,7 +149,7 @@ function WalletConnect() {
         }
       })()
     }
-  }, [tab, walletConnectAllowed])
+  }, [tab])
 
   const refreshSessions = useCallback(() => {
     const sessions = wcWallet.getActiveSessions()
@@ -231,12 +222,6 @@ function WalletConnect() {
     setError(null)
     setStatus('idle')
     setSuccess(null)
-    try {
-      assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.WALLETCONNECT)
-    } catch (err) {
-      setError((err as Error).message || 'WalletConnect no está disponible hasta el respaldo.')
-      return
-    }
 
     const cleaned = sanitizeWcUri(effectiveUri)
     if (cleaned !== effectiveUri) {
@@ -333,10 +318,6 @@ function WalletConnect() {
     } catch (err) {
       setError((err as Error).message || 'No se pudo rechazar el vínculo.')
     }
-  }
-
-  if (!walletConnectAllowed) {
-    return <CapabilityBlocked title="Protege tu Tonalli para conectar dApps" />
   }
 
   return (

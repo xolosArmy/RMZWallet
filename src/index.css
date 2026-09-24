@@ -336,18 +336,6 @@ textarea:focus-visible {
   font-weight: 700;
 }
 
-.onboarding-hero-actions {
-  display: grid;
-  gap: 12px;
-  max-width: 420px;
-}
-
-.onboarding-primary-cta,
-.onboarding-secondary-cta {
-  width: 100%;
-  justify-content: center;
-}
-
 .onboarding-action-list {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -385,11 +373,6 @@ textarea:focus-visible {
 .onboarding-action-card .cta {
   width: 100%;
   margin-top: 4px;
-}
-
-.welcome-xec-card,
-.backup-progress-banner {
-  margin-bottom: 16px;
 }
 
 .security-note {

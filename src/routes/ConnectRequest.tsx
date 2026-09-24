@@ -2,8 +2,6 @@ import { useEffect, useMemo, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
-import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
-import { assertWalletCapabilityEnabled } from '../domain/walletCapabilityGuard'
 import { xolosWalletService } from '../services/XolosWalletService'
 import { storePendingConnectRequest } from '../utils/tonalliConnect'
 
@@ -21,8 +19,7 @@ function ConnectRequest() {
   const location = useLocation()
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
-  const wallet = useWallet()
-  const { initialized, backupVerified } = wallet
+  const { initialized, backupVerified } = useWallet()
   const [actionError, setActionError] = useState<string | null>(null)
 
   const isSignMessageRoute = location.pathname === '/connect/sign-message'
@@ -123,7 +120,6 @@ function ConnectRequest() {
     setActionError(null)
 
     try {
-      assertWalletCapabilityEnabled(wallet, WALLET_CAPABILITY.EXTERNAL_SIGNING)
       if (isSignMessageRoute) {
         if (!walletAddress || !walletPubkey) {
           throw new Error('WALLET_LOCKED')

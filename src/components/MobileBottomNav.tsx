@@ -1,8 +1,6 @@
 import type { ReactElement } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { useWallet } from '../context/useWallet'
-import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
-import { isWalletNavigationActive, walletNavigationItemsForCapabilities } from './walletNavigation'
+import { isWalletNavigationActive, walletNavigationItems } from './walletNavigation'
 import type { WalletNavigationItemId } from './walletNavigation'
 
 type NavIconMap = Record<WalletNavigationItemId, ReactElement>
@@ -47,12 +45,10 @@ const navIcons: NavIconMap = {
 
 function MobileBottomNav() {
   const { pathname } = useLocation()
-  const { hasCapability } = useWallet()
-  const items = walletNavigationItemsForCapabilities(hasCapability?.(WALLET_CAPABILITY.SEND_XEC) ?? true)
 
   return (
     <nav className="mobile-bottom-nav" aria-label="Navegación principal">
-      {items.map((item) => {
+      {walletNavigationItems.map((item) => {
         const active = isWalletNavigationActive(item.id, pathname)
         return (
           <Link

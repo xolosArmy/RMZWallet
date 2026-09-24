@@ -88,15 +88,8 @@ describe('dual derivation discovery security boundary', () => {
 
     expect(buildBoundary).toContain('MINIMAL_WALLET_UTILITY_MNEMONIC')
     expect(buildBoundary).not.toContain('new MinimalXECWalletResolved(mnemonic')
-    expect(activationBoundary).toContain('activateMnemonicLocalIdentity')
-    expect(activationBoundary.indexOf('activateMnemonicLocalIdentity'))
-      .toBeLessThan(activationBoundary.indexOf('void wallet.initialize()'))
-    const localIdentity = service.slice(
-      service.indexOf('private async activateMnemonicLocalIdentity('),
-      service.indexOf('async createQuickStartWallet(')
-    )
-    expect(localIdentity).toContain('this.bindMinimalWalletToCanonicalProfile(mnemonic)')
-    expect(localIdentity).not.toContain('wallet.initialize()')
+    expect(activationBoundary.indexOf('this.bindMinimalWalletToCanonicalProfile(mnemonic)'))
+      .toBeLessThan(activationBoundary.indexOf('await wallet.initialize()'))
   })
 
   test('missing stored metadata is detected read-only before profile persistence', () => {

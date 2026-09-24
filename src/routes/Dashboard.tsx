@@ -3,10 +3,6 @@ import { Link, useNavigate } from 'react-router-dom'
 import type { WsMsgClient } from 'chronik-client'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
-import WelcomeXecCard from '../components/WelcomeXecCard'
-import ProgressiveBackupBanner from '../components/ProgressiveBackupBanner'
-import { WALLET_CAPABILITY } from '../domain/walletCapabilities'
-import { WALLET_LIFECYCLE } from '../domain/walletLifecycle'
 import { getChronik } from '../services/ChronikClient'
 import { mapChronikTxToRecord } from '../utils/txHistory'
 import type { TxRecord } from '../types/tx'
@@ -28,9 +24,7 @@ const ENABLE_CHRONIK_WS = (() => {
 
 function Dashboard() {
   const navigate = useNavigate()
-  const { address, balance, initialized, refreshBalances, rescanWallet, loading, error, lifecycle, hasCapability } = useWallet()
-  const canSend = hasCapability?.(WALLET_CAPABILITY.SEND_XEC) ?? true
-  const isQuickStart = lifecycle === WALLET_LIFECYCLE.QUICK_START_UNBACKED
+  const { address, balance, initialized, refreshBalances, rescanWallet, loading, error } = useWallet()
   const [txHistory, setTxHistory] = useState<TxRecord[]>([])
   const [txHistoryLoading, setTxHistoryLoading] = useState(false)
   const [txHistoryError, setTxHistoryError] = useState<string | null>(null)
@@ -340,34 +334,23 @@ function Dashboard() {
       <header className="section-header">
         <div>
           <p className="eyebrow">Panel principal</p>
-          <h1 className="section-title">
-            {isQuickStart ? 'Tu Tonalli ya está lista' : 'Tu patrimonio digital, bajo tus llaves'}
-          </h1>
+          <h1 className="section-title">Tu patrimonio digital, bajo tus llaves</h1>
           <p className="muted">
-            {isQuickStart
-              ? 'Consulta tu saldo, recibe XEC y explora con calma. El envío y las funciones avanzadas se activan cuando protejas tu wallet.'
-              : 'Consulta XEC, eToken Xolos RMZ, NFTs, actividad y herramientas on-chain desde una sola interfaz no custodial.'}
+            Consulta XEC, eToken Xolos RMZ, NFTs, actividad y herramientas on-chain desde una sola interfaz no custodial.
           </p>
         </div>
         <div className="quick-actions" aria-label="Acciones rápidas">
-          {canSend && (
-            <Link className="cta primary" to="/send-menu">
-              Enviar
-            </Link>
-          )}
-          <Link className={canSend ? 'cta outline' : 'cta primary'} to="/receive">
+          <Link className="cta primary" to="/send-menu">
+            Enviar
+          </Link>
+          <Link className="cta outline" to="/receive">
             Recibir
           </Link>
-          {canSend && (
-            <Link className="cta outline" to="/scan">
-              Escanear
-            </Link>
-          )}
+          <Link className="cta outline" to="/scan">
+            Escanear
+          </Link>
         </div>
       </header>
-
-      <ProgressiveBackupBanner />
-      <WelcomeXecCard />
 
       <div className="grid">
         <div className="card">
@@ -387,16 +370,12 @@ function Dashboard() {
           </div>
         </div>
         <div className="card">
-          <p className="muted">{isQuickStart ? 'XEC' : 'XEC libre para comisiones'}</p>
+          <p className="muted">XEC libre para comisiones</p>
           <h3 className="metric-value" style={{ marginTop: 4 }}>{balance ? `${balance.xecFormatted} XEC` : 'Cargando...'}</h3>
-          {!isQuickStart && (
-            <>
-              <p className="muted">({balance ? `${balance.xec.toString()} sats spendable` : 'sats...'})</p>
-              <p className="muted">
-                Sats asociados a token UTXOs: {balance ? `${balance.tokenUtxoSats.toString()} sats (${balance.tokenUtxoXecFormatted} XEC)` : 'cargando...'}
-              </p>
-            </>
-          )}
+          <p className="muted">({balance ? `${balance.xec.toString()} sats spendable` : 'sats...'})</p>
+          <p className="muted">
+            Sats asociados a token UTXOs: {balance ? `${balance.tokenUtxoSats.toString()} sats (${balance.tokenUtxoXecFormatted} XEC)` : 'cargando...'}
+          </p>
         </div>
       </div>
 
@@ -414,12 +393,10 @@ function Dashboard() {
               {balance ? `${balance.firmaFormatted} FIRMA` : 'Cargando...'}
             </p>
           </div>
-          {canSend && (
-            <div className="actions compatible-asset__actions">
-              <Link className="cta outline small" to="/send-firma">Enviar</Link>
-              <Link className="cta outline small" to="/dex?mode=firma">Mercado</Link>
-            </div>
-          )}
+          <div className="actions compatible-asset__actions">
+            <Link className="cta outline small" to="/send-firma">Enviar</Link>
+            <Link className="cta outline small" to="/dex?mode=firma">Mercado</Link>
+          </div>
         </div>
       </section>
 
