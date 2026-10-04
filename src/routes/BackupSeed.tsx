@@ -5,9 +5,10 @@ import SensitiveSeedPhrase from '../components/SensitiveSeedPhrase'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
 import { validateLocalPassword } from './onboardingValidation'
-import { takePendingBackupPassword } from '../services/backupSession'
+import { clearPendingBackupSession, readPendingBackupSession } from '../services/backupSession'
 
 interface BackupState {
+  backupSessionId?: string
   restoreNotice?: string
 }
 
@@ -16,19 +17,24 @@ function BackupSeed() {
   const { state } = useLocation() as { state?: BackupState }
   const { encryptAndStore, setBackupVerified, getMnemonic } = useWallet()
   const [answers, setAnswers] = useState({ w3: '', w7: '', w11: '' })
-  const [password, setPassword] = useState(() => takePendingBackupPassword() ?? '')
+  const [handoffPassword] = useState(() => readPendingBackupSession(state?.backupSessionId))
+  const [password, setPassword] = useState(() => handoffPassword ?? '')
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
 
-  const mnemonic = getMnemonic()
+  const hasBackupHandoff = handoffPassword !== null
+  const mnemonic = hasBackupHandoff ? getMnemonic() : null
   const words = useMemo(() => (mnemonic ? mnemonic.split(' ') : []), [mnemonic])
 
   useEffect(() => {
-    if (!mnemonic) {
-      navigate('/onboarding', { replace: true })
+    if (hasBackupHandoff && state?.backupSessionId) {
+      clearPendingBackupSession(state.backupSessionId)
     }
-  }, [mnemonic, navigate])
+    if (!hasBackupHandoff || !mnemonic) {
+      navigate('/onboarding', { replace: true, state: null })
+    }
+  }, [hasBackupHandoff, mnemonic, navigate, state?.backupSessionId])
 
   const checkAnswers = async (e: FormEvent) => {
     e.preventDefault()
