@@ -11,11 +11,14 @@ describe('wallet secret history regression', () => {
     expect(source).not.toMatch(/state:\s*\{[^}]*mnemonic/s)
     expect(source).not.toMatch(/state:\s*\{[^}]*password/s)
     expect(source).not.toContain("navigate('/backup', { state: { password")
+    expect(source).toContain('createPendingBackupSession')
+    expect(source).toContain('backupSessionId')
   })
 
   test('backup reads mnemonic from the active wallet and clears the history entry on completion', () => {
     const source = readSource('./BackupSeed.tsx')
-    expect(source).toContain('const mnemonic = getMnemonic()')
+    expect(source).toContain('const hasBackupHandoff = handoffPassword !== null')
+    expect(source).toContain('const mnemonic = hasBackupHandoff ? getMnemonic() : null')
     expect(source).not.toContain('backupState?.mnemonic')
     expect(source).not.toContain('backupState?.password')
     expect(source).toContain("navigate('/', { replace: true, state: null })")
