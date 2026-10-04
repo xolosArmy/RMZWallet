@@ -4,15 +4,16 @@ import TopBar from '../components/TopBar'
 import { useWallet } from '../context/useWallet'
 import { xolosWalletService } from '../services/XolosWalletService'
 import { storePendingConnectRequest } from '../utils/tonalliConnect'
+import { parseTonalliConnectCallback } from '../utils/tonalliConnectCallback'
 
 const MAX_TS_SKEW_SEC = 300
 
 const CONNECT_REQUEST_NOW_SEC = Math.floor(Date.now() / 1000)
 
-const redirectHash = (returnUrl: string, params: Record<string, string>) => {
-  const url = new URL(returnUrl)
+const redirectHash = (returnUrl: string, expectedOrigin: string, params: Record<string, string>) => {
+  const url = parseTonalliConnectCallback(returnUrl, expectedOrigin, import.meta.env.DEV)
   url.hash = new URLSearchParams(params).toString()
-  window.location.href = url.toString()
+  window.location.assign(url.toString())
 }
 
 function ConnectRequest() {
@@ -45,12 +46,9 @@ function ConnectRequest() {
     }
 
     try {
-      const parsedReturnUrl = new URL(returnUrl)
-      if (parsedReturnUrl.origin !== origin) {
-        return 'Invalid Tonalli Connect signing request.'
-      }
+      parseTonalliConnectCallback(returnUrl, origin, import.meta.env.DEV)
     } catch {
-      return 'Missing return URL.'
+      return 'Invalid Tonalli Connect signing request.'
     }
 
     if (!challengeId || message.length === 0) {
@@ -72,12 +70,9 @@ function ConnectRequest() {
       return 'Solicitud inválida: timestamp fuera de tiempo.'
     }
     try {
-      const parsedUrl = new URL(returnUrl)
-      if (parsedUrl.origin !== origin) {
-        return 'Solicitud inválida: origin no coincide con returnUrl.'
-      }
+      parseTonalliConnectCallback(returnUrl, origin, import.meta.env.DEV)
     } catch {
-      return 'Solicitud inválida: returnUrl no válido.'
+      return 'Solicitud inválida: returnUrl no válido o no permitido.'
     }
     return null
   })()
@@ -99,7 +94,7 @@ function ConnectRequest() {
     if (validationError) return
 
     if (isSignMessageRoute) {
-      redirectHash(returnUrl, {
+      redirectHash(returnUrl, origin, {
         status: 'error',
         reason: 'USER_CANCELLED',
         challengeId
@@ -107,7 +102,7 @@ function ConnectRequest() {
       return
     }
 
-    redirectHash(returnUrl, {
+    redirectHash(returnUrl, origin, {
       status: 'error',
       requestId,
       code: 'USER_REJECTED',
@@ -129,7 +124,7 @@ function ConnectRequest() {
         // The Gateway verifies the signature, public key, address, nonce/challengeId, and expiration.
         // Tonalli never exposes private keys during this flow.
         const signature = await xolosWalletService.signMessage(message)
-        redirectHash(returnUrl, {
+        redirectHash(returnUrl, origin, {
           status: 'ok',
           wallet: 'tonalli',
           chain: 'ecash',
@@ -160,7 +155,7 @@ function ConnectRequest() {
       ].join('\n')
 
       const signature = await xolosWalletService.signMessage(challenge)
-      redirectHash(returnUrl, {
+      redirectHash(returnUrl, origin, {
         status: 'ok',
         wallet: 'tonalli',
         chain: 'ecash',
@@ -176,7 +171,7 @@ function ConnectRequest() {
       const errorMessage = (err as Error).message
       if (errorMessage === 'WALLET_LOCKED') {
         if (isSignMessageRoute) {
-          redirectHash(returnUrl, {
+          redirectHash(returnUrl, origin, {
             status: 'error',
             reason: 'WALLET_LOCKED',
             challengeId
@@ -191,7 +186,7 @@ function ConnectRequest() {
         if (import.meta.env.DEV) {
           console.error('[Tonalli Connect sign-message] signing failed', err)
         }
-        redirectHash(returnUrl, {
+        redirectHash(returnUrl, origin, {
           status: 'error',
           reason: 'SIGNING_FAILED',
           challengeId
