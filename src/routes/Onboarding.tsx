@@ -11,6 +11,7 @@ import {
 } from '../services/derivationProfiles'
 import type { DerivationProfileId } from '../services/derivationProfiles'
 import type { DerivationDiscovery } from '../services/dualDerivationDiscovery'
+import { setPendingBackupPassword } from '../services/backupSession'
 
 const formatSatsAsXec = (sats: bigint) =>
   `${sats / 100n}.${(sats % 100n).toString().padStart(2, '0')}`
@@ -170,8 +171,9 @@ export function CreateWallet() {
     }
 
     try {
-      const mnemonic = await createNewWallet()
-      navigate('/backup', { state: { password: passwordNew, mnemonic } })
+      await createNewWallet()
+      setPendingBackupPassword(passwordNew)
+      navigate('/backup', { replace: true })
     } catch (err) {
       setLocalError((err as Error).message)
     }
@@ -220,11 +222,11 @@ export function UnlockWallet() {
       navigate('/')
       return
     }
-    const mnemonic = getMnemonic()
-    if (!mnemonic) {
+    if (!getMnemonic()) {
       throw new Error('No se pudo recuperar la seed para el respaldo.')
     }
-    navigate('/backup', { state: { password: passwordExisting, mnemonic } })
+    setPendingBackupPassword(passwordExisting)
+    navigate('/backup', { replace: true })
   }
 
   const continueWithProfile = async (profileId: DerivationProfileId) => {
@@ -313,12 +315,10 @@ export function ImportWallet() {
       if (result.status !== 'restored') {
         throw new Error('No se pudo fijar el perfil de derivación elegido.')
       }
+      setPendingBackupPassword(passwordImport)
       navigate('/backup', {
-        state: {
-          password: passwordImport,
-          mnemonic: phrase,
-          restoreNotice: result.notice
-        }
+        replace: true,
+        state: { restoreNotice: result.notice }
       })
     } catch (err) {
       setLocalError((err as Error).message)
@@ -347,12 +347,10 @@ export function ImportWallet() {
         setProfileChoice(result.detection)
         return
       }
+      setPendingBackupPassword(passwordImport)
       navigate('/backup', {
-        state: {
-          password: passwordImport,
-          mnemonic: phrase,
-          restoreNotice: result.notice
-        }
+        replace: true,
+        state: { restoreNotice: result.notice }
       })
     } catch (err) {
       setLocalError((err as Error).message)
