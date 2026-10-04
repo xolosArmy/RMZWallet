@@ -11,7 +11,7 @@ import {
 } from '../services/derivationProfiles'
 import type { DerivationProfileId } from '../services/derivationProfiles'
 import type { DerivationDiscovery } from '../services/dualDerivationDiscovery'
-import { setPendingBackupPassword } from '../services/backupSession'
+import { createPendingBackupSession } from '../services/backupSession'
 
 const formatSatsAsXec = (sats: bigint) =>
   `${sats / 100n}.${(sats % 100n).toString().padStart(2, '0')}`
@@ -172,8 +172,8 @@ export function CreateWallet() {
 
     try {
       await createNewWallet()
-      setPendingBackupPassword(passwordNew)
-      navigate('/backup', { replace: true })
+      const backupSessionId = createPendingBackupSession(passwordNew)
+      navigate('/backup', { replace: true, state: { backupSessionId } })
     } catch (err) {
       setLocalError((err as Error).message)
     }
@@ -225,8 +225,8 @@ export function UnlockWallet() {
     if (!getMnemonic()) {
       throw new Error('No se pudo recuperar la seed para el respaldo.')
     }
-    setPendingBackupPassword(passwordExisting)
-    navigate('/backup', { replace: true })
+    const backupSessionId = createPendingBackupSession(passwordExisting)
+    navigate('/backup', { replace: true, state: { backupSessionId } })
   }
 
   const continueWithProfile = async (profileId: DerivationProfileId) => {
@@ -315,10 +315,10 @@ export function ImportWallet() {
       if (result.status !== 'restored') {
         throw new Error('No se pudo fijar el perfil de derivación elegido.')
       }
-      setPendingBackupPassword(passwordImport)
+      const backupSessionId = createPendingBackupSession(passwordImport)
       navigate('/backup', {
         replace: true,
-        state: { restoreNotice: result.notice }
+        state: { backupSessionId, restoreNotice: result.notice }
       })
     } catch (err) {
       setLocalError((err as Error).message)
@@ -347,10 +347,10 @@ export function ImportWallet() {
         setProfileChoice(result.detection)
         return
       }
-      setPendingBackupPassword(passwordImport)
+      const backupSessionId = createPendingBackupSession(passwordImport)
       navigate('/backup', {
         replace: true,
-        state: { restoreNotice: result.notice }
+        state: { backupSessionId, restoreNotice: result.notice }
       })
     } catch (err) {
       setLocalError((err as Error).message)
