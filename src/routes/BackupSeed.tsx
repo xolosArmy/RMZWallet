@@ -4,30 +4,31 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import SensitiveSeedPhrase from '../components/SensitiveSeedPhrase'
 import { useWallet } from '../context/useWallet'
 import TopBar from '../components/TopBar'
+import { validateLocalPassword } from './onboardingValidation'
+import { takePendingBackupPassword } from '../services/backupSession'
 
 interface BackupState {
-  password: string
-  mnemonic: string
   restoreNotice?: string
 }
 
 function BackupSeed() {
   const navigate = useNavigate()
   const { state } = useLocation() as { state?: BackupState }
-  const { encryptAndStore, setBackupVerified } = useWallet()
+  const { encryptAndStore, setBackupVerified, getMnemonic } = useWallet()
   const [answers, setAnswers] = useState({ w3: '', w7: '', w11: '' })
+  const [password, setPassword] = useState(() => takePendingBackupPassword() ?? '')
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
 
-  const backupState = state
-  const words = useMemo(() => (backupState?.mnemonic ? backupState.mnemonic.split(' ') : []), [backupState])
+  const mnemonic = getMnemonic()
+  const words = useMemo(() => (mnemonic ? mnemonic.split(' ') : []), [mnemonic])
 
   useEffect(() => {
-    if (!backupState?.mnemonic || !backupState?.password) {
-      navigate('/onboarding')
+    if (!mnemonic) {
+      navigate('/onboarding', { replace: true })
     }
-  }, [backupState, navigate])
+  }, [mnemonic, navigate])
 
   const checkAnswers = async (e: FormEvent) => {
     e.preventDefault()
@@ -44,17 +45,18 @@ function BackupSeed() {
       return
     }
 
-    if (!backupState?.password) {
-      setError('Falta el password de cifrado. Regresa al onboarding.')
+    const passwordError = validateLocalPassword(password, 'Usa al menos 6 caracteres para el password/PIN local.')
+    if (passwordError) {
+      setError(passwordError)
       return
     }
 
     try {
       setSaving(true)
-      await encryptAndStore(backupState.password)
+      await encryptAndStore(password)
       setBackupVerified?.(true)
       setSuccess('Seed respaldada. Puedes usar la billetera.')
-      navigate('/')
+      navigate('/', { replace: true, state: null })
     } catch {
       setError('No pudimos cifrar la seed para guardarla en este dispositivo.')
     } finally {
@@ -62,7 +64,7 @@ function BackupSeed() {
     }
   }
 
-  if (!backupState?.mnemonic || !backupState?.password) {
+  if (!mnemonic) {
     return null
   }
 
@@ -78,11 +80,11 @@ function BackupSeed() {
       </header>
 
       <div className="card">
-        {backupState.restoreNotice && <p className="success">{backupState.restoreNotice}</p>}
+        {state?.restoreNotice && <p className="success">{state.restoreNotice}</p>}
         <p className="muted">
           Escribe estas 12 palabras en orden. La seed solo vive en tu memoria y se cifra con tu password local.
         </p>
-        <SensitiveSeedPhrase key={backupState.mnemonic} mnemonic={backupState.mnemonic} />
+        <SensitiveSeedPhrase key={mnemonic} mnemonic={mnemonic} />
       </div>
 
       <form className="card" onSubmit={checkAnswers}>
@@ -105,6 +107,15 @@ function BackupSeed() {
           id="w11"
           value={answers.w11}
           onChange={(e) => setAnswers((prev) => ({ ...prev, w11: e.target.value }))}
+        />
+        <label htmlFor="backup-password">Password/PIN local</label>
+        <input
+          id="backup-password"
+          type="password"
+          autoComplete="new-password"
+          placeholder="Mínimo 6 caracteres"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
         />
         <div className="actions">
           <button className="cta" type="submit" disabled={saving}>
