@@ -526,14 +526,15 @@ function Nfts() {
                     )
                   })()}
                   <div className="actions" style={{ marginTop: 12 }}>
-                    <button
+                    <a
                       className="cta primary"
-                      type="button"
-                      aria-pressed={selectedNftTokenId === nft.tokenId}
+                      href={`https://explorer.xolosarmy.xyz/linaje/${encodeURIComponent(nft.tokenId)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
                       onClick={() => setSelectedNftTokenId(nft.tokenId)}
                     >
                       Verificar linaje
-                    </button>
+                    </a>
                     <Link className="cta outline" to={`/send-nft?tokenId=${nft.tokenId}`}>
                       Enviar
                     </Link>
