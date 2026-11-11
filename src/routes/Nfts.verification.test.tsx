@@ -91,10 +91,16 @@ describe('/nfts on-chain verification integration', () => {
       </MemoryRouter>
     )
 
-    const verifyButton = await screen.findByRole('button', { name: 'Verificar linaje' })
+    const verifyLink = await screen.findByRole('link', { name: 'Verificar linaje' })
+    expect(verifyLink.getAttribute('href')).toBe(
+      `https://explorer.xolosarmy.xyz/linaje/${CHILD_TOKEN_ID}`
+    )
+    expect(verifyLink.getAttribute('target')).toBe('_blank')
+    expect(verifyLink.getAttribute('rel')).toContain('noopener')
+    expect(verifyLink.getAttribute('rel')).toContain('noreferrer')
     expect(mocks.verifyNftCollection).not.toHaveBeenCalled()
 
-    fireEvent.click(verifyButton)
+    fireEvent.click(verifyLink)
 
     await waitFor(() =>
       expect(mocks.verifyNftCollection).toHaveBeenCalledExactlyOnceWith(CHILD_TOKEN_ID)
