@@ -125,8 +125,10 @@ describe('PublishStateMachineButton Component', () => {
     expect(screen.getByTestId('success-txid').textContent).toBe(testTxid)
 
     const explorerLink = screen.getByTestId('explorer-link') as HTMLAnchorElement
-    expect(explorerLink.href).toBe(`https://explorer.e.cash/tx/${testTxid}`)
+    expect(explorerLink.href).toBe(`https://explorer.xolosarmy.xyz/tx/${testTxid}`)
     expect(explorerLink.getAttribute('target')).toBe('_blank')
+    expect(explorerLink.getAttribute('rel')).toBe('noopener noreferrer')
+    expect(explorerLink.textContent).toContain('Ver en Xolos Explorer')
 
     const resetBtn = screen.getByTestId('publish-reset-button')
     fireEvent.click(resetBtn)
@@ -150,6 +152,8 @@ describe('PublishStateMachineButton Component', () => {
       'Indexación pendiente'
     )
     expect(screen.getByTestId('published-txid').textContent).toBe(testTxid)
+    const pendingExplorerLink = screen.getByTestId('published-explorer-link') as HTMLAnchorElement
+    expect(pendingExplorerLink.href).toBe(`https://explorer.xolosarmy.xyz/tx/${testTxid}`)
   })
 
   it('offers an indexing-only retry after the bounded wait expires', () => {
