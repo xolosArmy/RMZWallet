@@ -157,7 +157,7 @@ describe('TonalliMemoComposer Integration', () => {
     })
 
     const explorerLink = screen.getByTestId('explorer-link') as HTMLAnchorElement
-    expect(explorerLink.href).toBe(`https://explorer.e.cash/tx/${testTxid}`)
+    expect(explorerLink.href).toBe(`https://explorer.xolosarmy.xyz/tx/${testTxid}`)
 
     // Reset back to idle
     const resetBtn = screen.getByTestId('publish-reset-button')
