@@ -12,7 +12,7 @@ export interface PublishStateMachineButtonProps {
   explorerBaseUrl?: string
 }
 
-const DEFAULT_EXPLORER_BASE_URL = 'https://explorer.e.cash/tx/'
+const DEFAULT_EXPLORER_BASE_URL = 'https://explorer.xolosarmy.xyz/tx/'
 
 export function PublishStateMachineButton({
   phase,
@@ -316,7 +316,7 @@ function PublishedTransaction({
             className="cta outline small memo-tx-link"
             data-testid={success ? 'explorer-link' : 'published-explorer-link'}
           >
-            Ver en eCash Explorer ↗
+            Ver en Xolos Explorer ↗
           </a>
         </div>
       )}
